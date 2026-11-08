@@ -200,6 +200,10 @@ pub struct LstrApp {
     typing: Option<crate::win::typing::TypingWatch>,
     /// 设置页「资产」的草稿输入状态。
     assets_ui: crate::assets_ui::AssetUiState,
+    /// P0-2：这次唤出锁定的 Explorer 当前目录（None = 普通全局启动器）。
+    typing_folder: Option<std::path::PathBuf>,
+    /// 目录上下文里临时切到全局搜索（Ctrl+Shift+G）。
+    typing_global: bool,
 }
 
 impl LstrApp {
@@ -313,6 +317,8 @@ impl LstrApp {
             icons: IconStore::new(),
             typing,
             assets_ui: crate::assets_ui::AssetUiState::default(),
+            typing_folder: None,
+            typing_global: false,
         }
     }
 
@@ -338,7 +344,13 @@ impl LstrApp {
             return;
         };
         if self.hidden {
+            // 必须在 show() 之前取：钩子吞键时前台还是 Explorer，
+            // show() 一旦把窗口显示/激活，GetForegroundWindow 就变成 lstr 自己了。
+            let folder = crate::win::explorer::foreground_explorer_folder();
             self.show(ctx);
+            self.typing_folder = folder;
+            self.typing_global = false;
+            self.scope = Scope::All;
         }
         self.input.push(ch);
         self.selected = 0;
@@ -455,7 +467,20 @@ impl LstrApp {
     fn poll_search(&mut self, ctx: &egui::Context) {
         if let Some(deadline) = self.dirty_at {
             if Instant::now() >= deadline {
-                self.pending_gen = self.service.search(&self.input, self.scope, self.dialog.is_some(), &self.filters, &self.cfg.rank, self.cfg.show_history);
+                let base_folder = if self.typing_global {
+                    None
+                } else {
+                    self.typing_folder.clone()
+                };
+                self.pending_gen = self.service.search_in(
+                    &self.input,
+                    self.scope,
+                    self.dialog.is_some(),
+                    &self.filters,
+                    &self.cfg.rank,
+                    self.cfg.show_history,
+                    base_folder,
+                );
                 self.waiting = true;
                 self.dirty_at = None;
             } else {
@@ -515,6 +540,9 @@ impl LstrApp {
         self.scroll_to_selection = false;
         self.filters = SearchFilters::default();
         self.filter_menu = None;
+        // 普通唤出（双击 Space / 托盘）不携带 Explorer 目录上下文。
+        self.typing_folder = None;
+        self.typing_global = false;
         self.apply_size(ctx);
         if let Some(hwnd) = self.hwnd {
             window::position_center(hwnd);
@@ -527,6 +555,8 @@ impl LstrApp {
 
     fn open_dialog_mode(&mut self, ctx: &egui::Context, info: DialogInfo) {
         self.dialog = Some(info.clone());
+        self.typing_folder = None;
+        self.typing_global = false;
         self.menu_open = false;
         self.center_frames = 0;
         self.pending_show = true;
@@ -580,6 +610,9 @@ impl LstrApp {
         self.menu_open = false;
         self.center_frames = 0;
         self.focus_requested = false;
+        // 下次在 Explorer 里打字会重新读取当时浏览的目录。
+        self.typing_folder = None;
+        self.typing_global = false;
     }
 
     fn apply_size(&mut self, ctx: &egui::Context) {
@@ -679,6 +712,27 @@ impl LstrApp {
             self.preview_open = !self.preview_open;
             self.cfg.preview = self.preview_open;
             let _ = self.cfg.save();
+            return;
+        }
+
+        // P0-2：目录上下文里一键切到全局搜索 / 切回来。
+        if self.typing_folder.is_some()
+            && ctx.input_mut(|i| {
+                i.consume_key(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::G)
+            })
+        {
+            self.typing_global = !self.typing_global;
+            self.selected = 0;
+            self.trigger(ctx);
+            self.toast(
+                ctx,
+                if self.typing_global {
+                    "已切换到全局搜索"
+                } else {
+                    "已切回当前目录"
+                }
+                .to_string(),
+            );
             return;
         }
 
@@ -918,6 +972,18 @@ impl LstrApp {
             self.run_command(ctx, &entry);
             return;
         }
+        // P0-2：从 Explorer 唤起时，文件夹结果让原窗口直接跳过去，
+        // 而不是 shell::open_entry 再开一个新资源管理器窗口。
+        if entry.kind == Kind::Folder && self.typing_folder.is_some() && !self.typing_global {
+            if crate::win::explorer::navigate_active_to(&entry.full_path()).is_ok() {
+                self.service.record_open(&entry);
+                if let Ok(mut history) = self.history.lock() {
+                    history.record_query(&self.input, &entry);
+                }
+                self.hide(ctx);
+                return;
+            }
+        }
         match shell::open_entry(&entry) {
             Ok(()) => {
                 self.service.record_open(&entry);
@@ -1141,9 +1207,19 @@ impl LstrApp {
                     egui::vec2(rect.width() - 2.0 * PAD, 28.0),
                 );
                 let hint = if self.dialog.is_some() {
-                    dialog_hint(query.scope)
+                    dialog_hint(query.scope).to_string()
+                } else if let Some(folder) = &self.typing_folder {
+                    if self.typing_global {
+                        "全局搜索中（Ctrl+Shift+G 回到当前目录）…".to_string()
+                    } else {
+                        let name = folder
+                            .file_name()
+                            .map(|part| part.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| folder.to_string_lossy().into_owned());
+                        format!("在 {name} 中搜索（Ctrl+Shift+G 全局）…")
+                    }
                 } else {
-                    hint_for(query.scope)
+                    hint_for(query.scope).to_string()
                 };
                 let response = ui.put(
                     search_rect,
@@ -1152,7 +1228,7 @@ impl LstrApp {
                         .margin(egui::Margin::same(0))
                         .font(ui::text_font(22.0))
                         .text_color(theme.text)
-                        .hint_text(hint)
+                        .hint_text(hint.as_str())
                         .desired_width(f32::INFINITY)
                         .id(egui::Id::new("lstr-search-input")),
                 );
@@ -1846,6 +1922,8 @@ impl LstrApp {
                     Scope::Folder => "输入文件夹名，Enter 跳转",
                     _ => "输入文件名，Enter 填入",
                 }
+            } else if self.typing_folder.is_some() && !self.typing_global {
+                "当前目录内无匹配 · Ctrl+Shift+G 全局搜索"
             } else {
                 "试试 ext:rs、path: 或 a 微信"
             };
@@ -2242,7 +2320,7 @@ impl LstrApp {
             Stroke::new(1.0, theme.hair),
         );
 
-        let default_text = if query.is_empty() {
+        let mut default_text = if query.is_empty() {
             format!(
                 "{} 项{}",
                 entries.len(),
@@ -2260,6 +2338,17 @@ impl LstrApp {
                 if self.scrollable { " · 滚轮查看更多" } else { "" }
             )
         };
+        if let Some(folder) = &self.typing_folder {
+            if self.typing_global {
+                default_text.push_str(" · 全局");
+            } else {
+                let name = folder
+                    .file_name()
+                    .map(|part| part.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| folder.to_string_lossy().into_owned());
+                default_text.push_str(&format!(" · 目录: {name}"));
+            }
+        }
         let now = Instant::now();
         let active_toast = match &self.toast {
             Some((message, until)) if now < *until => Some(message.clone()),

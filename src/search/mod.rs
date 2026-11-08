@@ -39,6 +39,8 @@ struct Request {
     show_history: bool,
     /// P0-1：收藏列表（Quick Switch 数据源）。
     favorites: Vec<crate::assets::Favorite>,
+    /// P0-2：「Explorer 内键入即搜」锁定的当前目录（None = 全局搜索）。
+    base_folder: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +107,21 @@ impl SearchService {
         rank: &RankConfig,
         show_history: bool,
     ) -> u64 {
+        self.search_in(raw, scope, dialog_quick, filters, rank, show_history, None)
+    }
+
+    /// P0-2：带目录上下文的搜索。base_folder 由「Explorer 内键入即搜」提供，
+    /// worker 把它作为隐含的 path: 过滤；用户显式输入路径模式时自动忽略。
+    pub fn search_in(
+        &mut self,
+        raw: &str,
+        scope: Scope,
+        dialog_quick: bool,
+        filters: &SearchFilters,
+        rank: &RankConfig,
+        show_history: bool,
+        base_folder: Option<PathBuf>,
+    ) -> u64 {
         self.generation += 1;
         let query = query::parse(raw, scope);
         let _ = self.tx.send(Request {
@@ -117,6 +134,7 @@ impl SearchService {
             rank: rank.clone(),
             show_history,
             favorites: self.favorites.clone(),
+            base_folder,
         });
         self.generation
     }
@@ -302,6 +320,19 @@ fn run_worker(
             request = next;
         }
 
+        // P0-2：目录上下文。用户显式输入路径模式时退出，手输 path: 时以用户为准，
+        // 避免把「在当前目录里搜」悄悄套到用户指定的另一个目录上。
+        let in_folder_context =
+            request.base_folder.is_some() && browse::parse(&request.query.raw).is_none();
+        if in_folder_context && request.query.path_filter.is_none() {
+            if let Some(folder) = &request.base_folder {
+                let dir = folder.to_string_lossy().into_owned();
+                if !dir.is_empty() {
+                    request.query.path_filter = Some(dir);
+                }
+            }
+        }
+
         // 路径模式（D:\foo\bar、\\server\share）：直接列目录，
         // 不碰 Everything，也不必为它懒启动 PowerShell 枚举 UWP。
         if let Some(path_query) = browse::parse(&request.query.raw) {
@@ -344,9 +375,32 @@ fn run_worker(
             continue;
         }
 
+        // P0-2：目录上下文下清空输入时直接列当前目录的子项（就地浏览），
+        // 而不是「最近使用」。查询时仍有隐含 path:，范围始终是这个目录。
+        if in_folder_context && request.query.is_empty() {
+            let started = Instant::now();
+            let dir = request
+                .base_folder
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut entries: Vec<Entry> = dir_cache.children(&dir).to_vec();
+            let total = entries.len();
+            entries.truncate(request.limit.max(200));
+            let _ = tx.send(Response {
+                generation: request.generation,
+                entries,
+                total,
+                elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
+                error: None,
+            });
+            ctx.request_repaint();
+            continue;
+        }
+
         let needs_uwp = match request.query.scope {
             Scope::App => true,
-            Scope::All => !request.query.is_empty(),
+            Scope::All => !request.query.is_empty() && !in_folder_context,
             _ => false,
         };
         if needs_uwp && !uwp_started {
@@ -406,7 +460,7 @@ fn run_worker(
                 Scope::All => {
                     // 有筛选时只搜文件：位置/时间/类型对应用和命令没有意义，
                     // 硬塞进来只会让人疑惑「选了 D 盘怎么还出现微信」。
-                    if request.filters.is_empty() {
+                    if request.filters.is_empty() && !in_folder_context {
                         keyword_rows = keyword_entries(&request.keywords, &request.query.text);
                     }
                     let mut needs_exact = false;
@@ -450,7 +504,7 @@ fn run_worker(
                     } else {
                         error = Some("Everything 未运行".to_string());
                     }
-                    if request.filters.is_empty() {
+                    if request.filters.is_empty() && !in_folder_context {
                         let mut app_hits = apps.search(&request.query.text, request.limit);
                         total += app_hits.len();
                         entries.append(&mut app_hits);
