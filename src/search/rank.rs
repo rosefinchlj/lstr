@@ -1,0 +1,642 @@
+use crate::config::RankConfig;
+use crate::history::History;
+use crate::model::{Entry, Kind};
+
+// 匹配档位分值来自 RankConfig（设置面板可调），这里只保留固定微调。
+// 各档默认值：精确 1000 / 前缀 800 / 子串 600 / 多词 550 / 分隔符 520 /
+// 拼音 450/350 / 模糊 300 / 仅路径 200。
+
+// 历史分数换算：每 1.0 frecency 折算 10 分，上限来自 RankConfig（默认 150）。
+const HISTORY_WEIGHT: f32 = 10.0;
+// app_boost 的每个单位折算 10 分，只作用于 Kind::App。
+const APP_BOOST_UNIT: i32 = 10;
+// 同分时文件夹略微优先于文件。
+const FOLDER_TIE_BONUS: i32 = 5;
+// 命令的别名精确命中（如「设置」）要压过最近用过的同名应用，但不能
+// 让「启动 Everything」这类命令在搜索 everything 时盖过应用本身。
+const COMMAND_BOOST: i32 = 300;
+// 精确同名时按路径深浅再排一次：E:\use 应压过
+// C:\...\perl5\core_perl\Test\use 这种深埋的同名目录（home 加权会反过来）。
+const EXACT_SHALLOW_DEPTH: i32 = 12;
+const EXACT_SHALLOW_UNIT: i32 = 2;
+// 名称子串匹配的额外加分：词首（下划线/连字符/点后）比词中更像用户要的；
+// 出现位置越靠前越好。上限 40，保证不越过「名称前缀」。
+const SUBSTRING_BOUNDARY_BONUS: i32 = 30;
+const SUBSTRING_POSITION_BONUS: i32 = 10;
+
+/// 按分数从高到低稳定排序（使用设置面板里的排序权重）。
+pub fn rank_with(
+    entries: &mut Vec<Entry>,
+    q: &str,
+    history: &History,
+    app_boost: i32,
+    cfg: &RankConfig,
+) {
+    entries.sort_by_cached_key(|entry| {
+        std::cmp::Reverse(score_entry_with(entry, q, history, app_boost, cfg))
+    });
+}
+
+/// 测试用默认权重的包装。
+#[cfg(test)]
+pub fn rank(entries: &mut Vec<Entry>, q: &str, history: &History, app_boost: i32) {
+    rank_with(entries, q, history, app_boost, &RankConfig::default());
+}
+
+/// 单个条目的排序分（默认权重，测试用）。
+#[cfg(test)]
+pub fn score_entry(entry: &Entry, q: &str, history: &History, app_boost: i32) -> i32 {
+    score_entry_with(entry, q, history, app_boost, &RankConfig::default())
+}
+
+/// 单个条目的排序分。查询为空时按历史、应用加权和类型偏好排序（最近使用优先）。
+pub fn score_entry_with(
+    entry: &Entry,
+    q: &str,
+    history: &History,
+    app_boost: i32,
+    cfg: &RankConfig,
+) -> i32 {
+    let needle = q.trim().to_lowercase();
+    let history_points = (history.score(&entry.id) * HISTORY_WEIGHT)
+        .round()
+        .clamp(0.0, cfg.history_cap.max(0) as f32) as i32;
+    // 启动项（应用 + 可执行程序）加权：用户优先看到可以直接启动的东西。
+    let launch_points = match entry.kind {
+        Kind::App | Kind::Program => app_boost.max(0) * APP_BOOST_UNIT,
+        Kind::Command => COMMAND_BOOST,
+        _ => 0,
+    };
+    let folder_points = if entry.kind == Kind::Folder {
+        FOLDER_TIE_BONUS
+    } else {
+        0
+    };
+
+    if needle.is_empty() {
+        return history_points + launch_points + kind_preference(entry.kind) + folder_points;
+    }
+
+    let match_points = match_tier(entry, &needle, cfg);
+    if match_points == 0 {
+        return 0;
+    }
+    // 精确同名：路径越浅越可能是用户要找的那个（E:\use vs Perl 测试目录）。
+    // 同时压过 USERPROFILE 加权——深埋在用户目录里的同名目录不该赢过根目录。
+    let exact_shallow_points = if match_points == cfg.exact {
+        let depth = entry.full_path().matches('\\').count() as i32;
+        (EXACT_SHALLOW_DEPTH - depth).max(0) * EXACT_SHALLOW_UNIT
+    } else {
+        0
+    };
+    // 拉丁字母查询命中中文应用/程序拼音时，启动目标应排到普通文件前面。
+    let pinyin_app_points = if matches!(entry.kind, Kind::App | Kind::Program)
+        && !entry.name.to_lowercase().contains(&needle)
+    {
+        let mut hit = false;
+        if let Some(pinyin) = &entry.pinyin {
+            hit = pinyin.to_lowercase().contains(&needle);
+        }
+        if !hit {
+            hit = entry.initial.to_lowercase().contains(&needle);
+        }
+        if hit { 450 } else { 0 }
+    } else {
+        0
+    };
+    match_points
+        + history_points
+        + launch_points
+        + folder_points
+        + pinyin_app_points
+        + exact_shallow_points
+        + recency_points(entry.modified, cfg)
+        + path_adjustment(entry, &needle, cfg)
+}
+
+/// 最近修改过的文件更可能是目标（轻量加分，不压过匹配档位）。
+fn recency_points(modified: Option<i64>, cfg: &RankConfig) -> i32 {
+    let Some(ts) = modified else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let age = (now - ts).max(0);
+    let boost = cfg.recent_boost.max(0);
+    if age <= 7 * 86400 {
+        boost
+    } else if age <= 30 * 86400 {
+        boost / 2
+    } else {
+        0
+    }
+}
+
+/// 环境路径只算一次：之前每个候选都调 `std::env::var` + `current_dir`，
+/// 500 个候选 × 每次击键就是上千次查询。
+struct EnvPaths {
+    home: Option<String>,
+    cwd: Option<String>,
+    cwd_parent: Option<String>,
+}
+
+fn env_paths() -> &'static EnvPaths {
+    use std::sync::OnceLock;
+    static ENV: OnceLock<EnvPaths> = OnceLock::new();
+    ENV.get_or_init(|| {
+        let home = std::env::var("USERPROFILE").ok().map(|home| home.to_lowercase());
+        let cwd = std::env::current_dir().ok();
+        let cwd_parent = cwd
+            .as_ref()
+            .and_then(|dir| dir.parent().map(|parent| parent.to_string_lossy().to_lowercase()));
+        let cwd = cwd.map(|dir| dir.to_string_lossy().to_lowercase());
+        EnvPaths { home, cwd, cwd_parent }
+    })
+}
+
+/// 噪声惩罚：遍历用户可编辑的规则表，取命中的最重一档，再乘全局强度。
+/// 规则统一按正斜杠匹配（先把路径里的 `\` 换成 `/`）。
+fn noise_penalty(path: &str, needle: &str, kind: Kind, cfg: &RankConfig) -> i32 {
+    let normalized_path = path.replace('\\', "/");
+    let mut worst = 0;
+    for rule in &cfg.noise_rules {
+        let pattern = rule.pattern.trim().to_lowercase().replace('\\', "/");
+        if pattern.is_empty() || !normalized_path.contains(&pattern) {
+            continue;
+        }
+        // target 下的 .exe 是正常程序产物，不罚。
+        if pattern == "/target/" && kind == Kind::Program {
+            continue;
+        }
+        // 「用户在找噪声目录本身」：查询词包含在片段里，如 cache / temp。
+        if needle.len() >= 2 && pattern.contains(needle) {
+            continue;
+        }
+        worst = worst.max(rule.penalty.clamp(0, 500));
+    }
+    worst * cfg.noise_strength.clamp(0, 200) / 100
+}
+
+fn path_adjustment(entry: &Entry, needle: &str, cfg: &RankConfig) -> i32 {
+    let path = entry.full_path().to_lowercase();
+    let mut score = 0;
+
+    // 名字越短，越可能是用户真正要找的条目。
+    score += 30 - (entry.name.chars().count() as i32).min(30);
+    // 浅层路径优先。
+    score += 20 - (path.matches('\\').count() as i32).min(20);
+
+    // 噪声规则降权（设置「噪声规则」页可增删改）。
+    score -= noise_penalty(&path, needle, entry.kind, cfg);
+
+    let env = env_paths();
+    if let Some(home) = &env.home {
+        if path.starts_with(home.as_str()) {
+            score += 20;
+        }
+    }
+
+    // 当前工作目录上下文：从项目里启动时，优先当前项目树。
+    if let Some(parent) = &env.cwd_parent {
+        if path.starts_with(parent.as_str()) {
+            score += 200;
+        }
+    }
+    if let Some(cwd) = &env.cwd {
+        if path.starts_with(cwd.as_str()) {
+            score += 300;
+        }
+    }
+    score
+}
+
+fn match_tier(entry: &Entry, needle: &str, cfg: &RankConfig) -> i32 {
+    if entry.kind == Kind::Command {
+        for alias in crate::search::command_aliases(&entry.id) {
+            let alias = alias.to_lowercase();
+            if alias == needle {
+                return cfg.exact;
+            }
+            if alias.starts_with(needle) {
+                return cfg.prefix;
+            }
+            if alias.contains(needle) {
+                return cfg.substring;
+            }
+        }
+    }
+    let name = entry.name.to_lowercase();
+    if name == needle {
+        return cfg.exact;
+    }
+    if name.starts_with(needle) {
+        return cfg.prefix;
+    }
+    if let Some(byte_pos) = name.find(needle) {
+        // 词首匹配（app_config → 命中 config）比词中匹配更像目标；
+        // 出现位置越靠前越好。
+        let char_pos = name[..byte_pos].chars().count() as i32;
+        let position_bonus = (SUBSTRING_POSITION_BONUS - char_pos.min(SUBSTRING_POSITION_BONUS)).max(0);
+        let boundary = byte_pos == 0
+            || name[..byte_pos]
+                .chars()
+                .last()
+                .is_some_and(|ch| matches!(ch, '_' | '-' | '.' | ' ' | '(' | '['));
+        let boundary_bonus = if boundary { SUBSTRING_BOUNDARY_BONUS } else { 0 };
+        return cfg.substring + boundary_bonus + position_bonus;
+    }
+
+    // 多词查询：所有词都出现在名称里（`my report` → `my_report.pdf`）。
+    // Everything 已按 AND 过滤，这里给个合理档位，别让它们沉底。
+    if needle.contains(char::is_whitespace) {
+        let tokens: Vec<&str> = needle.split_whitespace().collect();
+        if tokens.len() > 1 && tokens.iter().all(|token| name.contains(token)) {
+            return cfg.tokens;
+        }
+    }
+
+    // 分隔符不敏感：`myreport` → `my_report.pdf`。
+    let normalize = |text: &str| -> String {
+        text.chars()
+            .filter(|ch| !matches!(ch, '_' | '-' | '.' | ' '))
+            .collect()
+    };
+    let normalized_needle = normalize(needle);
+    if normalized_needle.chars().count() >= 3
+        && normalize(&name).contains(&normalized_needle)
+    {
+        return cfg.normalized;
+    }
+
+    let mut pinyin_substring = false;
+    let candidates = entry
+        .pinyin
+        .iter()
+        .flat_map(|pinyin| pinyin.split(' '))
+        .chain(std::iter::once(entry.initial.as_str()));
+    for candidate in candidates {
+        let candidate = candidate.to_lowercase();
+        if candidate.is_empty() {
+            continue;
+        }
+        if candidate.starts_with(needle) {
+            return cfg.pinyin_prefix;
+        }
+        if candidate.contains(needle) {
+            pinyin_substring = true;
+        }
+    }
+    if pinyin_substring {
+        return cfg.pinyin_substring;
+    }
+
+    // 子序列模糊只作用于本地索引能新产出结果的类别（应用/命令/程序）；
+    // 文件类由 Everything 按子串过滤，模糊档加不出新结果只会带来噪声。
+    if matches!(entry.kind, Kind::App | Kind::Command | Kind::Program) {
+        let mut best = crate::search::fuzzy::score_dense(&entry.name, needle);
+        if best.is_none() {
+            if let Some(pinyin) = &entry.pinyin {
+                // 拼音容错（wxin → weixin）：逐段密度匹配，得分打八折；
+                // 不做跨段拼接、拒绝纯散布命中（噪声）。
+                best = pinyin
+                    .split(' ')
+                    .filter_map(|token| crate::search::fuzzy::score_dense(token, needle))
+                    .map(|s| s * 4 / 5)
+                    .max();
+            }
+        }
+        if let Some(score) = best {
+            return cfg.fuzzy + score.clamp(0, 49);
+        }
+    }
+
+    if entry.full_path().to_lowercase().contains(needle) {
+        return cfg.path_only;
+    }
+
+    0
+}
+
+/// 空查询时的类型偏好；最近使用分会叠加在这之上。
+fn kind_preference(kind: Kind) -> i32 {
+    match kind {
+        Kind::App => 20,
+        Kind::Folder => 10,
+        Kind::Program => 8,
+        Kind::File => 5,
+        Kind::Command => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Kind;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_secs()
+    }
+
+    fn entry(id: &str, name: &str, kind: Kind) -> Entry {
+        Entry {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            path: Some(PathBuf::from(format!("C:\\tools\\{name}"))),
+            size: None,
+            modified: None,
+            pinyin: None,
+            initial: String::new(),
+            tone: 0,
+        }
+    }
+
+    fn history(entries: &[(&str, u32, u64)]) -> History {
+        let mut history = History::in_memory();
+        for (id, count, last) in entries {
+            history.seed(&entry(id, id, Kind::File), *count, *last);
+        }
+        history
+    }
+
+    #[test]
+    fn noise_directories_are_downranked() {
+        let mk = |id: &str, path: &str| {
+            let mut e = entry(id, "settings.json", Kind::File);
+            e.path = Some(std::path::PathBuf::from(path));
+            e
+        };
+        let history = History::in_memory();
+        let clean = mk("clean", r"D:\proj\pkg\settings.json");
+        for path in [
+            r"D:\proj\node_modules\pkg\settings.json",
+            r"D:\proj\target\debug\settings.json",
+            r"D:\project\.git\settings.json",
+            r"C:\Users\x\AppData\Local\Temp\settings.json",
+            r"C:\Windows\WinSxS\settings.json",
+            r"D:\py\Lib\site-packages\pkg\settings.json",
+            r"D:\go\pkg\mod\pkg\settings.json",
+        ] {
+            let noisy = mk("noisy", path);
+            let delta = score_entry(&clean, "settings", &history, 3)
+                - score_entry(&noisy, "settings", &history, 3);
+            assert!(delta >= 60, "噪声目录应明显降权: {path} (delta={delta})");
+        }
+    }
+
+    #[test]
+    fn searching_noise_keyword_disables_penalty() {
+        // 用户明确搜 "cache" 时，.cache 目录不该被降权。
+        let mut noisy = entry("noisy", "cache", Kind::Folder);
+        noisy.path = Some(std::path::PathBuf::from(r"D:\proj\.cache\cache"));
+        let mut clean = entry("clean", "cache", Kind::Folder);
+        clean.path = Some(std::path::PathBuf::from(r"D:\proj\cache"));
+        let history = History::in_memory();
+        let a = score_entry(&noisy, "cache", &history, 0);
+        let b = score_entry(&clean, "cache", &history, 0);
+        assert!((b - a).abs() <= 4, "搜 cache 不应降权: noisy={a} clean={b}");
+    }
+
+    #[test]
+    fn temp_file_names_are_downranked() {
+        let cfg = RankConfig::default();
+        assert!(noise_penalty(r"C:\x\~$report.docx", "report", Kind::File, &cfg) > 0);
+        assert!(noise_penalty(r"C:\x\data.tmp", "data", Kind::File, &cfg) > 0);
+        assert_eq!(
+            noise_penalty(r"C:\x\video.mp4.crdownload", "video", Kind::File, &cfg),
+            100
+        );
+        // 用户明确在找它时不罚。
+        assert_eq!(noise_penalty(r"C:\x\Thumbs.db", "thumbs", Kind::File, &cfg), 0);
+        assert_eq!(noise_penalty(r"C:\x\data.tmp", "tmp", Kind::File, &cfg), 0);
+        assert_eq!(noise_penalty(r"C:\x\report.docx", "report", Kind::File, &cfg), 0);
+    }
+
+    #[test]
+    fn word_boundary_matches_rank_higher() {
+        // app_config 命中 config 应比 appxconfig 命中更靠前。
+        let boundary = entry("b", "app_config.json", Kind::File);
+        let middle = entry("m", "appxconfig.json", Kind::File);
+        let history = History::in_memory();
+        assert!(
+            score_entry(&boundary, "config", &history, 0)
+                > score_entry(&middle, "config", &history, 0)
+        );
+    }
+
+    #[test]
+    fn multi_word_queries_match_separated_names() {
+        // my report → my_report_2024.pdf：所有词都在名称里，不该沉底。
+        let entry = entry("e", "my_report_2024.pdf", Kind::File);
+        let score = score_entry(&entry, "my report", &History::in_memory(), 0);
+        assert!(score >= RankConfig::default().tokens, "多词全含应有 550 档: {score}");
+    }
+
+    #[test]
+    fn separator_insensitive_match() {
+        // myreport → my_report.pdf（忽略下划线/连字符/点）。
+        let entry = entry("e", "my_report.pdf", Kind::File);
+        let score = score_entry(&entry, "myreport", &History::in_memory(), 0);
+        assert!(score >= RankConfig::default().normalized, "分隔符不敏感匹配: {score}");
+    }
+
+    #[test]
+    fn recent_files_get_a_small_boost() {
+        let now = now() as i64;
+        let mut fresh = entry("fresh", "notes.md", Kind::File);
+        fresh.modified = Some(now);
+        let mut stale = entry("stale", "notes.md", Kind::File);
+        stale.modified = Some(now - 400 * 86400);
+        let history = History::in_memory();
+        assert!(
+            score_entry(&fresh, "notes", &history, 0)
+                > score_entry(&stale, "notes", &history, 0)
+        );
+        // 只是轻微加成，不能压过匹配档位。
+        assert!(score_entry(&fresh, "notes", &history, 0)
+            - score_entry(&stale, "notes", &history, 0)
+            <= RankConfig::default().recent_boost);
+    }
+
+    #[test]
+    fn exact_match_prefers_shallow_paths() {
+        // E:\use 与深埋的同名目录都能精确命中时，浅路径优先。
+        let mut shallow = entry("shallow", "use", Kind::Folder);
+        shallow.path = Some(std::path::PathBuf::from(r"E:\use"));
+        let mut deep = entry("deep", "use", Kind::Folder);
+        deep.path = Some(std::path::PathBuf::from(
+            r"C:\Users\someone\.workbuddy\vendor\PortableGit\usr\share\perl5\Test\use",
+        ));
+        let mut entries = vec![deep, shallow];
+        rank(&mut entries, "use", &History::in_memory(), 3);
+        assert_eq!(entries[0].id, "shallow");
+    }
+
+    #[test]
+    fn fuzzy_app_match_scores_above_zero() {
+        let mut entries = vec![
+            entry("app", "Visual Studio Code", Kind::App),
+            entry("file", "notes.txt", Kind::File),
+        ];
+        rank(&mut entries, "vsc", &History::in_memory(), 3);
+        assert_eq!(entries[0].id, "app");
+    }
+
+    #[test]
+    fn name_substring_beats_fuzzy() {
+        let mut entries = vec![
+            entry("fuzzy", "Visual Studio Code", Kind::App),
+            entry("sub", "vsc-backup.zip", Kind::File),
+        ];
+        rank(&mut entries, "vsc", &History::in_memory(), 3);
+        assert_eq!(entries[0].id, "sub");
+    }
+
+    #[test]
+    fn files_do_not_fuzzy_match() {
+        // 文件类结果由 Everything 按子串过滤，客户端不再做模糊，避免噪声。
+        let file = entry("f", "calendar.ics", Kind::File);
+        assert_eq!(score_entry(&file, "cdr", &History::in_memory(), 3), 0);
+    }
+
+    #[test]
+    fn name_prefix_beats_name_substring() {
+        let mut entries = vec![
+            entry("sub", "my-report.txt", Kind::File),
+            entry("prefix", "report.txt", Kind::File),
+        ];
+        rank(&mut entries, "report", &History::in_memory(), 3);
+        assert_eq!(entries[0].id, "prefix");
+    }
+
+    #[test]
+    fn name_exact_beats_pinyin_prefix() {
+        let exact = entry("exact", "wx", Kind::File);
+        let mut pinyin = entry("pinyin", "微信", Kind::File);
+        pinyin.pinyin = Some("weixin".to_string());
+        pinyin.initial = "wx".to_string();
+        let mut entries = vec![pinyin, exact];
+        rank(&mut entries, "wx", &History::in_memory(), 3);
+        assert_eq!(entries[0].id, "exact");
+    }
+
+    #[test]
+    fn pinyin_prefix_beats_path_substring() {
+        let mut pinyin = entry("pinyin", "微信", Kind::File);
+        pinyin.pinyin = Some("weixin".to_string());
+        pinyin.initial = "wx".to_string();
+        let mut path = entry("path", "readme.txt", Kind::File);
+        path.path = Some(PathBuf::from("C:\\wx-tools\\readme.txt"));
+        let mut entries = vec![path, pinyin];
+        rank(&mut entries, "wx", &History::in_memory(), 3);
+        assert_eq!(entries[0].id, "pinyin");
+    }
+
+    #[test]
+    fn matching_is_case_insensitive() {
+        let entry = entry("upper", "REPORT.TXT", Kind::File);
+        assert!(score_entry(&entry, "report", &History::in_memory(), 3) > 0);
+    }
+
+    #[test]
+    fn history_boosts_equal_matches() {
+        let mut entries = vec![
+            entry("cold", "report-old.txt", Kind::File),
+            entry("hot", "report-new.txt", Kind::File),
+        ];
+        let history = history(&[("hot", 5, now())]);
+        rank(&mut entries, "report", &history, 3);
+        assert_eq!(entries[0].id, "hot");
+    }
+
+    #[test]
+    fn empty_query_puts_most_recent_first() {
+        let t = now();
+        let mut entries = vec![
+            entry("stale", "stale.txt", Kind::File),
+            entry("fresh", "fresh.txt", Kind::File),
+        ];
+        let history = history(&[
+            ("stale", 1, t.saturating_sub(30 * 24 * 60 * 60)),
+            ("fresh", 1, t),
+        ]);
+        rank(&mut entries, "", &history, 3);
+        assert_eq!(entries[0].id, "fresh");
+    }
+
+    #[test]
+    fn app_boost_prefers_apps_on_equal_match() {
+        let mut entries = vec![
+            entry("file", "notes", Kind::File),
+            entry("app", "notes", Kind::App),
+        ];
+        rank(&mut entries, "notes", &History::in_memory(), 3);
+        assert_eq!(entries[0].id, "app");
+    }
+
+    #[test]
+    fn folder_beats_file_on_tie() {
+        let mut entries = vec![
+            entry("file", "docs", Kind::File),
+            entry("folder", "docs", Kind::Folder),
+        ];
+        rank(&mut entries, "docs", &History::in_memory(), 0);
+        assert_eq!(entries[0].id, "folder");
+    }
+
+    #[test]
+    fn equal_scores_keep_input_order() {
+        let mut entries = vec![
+            entry("first", "a.txt", Kind::File),
+            entry("second", "b.txt", Kind::File),
+        ];
+        rank(&mut entries, "txt", &History::in_memory(), 0);
+        assert_eq!(entries[0].id, "first");
+        assert_eq!(entries[1].id, "second");
+    }
+
+    #[test]
+    fn control_panel_uninstall_beats_file_matches() {
+        // 控制面板「卸载程序」：名称精确命中，应压过同名文件和设置页。
+        let mut uninstall = entry("sys:卸载程序", "卸载程序", Kind::App);
+        uninstall.path = Some(PathBuf::from("appwiz.cpl"));
+        let mut entries = vec![
+            entry("file:1", "卸载程序.txt", Kind::File),
+            entry("file:2", "如何卸载程序.pdf", Kind::File),
+            entry("sys:应用和功能", "应用和功能", Kind::App),
+            uninstall,
+        ];
+        rank(&mut entries, "卸载程序", &History::in_memory(), 3);
+        assert_eq!(entries[0].id, "sys:卸载程序");
+        assert_eq!(
+            entries[0].path.as_ref().unwrap().to_string_lossy(),
+            "appwiz.cpl"
+        );
+    }
+
+    #[test]
+    fn settings_alias_outranks_frequently_used_app_named_settings() {
+        let mut command = entry("cmd:settings", "打开设置", Kind::Command);
+        command.path = None;
+        let mut settings_app = entry("app:settings", "设置", Kind::App);
+        settings_app.path = Some(PathBuf::from(
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\设置.lnk",
+        ));
+        let mut entries = vec![settings_app, command];
+        // 应用最近用了 20 次，仍应输给「设置」这个明确命令意图。
+        rank(
+            &mut entries,
+            "设置",
+            &history(&[("app:settings", 20, now())]),
+            3,
+        );
+        assert_eq!(entries[0].id, "cmd:settings");
+    }
+}
