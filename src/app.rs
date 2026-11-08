@@ -353,6 +353,7 @@ impl LstrApp {
             self.scope = Scope::All;
         }
         self.input.push(ch);
+        Self::reset_input_cursor(ctx);
         self.selected = 0;
         self.trigger(ctx);
     }
@@ -521,6 +522,15 @@ impl LstrApp {
         }
     }
 
+    /// 外部改写 input 后，TextEdit 的持久光标状态还停在旧位置（通常是 0），
+    /// 清掉它，下一帧就会按 cursor_at_end 把光标放到文本末尾。
+    fn reset_input_cursor(ctx: &egui::Context) {
+        let id = egui::Id::new("lstr-search-input");
+        ctx.data_mut(|data| {
+            let _ = data.remove::<egui::widgets::text_edit::TextEditState>(id);
+        });
+    }
+
     fn show(&mut self, ctx: &egui::Context) {
         self.dialog = None;
         self.settings_open = false;
@@ -535,6 +545,7 @@ impl LstrApp {
         self.mouse_moved = false;
         self.needle_ready = false;
         self.input.clear();
+        Self::reset_input_cursor(ctx);
         self.selected = 0;
         self.scroll_y = 0.0;
         self.scroll_to_selection = false;
@@ -2114,67 +2125,112 @@ impl LstrApp {
             // 一个连字符在第 5 个字符，会被截成 "lstr-…"。break_anywhere 让
             // 它在真实宽度边缘截断，窗口拉宽就能多看几个字。
             title_job.wrap.break_anywhere = true;
+            let title_galley = painter.layout_job(title_job);
+            let title_width = title_galley.size().x;
+            let title_height = title_galley.size().y;
             painter.galley(
                 egui::pos2(row_rect.left() + 54.0, row_rect.top() + 5.0),
-                painter.layout_job(title_job),
+                title_galley,
                 theme.text,
             );
 
-            let subtitle = match entry.kind {
-                Kind::App => {
-                    if pinyin_hit {
-                        format!("应用 · 拼音 {}", query.text)
-                    } else if fuzzy_hit.is_some() {
-                        format!("应用 · 模糊 {}", query.text)
-                    } else if entry.id.starts_with("sys:") {
-                        format!("系统功能 · {}", ui::display_path(entry))
-                    } else {
-                        "应用".to_string()
-                    }
+            // 长路径不再中段省略：从第一行「文件名之后」开始接排，
+            // 放不下的部分折到第二行行首继续，两行合起来是完整路径，行高不变。
+            let is_path_row = matches!(entry.kind, Kind::File | Kind::Folder | Kind::Program);
+            let full_path = entry.full_path();
+            let lead = if entry.id.starts_with("qs:") { "已打开 · " } else { "" };
+            let two_line_path = is_path_row && full_path.chars().count() > sub_budget;
+
+            if two_line_path {
+                let mono = ui::mono_font(11.5);
+                let text = format!("{lead}{full_path}");
+                let needle = if path_mode { "" } else { &query.text };
+                let gap = 10.0;
+                // 第一行右侧还要给选中行的 meta（文件夹/大小）留位置。
+                let head_max = (row_rect.width() - 54.0 - 76.0 - title_width - gap).max(24.0);
+                let cut = split_path_head(painter, &text, head_max, mono.clone());
+                let (head, tail) = split_at_chars(&text, cut);
+
+                if !head.is_empty() {
+                    let mut head_job = ui::text_job(&head, needle, &mono, theme.sub, theme.amber);
+                    // 切分按纯文本测量，高亮分段可能带来极小宽度差，留几像素防裁字。
+                    head_job.wrap.max_width = head_max + 6.0;
+                    head_job.wrap.max_rows = 1;
+                    head_job.wrap.break_anywhere = true;
+                    let head_galley = painter.layout_job(head_job);
+                    let y = row_rect.top() + 5.0 + (title_height - head_galley.size().y).max(0.0);
+                    painter.galley(
+                        egui::pos2(row_rect.left() + 54.0 + title_width + gap, y),
+                        head_galley,
+                        theme.sub,
+                    );
                 }
-                Kind::Command => {
-                    if entry.id.starts_with("kwurl:") {
-                        let host = entry
-                            .path
-                            .as_ref()
-                            .map(|p| ui::url_host(&p.to_string_lossy()).to_string())
-                            .unwrap_or_default();
-                        format!("网络搜索 · {host}")
-                    } else if entry.id.starts_with("kwexec:") {
-                        "关键字 · Enter 运行".to_string()
-                    } else {
-                        "命令 · Enter 执行".to_string()
-                    }
+                if !tail.is_empty() {
+                    let mut tail_job = ui::text_job(&tail, needle, &mono, theme.sub, theme.amber);
+                    tail_job.wrap.max_width = row_rect.width() - 54.0 - 10.0;
+                    tail_job.wrap.max_rows = 1;
+                    tail_job.wrap.break_anywhere = true;
+                    // 极端超长路径的兜底：正常窗口宽度两行足够，不会走到省略。
+                    tail_job.wrap.overflow_character = Some('…');
+                    painter.galley(
+                        egui::pos2(row_rect.left() + 54.0, row_rect.top() + 25.0),
+                        painter.layout_job(tail_job),
+                        theme.sub,
+                    );
                 }
-                _ => {
-                    // 按实际可用像素换算字符预算：以前固定 72 字符 + 只留两段尾，
-                    // 两条不同的深路径会显示成同一串，同名结果无法区分。
-                    let path_text = ui::middle_ellipsis(&entry.full_path(), sub_budget);
-                    if entry.id.starts_with("qs:") {
-                        format!("已打开 · {path_text}")
-                    } else {
-                        path_text
+            } else {
+                let subtitle = match entry.kind {
+                    Kind::App => {
+                        if pinyin_hit {
+                            format!("应用 · 拼音 {}", query.text)
+                        } else if fuzzy_hit.is_some() {
+                            format!("应用 · 模糊 {}", query.text)
+                        } else if entry.id.starts_with("sys:") {
+                            format!("系统功能 · {}", ui::display_path(entry))
+                        } else {
+                            "应用".to_string()
+                        }
                     }
-                }
-            };
-            let mut sub_job = ui::text_job(
-                &subtitle,
-                if path_mode { "" } else { &query.text },
-                &ui::mono_font(11.5),
-                theme.sub,
-                theme.amber,
-            );
-            sub_job.wrap.max_width = row_rect.width() - 54.0 - 10.0;
-            sub_job.wrap.max_rows = 1;
-            sub_job.wrap.overflow_character = Some('…');
-            // 同上：路径里大量 "\\" / "." 会被当断行点，加 break_anywhere 才会
-            // 在宽度边缘截断。
-            sub_job.wrap.break_anywhere = true;
-            painter.galley(
-                egui::pos2(row_rect.left() + 54.0, row_rect.top() + 25.0),
-                painter.layout_job(sub_job),
-                theme.sub,
-            );
+                    Kind::Command => {
+                        if entry.id.starts_with("kwurl:") {
+                            let host = entry
+                                .path
+                                .as_ref()
+                                .map(|p| ui::url_host(&p.to_string_lossy()).to_string())
+                                .unwrap_or_default();
+                            format!("网络搜索 · {host}")
+                        } else if entry.id.starts_with("kwexec:") {
+                            "关键字 · Enter 运行".to_string()
+                        } else {
+                            "命令 · Enter 执行".to_string()
+                        }
+                    }
+                    _ => {
+                        let path_text = ui::middle_ellipsis(&full_path, sub_budget);
+                        if lead.is_empty() {
+                            path_text
+                        } else {
+                            format!("{lead}{path_text}")
+                        }
+                    }
+                };
+                let mut sub_job = ui::text_job(
+                    &subtitle,
+                    if path_mode { "" } else { &query.text },
+                    &ui::mono_font(11.5),
+                    theme.sub,
+                    theme.amber,
+                );
+                sub_job.wrap.max_width = row_rect.width() - 54.0 - 10.0;
+                sub_job.wrap.max_rows = 1;
+                sub_job.wrap.overflow_character = Some('…');
+                sub_job.wrap.break_anywhere = true;
+                painter.galley(
+                    egui::pos2(row_rect.left() + 54.0, row_rect.top() + 25.0),
+                    painter.layout_job(sub_job),
+                    theme.sub,
+                );
+            }
 
             if selected && self.cfg.show_meta {
                 let meta = match entry.kind {
@@ -4082,6 +4138,41 @@ impl eframe::App for LstrApp {
     }
 }
 
+/// 按像素宽度二分出「第一行能放下的字符数」：中文/西文混排也准，
+/// 不用假设等宽字体的字符宽度。
+fn split_path_head(
+    painter: &egui::Painter,
+    text: &str,
+    max_width: f32,
+    font: egui::FontId,
+) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let candidate: String = chars[..mid].iter().collect();
+        let width = painter
+            .layout_no_wrap(candidate, font.clone(), Color32::WHITE)
+            .size()
+            .x;
+        if width <= max_width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+/// 按字符数把完整路径切成「第一行接排段」与「第二行续段」。
+fn split_at_chars(text: &str, count: usize) -> (String, String) {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(count).collect();
+    let tail: String = chars.collect();
+    (head, tail)
+}
+
 fn dialog_hint(scope: Scope) -> &'static str {
     match scope {
         Scope::Folder => "搜索文件夹并跳转…",
@@ -4111,5 +4202,32 @@ fn strip_prefix(input: &mut String) {
     let lower = value.to_lowercase();
     if lower.starts_with("a ") || lower.starts_with("f ") {
         *input = value[2..].trim_start().to_string();
+    }
+}
+
+#[cfg(test)]
+mod path_layout_tests {
+    use super::*;
+
+    #[test]
+    fn split_at_chars_keeps_the_full_path() {
+        let (head, tail) = split_at_chars("abcdef", 2);
+        assert_eq!(head, "ab");
+        assert_eq!(tail, "cdef");
+        assert_eq!(format!("{head}{tail}"), "abcdef");
+    }
+
+    #[test]
+    fn split_at_chars_is_unicode_safe() {
+        let (head, tail) = split_at_chars("中文路径", 2);
+        assert_eq!(head, "中文");
+        assert_eq!(tail, "路径");
+        assert_eq!(format!("{head}{tail}"), "中文路径");
+    }
+
+    #[test]
+    fn split_at_chars_handles_out_of_range_counts() {
+        assert_eq!(split_at_chars("abc", 0), (String::new(), "abc".to_string()));
+        assert_eq!(split_at_chars("abc", 99), ("abc".to_string(), String::new()));
     }
 }

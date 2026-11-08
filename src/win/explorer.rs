@@ -60,7 +60,7 @@ pub fn active_explorer_folder() -> Option<PathBuf> {
 }
 
 /// 前台 Explorer 窗口的目录：先按 HWND 精确匹配 ShellWindows，
-/// 匹配不到再按窗口标题兜底，最后才回退缓存。
+/// 匹配不到再按窗口标题兜底；仍失败返回 None（表示退到全局搜索，不用旧缓存）。
 /// 只在「键入即搜」吞下第一个字符时调用一次，此时前台还是资源管理器。
 pub fn foreground_explorer_folder() -> Option<PathBuf> {
     let handle = unsafe { GetForegroundWindow() };
@@ -79,11 +79,14 @@ pub fn foreground_explorer_folder() -> Option<PathBuf> {
         remember(matched_hwnd, &folder);
         return Some(folder);
     }
-    let fallback = active_explorer_folder();
+    // 「此电脑」/回收站/控制面板等虚拟位置以及桌面都没有真实目录。
+    // 这里绝不能回退到 LAST_FOLDER 缓存：那会把上一次浏览的路径冒充当前路径，
+    // 让键入即搜显示错误的目录提示、还按旧目录过滤结果。缓存只服务于
+    // 对话框模式（前台已不是 Explorer 时的 Ctrl+G / 自动跟随）。
     log_explorer(&format!(
-        "no match (hwnd={hwnd}, title={title}) fallback={fallback:?}"
+        "no match (hwnd={hwnd}, title={title}) -> global search"
     ));
-    fallback
+    None
 }
 
 /// 一次 ShellWindows 枚举里先试 HWND 精确匹配，再试标题近似匹配。
