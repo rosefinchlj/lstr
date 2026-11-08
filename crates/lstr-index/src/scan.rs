@@ -100,28 +100,32 @@ impl Drop for VolumeHandle {
 
 /// ENUM 全卷,目录先行回放(存储层 scan 模式依赖父先到)。
 /// `resume_frn > 0` 时从断点续扫(其余记录已在主进程快照里)。
-/// `emit` 逐批回调;`stop` 置位即中止。返回 (总条数, 结束时 next_usn)。
+/// `high_usn` 必须是**扫描开始前**采样的 journal NextUsn:ENUM 只回放该位点之前
+/// 的记录,之后的变更留给 journal 增量,避免「扫描期间新建的文件」永久丢失(H4)。
+/// `emit` 逐批回调;`stop` 置位即中止。返回 `Ok(Some(总条数))` 表示扫完,
+/// `Ok(None)` 表示被 stop 中止(调用方不得宣告 Ready)。
 pub fn scan_volume(
     letter: char,
     resume_frn: u64,
+    high_usn: i64,
     stop: &std::sync::atomic::AtomicBool,
     mut progress: impl FnMut(u64, u64, u32),
     mut emit: impl FnMut(Vec<Rec>),
-) -> Result<(u32, i64), String> {
+) -> Result<Option<u32>, String> {
     use std::sync::atomic::Ordering;
     let vol = VolumeHandle::open(letter)?;
     let (est, _mft_len) = vol.ntfs_data().unwrap_or((0, 0));
     let mut med = MFT_ENUM_DATA_V0 {
         StartFileReferenceNumber: resume_frn,
         LowUsn: 0,
-        HighUsn: i64::MAX,
+        HighUsn: high_usn,
     };
     let mut buf = vec![0u8; ENUM_BUF];
     let mut all: Vec<Rec> = Vec::new();
     let mut count: u32 = 0;
     loop {
         if stop.load(Ordering::Relaxed) {
-            return Ok((count, 0));
+            return Ok(None);
         }
         let mut ret: u32 = 0;
         let ok = unsafe {
@@ -156,18 +160,17 @@ pub fn scan_volume(
         .partition(|r| r.attrs & usn::FILE_ATTRIBUTE_DIRECTORY != 0);
     for chunk in dirs.chunks(4000) {
         if stop.load(Ordering::Relaxed) {
-            return Ok((count, 0));
+            return Ok(None);
         }
         emit(chunk.to_vec());
     }
     for chunk in files.chunks(4000) {
         if stop.load(Ordering::Relaxed) {
-            return Ok((count, 0));
+            return Ok(None);
         }
         emit(chunk.to_vec());
     }
-    let next_usn = vol.journal_state().map(|(_, _, n)| n).unwrap_or(0);
-    Ok((count, next_usn))
+    Ok(Some(count))
 }
 
 /// journal 增量读取。返回 Ok(Some((记录, 新 next_usn))) 或
