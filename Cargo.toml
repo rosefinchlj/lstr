@@ -9,6 +9,7 @@ description = "A fast, quiet Windows launcher backed by Everything"
 members = ["crates/lstr-index"]
 
 [dependencies]
+lstr-index = { path = "crates/lstr-index" }
 eframe = { version = "=0.32.3", default-features = false, features = ["glow", "default_fonts"] }
 everything-ipc = "0.1.4"
 pinyin = "0.11.0"

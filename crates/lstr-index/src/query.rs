@@ -33,6 +33,8 @@ pub struct QuerySpec {
     pub path_prefix: Option<String>,
     /// 类型组的扩展名集合(小写、无点)。
     pub group_exts: Vec<String>,
+    /// 精确匹配(名字完全一致,小写比较;wfn: 语义)。设置后只返回精确名。
+    pub exact: Option<String>,
 }
 
 impl QuerySpec {
@@ -100,6 +102,33 @@ pub fn query_volume(store: &VolumeStore, spec: &QuerySpec, cap: usize) -> (Vec<u
     if tokens.is_empty() {
         return (Vec::new(), 0, false);
     }
+    // 精确模式:wfn 语义,直接二分 offs(ready 模式);scan 模式退化为逐项比对
+    if let Some(ex) = &spec.exact {
+        let exb = ex.as_bytes();
+        let mut slots = Vec::new();
+        if !store.offs.is_empty() {
+            let lo = store.offs.partition_point(|&s| store.name_lc(s) < exb);
+            for &slot in &store.offs[lo..] {
+                if store.name_lc(slot) == exb {
+                    if passes_filters(store, slot, spec) {
+                        slots.push(slot);
+                    }
+                } else {
+                    break;
+                }
+            }
+            let total = slots.len();
+            return (slots, total, false);
+        }
+        for slot in 0..store.name_off.len() as u32 {
+            if store.name_lc(slot) == exb && passes_filters(store, slot, spec) {
+                slots.push(slot);
+            }
+        }
+        let total = slots.len();
+        return (slots, total, false);
+    }
+
     // 生成 token 取最长(一般最稀有)
     let gen_idx = tokens
         .iter()

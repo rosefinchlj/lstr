@@ -1573,6 +1573,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "everything-ipc",
+ "lstr-index",
  "pinyin",
  "raw-window-handle",
  "rusqlite",

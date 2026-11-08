@@ -1,5 +1,6 @@
 pub mod apps;
 pub mod browse;
+pub mod builtin;
 pub mod everything;
 pub mod filters;
 pub mod fuzzy;
@@ -10,6 +11,7 @@ pub mod uwp;
 
 use crate::config::{Config, KeywordConfig, RankConfig};
 use crate::history::History;
+use lstr_index::EngineMsg;
 use crate::model::{Entry, Kind, Query, Scope};
 use crate::search::filters::SearchFilters;
 use std::collections::HashSet;
@@ -57,6 +59,8 @@ pub struct SearchService {
     keywords: Vec<KeywordConfig>,
     /// 「重新加载」命令置位，worker 下一请求立即重建应用索引。
     apps_dirty: Arc<AtomicBool>,
+    /// 自研索引状态(设置页/状态行用);worker 线程随时刷新。
+    pub index_status: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
 }
 
 impl SearchService {
@@ -67,6 +71,8 @@ impl SearchService {
         let worker_config = config.clone();
         let apps_dirty = Arc::new(AtomicBool::new(false));
         let worker_apps_dirty = Arc::clone(&apps_dirty);
+        let status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>> = Arc::new(Mutex::new(None));
+        let worker_status = Arc::clone(&status_slot);
         std::thread::Builder::new()
             .name("lstr-search".to_string())
             .spawn(move || {
@@ -77,6 +83,7 @@ impl SearchService {
                     worker_config,
                     ctx,
                     worker_apps_dirty,
+                    worker_status,
                 )
             })
             .expect("spawn search worker");
@@ -88,6 +95,7 @@ impl SearchService {
             limit: config.max_results,
             keywords: config.keywords,
             apps_dirty,
+            index_status: status_slot,
         }
     }
 
@@ -245,6 +253,7 @@ fn run_worker(
     config: Config,
     ctx: egui::Context,
     apps_dirty: Arc<AtomicBool>,
+    status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
 ) {
     let mut everything = match everything::EverythingProvider::new() {
         Ok(provider) => Some(provider),
@@ -253,6 +262,42 @@ fn run_worker(
             None
         }
     };
+    // —— 自研索引后端(方案 §4/§6):engine 由本线程独占;client 线程推 EngineMsg ——
+    let (engine_tx, engine_rx) = mpsc::channel::<EngineMsg>();
+    let mut builtin: Option<builtin::BuiltinProvider> = None;
+    let shutdown_client = Arc::new(AtomicBool::new(false));
+    let handshake_slot: Arc<Mutex<Vec<(u128, u64, i64)>>> = Arc::new(Mutex::new(Vec::new()));
+    match config.index.backend.as_str() {
+        "off" => {}
+        "everything" => {}
+        backend_kind => {
+            let engine = builtin::make_engine(&config.index);
+            *handshake_slot.lock().unwrap() = engine.handshake_state();
+            builtin::spawn_client_thread(
+                Arc::clone(&handshake_slot),
+                engine_tx.clone(),
+                Arc::clone(&shutdown_client),
+                false,
+            );
+            builtin = Some(builtin::BuiltinProvider::new(engine));
+            let _ = backend_kind; // auto / builtin 同路径,显式 everything 时不建
+            if backend_kind == "builtin" {
+                // 强制内置:宁可空结果也不回落(用户显式选择)
+            }
+        }
+    }
+    let publish_status = |builtin: Option<&builtin::BuiltinProvider>,
+                          everything: Option<&everything::EverythingProvider>,
+                          slot: &Arc<Mutex<Option<builtin::IndexUiStatus>>>| {
+        if let Some(b) = builtin {
+            let mut st = b.status();
+            st.everything_ok = everything.is_some();
+            *slot.lock().unwrap() = Some(st);
+        } else if let Some(_e) = everything {
+            *slot.lock().unwrap() = None;
+        }
+    };
+    publish_status(builtin.as_ref(), everything.as_ref(), &status_slot);
     let mut apps = apps::AppIndex::load();
     let mut apps_loaded = Instant::now();
     let mut dir_cache = browse::DirCache::new();
@@ -268,6 +313,20 @@ fn run_worker(
         if everything.is_none() {
             everything = everything::EverythingProvider::new().ok();
         }
+        // 应用自研索引的增量(查询间隙批量消费,单轮上限防饿死查询)
+        if let Some(b) = &mut builtin {
+            let mut applied = 0usize;
+            while let Ok(msg) = engine_rx.try_recv() {
+                b.engine.handle(msg);
+                applied += 1;
+                if applied >= 20 {
+                    break;
+                }
+            }
+            b.engine.maintain();
+            *handshake_slot.lock().unwrap() = b.engine.handshake_state();
+        }
+        publish_status(builtin.as_ref(), everything.as_ref(), &status_slot);
         while let Ok(uwp_entries) = uwp_rx.try_recv() {
             apps.append_uwp(uwp_entries);
         }
@@ -392,15 +451,46 @@ fn run_worker(
                         keyword_rows = keyword_entries(&request.keywords, &request.query.text);
                     }
                     let mut needs_exact = false;
-                    if let Some(provider) = &everything {
-                        let fetch = fetch_count(&request.query, request.limit);
-                        // 分两路取候选：文件夹一路、非文件夹一路。Everything 会在
-                        // 返回前按排序截断，单次查询可能整类缺席（实测 "rust" 最近
-                        // 400 条里 0 个文件夹，精确命中的「Rust」目录进不了排序），
-                        // 于是「全部」标签只剩下文件。文件夹查询很便宜（~50ms）。
-                        let folder_fetch = (fetch / 5).clamp(40, 120);
-                        let file_fetch = fetch.saturating_sub(folder_fetch).max(60);
-                        let mut truncation = 0usize;
+                    let phase = builtin
+                        .as_ref()
+                        .map(|b| b.engine.status().phase)
+                        .unwrap_or(lstr_index::Phase::Fallback);
+                    let use_builtin = phase != lstr_index::Phase::Fallback;
+                    // 时间筛选依赖文件 mtime:USN 不含(方案 §3.2),降级走 Everything
+                    let time_forced = request.filters.time.is_some();
+                    // 构建期与 Everything 合并(方案 §5.2.2);Ready 后纯内置
+                    let merge_everything = use_builtin
+                        && phase != lstr_index::Phase::Ready
+                        && !time_forced
+                        && everything.is_some();
+                    let fetch = fetch_count(&request.query, request.limit);
+                    let folder_fetch = (fetch / 5).clamp(40, 120);
+                    let file_fetch = fetch.saturating_sub(folder_fetch).max(60);
+                    let mut truncation = 0usize;
+                    if use_builtin && !time_forced {
+                        // 内置索引:本地引擎,双路语义在 kind 过滤层保持
+                        if let Some(b) = &builtin {
+                            match b.search_split(&request.query, &request.filters, folder_fetch, true)
+                            {
+                                Ok((mut folders, count)) => {
+                                    total += count;
+                                    truncation += count.saturating_sub(folders.len());
+                                    entries.append(&mut folders);
+                                }
+                                Err(err) => error = Some(err),
+                            }
+                            match b.search_split(&request.query, &request.filters, file_fetch, false)
+                            {
+                                Ok((mut files, count)) => {
+                                    total += count;
+                                    truncation += count.saturating_sub(files.len());
+                                    entries.append(&mut files);
+                                }
+                                Err(err) => error = error.or(Some(err)),
+                            }
+                            needs_exact = truncation > 0;
+                        }
+                    } else if let Some(provider) = &everything {
                         match provider.search_split(
                             &request.query,
                             &request.filters,
@@ -429,8 +519,31 @@ fn run_worker(
                         }
                         // 截断才需要 wfn 精确兜底；延后到第一版结果发出后再查。
                         needs_exact = truncation > 0;
+                    } else if time_forced {
+                        error =
+                            Some("时间筛选需要 Everything(内置索引暂不含文件修改时间)".to_string());
                     } else {
-                        error = Some("Everything 未运行".to_string());
+                        error = Some("索引未启用且 Everything 未运行".to_string());
+                    }
+                    if merge_everything {
+                        if let Some(provider) = &everything {
+                            if let Ok((mut folders, _)) = provider.search_split(
+                                &request.query,
+                                &request.filters,
+                                folder_fetch,
+                                true,
+                            ) {
+                                entries.append(&mut folders);
+                            }
+                            if let Ok((mut files, _)) = provider.search_split(
+                                &request.query,
+                                &request.filters,
+                                file_fetch,
+                                false,
+                            ) {
+                                entries.append(&mut files);
+                            }
+                        }
                     }
                     if request.filters.is_empty() {
                         let mut app_hits = apps.search(&request.query.text, request.limit);
@@ -459,7 +572,27 @@ fn run_worker(
                             error: error.clone(),
                         });
                         ctx.request_repaint();
-                        if let Some(provider) = &everything {
+                        let phase = builtin
+                            .as_ref()
+                            .map(|b| b.engine.status().phase)
+                            .unwrap_or(lstr_index::Phase::Fallback);
+                        if let Some(b) = &builtin {
+                            if phase != lstr_index::Phase::Fallback
+                                && request.filters.time.is_none()
+                            {
+                                if let Ok((mut exact, _)) =
+                                    b.search_exact(&request.query, &request.filters, 50)
+                                {
+                                    entries.append(&mut exact);
+                                }
+                            } else if let Some(provider) = &everything {
+                                if let Ok((mut exact, _)) =
+                                    provider.search_exact(&request.query, &request.filters, 50)
+                                {
+                                    entries.append(&mut exact);
+                                }
+                            }
+                        } else if let Some(provider) = &everything {
                             if let Ok((mut exact, _)) =
                                 provider.search_exact(&request.query, &request.filters, 50)
                             {
@@ -470,7 +603,37 @@ fn run_worker(
                 }
                 _ => {
                     let mut needs_exact = false;
-                    if let Some(provider) = &everything {
+                    let phase = builtin
+                        .as_ref()
+                        .map(|b| b.engine.status().phase)
+                        .unwrap_or(lstr_index::Phase::Fallback);
+                    let time_forced = request.filters.time.is_some();
+                    if let Some(b) = &builtin {
+                        if phase != lstr_index::Phase::Fallback && !time_forced {
+                            let fetch = fetch_count(&request.query, request.limit);
+                            match b.search(&request.query, &request.filters, fetch) {
+                                Ok((mut files, count)) => {
+                                    total = count;
+                                    needs_exact = count > files.len();
+                                    entries.append(&mut files);
+                                }
+                                Err(err) => error = Some(err),
+                            }
+                        } else if let Some(provider) = &everything {
+                            let fetch = fetch_count(&request.query, request.limit);
+                            match provider.search(&request.query, &request.filters, fetch) {
+                                Ok((mut files, count)) => {
+                                    total = count;
+                                    needs_exact = count > files.len();
+                                    entries.append(&mut files);
+                                }
+                                Err(err) => error = Some(err),
+                            }
+                        } else {
+                            error = Some("时间筛选需要 Everything(内置索引暂不含文件修改时间)"
+                                .to_string());
+                        }
+                    } else if let Some(provider) = &everything {
                         let fetch = fetch_count(&request.query, request.limit);
                         match provider.search(&request.query, &request.filters, fetch) {
                             Ok((mut files, count)) => {
@@ -481,7 +644,7 @@ fn run_worker(
                             Err(err) => error = Some(err),
                         }
                     } else {
-                        error = Some("Everything 未运行".to_string());
+                        error = Some("索引未启用且 Everything 未运行".to_string());
                     }
                     if needs_exact {
                         let first = finalize_entries(
@@ -499,7 +662,27 @@ fn run_worker(
                             error: error.clone(),
                         });
                         ctx.request_repaint();
-                        if let Some(provider) = &everything {
+                        let phase = builtin
+                            .as_ref()
+                            .map(|b| b.engine.status().phase)
+                            .unwrap_or(lstr_index::Phase::Fallback);
+                        if let Some(b) = &builtin {
+                            if phase != lstr_index::Phase::Fallback
+                                && request.filters.time.is_none()
+                            {
+                                if let Ok((mut exact, _)) =
+                                    b.search_exact(&request.query, &request.filters, 50)
+                                {
+                                    entries.append(&mut exact);
+                                }
+                            } else if let Some(provider) = &everything {
+                                if let Ok((mut exact, _)) =
+                                    provider.search_exact(&request.query, &request.filters, 50)
+                                {
+                                    entries.append(&mut exact);
+                                }
+                            }
+                        } else if let Some(provider) = &everything {
                             if let Ok((mut exact, _)) =
                                 provider.search_exact(&request.query, &request.filters, 50)
                             {

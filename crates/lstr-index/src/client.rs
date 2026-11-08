@@ -60,3 +60,9 @@ pub fn read_frame(client: HANDLE, timeout: Duration) -> Option<Frame> {
 pub fn write_frame(client: HANDLE, frame: &Frame) -> bool {
     crate::worker::write_frame_pub(client, frame)
 }
+
+/// 管道是否仍然连通(peek 探测)。
+pub fn pipe_alive(client: HANDLE) -> bool {
+    use windows::Win32::System::Pipes::PeekNamedPipe;
+    unsafe { PeekNamedPipe(client, None, 0, None, None, None).is_ok() }
+}

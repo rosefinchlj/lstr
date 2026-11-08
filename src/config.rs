@@ -26,6 +26,32 @@ pub struct Config {
     /// 排序规则（设置面板「排序」页可视化编辑）。
     #[serde(default)]
     pub rank: RankConfig,
+    /// 自研索引引擎（设置面板「搜索」页）。
+    #[serde(default)]
+    pub index: IndexConfig,
+}
+
+/// 自研索引引擎配置。backend:
+/// `auto` = worker 可用走内置,否则 Everything;`builtin`/`everything` 强制;
+/// `off` 关闭内置索引。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IndexConfig {
+    pub backend: String,
+    /// 排除噪声目录(node_modules/.git/target 等,实测省 53% 内存)。
+    pub exclude_noise: bool,
+    /// 单次查询候选收集上限(total 仍精确)。
+    pub candidate_cap: usize,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            backend: "auto".into(),
+            exclude_noise: true,
+            candidate_cap: 2000,
+        }
+    }
 }
 
 /// 排序权重：设置面板里可以直接拖滑块调整，实时生效。
@@ -249,6 +275,7 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             keywords: default_keywords(),
             rank: RankConfig::default(),
+            index: IndexConfig::default(),
         }
     }
 }

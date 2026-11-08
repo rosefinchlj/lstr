@@ -216,3 +216,28 @@ pub fn close(h: HANDLE) {
 pub fn is_pipe(h: HANDLE) -> bool {
     unsafe { windows::Win32::Storage::FileSystem::GetFileType(h) == FILE_TYPE_PIPE }
 }
+
+/// 懒填元数据(方案 §3.2 路线 A):FindFirstFileW 拿 size/mtime/精确名。
+/// 目标不存在(USN 延迟)返回 None。
+pub fn find_meta(path: &str) -> Option<(u64, i64, bool)> {
+    use windows::Win32::Storage::FileSystem::{
+        FindClose, FindFirstFileW, WIN32_FIND_DATAW,
+    };
+    let wpath = to_wide(path);
+    let mut ffd = WIN32_FIND_DATAW::default();
+    unsafe {
+        let handle = FindFirstFileW(PCWSTR(wpath.as_ptr()), &mut ffd).ok()?;
+        let _ = FindClose(handle);
+    }
+    let size = ((ffd.nFileSizeHigh as u64) << 32) | ffd.nFileSizeLow as u64;
+    let mtime = ((ffd.ftLastWriteTime.dwHighDateTime as u64) << 32)
+        | ffd.ftLastWriteTime.dwLowDateTime as u64;
+    // FILETIME → unix 秒(0 = 无效)
+    let mtime = if mtime == 0 {
+        None
+    } else {
+        Some(((mtime as i128 - 11_644_473_600_000_000_000u128 as i128) / 10_000_000) as i64)
+    };
+    let is_dir = ffd.dwFileAttributes & 0x10 != 0;
+    Some((size, mtime.unwrap_or(0), is_dir))
+}

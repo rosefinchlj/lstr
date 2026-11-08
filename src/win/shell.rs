@@ -36,6 +36,10 @@ fn shell_execute(operation: &str, target: &Path) -> Result<(), String> {
     shell_execute_with(operation, &target.display().to_string(), None)
 }
 
+pub fn shell_execute_runas_with_args(file: &str, params: &str) -> Result<(), String> {
+    shell_execute_with("runas", file, Some(params))
+}
+
 fn shell_execute_with(
     operation: &str,
     file: &str,

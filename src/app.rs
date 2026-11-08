@@ -144,6 +144,10 @@ pub struct LstrApp {
     total: usize,
     elapsed_ms: f32,
     error: Option<String>,
+    /// 自研索引状态行(渐进启动:构建中/未启用提示;错误条优先)。
+    index_note: Option<String>,
+    /// 状态行首次出现时间(>300ms 才显示,避免闪烁)。
+    index_note_since: Option<std::time::Instant>,
     pending_gen: u64,
     waiting: bool,
     dirty_at: Option<Instant>,
@@ -253,6 +257,8 @@ impl LstrApp {
             total: 0,
             elapsed_ms: 0.0,
             error: None,
+            index_note: None,
+            index_note_since: None,
             pending_gen,
             waiting: true,
             dirty_at: None,
@@ -392,6 +398,7 @@ impl LstrApp {
                 ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
             }
         }
+        self.poll_index_status();
         if let Some(response) = self.service.poll() {
             if response.generation == self.pending_gen {
                 self.entries = response.entries;
@@ -534,7 +541,7 @@ impl LstrApp {
             // 窗口只长到设置的行数，不会因为候选多就撑满屏幕。
             let rows = self.entries.len().min(self.cfg.max_results);
             let list_h = if rows == 0 { 120.0 } else { rows as f32 * self.theme.row_h };
-            let banner_h = if self.error.is_some() { 30.0 } else { 0.0 };
+            let banner_h = if self.error.is_some() || self.index_note.is_some() { 30.0 } else { 0.0 };
             let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
             let computed_h = (SEARCH_H
                 + TABS_H
@@ -930,6 +937,47 @@ impl LstrApp {
         }
     }
 
+    /// 自研索引状态 → 状态行文案(方案 §5:不闪、不骗人、复用横幅)。
+    fn poll_index_status(&mut self) {
+        let status = self.service.index_status.lock().unwrap().clone();
+        let mut note = None;
+        if let Some(st) = &status {
+            if st.phase == lstr_index::Phase::Scanning {
+                let total: u32 = st.volumes.iter().map(|v| v.count).sum();
+                let known: Vec<f32> = st.volumes.iter().filter_map(|v| v.pct).collect();
+                let pct = if known.is_empty() {
+                    None
+                } else {
+                    Some(known.iter().sum::<f32>() / known.len() as f32)
+                };
+                note = Some(match pct {
+                    Some(p) => format!(
+                        "正在构建索引 {:.0}% · 已收录 {} 万项",
+                        (p * 100.0).min(99.0),
+                        total / 10_000
+                    ),
+                    None => format!("正在构建索引 · 已收录 {} 万项", total / 10_000),
+                });
+            }
+        }
+        match &note {
+            Some(_) => {
+                if self.index_note_since.is_none() {
+                    self.index_note_since = Some(std::time::Instant::now());
+                }
+                if let Some(t) = self.index_note_since {
+                    if t.elapsed().as_millis() > 300 {
+                        self.index_note = note;
+                    }
+                }
+            }
+            None => {
+                self.index_note = None;
+                self.index_note_since = None;
+            }
+        }
+    }
+
     fn toast(&mut self, ctx: &egui::Context, message: String) {
         self.toast = Some((message, Instant::now() + Duration::from_millis(1300)));
         ctx.request_repaint_after(Duration::from_millis(1330));
@@ -983,7 +1031,7 @@ impl LstrApp {
         } else {
             entries.len() as f32 * row_h
         };
-        let banner_h = if self.error.is_some() { 30.0 } else { 0.0 };
+        let banner_h = if self.error.is_some() || self.index_note.is_some() { 30.0 } else { 0.0 };
         let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
         let preview_w = if self.preview_open { 216.0 } else { 0.0 };
         let height = if self.settings_open {
@@ -1249,6 +1297,28 @@ impl LstrApp {
 
                 let banner_top = list_top + list_h.min(view_h) + LIST_GAP;
                 let mut extra_top = banner_top;
+                if self.error.is_none() {
+                    if let Some(note) = self.index_note.clone() {
+                        let banner = Rect::from_min_size(
+                            egui::pos2(rect.left() + PAD, extra_top),
+                            egui::vec2(rect.width() - 2.0 * PAD, 24.0),
+                        );
+                        painter.rect_filled(banner, CornerRadius::same(7), theme.amber_soft);
+                        painter.circle_filled(
+                            egui::pos2(banner.left() + 11.0, banner.center().y),
+                            3.0,
+                            theme.sub,
+                        );
+                        painter.text(
+                            egui::pos2(banner.left() + 21.0, banner.center().y),
+                            Align2::LEFT_CENTER,
+                            note,
+                            ui::text_font(11.5),
+                            theme.sub,
+                        );
+                        extra_top += 30.0;
+                    }
+                }
                 if let Some(error) = self.error.clone() {
                     let banner = Rect::from_min_size(
                         egui::pos2(rect.left() + PAD, extra_top),
@@ -2737,6 +2807,7 @@ impl LstrApp {
         const SIDEBAR_W: f32 = 150.0;
         let tabs = [
             (SettingsTab::Appearance, "外观"),
+            (SettingsTab::Search, "搜索"),
             (SettingsTab::Behavior, "行为"),
             (SettingsTab::Ranking, "排序规则"),
             (SettingsTab::Noise, "噪声规则"),
@@ -2794,6 +2865,7 @@ impl LstrApp {
         );
         match self.settings_tab {
             SettingsTab::Appearance => self.paint_settings_appearance(ui, &painter, area),
+            SettingsTab::Search => self.paint_settings_search(ui, ctx, &painter, area),
             SettingsTab::Behavior => self.paint_settings_behavior(ui, ctx, &painter, area),
             SettingsTab::Ranking => self.paint_settings_ranking(ui, ctx, &painter, area),
             SettingsTab::Noise => self.paint_settings_noise(ui, ctx, &painter, area),
@@ -3274,6 +3346,134 @@ impl LstrApp {
         }
     }
 
+    /// 「搜索」设置页:索引后端、噪声排除、状态(方案 §7 P3)。
+    fn paint_settings_search(
+        &mut self,
+        ui: &mut egui::Ui,
+        _ctx: &egui::Context,
+        painter: &egui::Painter,
+        area: Rect,
+    ) {
+        let theme = self.theme;
+        Self::settings_heading(painter, &theme, area, "搜索", "文件索引引擎与候选策略");
+        let mut y = area.top() + 62.0;
+        const ROW: f32 = 38.0;
+
+        // —— 状态行 ——
+        let status = self.service.index_status.lock().unwrap().clone();
+        let status_text = match &status {
+            Some(st) => match st.phase {
+                lstr_index::Phase::Ready => "内置索引:就绪".to_string(),
+                lstr_index::Phase::Scanning => {
+                    let total: u32 = st.volumes.iter().map(|v| v.count).sum();
+                    let done = st.volumes.iter().filter(|v| v.complete).count();
+                    format!(
+                        "内置索引:构建中({}/{}) · 已收录 {} 万项",
+                        done,
+                        st.volumes.len(),
+                        total / 10_000
+                    )
+                }
+                lstr_index::Phase::Loading => "内置索引:等待 worker 连接…".to_string(),
+                lstr_index::Phase::Fallback => "内置索引:未启用(需管理员授权)".to_string(),
+            },
+            None => "内置索引:未启用".to_string(),
+        };
+        Self::settings_label(painter, &theme, area.left(), y, "索引状态");
+        painter.text(
+            egui::pos2(area.left() + 130.0, y + 13.0),
+            Align2::LEFT_CENTER,
+            status_text,
+            ui::text_font(11.5),
+            theme.text,
+        );
+        if let Some(st) = &status {
+            let mut y2 = y + 24.0;
+            for v in &st.volumes {
+                let mark = if v.complete { "✓" } else { "…" };
+                let pct = v.pct.map(|p| format!(" {:.0}%", p * 100.0)).unwrap_or_default();
+                painter.text(
+                    egui::pos2(area.left() + 130.0, y2 + 6.0),
+                    Align2::LEFT_CENTER,
+                    format!("{} 卷 {}:{}  {} 万项", mark, v.letter, pct, v.count / 10_000),
+                    ui::text_font(11.0),
+                    if v.complete { theme.sub } else { theme.text },
+                );
+                y2 += 20.0;
+            }
+            if y2 > y {
+                y = y2 + 8.0;
+            }
+        }
+        y += ROW;
+
+        // —— 后端选择 ——
+        Self::settings_label(painter, &theme, area.left(), y, "索引后端");
+        let backends = [("auto", "自动(内置优先)"), ("builtin", "仅内置索引"), ("everything", "仅 Everything"), ("off", "关闭内置索引")];
+        let current = self.cfg_index_backend();
+        let mut x = area.left() + 130.0;
+        for (key, label) in backends {
+            let rect = Rect::from_min_size(egui::pos2(x, y), egui::vec2(118.0, 26.0));
+            let accent = key == current;
+            let response = ui.interact(rect, Id::new(("lstr-idx-backend", key)), Sense::click());
+            painter.rect_filled(rect, CornerRadius::same(6), if accent { theme.amber_soft } else { theme.hover });
+            painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, if accent { theme.amber } else { theme.hair }), StrokeKind::Inside);
+            painter.text(rect.center(), Align2::CENTER_CENTER, label, ui::text_font(10.5), if accent { theme.amber } else { theme.text });
+            if response.clicked() {
+                self.set_cfg_index_backend(key);
+            }
+            x += 124.0;
+        }
+        y += ROW;
+
+        // —— 噪声排除开关 ——
+        Self::settings_label(painter, &theme, area.left(), y, "噪声目录");
+        let noise_on = self.cfg_index_noise();
+        let rect = Rect::from_min_size(egui::pos2(area.left() + 130.0, y), egui::vec2(180.0, 26.0));
+        let response = ui.interact(rect, Id::new("lstr-idx-noise"), Sense::click());
+        painter.rect_filled(rect, CornerRadius::same(6), if noise_on { theme.amber_soft } else { theme.hover });
+        painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, if noise_on { theme.amber } else { theme.hair }), StrokeKind::Inside);
+        painter.text(rect.center(), Align2::CENTER_CENTER, if noise_on { "已排除(node_modules 等)" } else { "不过滤(内存占用更高)" }, ui::text_font(10.5), if noise_on { theme.amber } else { theme.text });
+        if response.clicked() {
+            self.set_cfg_index_noise(!noise_on);
+        }
+        y += ROW;
+
+        painter.text(
+            egui::pos2(area.left(), y + 8.0),
+            Align2::LEFT_CENTER,
+            "修改后需重启 lstr 生效;噪声排除变更会触发索引重建(删除快照后自动重扫)。",
+            ui::text_font(10.5),
+            theme.sub,
+        );
+    }
+
+    fn cfg_index_backend(&self) -> &'static str {
+        match self.cfg.index.backend.as_str() {
+            "builtin" => "builtin",
+            "everything" => "everything",
+            "off" => "off",
+            _ => "auto",
+        }
+    }
+
+    fn set_cfg_index_backend(&mut self, key: &str) {
+        self.cfg.index.backend = key.to_string();
+        let _ = self.cfg.save();
+    }
+
+    fn cfg_index_noise(&self) -> bool {
+        self.cfg.index.exclude_noise
+    }
+
+    fn set_cfg_index_noise(&mut self, on: bool) {
+        self.cfg.index.exclude_noise = on;
+        // 噪声位随扫描期写入,改开关必须重建快照
+        let dir = crate::config::attach_dir().join("index");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = self.cfg.save();
+    }
+
     fn paint_settings_maintenance(
         &mut self,
         ui: &mut egui::Ui,
@@ -3528,10 +3728,11 @@ enum MenuAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsTab {
     Appearance = 0,
-    Behavior = 1,
-    Ranking = 2,
-    Noise = 3,
-    Maintenance = 4,
+    Search = 1,
+    Behavior = 2,
+    Ranking = 3,
+    Noise = 4,
+    Maintenance = 5,
 }
 
 /// 筛选条上的三个按钮。

@@ -34,6 +34,10 @@ fn install_panic_logger() {
 }
 
 fn main() -> eframe::Result<()> {
+    // --index-worker:提权数据泵,不走单实例、不进 UI
+    if std::env::args().any(|a| a == "--index-worker") {
+        std::process::exit(lstr_index::worker::worker_main());
+    }
     install_panic_logger();
     let single = match win::single_instance::acquire() {
         Some(guard) => guard,

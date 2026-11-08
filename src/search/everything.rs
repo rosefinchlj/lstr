@@ -209,7 +209,7 @@ fn push_filters(
     parts.extend(filters.query_parts(query.ext.is_some(), query.path_filter.is_some()));
 }
 
-fn kept_in_scope(scope: Scope, kind: Kind) -> bool {
+pub(crate) fn kept_in_scope(scope: Scope, kind: Kind) -> bool {
     match scope {
         Scope::Folder => kind == Kind::Folder,
         Scope::Program => kind == Kind::Program,
@@ -218,7 +218,7 @@ fn kept_in_scope(scope: Scope, kind: Kind) -> bool {
     }
 }
 
-fn kind_of(name: &str, is_dir: bool) -> Kind {
+pub(crate) fn kind_of(name: &str, is_dir: bool) -> Kind {
     if is_dir {
         Kind::Folder
     } else if name
@@ -232,14 +232,14 @@ fn kind_of(name: &str, is_dir: bool) -> Kind {
     }
 }
 
-fn initial_of(name: &str) -> String {
+pub(crate) fn initial_of(name: &str) -> String {
     name.chars()
         .next()
         .map(|c| c.to_uppercase().collect())
         .unwrap_or_default()
 }
 
-fn tone_for(value: &str) -> u32 {
+pub(crate) fn tone_for(value: &str) -> u32 {
     let mut hash: u32 = 0x811C_9DC5;
     for byte in value.bytes() {
         hash ^= u32::from(byte);
