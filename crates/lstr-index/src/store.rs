@@ -504,7 +504,12 @@ impl VolumeStore {
         } else {
             offs = delta_sorted;
         }
-        // 9. 换血(off_index 重建为新鲜项;幽灵与陈项清零)
+        // 9. 换血(off_index 重建为新鲜项;幽灵与陈项清零)。
+        // 噪声剔除后保留集远小于旧容量,收缩避免 names 双缓冲虚胖 3 倍。
+        let mut names = names;
+        let mut names_lc = names_lc;
+        names.shrink_to_fit();
+        names_lc.shrink_to_fit();
         let off_index: Vec<(u32, u32)> =
             name_off.iter().enumerate().map(|(i, &o)| (o, i as u32)).collect();
         self.names = names;
