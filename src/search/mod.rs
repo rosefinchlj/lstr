@@ -491,10 +491,17 @@ fn run_worker(
                     if use_builtin && !time_forced {
                         // 内置索引:本地引擎,双路语义在 kind 过滤层保持
                         if let Some(b) = &builtin {
+                            // H4:内置双路都用同一 spec 时,旧实现把同一个 All-kind
+                            // 总数加了两次(total=2N),且 truncation 恒 >0 → 每次
+                            // All 查询都走“先发一版 + exact 补”两阶段。
+                            // 现 folders 路按 KindFilter::Folders 统计,files 路按
+                            // All 统计后扣掉文件夹数,两路 total 同口径且不重复。
+                            let mut folder_total = 0usize;
+                            let mut file_total = 0usize;
                             match b.search_split(&request.query, &request.filters, folder_fetch, true)
                             {
                                 Ok((mut folders, count)) => {
-                                    total += count;
+                                    folder_total = count;
                                     truncation += count.saturating_sub(folders.len());
                                     entries.append(&mut folders);
                                 }
@@ -502,13 +509,14 @@ fn run_worker(
                             }
                             match b.search_split(&request.query, &request.filters, file_fetch, false)
                             {
-                                Ok((mut files, count)) => {
-                                    total += count;
-                                    truncation += count.saturating_sub(files.len());
+                                Ok((mut files, count_all)) => {
+                                    file_total = count_all.saturating_sub(folder_total);
+                                    truncation += file_total.saturating_sub(files.len());
                                     entries.append(&mut files);
                                 }
                                 Err(err) => error = error.or(Some(err)),
                             }
+                            total += folder_total + file_total;
                             needs_exact = truncation > 0;
                         }
                     } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
@@ -654,8 +662,11 @@ fn run_worker(
                                 Err(err) => error = Some(err),
                             }
                         } else {
-                            error = Some("时间筛选需要 Everything(内置索引暂不含文件修改时间)"
-                                .to_string());
+                            error = Some(if time_forced {
+                                "时间筛选需要 Everything(内置索引暂不含文件修改时间)".to_string()
+                            } else {
+                                "内置索引尚未就绪(需管理员授权或等待首次构建)".to_string()
+                            });
                         }
                     } else if let Some(provider) = &everything {
                         let fetch = fetch_count(&request.query, request.limit);

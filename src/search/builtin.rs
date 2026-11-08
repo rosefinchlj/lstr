@@ -61,7 +61,7 @@ impl BuiltinProvider {
         filters: &SearchFilters,
         limit: usize,
     ) -> Result<(Vec<Entry>, usize), String> {
-        self.run(query, filters, limit, |_| true)
+        self.run(query, filters, limit, KindFilter::All, |_| true)
     }
 
     /// 「全部」双路:kind 过滤在引擎侧完成,语义与 Everything 的
@@ -73,7 +73,8 @@ impl BuiltinProvider {
         limit: usize,
         folders: bool,
     ) -> Result<(Vec<Entry>, usize), String> {
-        self.run(query, filters, limit, move |kind| {
+        let kind_filter = if folders { KindFilter::Folders } else { KindFilter::All };
+        self.run(query, filters, limit, kind_filter, move |kind| {
             if folders {
                 kind == Kind::Folder
             } else {
@@ -124,14 +125,21 @@ impl BuiltinProvider {
         query: &Query,
         filters: &SearchFilters,
         limit: usize,
+        kind_filter: KindFilter,
         keep: impl Fn(Kind) -> bool,
     ) -> Result<(Vec<Entry>, usize), String> {
-        let spec = build_spec(query, filters);
+        let mut spec = build_spec(query, filters);
+        spec.kind = kind_filter;
         let outcome = self.engine.query(&spec);
         let want_pinyin = query.text.is_ascii();
 
-        let mut entries = Vec::with_capacity(outcome.hits.len());
+        let mut entries = Vec::with_capacity(outcome.hits.len().min(limit));
         for hit in &outcome.hits {
+            // H3:limit 契约 —— 调用方预算(40-120/60-500)必须生效,
+            // 不能对最多 2000×卷 的全部候选逐条 find_meta 后才返回。
+            if entries.len() >= limit {
+                break;
+            }
             let Some(path) = self.engine.path_of(hit) else {
                 continue;
             };
@@ -182,7 +190,11 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
             Scope::File => KindFilter::Files,
             _ => KindFilter::All,
         },
-        ext: query.ext.clone(),
+        // M1:ext 规范化 —— ext:RS / ext:.rs 必须与索引里的小写名匹配。
+        ext: query
+            .ext
+            .as_ref()
+            .map(|e| e.trim_start_matches('.').to_ascii_lowercase()),
         path_prefix: query.path_filter.as_deref().map(str::to_lowercase),
         group_exts: Vec::new(),
         exact: None,
@@ -339,4 +351,20 @@ pub fn make_engine(cfg: &crate::config::IndexConfig) -> Engine {
         exclude_noise: cfg.exclude_noise,
         candidate_cap: cfg.candidate_cap,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::query::parse;
+
+    #[test]
+    fn ext_filter_is_normalized_for_index() {
+        // M1:ext:RS / ext:.rs 必须规范化成索引里的小写无点形式。
+        let filters = SearchFilters::default();
+        let spec = build_spec(&parse("ext:RS", Scope::All), &filters);
+        assert_eq!(spec.ext.as_deref(), Some("rs"));
+        let spec = build_spec(&parse("ext:.arj", Scope::All), &filters);
+        assert_eq!(spec.ext.as_deref(), Some("arj"));
+    }
 }

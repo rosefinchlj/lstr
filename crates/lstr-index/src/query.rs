@@ -102,7 +102,27 @@ pub fn query_volume(store: &VolumeStore, spec: &QuerySpec, cap: usize) -> (Vec<u
         .map(|t| fold_ascii(t.as_bytes()))
         .collect();
     if tokens.is_empty() {
-        return (Vec::new(), 0, false);
+        // H5:空 token(单独 ext:rs / path:C:\dir 等过滤器查询)按过滤器全量列举,
+        // 逐 slot 走 passes_filters(名字/类型/扩展名/组),收集封顶 candidate_cap,
+        // total 精确统计。旧实现在此直接返回空 → 内置 Ready 后这两类筛选静默 0 结果。
+        let mut slots = Vec::with_capacity(256);
+        let mut total = 0usize;
+        let mut capped = false;
+        for slot in 0..store.name_off.len() as u32 {
+            if store.attrs[slot as usize] & ATTR_INTERNAL != 0 {
+                continue;
+            }
+            if !passes_filters(store, slot, spec) {
+                continue;
+            }
+            total += 1;
+            if slots.len() < cap {
+                slots.push(slot);
+            } else {
+                capped = true;
+            }
+        }
+        return (slots, total, capped);
     }
     // 精确模式:wfn 语义,直接二分 offs(ready 模式);scan 模式退化为逐项比对
     if let Some(ex) = &spec.exact {
@@ -303,6 +323,26 @@ mod tests {
         let (slots, total, _) = query_volume(&s, &spec, 2000);
         assert_eq!(total, 2);
         assert_eq!(slots.len(), 2);
+    }
+
+    #[test]
+    fn empty_tokens_list_by_filters() {
+        // H5:只有过滤器(无文字 token)时按过滤条件全量列举,而不是返回空。
+        let mut s = VolumeStore::new(false);
+        s.insert(5, 0, 0x10, b"root");
+        s.insert(10, 5, 0, b"a.rs");
+        s.insert(11, 5, 0, b"b.txt");
+        s.insert(12, 5, 0x10, b"dir.rs");
+        let spec = QuerySpec {
+            tokens: Vec::new(),
+            kind: KindFilter::Files,
+            ext: Some("rs".into()),
+            ..Default::default()
+        };
+        let (slots, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 1, "目录与 .txt 都不应计入");
+        assert_eq!(slots.len(), 1);
+        assert_eq!(s.name(slots[0]), b"a.rs");
     }
 
     #[test]
