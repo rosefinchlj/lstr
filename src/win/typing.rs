@@ -16,7 +16,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -27,7 +27,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SYSKEYUP,
 };
 
-static EVENT_TX: OnceLock<Sender<char>> = OnceLock::new();
+/// 用 Mutex<Option<Sender>> 而不是 OnceLock<Sender>：设置页可以反复开关钩子，
+/// 每次 start 都必须换上新通道，否则事件会发给已经丢弃的旧接收者。
+static EVENT_TX: OnceLock<Mutex<Option<Sender<char>>>> = OnceLock::new();
+
+fn current_sender() -> Option<Sender<char>> {
+    EVENT_TX
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|guard| guard.clone()))
+}
 static MOD_CTRL: AtomicBool = AtomicBool::new(false);
 static MOD_ALT: AtomicBool = AtomicBool::new(false);
 static MOD_WIN: AtomicBool = AtomicBool::new(false);
@@ -53,7 +61,10 @@ pub struct TypingWatch {
 impl TypingWatch {
     pub fn start() -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<char>();
-        let _ = EVENT_TX.set(tx);
+        let slot = EVENT_TX.get_or_init(|| Mutex::new(None));
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(tx);
+        }
         let (ready_tx, ready_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("lstr-typing".to_string())
@@ -88,6 +99,12 @@ impl TypingWatch {
 
 impl Drop for TypingWatch {
     fn drop(&mut self) {
+        // 卸载后不再向无人接收的通道投递事件。
+        if let Some(slot) = EVENT_TX.get() {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = None;
+            }
+        }
         unsafe {
             let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
         }
@@ -133,7 +150,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             return LRESULT(0);
         }
         if let Some(ch) = classify(kb) {
-            if let Some(tx) = EVENT_TX.get() {
+            if let Some(tx) = current_sender() {
                 let _ = tx.send(ch);
             }
             return LRESULT(1);

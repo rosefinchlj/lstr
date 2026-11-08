@@ -313,6 +313,20 @@ impl LstrApp {
         }
     }
 
+    /// 设置页开关：即时安装/卸载全局键盘钩子，不必重启程序。
+    fn set_explorer_typing(&mut self, enabled: bool, ctx: &egui::Context) {
+        self.cfg.explorer_typing = enabled;
+        // 先卸载旧实例（Drop 会反挂钩子并结束线程），再按需安装新的。
+        self.typing = None;
+        if enabled {
+            match crate::win::typing::TypingWatch::start() {
+                Ok(service) => self.typing = Some(service),
+                Err(err) => self.toast(ctx, format!("启动键入搜索失败: {err}")),
+            }
+        }
+        let _ = self.cfg.save();
+    }
+
     /// P0-2：Explorer 里敲下的第一个字符唤出启动器并写入输入框。
     /// 之后前台不再是 Explorer，钩子自动停止接管，后续输入交回 egui。
     fn poll_typing(&mut self, ctx: &egui::Context) {
@@ -3133,10 +3147,55 @@ impl LstrApp {
             }
         }
 
+        y += ROW;
+
+        Self::settings_label(painter, &theme, area.left(), y, "资源管理器键入即搜");
+        let mut explorer_typing = self.cfg.explorer_typing;
+        if Self::settings_checkbox(
+            ui,
+            painter,
+            &theme,
+            Id::new("lstr-typing-check"),
+            Rect::from_min_size(egui::pos2(ctrl_x, y), egui::vec2(60.0, 22.0)),
+            &mut explorer_typing,
+        ) {
+            self.set_explorer_typing(explorer_typing, ctx);
+            self.toast(
+                ctx,
+                if explorer_typing {
+                    "已启用：在资源管理器里直接打字即可搜索".to_string()
+                } else {
+                    "已停用键入搜索".to_string()
+                },
+            );
+        }
+        y += ROW;
+
+        Self::settings_label(painter, &theme, area.left(), y, "对话框自动跟随目录");
+        let mut dialog_auto_follow = self.cfg.dialog_auto_follow;
+        if Self::settings_checkbox(
+            ui,
+            painter,
+            &theme,
+            Id::new("lstr-follow-check"),
+            Rect::from_min_size(egui::pos2(ctrl_x, y), egui::vec2(60.0, 22.0)),
+            &mut dialog_auto_follow,
+        ) {
+            self.cfg.dialog_auto_follow = dialog_auto_follow;
+            let _ = self.cfg.save();
+        }
+
         painter.text(
-            egui::pos2(area.left(), area.bottom() - 26.0),
+            egui::pos2(area.left(), area.bottom() - 40.0),
             Align2::LEFT_TOP,
-            "最大结果数决定窗口一屏的行数，超出部分用滚轮查看",
+            "键入即搜：资源管理器内直接打字；自动跟随：对话框跳到刚浏览的目录",
+            ui::mono_font(10.0),
+            theme.dim,
+        );
+        painter.text(
+            egui::pos2(area.left(), area.bottom() - 24.0),
+            Align2::LEFT_TOP,
+            "收藏 / 动作 / 命令见 config.toml 的 [[favorite]] [[action]] [[command]]",
             ui::mono_font(10.0),
             theme.dim,
         );
