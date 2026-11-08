@@ -182,19 +182,40 @@ impl SearchService {
 /// 实测搜 `ai` 时，cwd 下名称蹭到 ai 的 Rust 构建产物靠 +500 环境加权压过了
 /// 名叫 ai 的目录。精确同名是「用户就是打的名字」，属于产品语义而非启发式，
 /// 因此在排序 + 去重之后做一次稳定置顶，keyword 行仍在它上面。
+///
+/// 命令的别名也算精确命中：`cmd:settings` 的名字是「打开设置」、别名才是「设置」，
+/// 用户打「设置」时期望的是设置命令，而不是同名的 app/文件。只按 name 置顶会让
+/// 同名 app 靠历史分把命令顶下去（见 rank 的
+/// `settings_alias_outranks_frequently_used_app_named_settings`）。
 fn pin_exact_name_matches(entries: &mut Vec<Entry>, needle: &str) {
     if needle.is_empty() {
+        return;
+    }
+    // needle 由调用方统一 to_lowercase 过，这里也用 to_lowercase 比较，
+    // 与去重/rank 的归一化保持一致（eq_ignore_ascii_case 只覆盖 ASCII）。
+    let is_exact = |entry: &Entry| {
+        if entry.name.to_lowercase() == needle {
+            return true;
+        }
+        entry.kind == Kind::Command
+            && command_aliases(&entry.id)
+                .iter()
+                .any(|alias| alias.to_lowercase() == needle)
+    };
+    // 没有命中就不搬动元素：短查询每次都全量 drain 没有必要。
+    if !entries.iter().any(|entry| is_exact(entry)) {
         return;
     }
     let mut exact = Vec::new();
     let mut rest = Vec::with_capacity(entries.len());
     for entry in entries.drain(..) {
-        if entry.name.eq_ignore_ascii_case(needle) {
+        if is_exact(&entry) {
             exact.push(entry);
         } else {
             rest.push(entry);
         }
     }
+    // 组内保持原有分数顺序（exact.append 不重排）。
     exact.append(&mut rest);
     *entries = exact;
 }
@@ -237,6 +258,159 @@ mod pin_tests {
         let mut entries = vec![item("a", "a"), item("b", "b")];
         pin_exact_name_matches(&mut entries, "");
         assert_eq!(entries[0].id, "a");
+    }
+
+    #[test]
+    fn pin_uses_unicode_lowercase_not_ascii_only() {
+        // L2：去重/rank 都按 to_lowercase 归一化，置顶也必须一致。
+        let mut entries = vec![item("sub", "x"), item("exact", "ÄI")];
+        pin_exact_name_matches(&mut entries, "äi");
+        assert_eq!(entries[0].id, "exact");
+    }
+
+    fn command(id: &str, name: &str) -> Entry {
+        let mut entry = item(id, name);
+        entry.kind = Kind::Command;
+        entry
+    }
+
+    fn entry_at(id: &str, name: &str, kind: Kind, path: &str) -> Entry {
+        let mut entry = item(id, name);
+        entry.kind = kind;
+        entry.path = Some(PathBuf::from(path));
+        entry
+    }
+
+    fn request(text: &str, limit: usize) -> Request {
+        Request {
+            generation: 1,
+            query: Query {
+                raw: text.to_string(),
+                scope: Scope::All,
+                text: text.to_string(),
+                ext: None,
+                path_filter: None,
+            },
+            limit,
+            keywords: Vec::new(),
+            dialog_quick: false,
+            filters: SearchFilters::default(),
+            rank: RankConfig::default(),
+            show_history: true,
+            favorites: Vec::new(),
+            base_folder: None,
+        }
+    }
+
+    #[test]
+    fn finalize_pins_command_alias_above_same_name_app() {
+        // H1 回归：命令别名「设置」精确命中，必须压过同名的 app/文件。
+        // 旧置顶只看 name，会把同名的 app（即使分数更低）移到命令前面。
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let app = entry_at(
+            "app:settings",
+            "设置",
+            Kind::App,
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\设置.lnk",
+        );
+        let file = entry_at("file:settings", "设置", Kind::File, r"D:\docs\设置");
+        {
+            let mut hist = history.lock().unwrap();
+            hist.seed(&app, 20, 0);
+        }
+        let entries = vec![app, file, command("cmd:settings", "打开设置")];
+        let out = finalize_entries(
+            entries,
+            &request("设置", 8),
+            &history,
+            &Config::default(),
+            Vec::new(),
+        );
+        assert_eq!(out[0].id, "cmd:settings", "命令别名精确命中应置顶");
+        assert_eq!(out[1].id, "app:settings");
+    }
+
+    #[test]
+    fn keyword_row_stays_above_pinned_command_alias() {
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let mut keyword = item("kwurl:g", "用 Google 搜索：设置");
+        keyword.kind = Kind::Command;
+        let out = finalize_entries(
+            vec![command("cmd:settings", "打开设置")],
+            &request("设置", 8),
+            &history,
+            &Config::default(),
+            vec![keyword],
+        );
+        assert_eq!(out[0].id, "kwurl:g");
+        assert_eq!(out[1].id, "cmd:settings");
+    }
+
+    #[test]
+    fn finalize_keeps_at_most_six_exact_names_and_pins_them() {
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let mut entries: Vec<Entry> = (0..8)
+            .map(|i| {
+                entry_at(
+                    &format!("exact{i}"),
+                    "ai",
+                    Kind::File,
+                    &format!(r"D:\work\{i}\ai"),
+                )
+            })
+            .collect();
+        // 前缀命中先排在前面，确保置顶不是「本来就在最前」。
+        entries.push(entry_at("prefix", "ai-notes", Kind::File, r"D:\work\ai-notes"));
+        let out = finalize_entries(
+            entries,
+            &request("ai", 8),
+            &history,
+            &Config::default(),
+            Vec::new(),
+        );
+        let exact_count = out.iter().filter(|entry| entry.name == "ai").count();
+        assert_eq!(exact_count, 6, "同名精确命中最多保留 6 条");
+        assert!(
+            out.iter().take(6).all(|entry| entry.name == "ai"),
+            "6 条精确同名都应被置顶"
+        );
+    }
+
+    #[test]
+    fn exact_name_pin_survives_candidate_truncation() {
+        // 105 条前缀命中靠历史分压过 3 条噪声路径里的精确同名：
+        // 若不先置顶再截断，精确同名会被 deliver=100 截掉。
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let mut entries = Vec::new();
+        {
+            let mut hist = history.lock().unwrap();
+            for i in 0..105 {
+                let name = format!("ai-extra-{i:03}");
+                let entry = entry_at(&format!("p{i}"), &name, Kind::File, &format!(r"D:\work\{i}\{name}"));
+                hist.seed(&entry, 20, 0);
+                entries.push(entry);
+            }
+        }
+        for i in 0..3 {
+            entries.push(entry_at(
+                &format!("exact{i}"),
+                "ai",
+                Kind::Folder,
+                &format!(r"D:\work\node_modules\{i}\ai"),
+            ));
+        }
+        let out = finalize_entries(
+            entries,
+            &request("ai", 8),
+            &history,
+            &Config::default(),
+            Vec::new(),
+        );
+        assert_eq!(out.len(), 100, "候选上限仍是 100");
+        assert!(
+            out.iter().take(3).all(|entry| entry.name == "ai"),
+            "截断前必须先把精确同名移到最前"
+        );
     }
 }
 

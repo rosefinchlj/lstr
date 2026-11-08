@@ -23,11 +23,38 @@ const EXACT_SHALLOW_UNIT: i32 = 2;
 // 出现位置越靠前越好。上限 40，保证不越过「名称前缀」。
 const SUBSTRING_BOUNDARY_BONUS: i32 = 30;
 const SUBSTRING_POSITION_BONUS: i32 = 10;
-/// 位置/短名/浅路径这类启发式加分的总上限。
-/// 它们只配在「同一匹配档位内」排序：默认最小档位差约 80~200，
-/// 之前 cwd(+300) + parent(+200) 合计 500，直接把当前目录下 tr-ai-ts 之类的
-/// 构建产物顶到「名称恰好叫 ai」的目录前面。cap 之后位置再好也跨不过档位。
-const HEURISTIC_CAP: i32 = 80;
+
+/// 位置/短名/浅路径这类启发式加分在**单个匹配档位内**的总上限。
+/// 档位分值由 RankConfig 提供、用户可调，所以上限必须跟着档位走：
+/// 取「相邻档位最小差 - 1」，否则位置更好的低档条目会反超高一档。
+/// 默认档位里 tokens(550) 与 normalized(520) 只差 30，写死 80 时
+/// cwd 里的 normalized 命中能反超 tokens 命中。
+/// 下限 20：档位被调得非常接近时仍保留最低限度的同档排序能力。
+fn heuristic_cap(cfg: &RankConfig) -> i32 {
+    let mut tiers = [
+        cfg.exact,
+        cfg.prefix,
+        cfg.substring,
+        cfg.tokens,
+        cfg.normalized,
+        cfg.pinyin_prefix,
+        cfg.pinyin_substring,
+        cfg.fuzzy,
+        cfg.path_only,
+    ];
+    tiers.sort_unstable();
+    let min_gap = tiers
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .filter(|gap| *gap > 0)
+        .min();
+    match min_gap {
+        // 留 1 分余量：档位内启发式最高只到下一档前一分。
+        Some(gap) => (gap - 1).max(20),
+        // 档位全相等时没有「相邻差」可言，给一个保守默认值。
+        None => 80,
+    }
+}
 
 /// 按分数从高到低稳定排序（使用设置面板里的排序权重）。
 pub fn rank_with(
@@ -164,18 +191,50 @@ fn env_paths() -> &'static EnvPaths {
     })
 }
 
+/// 构建产物目录规则集合：这些目录里产出的 `.exe` 是正常程序，不是用户要找的
+/// 临时/缓存文件，因此对 `Kind::Program` 不按噪声降权。
+/// 与 `config::default_noise_rules` 里的构建规则保持同步；用户自定义的
+/// `xxx-target/` 这类目录也一并豁免（`is_under_path` 式的边界规则在这里用
+/// 子串集合表达，因为噪声规则本身就是路径片段匹配）。
+fn is_build_dir_pattern(pattern: &str) -> bool {
+    matches!(
+        pattern,
+        "/target/"
+            | "-target/"
+            | "/target/debug/"
+            | "/target/release/"
+            | "/target/deps/"
+            | "/target/.fingerprint/"
+            | "/target/incremental/"
+            | "/target/doc/"
+            | "-target/debug/"
+            | "-target/release/"
+            | "-target/deps/"
+            | "-target/.fingerprint/"
+            | "-target/incremental/"
+            | "-target/doc/"
+            | ".fingerprint/"
+            | "/bin/debug/"
+            | "/bin/release/"
+            | "/obj/"
+            | "cmake-build-debug/"
+            | "cmake-build-release/"
+    )
+}
+
 /// 噪声惩罚：遍历用户可编辑的规则表，取命中的最重一档，再乘全局强度。
 /// 规则统一按正斜杠匹配（先把路径里的 `\` 换成 `/`）。
 fn noise_penalty(path: &str, needle: &str, kind: Kind, cfg: &RankConfig) -> i32 {
-    let normalized_path = path.replace('\\', "/");
+    // 规则表按小写正斜杠保存，路径也统一归一化（含大小写）后再匹配。
+    let normalized_path = path.replace('\\', "/").to_lowercase();
     let mut worst = 0;
     for rule in &cfg.noise_rules {
         let pattern = rule.pattern.trim().to_lowercase().replace('\\', "/");
         if pattern.is_empty() || !normalized_path.contains(&pattern) {
             continue;
         }
-        // target 下的 .exe 是正常程序产物，不罚。
-        if pattern == "/target/" && kind == Kind::Program {
+        // 构建目录下的 .exe 是正常程序产物，不罚。
+        if kind == Kind::Program && is_build_dir_pattern(&pattern) {
             continue;
         }
         // 「用户在找噪声目录本身」：查询词包含在片段里，如 cache / temp。
@@ -189,34 +248,37 @@ fn noise_penalty(path: &str, needle: &str, kind: Kind, cfg: &RankConfig) -> i32 
 
 fn path_adjustment(entry: &Entry, needle: &str, cfg: &RankConfig) -> i32 {
     let path = entry.full_path().to_lowercase();
-    let mut hint = 0;
-
-    // 名字越短，越可能是用户真正要找的条目。
-    hint += 30 - (entry.name.chars().count() as i32).min(30);
-    // 浅层路径优先。
-    hint += 20 - (path.matches('\\').count() as i32).min(20);
+    let cap = heuristic_cap(cfg);
+    // 分成「条目自身细节」和「环境上下文」两块额度：
+    // - 细节（短名、浅路径）决定同一档位内谁更靠前，不能被上下文挤掉；
+    // - 上下文（home/parent/cwd）只该拉近与当前目录的距离，不能把档位抹平。
+    // 两块合计严格小于 cap，因此永远跨不过下一档。
+    let detail_cap = cap / 2;
+    let name_raw = (30 - (entry.name.chars().count() as i32).min(30)).clamp(0, 30);
+    let depth_raw = (20 - (path.matches('\\').count() as i32).min(20)).clamp(0, 20);
+    let mut hint = (name_raw + depth_raw) * detail_cap / 50;
 
     let env = env_paths();
+    let mut context = 0;
     if let Some(home) = &env.home {
         if is_under_path(&path, home) {
-            hint += 20;
+            context += 20;
         }
     }
-    // 当前工作目录上下文：只用于同一匹配档位内排序。
-    // 曾经是 +200/+300，合计 500 足以压过 exact 与 substring 之间的档位差。
     if let Some(parent) = &env.cwd_parent {
         if is_under_path(&path, parent) {
-            hint += 60;
+            context += 60;
         }
     }
     if let Some(cwd) = &env.cwd {
         if is_under_path(&path, cwd) {
-            hint += 90;
+            context += 90;
         }
     }
+    hint += context.min(cap - detail_cap);
 
     // 噪声惩罚是「排除」信号，不受上界限制：该沉下去的就要沉下去。
-    hint.min(HEURISTIC_CAP) - noise_penalty(&path, needle, entry.kind, cfg)
+    hint - noise_penalty(&path, needle, entry.kind, cfg)
 }
 
 /// 路径边界匹配：dir 本身，或 dir 后紧跟路径分隔符才算在目录下。
@@ -437,6 +499,57 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_target_dirs_are_not_penalized_but_build_artifacts_are() {
+        // M4 误伤反例：目录名以 -target 结尾，但不是 Cargo 构建目录。
+        let cfg = RankConfig::default();
+        assert_eq!(
+            noise_penalty(r"D:\work\acme-target\src\main.rs", "main", Kind::File, &cfg),
+            0
+        );
+        assert_eq!(
+            noise_penalty(r"D:\work\build-target\src\lib.rs", "lib", Kind::File, &cfg),
+            0
+        );
+        // 真实产物子目录仍应明显降权。
+        for path in [
+            r"D:\work\lstr-wt-p0-target\debug\deps\meta.json",
+            r"D:\work\lstr-wt-p0-target\release\notes.txt",
+            r"D:\work\lstr-wt-p0-target\deps\meta.json",
+            r"D:\work\lstr-wt-p0-target\.fingerprint\abc\bin-lstr.json",
+            r"D:\work\lstr-wt-p0-target\incremental\xyz.bin",
+            r"D:\work\lstr-wt-p0-target\doc\lstr\index.html",
+        ] {
+            assert!(
+                noise_penalty(path, "lstr", Kind::File, &cfg) >= 100,
+                "真实构建产物应降权: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn program_in_build_dirs_is_not_penalized() {
+        // L1：构建目录里的 exe 是正常程序产物，不该按噪声降权。
+        let cfg = RankConfig::default();
+        for path in [
+            r"D:\work\lstr-wt-p0-target\debug\lstr.exe",
+            r"D:\work\lstr-wt-p0-target\.fingerprint\app.exe",
+            r"D:\work\cmake-build-debug\app.exe",
+            r"D:\work\bin\Debug\app.exe",
+            r"D:\work\obj\x64\app.exe",
+        ] {
+            assert_eq!(
+                noise_penalty(path, "lstr", Kind::Program, &cfg),
+                0,
+                "构建产物 exe 应豁免: {path}"
+            );
+        }
+        // 普通临时目录里的 exe 仍然降权（这些 exe 不是构建产物）。
+        assert!(
+            noise_penalty(r"C:\Users\x\AppData\Local\Temp\app.exe", "lstr", Kind::Program, &cfg) > 0
+        );
+    }
+
+    #[test]
     fn word_boundary_matches_rank_higher() {
         // app_config 命中 config 应比 appxconfig 命中更靠前。
         let boundary = entry("b", "app_config.json", Kind::File);
@@ -620,11 +733,64 @@ mod tests {
     }
 
     #[test]
+    fn heuristic_cap_derives_from_adjacent_tiers() {
+        // M1：cap 必须小于最小相邻档位差，否则低一档靠位置分就能反超。
+        let cfg = RankConfig::default();
+        assert_eq!(heuristic_cap(&cfg), 29, "默认 tokens 550 vs normalized 520 差 30");
+        let mut tight = RankConfig::default();
+        tight.tokens = 410;
+        tight.normalized = 400;
+        assert_eq!(heuristic_cap(&tight), 20, "档位差很小时保底 20");
+    }
+
+    #[test]
     fn path_context_is_bounded_by_heuristic_cap() {
-        let mut e = entry("hot", "a", Kind::Folder);
-        e.path = Some(PathBuf::from(r"C:/x/a"));
-        let hint = path_adjustment(&e, "a", &RankConfig::default());
-        assert!(hint <= HEURISTIC_CAP, "位置启发式不应跨越匹配档位: {hint}");
+        // 旧用例名不副实：49 分永远碰不到 80。这里让 cwd + 短名 + 浅路径
+        // 拉满，仍必须 ≤ cap（旧实现会直接饱和到 80）。
+        let cfg = RankConfig::default();
+        let cap = heuristic_cap(&cfg);
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut hot = entry("hot", "a", Kind::Folder);
+        hot.path = Some(cwd.join("a"));
+        let hint = path_adjustment(&hot, "a", &cfg);
+        assert!(
+            hint <= cap,
+            "位置启发式不应跨越匹配档位: hint={hint}, cap={cap}"
+        );
+        assert!(hint > 0);
+    }
+
+    #[test]
+    fn cwd_context_keeps_name_and_depth_differential() {
+        // M2：context 不再把 cwd 内所有条目抹平成同一个 cap，
+        // 短名/浅路径仍应略高于长名/深路径。
+        let cfg = RankConfig::default();
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut short = entry("short", "a", Kind::Folder);
+        short.path = Some(cwd.join("a"));
+        let mut deep = entry("deep", "a-very-long-folder-name", Kind::Folder);
+        deep.path = Some(cwd.join("deep").join("deeper").join("deeper").join("x"));
+        let short_hint = path_adjustment(&short, "a", &cfg);
+        let deep_hint = path_adjustment(&deep, "a", &cfg);
+        assert!(
+            short_hint > deep_hint,
+            "cwd 内短名/浅路径仍应更靠前: short={short_hint}, deep={deep_hint}"
+        );
+    }
+
+    #[test]
+    fn tokens_match_not_overtaken_by_cwd_normalized_match() {
+        // M1 回归：「my report」多词命中（tokens 550）vs cwd 里只靠分隔符
+        // 不敏感的命中（normalized 520）。旧 cap=80 时 cwd 的 +80 让后者反超。
+        let cfg = RankConfig::default();
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut tokens = entry("tokens", "my_report_2024.pdf", Kind::File);
+        tokens.path = Some(PathBuf::from(r"D:\archive\my_report_2024.pdf"));
+        let mut normalized = entry("normalized", "myre_port.pdf", Kind::File);
+        normalized.path = Some(cwd.join("myre_port.pdf"));
+        let mut entries = vec![normalized, tokens];
+        rank_with(&mut entries, "my report", &History::in_memory(), 3, &cfg);
+        assert_eq!(entries[0].id, "tokens");
     }
 
     #[test]
@@ -641,13 +807,19 @@ mod tests {
     #[test]
     fn exact_name_beats_substring_in_current_working_directory() {
         // 复现截图：cwd 下名称蹭到 ai 的构建产物 vs 名称恰好叫 ai 的目录。
+        // 再加历史 + query 学习把构建产物顶高——精确同名仍须靠档位差赢。
         let cwd = std::env::current_dir().expect("cwd");
         let mut noisy = entry("noisy", "num-traits-dab2dc0fb3c75e7", Kind::Folder);
         noisy.path = Some(cwd.join("target").join("debug").join("num-traits"));
         let mut exact = entry("exact", "ai", Kind::Folder);
-        exact.path = Some(PathBuf::from(r"C:/Users/someone/ai"));
+        exact.path = Some(PathBuf::from(r"D:\arch\ai"));
+        let mut history = History::in_memory();
+        history.seed(&noisy, 40, now());
+        for _ in 0..50 {
+            history.record_query("ai", &noisy);
+        }
         let mut entries = vec![noisy, exact];
-        rank(&mut entries, "ai", &History::in_memory(), 3);
+        rank(&mut entries, "ai", &history, 3);
         assert_eq!(entries[0].id, "exact");
     }
 
