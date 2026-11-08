@@ -19,6 +19,12 @@ use crate::{PROTO_VERSION, PIPE_NAME};
 /// 帧通道容量:批帧最大 4000 条,32 帧 ≈ 十余 MB 上限(背压防扫描期积压)。
 const FRAME_CHANNEL_CAP: usize = 32;
 
+/// 主进程在会话里显式发过 `Frame::Shutdown` 后置位:本次会话结束后
+/// 不再重建管道,worker 直接退出。这样 lstr 正常关闭时不会留下常驻的
+/// 提权进程;若主进程崩溃(没来得及发 Shutdown),worker 仍会留在管道上
+/// 等下一次连接——这是有意的兜底,代价是极少数情况下残留一个空闲进程。
+static EXIT_AFTER_SESSION: AtomicBool = AtomicBool::new(false);
+
 /// worker 入口(lstr main 检测到 --index-worker 后调用)。不返回。
 pub fn worker_main() -> i32 {
     let Ok(server) = win::create_pipe_server(PIPE_NAME) else {
@@ -43,6 +49,10 @@ impl Worker {
             // run_session 只借用句柄、不关闭,外层不再复用已关闭的句柄(H5)。
             win::close(self.server);
             self.server = HANDLE(std::ptr::null_mut());
+            // M4:主进程显式关闭 → 不重建管道,直接退出。
+            if EXIT_AFTER_SESSION.load(Ordering::Relaxed) {
+                return 0;
+            }
             match win::create_pipe_server(PIPE_NAME) {
                 Ok(s) => self.server = s,
                 Err(_) => {
@@ -136,7 +146,10 @@ fn run_session(client: HANDLE) {
                         threads.insert(guid, VolumeThread { stop, handle });
                     }
                 }
-                Frame::Shutdown => break 'session,
+                Frame::Shutdown => {
+                    EXIT_AFTER_SESSION.store(true, Ordering::Relaxed);
+                    break 'session;
+                }
                 _ => {}
             }
         }

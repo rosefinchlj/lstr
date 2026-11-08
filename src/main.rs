@@ -34,11 +34,13 @@ fn install_panic_logger() {
 }
 
 fn main() -> eframe::Result<()> {
+    // panic 钩子必须先装:--index-worker 分支也要留下崩溃证据,
+    // 否则提权 worker 在 release 下挂掉时没有任何日志可查。
+    install_panic_logger();
     // --index-worker:提权数据泵,不走单实例、不进 UI
     if std::env::args().any(|a| a == "--index-worker") {
         std::process::exit(lstr_index::worker::worker_main());
     }
-    install_panic_logger();
     let single = match win::single_instance::acquire() {
         Some(guard) => guard,
         None => return Ok(()),

@@ -398,7 +398,7 @@ impl LstrApp {
                 ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
             }
         }
-        self.poll_index_status();
+        self.poll_index_status(ctx);
         if let Some(response) = self.service.poll() {
             if response.generation == self.pending_gen {
                 self.entries = response.entries;
@@ -938,10 +938,18 @@ impl LstrApp {
     }
 
     /// 自研索引状态 → 状态行文案(方案 §5:不闪、不骗人、复用横幅)。
-    fn poll_index_status(&mut self) {
+    fn poll_index_status(&mut self, ctx: &egui::Context) {
         let status = self.service.index_status.lock().unwrap().clone();
         let mut note = None;
         if let Some(st) = &status {
+            // L2:进度百分比由后台线程推着走,但 UI 只在阶段变化时被唤醒,
+            // 不主动重绘的话横幅会停在第一次拿到的数字上。
+            if matches!(
+                st.phase,
+                lstr_index::Phase::Scanning | lstr_index::Phase::Loading
+            ) {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
             if st.phase == lstr_index::Phase::Scanning {
                 let total: u32 = st.volumes.iter().map(|v| v.count).sum();
                 let known: Vec<f32> = st.volumes.iter().filter_map(|v| v.pct).collect();
@@ -3362,21 +3370,33 @@ impl LstrApp {
         // —— 状态行 ——
         let status = self.service.index_status.lock().unwrap().clone();
         let status_text = match &status {
-            Some(st) => match st.phase {
-                lstr_index::Phase::Ready => "内置索引:就绪".to_string(),
-                lstr_index::Phase::Scanning => {
-                    let total: u32 = st.volumes.iter().map(|v| v.count).sum();
-                    let done = st.volumes.iter().filter(|v| v.complete).count();
-                    format!(
-                        "内置索引:构建中({}/{}) · 已收录 {} 万项",
-                        done,
-                        st.volumes.len(),
-                        total / 10_000
-                    )
-                }
-                lstr_index::Phase::Loading => "内置索引:等待 worker 连接…".to_string(),
-                lstr_index::Phase::Fallback => "内置索引:未启用(需管理员授权)".to_string(),
-            },
+            Some(st) => {
+                let base = match st.phase {
+                    lstr_index::Phase::Ready => "内置索引:就绪".to_string(),
+                    lstr_index::Phase::Scanning => {
+                        let total: u32 = st.volumes.iter().map(|v| v.count).sum();
+                        let done = st.volumes.iter().filter(|v| v.complete).count();
+                        format!(
+                            "内置索引:构建中({}/{}) · 已收录 {} 万项",
+                            done,
+                            st.volumes.len(),
+                            total / 10_000
+                        )
+                    }
+                    lstr_index::Phase::Loading => "内置索引:等待 worker 连接…".to_string(),
+                    lstr_index::Phase::Fallback => "内置索引:未启用(需管理员授权)".to_string(),
+                };
+                // L4:运行期后端与 Everything 可用性以前只赋值、没人读。显示出来
+                // 才能解释「自动」模式此刻是谁在出结果、时间筛选是否可用。
+                format!(
+                    "{base} · 后端:{} · Everything:{}",
+                    match st.backend {
+                        crate::search::builtin::BackendKind::Builtin => "内置索引",
+                        crate::search::builtin::BackendKind::Everything => "Everything",
+                    },
+                    if st.everything_ok { "在线" } else { "离线" }
+                )
+            }
             None => "内置索引:未启用".to_string(),
         };
         Self::settings_label(painter, &theme, area.left(), y, "索引状态");
@@ -3442,7 +3462,8 @@ impl LstrApp {
         painter.text(
             egui::pos2(area.left(), y + 8.0),
             Align2::LEFT_CENTER,
-            "修改后需重启 lstr 生效;噪声排除变更会触发索引重建(删除快照后自动重扫)。",
+            "修改后需重启 lstr 生效;噪声排除变更会触发索引重建(删除快照后自动重扫)。\
+内置索引仅覆盖本机固定 NTFS 卷;其他卷(网络盘/FAT32/exFAT)的结果仍需 Everything 提供。",
             ui::text_font(10.5),
             theme.sub,
         );
@@ -3468,9 +3489,25 @@ impl LstrApp {
 
     fn set_cfg_index_noise(&mut self, on: bool) {
         self.cfg.index.exclude_noise = on;
-        // 噪声位随扫描期写入,改开关必须重建快照
+        // 噪声位在扫描/compact 期写进 attrs,改开关只能重建快照。快照现在带
+        // exclude_noise 指纹,加载时不匹配会自行拒绝;这里主动删掉旧快照,
+        // 让用户在下次启动时就得到重建,而不是等到下次扫描。
+        // 只删 vol_*.bin:不动 index 目录里的日志等文件,也避免与引擎落盘
+        // 竞争(整目录 remove_dir_all 可能撞上正在写的临时文件)。
         let dir = crate::config::attach_dir().join("index");
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let looks_like_snapshot = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("vol_") && n.ends_with(".bin"))
+                    .unwrap_or(false);
+                if looks_like_snapshot {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
         let _ = self.cfg.save();
     }
 

@@ -173,12 +173,14 @@ fn finalize_entries(
         );
     }
 
-    // 两遍去重：借用不跨 retain，省去每条 id/name 的 clone 分配。
+    // 两遍去重：先算 keep 掩码再 retain（借用不跨 retain）。
+    // Windows 路径/ID 大小写不敏感，内置索引与 Everything 对同一个路径给的
+    // 大小写可能不同，所以 id 先归一化成小写再比较，否则同一条目出现两行。
     let keep_ids: Vec<bool> = {
-        let mut seen_ids = HashSet::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
         entries
             .iter()
-            .map(|entry| seen_ids.insert(entry.id.as_str()))
+            .map(|entry| seen_ids.insert(entry.id.to_lowercase()))
             .collect()
     };
     let mut keep_iter = keep_ids.into_iter();
@@ -586,6 +588,9 @@ fn run_worker(
                         total += command_hits.len();
                         entries.append(&mut command_hits);
                     }
+                    // M7:合并进来的 Everything 结果与应用/命令命中也要计入总数,
+                    // 否则会出现「显示 0 个结果但列表里有内容」。
+                    total = total.max(entries.len());
                     // 两阶段返回：先发不含精确补齐的结果（约 200ms 可见），
                     // 再补 wfn 精确项；最终结果与一次性返回等价。
                     if needs_exact {
@@ -640,8 +645,9 @@ fn run_worker(
                         .map(|b| b.engine.status().phase)
                         .unwrap_or(lstr_index::Phase::Fallback);
                     let time_forced = request.filters.time.is_some();
+                    let used_builtin = (force_builtin || phase != lstr_index::Phase::Fallback) && !time_forced;
                     if let Some(b) = &builtin {
-                        if (force_builtin || phase != lstr_index::Phase::Fallback) && !time_forced {
+                        if used_builtin {
                             let fetch = fetch_count(&request.query, request.limit);
                             match b.search(&request.query, &request.filters, fetch) {
                                 Ok((mut files, count)) => {
@@ -681,6 +687,22 @@ fn run_worker(
                     } else {
                         error = Some("索引未启用且 Everything 未运行".to_string());
                     }
+                    // M5:内置索引还没 Ready(Fallback 以上的构建期)时,单 scope
+                    // 也要像 All scope 一样合并 Everything 的结果;否则构建期
+                    // 只能看到半成品索引,查不到尚未扫到的文件。
+                    if used_builtin && phase != lstr_index::Phase::Ready {
+                        if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
+                            let fetch = fetch_count(&request.query, request.limit);
+                            if let Ok((mut extra, count)) =
+                                provider.search(&request.query, &request.filters, fetch)
+                            {
+                                total = total.max(count);
+                                entries.append(&mut extra);
+                            }
+                        }
+                    }
+                    // M7:合并的 Everything 结果与两阶段补齐都要计入总数。
+                    total = total.max(entries.len());
                     if needs_exact {
                         let first = finalize_entries(
                             entries.clone(),
@@ -740,6 +762,9 @@ let _ = tx.send(Response {
         });
         ctx.request_repaint();
     }
+    // M4:服务线程结束(SearchService 被 drop)→ 让 client 线程把 Shutdown
+    // 发给 worker,提权进程随之退出,不再常驻等下一次连接。
+    shutdown_client.store(true, Ordering::Relaxed);
 }
 
 fn fetch_count(query: &Query, limit: usize) -> usize {
@@ -932,6 +957,60 @@ fn url_encode(input: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 测试隔离:默认配置 backend=auto 会让服务线程真去探活/拉起 worker
+    /// (runas → 可能弹 UAC),在测试机器上既慢又打扰用户。单测一律关掉
+    /// 内置索引;需要 Everything 的用例本来就标了 #[ignore]。
+    fn test_config() -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.index.backend = "off".to_string();
+        config
+    }
+
+    /// L6:Windows 路径/ID 大小写不敏感,内置索引与 Everything 对同一路径给的
+    /// 大小写可能不同,去重必须归一化,否则同一条目出现两行。
+    #[test]
+    fn duplicate_ids_are_deduped_case_insensitively() {
+        fn entry(id: &str, name: &str) -> Entry {
+            Entry {
+                id: id.to_string(),
+                kind: Kind::File,
+                name: name.to_string(),
+                path: Some(std::path::PathBuf::from(name)),
+                size: None,
+                modified: None,
+                pinyin: None,
+                initial: "f".to_string(),
+                tone: 0,
+            }
+        }
+        let request = Request {
+            generation: 1,
+            query: Query {
+                raw: "abc".to_string(),
+                scope: Scope::All,
+                text: "abc".to_string(),
+                ext: None,
+                path_filter: None,
+            },
+            limit: 10,
+            keywords: Vec::new(),
+            dialog_quick: false,
+            filters: SearchFilters::default(),
+            rank: RankConfig::default(),
+            show_history: false,
+        };
+        let history = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::history::History::in_memory(),
+        ));
+        let entries = vec![
+            entry("file:C:\\Temp\\ABC.txt", "ABC.txt"),
+            entry("file:c:\\temp\\abc.txt", "abc.txt"),
+        ];
+        let out = finalize_entries(entries, &request, &history, &test_config(), Vec::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "ABC.txt");
+    }
+
     fn google() -> Vec<KeywordConfig> {
         vec![KeywordConfig {
             trigger: "g".to_string(),
@@ -1000,7 +1079,7 @@ mod tests {
         if !target.exists() {
             return;
         }
-        let config = crate::config::Config::default();
+        let config = test_config();
         let history = std::sync::Arc::new(std::sync::Mutex::new(
             crate::history::History::in_memory(),
         ));
@@ -1099,7 +1178,7 @@ mod tests {
     #[test]
     fn browse_mode_flows_through_service() {
         // 路径模式只依赖 read_dir，无需 Everything，可做端到端回归。
-        let config = crate::config::Config::default();
+        let config = test_config();
         let history = std::sync::Arc::new(std::sync::Mutex::new(
             crate::history::History::in_memory(),
         ));
@@ -1129,7 +1208,7 @@ mod tests {
     #[test]
     #[ignore = "requires a running Everything instance"]
     fn pipeline_perf() {
-        let config = crate::config::Config::default();
+        let config = test_config();
         let history = std::sync::Arc::new(std::sync::Mutex::new(
             crate::history::History::in_memory(),
         ));

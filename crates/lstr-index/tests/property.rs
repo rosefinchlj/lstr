@@ -269,6 +269,7 @@ fn random_op_stream_matches_model() {
                 guid: 0xABC,
                 letter: 'C',
                 complete: true,
+                exclude_noise: false,
                 journal_id: 1,
                 next_usn: 100,
                 resume_frn: 0,

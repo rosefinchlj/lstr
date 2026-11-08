@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use crate::store::{VolumeStore, NO_PARENT};
 
 pub const MAGIC: &[u8; 4] = b"LIDX";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// 引擎调试日志(%APPDATA%\lstr\index\engine.log)。
 /// worker 提权进程与 UI 都写同用户目录;失败静默。
@@ -44,12 +44,16 @@ fn chrono_now() -> String {
 }
 
 pub const FLAG_COMPLETE: u8 = 0x01;
+/// 快照生成时 `exclude_noise` 的取值(M3):NOISE 位是扫描/compact 期
+/// 写进 attrs 的,开关切换后旧快照的可见性与新配置不符,必须拒绝重扫。
+pub const FLAG_NOISE: u8 = 0x02;
 
 #[derive(Clone, Debug)]
 pub struct SnapshotHeader {
     pub guid: u128,
     pub letter: char,
     pub complete: bool,
+    pub exclude_noise: bool,
     pub journal_id: u64,
     pub next_usn: i64,
     pub resume_frn: u64,
@@ -82,7 +86,7 @@ pub fn save(
     w.write_all(&VERSION.to_le_bytes())?;
     w.write_all(&header.guid.to_le_bytes())?;
     w.write_all(&[header.letter as u32 as u8])?;
-    w.write_all(&flags_of(header.complete))?;
+    w.write_all(&[flags_of(header.complete, header.exclude_noise)])?;
     w.write_all(&header.journal_id.to_le_bytes())?;
     w.write_all(&header.next_usn.to_le_bytes())?;
     w.write_all(&header.resume_frn.to_le_bytes())?;
@@ -99,8 +103,8 @@ pub fn save(
     Ok(std::fs::metadata(&final_path)?.len())
 }
 
-fn flags_of(complete: bool) -> [u8; 1] {
-    [if complete { FLAG_COMPLETE } else { 0 }]
+fn flags_of(complete: bool, exclude_noise: bool) -> u8 {
+    (if complete { FLAG_COMPLETE } else { 0 }) | (if exclude_noise { FLAG_NOISE } else { 0 })
 }
 
 fn write_blob<W: Write>(w: &mut W, bytes: &[u8]) -> std::io::Result<()> {
@@ -173,6 +177,13 @@ pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapsho
     cur = &cur[1..];
     let flags = *cur.first()?;
     cur = &cur[1..];
+    let noise_flag = flags & FLAG_NOISE != 0;
+    if noise_flag != noise_enabled {
+        debug_log(&format!(
+            "load {guid:032x}: exclude_noise snapshot={noise_flag} cfg={noise_enabled}"
+        ));
+        return None;
+    }
     let journal_id = u64::from_le_array(&mut cur)?;
     let next_usn = i64::from_le_array(&mut cur)?;
     let resume_frn = u64::from_le_array(&mut cur)?;
@@ -241,6 +252,7 @@ pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapsho
             guid,
             letter,
             complete: flags & FLAG_COMPLETE != 0,
+            exclude_noise: noise_flag,
             journal_id,
             next_usn,
             resume_frn,
@@ -338,6 +350,7 @@ mod tests {
             guid: 0x1234_5678_9abc_def0_1122_3344,
             letter: 'C',
             complete: true,
+            exclude_noise: true,
             journal_id: 0xfeed,
             next_usn: 0x42,
             resume_frn: 0,
@@ -347,6 +360,9 @@ mod tests {
         let size = save(&dir, &header, &mut s).unwrap();
         assert!(size > 0);
         let loaded = load(&dir, header.guid, true).unwrap();
+        // M3:噪声排除开关与快照生成时不符 → 拒绝加载(触发全量重扫),
+        // 否则切换开关后旧快照里的 NOISE 位会让结果与设置页承诺不一致。
+        assert!(load(&dir, header.guid, false).is_none());
         assert_eq!(loaded.header.journal_id, 0xfeed);
         assert_eq!(loaded.header.next_usn, 0x42);
         assert!(loaded.header.complete);
@@ -373,6 +389,9 @@ mod tests {
             guid,
             letter: 'C',
             complete,
+            // 这些用例的 store 都是 VolumeStore::new(false),load 也传 false;
+            // 指纹必须一致,否则 M3 的加载校验会按设计拒绝(v1 快照语义)。
+            exclude_noise: false,
             journal_id: 7,
             next_usn: 900,
             resume_frn: 0,

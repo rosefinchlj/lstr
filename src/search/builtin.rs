@@ -218,8 +218,8 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
 }
 
 /// 启动客户端线程:连接 worker(runas 拉起含在内)→ 帧循环 → EngineMsg。
-/// `connect_timeout` 覆盖 UAC 等待;断线后按 `retry` 节奏重连(引擎状态保留,
-/// 重连握手从快照位点续传)。返回是否已发起 worker 拉起。
+/// UAC 等待由首次连接的 60s 超时覆盖;断线后按固定节奏重连(引擎状态保留,
+/// 重连握手从快照位点续传)。线程自管拉起与重连,便于调用方 fire-and-forget。
 pub fn spawn_client_thread(
     handshake_slot: std::sync::Arc<std::sync::Mutex<Vec<(u128, u64, i64)>>>,
     tx: std::sync::mpsc::SyncSender<EngineMsg>,
@@ -280,12 +280,17 @@ pub fn spawn_client_thread(
 fn frame_loop(client: windows::Win32::Foundation::HANDLE, tx: &std::sync::mpsc::SyncSender<EngineMsg>, shutdown: &AtomicBool) {
     'frames: loop {
         if shutdown.load(Ordering::Relaxed) {
+            // M4:主进程要退出时显式发 Shutdown,worker 收到后不再重建管道
+            // 并自行退出;否则提权的常驻 worker 会在 lstr 关闭后一直留着。
+            let _ = idx_client::write_frame(client, &lstr_index::proto::Frame::Shutdown);
             break 'frames;
         }
         match idx_client::read_frame(client, Duration::from_secs(2)) {
             Some(frame) => {
                 if let Some(msg) = to_engine_msg(frame) {
                     if tx.send(msg).is_err() {
+                        // 引擎线程已经收工(服务被 drop):顺手通知 worker 退出。
+                        let _ = idx_client::write_frame(client, &lstr_index::proto::Frame::Shutdown);
                         break 'frames;
                     }
                 }
@@ -313,7 +318,7 @@ fn to_engine_msg(frame: lstr_index::proto::Frame) -> Option<EngineMsg> {
         F::ScanProgress { guid, frn, est, count } => {
             EngineMsg::ScanProgress { guid, frn, est, count }
         }
-        F::Batch { guid, recs, .. } => EngineMsg::Records { guid, recs },
+        F::Batch { guid, recs, next_usn } => EngineMsg::Records { guid, recs, next_usn },
         F::VolumeReady { guid, journal_id, next_usn, count } => {
             EngineMsg::VolumeReady { guid, journal_id, next_usn, count }
         }

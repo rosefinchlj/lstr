@@ -66,7 +66,7 @@ pub enum EngineMsg {
     VolumeMeta { guid: u128, letter: char, journal_id: u64, next_usn: i64, est_records: u64 },
     ScanBegin { guid: u128, resume_frn: u64 },
     ScanProgress { guid: u128, frn: u64, est: u64, count: u32 },
-    Records { guid: u128, recs: Vec<Rec> },
+    Records { guid: u128, recs: Vec<Rec>, next_usn: i64 },
     VolumeReady { guid: u128, journal_id: u64, next_usn: i64, count: u32 },
     JournalReset { guid: u128 },
     VolumeGone { guid: u128 },
@@ -224,7 +224,7 @@ impl Engine {
                     }
                 }
             }
-            EngineMsg::Records { guid, recs } => {
+            EngineMsg::Records { guid, recs, next_usn } => {
                 let Some(i) = self.volumes.iter().position(|v| v.guid == guid) else {
                     return;
                 };
@@ -240,6 +240,12 @@ impl Engine {
                         }
                     }
                     self.volumes[i].dirty = true;
+                }
+                // M2:记录批次的 journal 位点,重连握手从最新位点续传。
+                // 仅对就绪卷生效:扫描中的卷若提前写入 next_usn,
+                // 空/半 store 会被 worker 误判成可增量,丢文件。
+                if self.volumes[i].complete {
+                    self.volumes[i].next_usn = next_usn;
                 }
             }
             EngineMsg::VolumeReady { guid, journal_id, next_usn, count } => {
@@ -371,8 +377,15 @@ impl Engine {
             }
             let Some(store) = &v.store else { continue };
             let generation = v.generation;
-            let (slots, total, capped) =
-                crate::query::query_volume(store, spec, self.cfg.candidate_cap);
+            // H5:仅过滤器(无名字 token)的查询没有名字锚点,候选池容易被
+            // 前 2000 个可见项占满(尤其 `path:C:\dir` 还要后置过滤),
+            // 放大 cap 让收集阶段多留余量;total 仍精确。
+            let cap = if spec.tokens.is_empty() {
+                self.cfg.candidate_cap.saturating_mul(8)
+            } else {
+                self.cfg.candidate_cap
+            };
+            let (slots, total, capped) = crate::query::query_volume(store, spec, cap);
             out.total += total;
             out.capped |= capped;
             let mut hits: Vec<Hit> = slots
@@ -523,6 +536,7 @@ impl Engine {
                 guid: v.guid,
                 letter: v.letter,
                 complete: v.complete,
+                exclude_noise: self.cfg.exclude_noise,
                 journal_id: v.journal_id,
                 next_usn: v.next_usn,
                 resume_frn: v.resume_frn,
@@ -601,6 +615,7 @@ mod tests {
                 rec(11, 10, 0, "alpha.txt"),
                 rec(12, 10, 0, "beta.txt"),
             ],
+            next_usn: 100,
         });
         engine.handle(EngineMsg::VolumeReady { guid, journal_id: 7, next_usn: 100, count: 3 });
     }
@@ -643,6 +658,7 @@ mod tests {
         engine.handle(EngineMsg::Records {
             guid,
             recs: vec![rec(10, 0, DIR, "docs"), rec(11, 10, 0, "alpha.txt")],
+            next_usn: 100,
         });
 
         // 尚无扫描进度:不落盘,避免反复写空卷。
@@ -657,6 +673,46 @@ mod tests {
         assert_eq!(engine2.volumes.len(), 1);
         assert!(!engine2.volumes[0].complete);
         assert_eq!(engine2.volumes[0].store.as_ref().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M2:批次位点只对「已就绪」的卷生效。扫描中的卷提前写 next_usn 会让
+    /// 空/半 store 被 worker 误判成可增量;就绪后则必须推进到最新位点,否则
+    /// 重连只能从扫描结束位置续传(重放巨量 journal)。
+    #[test]
+    fn m2_next_usn_only_tracks_ready_volumes() {
+        const DIR: u32 = 0x0010;
+        let dir = temp_index_dir("m2");
+        let guid = 0x55u128;
+        let mut engine = engine_with(&dir);
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'C',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: 2,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        // 扫描中:即使批次带位点也不能落进握手状态
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(10, 0, DIR, "docs")],
+            next_usn: 555,
+        });
+        assert_eq!(engine.handshake_state(), vec![(guid, 0, 0)]);
+        engine.handle(EngineMsg::VolumeReady {
+            guid,
+            journal_id: 7,
+            next_usn: 100,
+            count: 1,
+        });
+        // 就绪后:批次位点推进,握手拿到的是最新位点而非扫描结束位点
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(11, 10, 0, "a.txt")],
+            next_usn: 900,
+        });
+        assert_eq!(engine.handshake_state(), vec![(guid, 7, 900)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
