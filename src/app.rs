@@ -198,6 +198,8 @@ pub struct LstrApp {
     icons: IconStore,
     /// P0-2：Explorer 内直接键入搜索（默认关闭）。
     typing: Option<crate::win::typing::TypingWatch>,
+    /// 设置页「资产」的草稿输入状态。
+    assets_ui: crate::assets_ui::AssetUiState,
 }
 
 impl LstrApp {
@@ -310,6 +312,7 @@ impl LstrApp {
             suppress_hide_until: Instant::now(),
             icons: IconStore::new(),
             typing,
+            assets_ui: crate::assets_ui::AssetUiState::default(),
         }
     }
 
@@ -2869,6 +2872,7 @@ impl LstrApp {
             (SettingsTab::Ranking, "排序规则"),
             (SettingsTab::Noise, "噪声规则"),
             (SettingsTab::Maintenance, "维护"),
+            (SettingsTab::Assets, "资产"),
         ];
         let mut y = rect.top() + 60.0;
         for (tab, label) in tabs {
@@ -2926,6 +2930,7 @@ impl LstrApp {
             SettingsTab::Ranking => self.paint_settings_ranking(ui, ctx, &painter, area),
             SettingsTab::Noise => self.paint_settings_noise(ui, ctx, &painter, area),
             SettingsTab::Maintenance => self.paint_settings_maintenance(ui, ctx, &painter, area),
+            SettingsTab::Assets => self.paint_settings_assets(ui, ctx, &painter, area),
         }
     }
 
@@ -3199,6 +3204,34 @@ impl LstrApp {
             ui::mono_font(10.0),
             theme.dim,
         );
+    }
+
+    /// 设置页「资产」：收藏 / 动作 / 命令的可视化增删改。
+    /// 渲染放在独立模块里，这里只负责分页区域、保存配置与同步搜索服务。
+    fn paint_settings_assets(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        area: Rect,
+    ) {
+        let theme = self.theme;
+        Self::settings_heading(painter, &theme, area, "资产", "收藏、自定义动作与命令");
+        let inner = Rect::from_min_max(
+            egui::pos2(area.left(), area.top() + 44.0),
+            egui::pos2(area.right(), area.bottom() - 6.0),
+        );
+        let cfg = &mut self.cfg;
+        let state = &mut self.assets_ui;
+        let mut changed = false;
+        ui.allocate_ui_at_rect(inner, |ui| {
+            changed = crate::assets_ui::paint(ui, cfg, state);
+        });
+        if changed {
+            let _ = self.cfg.save();
+            self.service.set_favorites(self.cfg.favorites.clone());
+            self.trigger(ctx);
+        }
     }
 
     fn paint_settings_ranking(
@@ -3707,6 +3740,7 @@ enum SettingsTab {
     Ranking = 2,
     Noise = 3,
     Maintenance = 4,
+    Assets = 5,
 }
 
 /// 筛选条上的三个按钮。

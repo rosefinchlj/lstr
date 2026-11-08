@@ -124,15 +124,20 @@ pub fn run_action(
     query: &str,
     current_folder: &str,
 ) -> Result<(), String> {
-    if def.admin {
-        return Err("提权执行尚未接线（admin = true）".to_string());
-    }
     let path = entry.full_path();
     let ctx = ExpandContext {
         action_path: &path,
         query,
         current_folder,
     };
+    if def.admin {
+        let workdir = expand(&def.workdir, &ctx);
+        if !workdir.trim().is_empty() {
+            return Err("提权执行不支持工作目录；请清空 workdir 或关闭 admin".to_string());
+        }
+        let args = expand(&def.args, &ctx);
+        return crate::win::shell::run_as_admin_with_args(&def.program, &args);
+    }
     spawn_program(&def.program, &def.args, &def.workdir, def.silent, &ctx)
 }
 

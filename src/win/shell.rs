@@ -110,6 +110,12 @@ pub fn run_as_admin(entry: &Entry) -> Result<(), String> {
     shell_execute("runas", path)
 }
 
+/// P0-1：以管理员权限运行程序并带参数（自定义动作 admin = true）。
+/// ShellExecute 的 runas 路径不支持指定工作目录，调用方需自行处理。
+pub fn run_as_admin_with_args(program: &str, params: &str) -> Result<(), String> {
+    shell_execute_with("runas", program, Some(params))
+}
+
 pub fn open_with(entry: &Entry) -> Result<(), String> {
     let path = entry
         .path

@@ -2,6 +2,7 @@
 
 mod app;
 mod assets;
+mod assets_ui;
 mod config;
 mod history;
 mod model;
