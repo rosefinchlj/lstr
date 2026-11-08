@@ -1,3 +1,4 @@
+use crate::assets::{ActionDef, CommandDef, Favorite};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -26,6 +27,24 @@ pub struct Config {
     /// 排序规则（设置面板「排序」页可视化编辑）。
     #[serde(default)]
     pub rank: RankConfig,
+
+    // —— P0-1 可积累资产 ——
+    /// 收藏的文件夹/文件，Quick Switch 与菜单的数据源。
+    #[serde(default)]
+    pub favorites: Vec<Favorite>,
+    /// 自定义动作：作用于选中的搜索结果，支持 {action_path}。
+    #[serde(default)]
+    pub actions: Vec<ActionDef>,
+    /// 自定义命令：作用于搜索词/当前文件夹，支持 {query}/{current_folder}。
+    #[serde(default)]
+    pub commands: Vec<CommandDef>,
+    // —— P0-2 / P0-3 开关 ——
+    /// Explorer 内「直接键入搜索」：全局低级键盘钩子，默认关闭（风险隔离）。
+    #[serde(default)]
+    pub explorer_typing: bool,
+    /// 文件对话框出现时自动跟随 Explorer 当前目录，默认关闭（会改动对话框路径）。
+    #[serde(default)]
+    pub dialog_auto_follow: bool,
 }
 
 /// 排序权重：设置面板里可以直接拖滑块调整，实时生效。
@@ -249,6 +268,11 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             keywords: default_keywords(),
             rank: RankConfig::default(),
+            favorites: Vec::new(),
+            actions: Vec::new(),
+            commands: Vec::new(),
+            explorer_typing: false,
+            dialog_auto_follow: false,
         }
     }
 }
@@ -332,5 +356,7 @@ mod tests {
         let parsed: Config = toml::from_str(&text).expect("deserialize config");
         assert!(parsed.height.is_none());
         assert_eq!(parsed.theme.mode, "frost");
+        assert!(!parsed.explorer_typing);
+        assert!(parsed.favorites.is_empty());
     }
 }

@@ -112,6 +112,9 @@ pub fn score_entry_with(
         + exact_shallow_points
         + recency_points(entry.modified, cfg)
         + path_adjustment(entry, &needle, cfg)
+        // P1-1：同一查询词下用户上次选过这个结果时加权。
+        // 全局 frecency 回答「常用吗」，query_boost 回答「搜这个词时要的是哪个」。
+        + history.query_boost(&needle, &entry.id)
 }
 
 /// 最近修改过的文件更可能是目标（轻量加分，不压过匹配档位）。

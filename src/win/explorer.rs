@@ -4,6 +4,7 @@
 
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
@@ -13,6 +14,78 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Variant::{VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4};
 use windows::Win32::UI::Shell::{IShellWindows, IWebBrowser2, ShellWindows};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClassNameW, GetForegroundWindow, GetWindowTextW,
+};
+
+/// P0-3：记住「最近一次前台 Explorer 窗口正在浏览的目录」。
+/// 文件对话框拿到前台后，前台窗口已不是 Explorer，只能靠这份缓存做
+/// Ctrl+G 一键跳 / 自动跟随。
+static LAST_FOLDER: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+static LAST_SEEN: OnceLock<Mutex<(isize, String)>> = OnceLock::new();
+
+fn last_folder() -> &'static Mutex<Option<PathBuf>> {
+    LAST_FOLDER.get_or_init(|| Mutex::new(None))
+}
+
+fn last_seen() -> &'static Mutex<(isize, String)> {
+    LAST_SEEN.get_or_init(|| Mutex::new((0, String::new())))
+}
+
+/// 返回缓存的活动目录（不触发 COM 枚举，可在每帧/热键路径里安全调用）。
+pub fn active_explorer_folder() -> Option<PathBuf> {
+    last_folder().lock().ok().and_then(|guard| guard.clone())
+}
+
+/// 每帧调用一次：只有「前台窗口是 Explorer 且窗口标题变化」时才做一次
+/// ShellWindows 枚举，避免把 COM 枚举（几十 ms）放进渲染循环。
+/// 匹配方式是窗口标题 ≈ 目录名，属于近似；匹配不到时保留上一次的值。
+pub fn note_foreground_explorer() {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return;
+        }
+        let mut class_buf = [0u16; 64];
+        let class_len = GetClassNameW(hwnd, &mut class_buf);
+        if class_len <= 0 {
+            return;
+        }
+        let class = String::from_utf16_lossy(&class_buf[..class_len as usize]);
+        if !class.eq_ignore_ascii_case("CabinetWClass")
+            && !class.eq_ignore_ascii_case("ExploreWClass")
+        {
+            return;
+        }
+        let mut title_buf = [0u16; 256];
+        let title_len = GetWindowTextW(hwnd, &mut title_buf);
+        if title_len <= 0 {
+            return;
+        }
+        let title = String::from_utf16_lossy(&title_buf[..title_len as usize]);
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let key = hwnd.0 as isize;
+        if let Ok(mut seen) = last_seen().lock() {
+            if seen.0 == key && seen.1 == trimmed {
+                return;
+            }
+            seen.0 = key;
+            seen.1 = trimmed.to_string();
+        }
+        if let Some(folder) = open_explorer_folders().into_iter().find(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().eq_ignore_ascii_case(trimmed))
+                .unwrap_or(false)
+        }) {
+            if let Ok(mut guard) = last_folder().lock() {
+                *guard = Some(folder);
+            }
+        }
+    }
+}
 
 /// 返回当前 Explorer 窗口正在显示的文件系统目录（按窗口枚举顺序，去重）。
 /// 只收真实存在的路径：回收站/控制面板等虚拟位置会被过滤掉。
@@ -129,6 +202,11 @@ mod tests {
             assert!(path.is_absolute(), "枚举结果必须是绝对路径: {path:?}");
             assert!(path.exists(), "枚举结果必须真实存在: {path:?}");
         }
+    }
+
+    #[test]
+    fn active_folder_cache_read_is_safe() {
+        let _ = active_explorer_folder();
     }
 
     #[test]

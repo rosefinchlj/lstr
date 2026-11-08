@@ -176,7 +176,15 @@ pub fn position_near_dialog(hwnd_value: isize, dialog_hwnd: isize) -> bool {
         // 左对齐停靠：与对话框左缘对齐（缩进 8px）。此前是水平居中于对话框，
         // 而对话框通常在屏幕中央——看起来就像「弹了一下又移到居中」。
         let x = (dialog_rect.left + 8).clamp(work.left + 8, max_x);
-        let mut y = dialog_rect.top + 56;
+        // P0-3：贴边自适应。对话框靠近工作区底部时，把快速切换窗口
+        // 翻到对话框上方（Listary V7 的做法），否则仍贴在下方。
+        let mut y = if dialog_rect.top + 56 + window_h <= work.bottom - 8 {
+            dialog_rect.top + 56
+        } else if dialog_rect.top - window_h - 8 >= work.top + 8 {
+            dialog_rect.top - window_h - 8
+        } else {
+            dialog_rect.bottom - window_h - 48
+        };
         if y + window_h > work.bottom - 8 {
             y = dialog_rect.bottom - window_h - 48;
         }

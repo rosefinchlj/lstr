@@ -37,6 +37,8 @@ struct Request {
     rank: RankConfig,
     /// 空查询是否显示「最近使用」历史（输入框右侧的历史开关）。
     show_history: bool,
+    /// P0-1：收藏列表（Quick Switch 数据源）。
+    favorites: Vec<crate::assets::Favorite>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +57,8 @@ pub struct SearchService {
     history: Arc<Mutex<History>>,
     limit: usize,
     keywords: Vec<KeywordConfig>,
+    /// P0-1：收藏列表，新增收藏后由 UI 同步进来。
+    favorites: Vec<crate::assets::Favorite>,
     /// 「重新加载」命令置位，worker 下一请求立即重建应用索引。
     apps_dirty: Arc<AtomicBool>,
 }
@@ -87,6 +91,7 @@ impl SearchService {
             history,
             limit: config.max_results,
             keywords: config.keywords,
+            favorites: config.favorites,
             apps_dirty,
         }
     }
@@ -111,6 +116,7 @@ impl SearchService {
             filters: filters.clone(),
             rank: rank.clone(),
             show_history,
+            favorites: self.favorites.clone(),
         });
         self.generation
     }
@@ -123,6 +129,11 @@ impl SearchService {
     /// 「重新加载」命令后同步最新关键字，不必重启进程。
     pub fn set_keywords(&mut self, keywords: Vec<KeywordConfig>) {
         self.keywords = keywords;
+    }
+
+    /// P0-1：收藏变更后同步给 worker，Quick Switch 立即生效，无需重载配置。
+    pub fn set_favorites(&mut self, favorites: Vec<crate::assets::Favorite>) {
+        self.favorites = favorites;
     }
 
     /// 应用索引立刻重建：新装/卸载应用后不想等 TTL 就执行「重新加载」命令。
@@ -216,11 +227,18 @@ fn finalize_entries(
     // 对话框模式空查询：已打开的 Explorer 文件夹置顶（Quick Switch）。
     // 同样不参与打分——历史 frecency 会把它们压下去。
     if request.query.is_empty() && request.dialog_quick && request.query.scope == Scope::Folder {
-        let mut quick: Vec<Entry> = crate::win::explorer::open_explorer_folders()
-            .into_iter()
-            .take(6)
-            .map(quick_switch_entry)
-            .collect();
+        // P0-3：活动目录 → 收藏 → 历史文件夹 → 已打开 Explorer 目录。
+        // 由 assets 统一生成并去重，取代原来「只列已打开窗口」的单一来源。
+        let mut quick: Vec<Entry> = if let Ok(history) = history.lock() {
+            crate::assets::quick_switch_entries(
+                &request.favorites,
+                &history,
+                crate::win::explorer::open_explorer_folders(),
+                crate::win::explorer::active_explorer_folder(),
+            )
+        } else {
+            Vec::new()
+        };
         // 和历史结果、quick 内部都按路径去重，避免同一目录出现两行。
         quick.retain(|q| {
             !entries
@@ -372,7 +390,7 @@ fn run_worker(
             if request.query.scope == Scope::App {
                 entries = apps.top(request.limit);
             } else if request.query.scope == Scope::Command {
-                entries = commands("");
+                entries = commands("", &config.commands);
             }
             total = entries.len();
         } else {
@@ -382,7 +400,7 @@ fn run_worker(
                     total = entries.len();
                 }
                 Scope::Command => {
-                    entries = commands(&request.query.text);
+                    entries = commands(&request.query.text, &config.commands);
                     total = entries.len();
                 }
                 Scope::All => {
@@ -437,7 +455,7 @@ fn run_worker(
                         total += app_hits.len();
                         entries.append(&mut app_hits);
                         // 内置命令也参与“全部”搜索（打开设置等）。
-                        let mut command_hits = commands(&request.query.text);
+                        let mut command_hits = commands(&request.query.text, &config.commands);
                         total += command_hits.len();
                         entries.append(&mut command_hits);
                     }
@@ -580,7 +598,7 @@ pub fn command_aliases(id: &str) -> &'static [&'static str] {
     }
 }
 
-fn commands(q: &str) -> Vec<Entry> {
+fn commands(q: &str, custom: &[crate::assets::CommandDef]) -> Vec<Entry> {
     let all = [
         ("cmd:settings", "打开设置"),
         ("cmd:reload", "重新加载"),
@@ -588,7 +606,8 @@ fn commands(q: &str) -> Vec<Entry> {
         ("cmd:quit", "退出 lstr"),
     ];
     let needle = q.to_lowercase();
-    all.into_iter()
+    let mut out: Vec<Entry> = all
+        .into_iter()
         .filter(|(id, name)| {
             if needle.is_empty() {
                 return true;
@@ -621,7 +640,28 @@ fn commands(q: &str) -> Vec<Entry> {
             initial: ">".to_string(),
             tone: 0xE0A040,
         })
-        .collect()
+        .collect();
+    // P0-1：自定义命令（{query} / {current_folder}）与内置命令同榜。
+    for def in custom {
+        if !needle.is_empty()
+            && !def.trigger.to_lowercase().contains(&needle)
+            && !def.title.to_lowercase().contains(&needle)
+        {
+            continue;
+        }
+        out.push(Entry {
+            id: format!("usercmd:{}", def.trigger),
+            kind: Kind::Command,
+            name: def.title.clone(),
+            path: None,
+            size: None,
+            modified: None,
+            pinyin: Some(pinyin::keys(&def.title)),
+            initial: ">".to_string(),
+            tone: 0xE0A040,
+        });
+    }
+    out
 }
 
 /// 自定义关键字：查询形如 "trigger 剩余词"（或刚好是 trigger）时，

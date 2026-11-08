@@ -196,6 +196,8 @@ pub struct LstrApp {
     center_frames: u8,
     suppress_hide_until: Instant,
     icons: IconStore,
+    /// P0-2：Explorer 内直接键入搜索（默认关闭）。
+    typing: Option<crate::win::typing::TypingWatch>,
 }
 
 impl LstrApp {
@@ -237,6 +239,18 @@ impl LstrApp {
             }
         };
         let tray = crate::win::tray::create().ok();
+        // P0-2：只有显式开启才安装全局低级键盘钩子。
+        let typing = if cfg.explorer_typing {
+            match crate::win::typing::TypingWatch::start() {
+                Ok(service) => Some(service),
+                Err(err) => {
+                    eprintln!("lstr: typing 启动失败: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let manual_size = cfg
             .height
             .map(|height| egui::vec2(cfg.width.clamp(420.0, 1000.0), height.clamp(160.0, 800.0)));
@@ -295,7 +309,23 @@ impl LstrApp {
             center_frames: 0,
             suppress_hide_until: Instant::now(),
             icons: IconStore::new(),
+            typing,
         }
+    }
+
+    /// P0-2：Explorer 里敲下的第一个字符唤出启动器并写入输入框。
+    /// 之后前台不再是 Explorer，钩子自动停止接管，后续输入交回 egui。
+    fn poll_typing(&mut self, ctx: &egui::Context) {
+        let ch = self.typing.as_ref().and_then(|service| service.poll());
+        let Some(ch) = ch else {
+            return;
+        };
+        if self.hidden {
+            self.show(ctx);
+        }
+        self.input.push(ch);
+        self.selected = 0;
+        self.trigger(ctx);
     }
 
     fn poll_hotkey(&mut self, ctx: &egui::Context) {
@@ -312,7 +342,21 @@ impl LstrApp {
                 }
                 HotkeyEvent::DialogSearch => {
                     if let Some(info) = dialog::active_dialog() {
-                        self.open_dialog_mode(ctx, info);
+                        // P0-3：有活动 Explorer 目录就零输入直跳，否则退回文件夹搜索。
+                        let target = crate::win::explorer::active_explorer_folder();
+                        if let Some(folder) = target {
+                            match dialog::navigate_to_folder(&info, &folder.to_string_lossy()) {
+                                Ok(()) => {
+                                    self.suppressed_dialog = Some(info.hwnd);
+                                    self.dialog = None;
+                                    self.hide(ctx);
+                                    dialog::restore_focus(&info);
+                                }
+                                Err(err) => self.toast(ctx, err),
+                            }
+                        } else {
+                            self.open_dialog_mode(ctx, info);
+                        }
                     } else if !self.hidden {
                         self.toast(ctx, "请先打开「打开/保存」对话框，再按 Ctrl+G".to_string());
                     }
@@ -359,6 +403,15 @@ impl LstrApp {
             return;
         }
         self.suppressed_dialog = None;
+        // P0-3：自动跟随 Explorer 当前目录（默认关闭，会改动对话框路径）。
+        if self.cfg.dialog_auto_follow {
+            if let Some(folder) = crate::win::explorer::active_explorer_folder() {
+                if dialog::navigate_to_folder(&info, &folder.to_string_lossy()).is_ok() {
+                    self.suppressed_dialog = Some(info.hwnd);
+                    return;
+                }
+            }
+        }
         self.open_dialog_mode(ctx, info);
     }
 
@@ -825,6 +878,9 @@ impl LstrApp {
             match result {
                 Ok(()) => {
                     self.service.record_open(&entry);
+                    if let Ok(mut history) = self.history.lock() {
+                        history.record_query(&self.input, &entry);
+                    }
                     // 焦点马上还给对话框：抑制它的自动唤出，不然会循环弹窗。
                     self.suppressed_dialog = Some(dialog.hwnd);
                     self.dialog = None;
@@ -848,6 +904,10 @@ impl LstrApp {
         match shell::open_entry(&entry) {
             Ok(()) => {
                 self.service.record_open(&entry);
+                // P1-1：记住「搜这个词时选了它」。
+                if let Ok(mut history) = self.history.lock() {
+                    history.record_query(&self.input, &entry);
+                }
                 self.hide(ctx);
             }
             Err(err) => self.toast(ctx, format!("打开失败: {err}")),
@@ -891,6 +951,25 @@ impl LstrApp {
     }
 
     fn run_command(&mut self, ctx: &egui::Context, entry: &Entry) {
+        // P0-1：自定义命令，{query} = 触发词之后的内容，{current_folder} = 最近浏览目录。
+        if let Some(trigger) = entry.id.strip_prefix("usercmd:") {
+            let Some(def) = self.cfg.commands.iter().find(|c| c.trigger == trigger).cloned() else {
+                return;
+            };
+            let query = self
+                .input
+                .split_once(char::is_whitespace)
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or("");
+            let current_folder = crate::win::explorer::active_explorer_folder()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match crate::assets::run_command(&def, query, &current_folder) {
+                Ok(()) => self.hide(ctx),
+                Err(err) => self.toast(ctx, err),
+            }
+            return;
+        }
         if entry.id.starts_with("kwurl:") {
             let Some(path) = &entry.path else { return };
             match shell::open_url(&path.to_string_lossy()) {
@@ -2339,7 +2418,8 @@ impl LstrApp {
             self.menu_open = false;
             return;
         };
-        let items = menu_items(entry);
+        let actions = self.cfg.actions.clone();
+        let items = menu_items(entry, &actions);
         if items.is_empty() {
             self.menu_open = false;
             return;
@@ -2360,7 +2440,8 @@ impl LstrApp {
             self.menu_open = false;
             return;
         };
-        let items = menu_items(entry);
+        let actions = self.cfg.actions.clone();
+        let items = menu_items(entry, &actions);
         if let Some(item) = items.get(self.menu_index) {
             if item.enabled {
                 let action = item.action;
@@ -2374,6 +2455,39 @@ impl LstrApp {
     fn run_menu_action(&mut self, ctx: &egui::Context, action: MenuAction) {
         self.menu_open = false;
         match action {
+            MenuAction::AddFavorite => {
+                let Some(entry) = self.entries.get(self.selected).cloned() else {
+                    return;
+                };
+                if entry.kind == Kind::Command {
+                    self.toast(ctx, "命令不能收藏".to_string());
+                    return;
+                }
+                match crate::assets::add_favorite(&mut self.cfg, &entry.name, &entry.full_path()) {
+                    Ok(true) => {
+                        self.service.set_favorites(self.cfg.favorites.clone());
+                        self.toast(ctx, "已加入收藏".to_string());
+                    }
+                    Ok(false) => self.toast(ctx, "已在收藏中".to_string()),
+                    Err(err) => self.toast(ctx, err),
+                }
+                self.trigger(ctx);
+            }
+            MenuAction::CustomAction(index) => {
+                let Some(entry) = self.entries.get(self.selected).cloned() else {
+                    return;
+                };
+                let Some(def) = self.cfg.actions.get(index).cloned() else {
+                    return;
+                };
+                let current_folder = crate::win::explorer::active_explorer_folder()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match crate::assets::run_action(&def, &entry, &self.input, &current_folder) {
+                    Ok(()) => self.hide(ctx),
+                    Err(err) => self.toast(ctx, err),
+                }
+            }
             MenuAction::Open => self.activate_selected(ctx),
             MenuAction::Reveal => self.reveal_selected(ctx),
             MenuAction::CopyPath => {
@@ -2419,7 +2533,7 @@ impl LstrApp {
             self.menu_open = false;
             return;
         };
-        let items = menu_items(&entry);
+        let items = menu_items(&entry, &self.cfg.actions);
         let theme = self.theme;
         let item_h = 30.0;
         let width = 236.0;
@@ -2477,7 +2591,7 @@ impl LstrApp {
                         ui.painter().text(
                             egui::pos2(row_rect.left() + 8.0, row_rect.center().y),
                             Align2::LEFT_CENTER,
-                            item.label,
+                            item.label.as_str(),
                             ui::text_font(13.0),
                             color,
                         );
@@ -3522,6 +3636,8 @@ enum MenuAction {
     Admin,
     OpenWith,
     RemoveHistory,
+    AddFavorite,
+    CustomAction(usize),
 }
 
 /// 设置面板的分页。
@@ -3565,62 +3681,78 @@ enum FilterChoice {
     Group(Option<FileGroup>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MenuItem {
-    label: &'static str,
+    label: String,
     shortcut: &'static str,
     enabled: bool,
     action: MenuAction,
 }
 
-fn menu_items(entry: &Entry) -> Vec<MenuItem> {
+fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef]) -> Vec<MenuItem> {
     let is_command = entry.kind == Kind::Command;
     let is_program = entry.kind == Kind::Program;
     let is_file = entry.kind == Kind::File;
-    vec![
+    let mut items = vec![
         MenuItem {
-            label: "打开",
+            label: "打开".to_string(),
             shortcut: "↵",
             enabled: true,
             action: MenuAction::Open,
         },
         MenuItem {
-            label: "在资源管理器中定位",
+            label: "在资源管理器中定位".to_string(),
             shortcut: "Ctrl ↵",
             enabled: !is_command,
             action: MenuAction::Reveal,
         },
         MenuItem {
-            label: "复制路径",
+            label: "复制路径".to_string(),
             shortcut: "Ctrl C",
             enabled: !is_command,
             action: MenuAction::CopyPath,
         },
         MenuItem {
-            label: "复制文件名",
+            label: "复制文件名".to_string(),
             shortcut: "",
             enabled: true,
             action: MenuAction::CopyName,
         },
         MenuItem {
-            label: "以管理员身份运行",
+            label: "以管理员身份运行".to_string(),
             shortcut: "Ctrl ⇧ ↵",
             enabled: is_program || is_file,
             action: MenuAction::Admin,
         },
         MenuItem {
-            label: "打开方式…",
+            label: "打开方式…".to_string(),
             shortcut: "",
             enabled: is_file || is_program,
             action: MenuAction::OpenWith,
         },
         MenuItem {
-            label: "从最近使用中移除",
+            label: "从最近使用中移除".to_string(),
             shortcut: "",
             enabled: !is_command,
             action: MenuAction::RemoveHistory,
         },
-    ]
+        MenuItem {
+            label: "加入收藏".to_string(),
+            shortcut: "",
+            enabled: !is_command,
+            action: MenuAction::AddFavorite,
+        },
+    ];
+    // P0-1：自定义动作作用于选中的结果，模板可引用 {action_path}。
+    for (index, action) in actions.iter().enumerate() {
+        items.push(MenuItem {
+            label: action.title.clone(),
+            shortcut: "",
+            enabled: !is_command,
+            action: MenuAction::CustomAction(index),
+        });
+    }
+    items
 }
 
 impl eframe::App for LstrApp {
@@ -3654,6 +3786,8 @@ impl eframe::App for LstrApp {
             }
         }
 
+        crate::win::explorer::note_foreground_explorer();
+        self.poll_typing(ctx);
         self.poll_hotkey(ctx);
         self.poll_dialog_watch(ctx);
         self.poll_tray(ctx);
