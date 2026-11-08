@@ -177,6 +177,69 @@ impl SearchService {
 
 /// 收尾管线：排序 → 去重 → 截断 → 置顶（关键字 / Quick Switch）。
 /// 抽成函数是为了「两阶段返回」：先发不含精确补齐的一版，再补发最终版。
+/// 名称与查询词完全一致的结果钉在最前（不依赖任何权重调参）。
+/// 打分是多信号加和：历史、query 学习、位置启发式都可能把精确同名挤下去。
+/// 实测搜 `ai` 时，cwd 下名称蹭到 ai 的 Rust 构建产物靠 +500 环境加权压过了
+/// 名叫 ai 的目录。精确同名是「用户就是打的名字」，属于产品语义而非启发式，
+/// 因此在排序 + 去重之后做一次稳定置顶，keyword 行仍在它上面。
+fn pin_exact_name_matches(entries: &mut Vec<Entry>, needle: &str) {
+    if needle.is_empty() {
+        return;
+    }
+    let mut exact = Vec::new();
+    let mut rest = Vec::with_capacity(entries.len());
+    for entry in entries.drain(..) {
+        if entry.name.eq_ignore_ascii_case(needle) {
+            exact.push(entry);
+        } else {
+            rest.push(entry);
+        }
+    }
+    exact.append(&mut rest);
+    *entries = exact;
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    fn item(id: &str, name: &str) -> Entry {
+        Entry {
+            id: id.to_string(),
+            kind: Kind::Folder,
+            name: name.to_string(),
+            path: None,
+            size: None,
+            modified: None,
+            pinyin: None,
+            initial: String::new(),
+            tone: 0,
+        }
+    }
+
+    #[test]
+    fn exact_name_matches_are_pinned_in_stable_order() {
+        let mut entries = vec![
+            item("sub", "num-traits"),
+            item("exact1", "ai"),
+            item("other", "trailer"),
+            item("exact2", "AI"),
+        ];
+        pin_exact_name_matches(&mut entries, "ai");
+        assert_eq!(
+            entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["exact1", "exact2", "sub", "other"]
+        );
+    }
+
+    #[test]
+    fn empty_needle_keeps_the_original_order() {
+        let mut entries = vec![item("a", "a"), item("b", "b")];
+        pin_exact_name_matches(&mut entries, "");
+        assert_eq!(entries[0].id, "a");
+    }
+}
+
 fn finalize_entries(
     mut entries: Vec<Entry>,
     request: &Request,
@@ -228,6 +291,8 @@ fn finalize_entries(
     };
     let mut keep_iter = keep_names.into_iter();
     entries.retain(|_| keep_iter.next().unwrap_or(false));
+    // 名称完全一致的结果硬置顶：档位权重可能被用户调整，或被历史/位置加权翻过。
+    pin_exact_name_matches(&mut entries, &needle_lower);
     // 列表可滚动：多送一些候选（最多 100 条），UI 只按窗口高度展示前几条，
     // 滚轮可以继续往下看——不再一屏截断。
     let deliver = request.limit.max(100);

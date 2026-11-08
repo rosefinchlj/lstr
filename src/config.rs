@@ -135,6 +135,10 @@ pub fn default_noise_rules() -> Vec<NoiseRule> {
         (".parcel-cache/", 100),
         // —— Rust ——
         ("/target/", 120),
+        // 目录名带后缀时 /target/ 匹配不到（lstr-wt-p0-target/），补一条。
+        ("-target/", 120),
+        // Cargo 指纹目录：num-traits-xxx 之类纯构建产物，短查询极易误命中。
+        (".fingerprint/", 140),
         (".cargo/registry/", 120),
         (".cargo/git/", 120),
         (".rustup/toolchains/", 120),

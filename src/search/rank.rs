@@ -23,6 +23,11 @@ const EXACT_SHALLOW_UNIT: i32 = 2;
 // 出现位置越靠前越好。上限 40，保证不越过「名称前缀」。
 const SUBSTRING_BOUNDARY_BONUS: i32 = 30;
 const SUBSTRING_POSITION_BONUS: i32 = 10;
+/// 位置/短名/浅路径这类启发式加分的总上限。
+/// 它们只配在「同一匹配档位内」排序：默认最小档位差约 80~200，
+/// 之前 cwd(+300) + parent(+200) 合计 500，直接把当前目录下 tr-ai-ts 之类的
+/// 构建产物顶到「名称恰好叫 ai」的目录前面。cap 之后位置再好也跨不过档位。
+const HEURISTIC_CAP: i32 = 80;
 
 /// 按分数从高到低稳定排序（使用设置面板里的排序权重）。
 pub fn rank_with(
@@ -184,35 +189,44 @@ fn noise_penalty(path: &str, needle: &str, kind: Kind, cfg: &RankConfig) -> i32 
 
 fn path_adjustment(entry: &Entry, needle: &str, cfg: &RankConfig) -> i32 {
     let path = entry.full_path().to_lowercase();
-    let mut score = 0;
+    let mut hint = 0;
 
     // 名字越短，越可能是用户真正要找的条目。
-    score += 30 - (entry.name.chars().count() as i32).min(30);
+    hint += 30 - (entry.name.chars().count() as i32).min(30);
     // 浅层路径优先。
-    score += 20 - (path.matches('\\').count() as i32).min(20);
-
-    // 噪声规则降权（设置「噪声规则」页可增删改）。
-    score -= noise_penalty(&path, needle, entry.kind, cfg);
+    hint += 20 - (path.matches('\\').count() as i32).min(20);
 
     let env = env_paths();
     if let Some(home) = &env.home {
-        if path.starts_with(home.as_str()) {
-            score += 20;
+        if is_under_path(&path, home) {
+            hint += 20;
         }
     }
-
-    // 当前工作目录上下文：从项目里启动时，优先当前项目树。
+    // 当前工作目录上下文：只用于同一匹配档位内排序。
+    // 曾经是 +200/+300，合计 500 足以压过 exact 与 substring 之间的档位差。
     if let Some(parent) = &env.cwd_parent {
-        if path.starts_with(parent.as_str()) {
-            score += 200;
+        if is_under_path(&path, parent) {
+            hint += 60;
         }
     }
     if let Some(cwd) = &env.cwd {
-        if path.starts_with(cwd.as_str()) {
-            score += 300;
+        if is_under_path(&path, cwd) {
+            hint += 90;
         }
     }
-    score
+
+    // 噪声惩罚是「排除」信号，不受上界限制：该沉下去的就要沉下去。
+    hint.min(HEURISTIC_CAP) - noise_penalty(&path, needle, entry.kind, cfg)
+}
+
+/// 路径边界匹配：dir 本身，或 dir 后紧跟路径分隔符才算在目录下。
+/// 裸 starts_with 会把 `lstr-wt-p0-target` 误当成 `lstr-wt-p0` 的子目录。
+fn is_under_path(path: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches(|c| c == '\\' || c == '/');
+    path == dir
+        || path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('\\') || rest.starts_with('/'))
 }
 
 fn match_tier(entry: &Entry, needle: &str, cfg: &RankConfig) -> i32 {
@@ -603,6 +617,38 @@ mod tests {
         rank(&mut entries, "txt", &History::in_memory(), 0);
         assert_eq!(entries[0].id, "first");
         assert_eq!(entries[1].id, "second");
+    }
+
+    #[test]
+    fn path_context_is_bounded_by_heuristic_cap() {
+        let mut e = entry("hot", "a", Kind::Folder);
+        e.path = Some(PathBuf::from(r"C:/x/a"));
+        let hint = path_adjustment(&e, "a", &RankConfig::default());
+        assert!(hint <= HEURISTIC_CAP, "位置启发式不应跨越匹配档位: {hint}");
+    }
+
+    #[test]
+    fn path_context_requires_a_directory_boundary() {
+        let dir = r"e:/use/ai/deepseek/rust/lstr-wt-p0";
+        assert!(is_under_path(r"e:/use/ai/deepseek/rust/lstr-wt-p0/src", dir));
+        assert!(!is_under_path(
+            r"e:/use/ai/deepseek/rust/lstr-wt-p0-target/debug",
+            dir
+        ));
+        assert!(is_under_path(dir, dir));
+    }
+
+    #[test]
+    fn exact_name_beats_substring_in_current_working_directory() {
+        // 复现截图：cwd 下名称蹭到 ai 的构建产物 vs 名称恰好叫 ai 的目录。
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut noisy = entry("noisy", "num-traits-dab2dc0fb3c75e7", Kind::Folder);
+        noisy.path = Some(cwd.join("target").join("debug").join("num-traits"));
+        let mut exact = entry("exact", "ai", Kind::Folder);
+        exact.path = Some(PathBuf::from(r"C:/Users/someone/ai"));
+        let mut entries = vec![noisy, exact];
+        rank(&mut entries, "ai", &History::in_memory(), 3);
+        assert_eq!(entries[0].id, "exact");
     }
 
     #[test]
