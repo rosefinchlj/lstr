@@ -39,8 +39,9 @@ pub struct Config {
     #[serde(default)]
     pub commands: Vec<CommandDef>,
     // —— P0-2 / P0-3 开关 ——
-    /// Explorer 内「直接键入搜索」：全局低级键盘钩子，默认关闭（风险隔离）。
-    #[serde(default)]
+    /// Explorer 内「直接键入搜索」：全局低级键盘钩子，默认开启（对标 Listary）。
+    /// 判定严格：仅 Explorer 前台 + 非编辑框 + 无修饰键/IME；设置页可随时关闭。
+    #[serde(default = "default_true")]
     pub explorer_typing: bool,
     /// 文件对话框出现时自动跟随 Explorer 当前目录，默认关闭（会改动对话框路径）。
     #[serde(default)]
@@ -271,7 +272,7 @@ impl Default for Config {
             favorites: Vec::new(),
             actions: Vec::new(),
             commands: Vec::new(),
-            explorer_typing: false,
+            explorer_typing: true,
             dialog_auto_follow: false,
         }
     }
@@ -356,7 +357,7 @@ mod tests {
         let parsed: Config = toml::from_str(&text).expect("deserialize config");
         assert!(parsed.height.is_none());
         assert_eq!(parsed.theme.mode, "frost");
-        assert!(!parsed.explorer_typing);
+        assert!(parsed.explorer_typing);
         assert!(parsed.favorites.is_empty());
     }
 }

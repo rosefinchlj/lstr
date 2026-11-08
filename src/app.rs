@@ -3194,6 +3194,18 @@ impl LstrApp {
                 },
             );
         }
+        // 钩子实际状态可见：避免「开关开着但钩子没起来」变成黑盒。
+        painter.text(
+            egui::pos2(ctrl_x + 70.0, y + 14.0),
+            Align2::LEFT_CENTER,
+            if self.typing.is_some() {
+                "钩子运行中"
+            } else {
+                "未启动（见 typing.log）"
+            },
+            ui::mono_font(10.5),
+            if self.typing.is_some() { theme.sub } else { theme.dim },
+        );
         y += ROW;
 
         Self::settings_label(painter, &theme, area.left(), y, "对话框自动跟随目录");
