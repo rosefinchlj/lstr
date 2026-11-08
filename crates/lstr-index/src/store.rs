@@ -197,6 +197,19 @@ impl VolumeStore {
         None
     }
 
+    /// 同 [`Self::find_slot`],但允许命中 DEAD slot(用于 FRN 复用时的原地复活)。
+    fn find_slot_any(&self, frn: u64) -> Option<u32> {
+        if let Some(&s) = self.delta_frn.get(&frn) {
+            return Some(s);
+        }
+        if self.base_len > 0 {
+            if let Ok(i) = self.frn[..self.base_len as usize].binary_search(&frn) {
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
     /// 追加式插入(scan 模式主路径 / journal upsert)。
     /// 返回 false 表示 FRN 已存在且名字/父都没变(无操作)。
     ///
@@ -211,7 +224,19 @@ impl VolumeStore {
     ) -> bool {
         let scanning = self.is_scanning();
         if !scanning {
-            if let Some(old) = self.find_slot(frn) {
+            // 命中活槽 → 就地更新;只命中死槽 → 原地复活(FRN 复用 / OLD 当删除的
+            // 旧语义遗留),保证 slot 身份不变,子项 parent 指针继续有效。
+            let hit = self
+                .find_slot(frn)
+                .or_else(|| self.find_slot_any(frn).filter(|&s| !self.alive(s)));
+            if let Some(old) = hit {
+                if !self.alive(old) {
+                    self.attrs[old as usize] &= !ATTR_DEAD;
+                    self.dead_count = self.dead_count.saturating_sub(1);
+                    if old >= self.base_len {
+                        self.delta_frn.insert(frn, old);
+                    }
+                }
                 let same_name = self.name(old) == name;
                 let new_p = if parent_frn == 0 {
                     NO_PARENT
@@ -296,7 +321,8 @@ impl VolumeStore {
             if self.attrs[slot as usize] & ATTR_DEAD == 0 {
                 self.attrs[slot as usize] |= ATTR_DEAD;
                 self.dead_count += 1;
-                self.delta_frn.remove(&frn);
+                // 保留 delta_frn 映射:find_slot 仍按 alive 过滤,但 FRN 复用/
+                // 同 FRN 复活时 find_slot_any 能定位到这个死槽并原地复用。
                 return true;
             }
         }
@@ -571,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_creates_new_slot_and_keeps_order() {
+    fn rename_keeps_slot_and_rebuilds_offs_order() {
         let mut s = VolumeStore::new(false);
         insert(&mut s, 5, 0, 0x10, "root");
         insert(&mut s, 10, 5, 0, "alpha.txt");
@@ -616,6 +642,64 @@ mod tests {
         }
         let names: Vec<&[u8]> = s.offs.iter().map(|&x| s.name(x)).collect();
         assert_eq!(names, vec![&b"aaa"[..], &b"ccc"[..], &b"ddd"[..]]);
+    }
+
+    /// H3:改名 = 原地更新,slot 身份不变 → 子项 parent 指针继续有效。
+    #[test]
+    fn rename_keeps_slot_and_children_pointers() {
+        let mut s = VolumeStore::new(false);
+        insert(&mut s, 5, 0, 0x10, "root");
+        insert(&mut s, 10, 5, 0x10, "old-dir");
+        insert(&mut s, 11, 10, 0, "child.txt");
+        s.compact();
+        let dir = s.find_slot(10).unwrap();
+        // 旧语义(OLD→Remove)会先打 DEAD;新语义只有 NEW→Upsert
+        assert!(s.insert(10, 5, 0x10, b"new-dir"));
+        assert_eq!(s.find_slot(10), Some(dir));
+        assert_eq!(s.name(dir), b"new-dir");
+        assert_eq!(s.parent[s.find_slot(11).unwrap() as usize], dir);
+        // 父链上的名字已更新,子项无需级联记录
+        assert_eq!(s.name(s.parent[s.find_slot(11).unwrap() as usize]), b"new-dir");
+        s.compact();
+        assert_eq!(s.len(), 3);
+    }
+
+    /// H3:命中 DEAD slot 时原地复活(FRN 复用 / 旧语义遗留的删+建),
+    /// 不追加重复 slot。
+    #[test]
+    fn dead_slot_revived_in_place() {
+        let mut s = VolumeStore::new(false);
+        insert(&mut s, 5, 0, 0x10, "root");
+        insert(&mut s, 10, 5, 0, "ghost.txt");
+        s.compact();
+        let slot = s.find_slot(10).unwrap();
+        assert!(s.remove(10));
+        assert_eq!(s.find_slot(10), None);
+        let len_before = s.len();
+        // 内容未变的复活返回 false(只有名字/父变化才算 update),但必须原地复用 slot
+        s.insert(10, 5, 0, b"ghost.txt");
+        assert_eq!(s.len(), len_before, "复活不应追加新 slot");
+        assert_eq!(s.find_slot(10), Some(slot));
+        assert!(s.visible(slot));
+        s.compact();
+        assert_eq!(s.len(), 2);
+    }
+
+    /// H3:delta 槽删除后同 FRN 再出现同样原地复活(delta_frn 保留死映射)。
+    #[test]
+    fn dead_delta_slot_revived_in_place() {
+        let mut s = VolumeStore::new(false);
+        insert(&mut s, 5, 0, 0x10, "root");
+        s.compact();
+        insert(&mut s, 20, 5, 0, "tmp.txt");
+        let slot = s.find_slot(20).unwrap();
+        assert!(s.remove(20));
+        assert_eq!(s.find_slot(20), None);
+        let len_before = s.len();
+        s.insert(20, 5, 0, b"tmp.txt");
+        assert_eq!(s.len(), len_before);
+        assert_eq!(s.find_slot(20), Some(slot));
+        assert!(s.visible(slot));
     }
 
     #[test]

@@ -28,9 +28,12 @@ pub const USN_REASON_RENAME_NEW_NAME: u32 = 0x0000_2000;
 pub const USN_REASON_CLOSE: u32 = 0x8000_0000;
 
 /// 名字/存在性会变的 reason 集合,其余(DATA_* 等)忽略。
+///
+/// H3:`RENAME_OLD_NAME` **不**在此列 —— 改名是「原地更新」,旧名记录若翻译成
+/// Remove 会把 slot 打成 DEAD,子项 parent 指向死槽、路径退化。旧名记录只在
+/// 同一条记录同时带 NEW_NAME 时才随 Upsert 一起生效。
 pub const REASON_LIFECYCLE: u32 =
-    USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME
-        | USN_REASON_RENAME_NEW_NAME;
+    USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE | USN_REASON_RENAME_NEW_NAME;
 
 pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 
@@ -121,9 +124,11 @@ impl RawRecord {
             || self.reason & USN_REASON_FILE_CREATE != 0
         {
             Op::Upsert
-        } else if self.reason & (USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME) != 0 {
+        } else if self.reason & USN_REASON_FILE_DELETE != 0 {
             Op::Remove
         } else {
+            // H3:RENAME_OLD_NAME 单独出现时忽略 —— 新名记录(同一改名操作的
+            // 后一条 USN)会以 Upsert 原地更新 slot,slot 身份保持不变。
             return None;
         };
         Some(Rec {
@@ -214,9 +219,15 @@ mod tests {
             Op::Upsert
         );
         assert_eq!(mk(USN_REASON_FILE_DELETE, "a").to_engine_op().unwrap().op, Op::Remove);
+        // H3:旧名记录不再翻译成 Remove(否则改名=删+建,子项指向死槽)
+        assert!(mk(USN_REASON_RENAME_OLD_NAME, "a").to_engine_op().is_none());
+        // 同一条记录同时带 OLD|NEW(部分实现合并上报):仍是 Upsert
         assert_eq!(
-            mk(USN_REASON_RENAME_OLD_NAME, "a").to_engine_op().unwrap().op,
-            Op::Remove
+            mk(USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME, "a")
+                .to_engine_op()
+                .unwrap()
+                .op,
+            Op::Upsert
         );
         // 纯内容写 / CLOSE:忽略
         assert!(mk(USN_REASON_DATA_EXTEND | USN_REASON_CLOSE, "a").to_engine_op().is_none());
