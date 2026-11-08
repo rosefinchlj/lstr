@@ -5,14 +5,18 @@
 //! - 非提权主进程持有 [`engine::Engine`](内存列式存储),击键查询零 IPC;
 //! - 握手携带 `{journal_id, next_usn}` 增量续传,仅 journal 回绕才全量重扫。
 
+pub mod client;
 pub mod engine;
 pub mod noise;
 pub mod pinyin;
 pub mod proto;
 pub mod query;
+pub mod scan;
 pub mod snapshot;
 pub mod store;
 pub mod usn;
+pub mod win;
+pub mod worker;
 
 pub use engine::{Engine, EngineConfig, EngineMsg, IndexStatus, Phase, VolumeProgress};
 pub use query::{Hit, KindFilter, QueryOutcome, QuerySpec};
