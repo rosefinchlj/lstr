@@ -64,11 +64,6 @@ struct VolumeThread {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-/// HANDLE 不是 Send,包一层(管道句柄在线程间移交是受控的:单客户端会话内)。
-#[derive(Clone, Copy)]
-struct PipeHandle(HANDLE);
-unsafe impl Send for PipeHandle {}
-
 fn run_session(client: HANDLE) {
     // 握手:Hello → Welcome
     let hello = match read_frame_pub(client, Duration::from_secs(30)) {
@@ -409,7 +404,6 @@ fn read_exact(h: HANDLE, mut buf: &mut [u8], deadline: std::time::Instant) -> bo
                 continue;
             }
             let mut got: u32 = 0;
-            let to_read = buf.len().min(avail as usize) as u32;
             if ReadFile(h, Some(buf), Some(&mut got), None).is_err() || got == 0 {
                 return false;
             }

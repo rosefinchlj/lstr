@@ -407,9 +407,10 @@ impl VolumeStore {
         let mut by_frn: Vec<(u64, u32)> = live.iter().map(|&s| (self.frn[s as usize], s)).collect();
         // base 部分已按 frn 有序,但重排序一次最简单(整型排序 845万 ~0.5s,发生在空闲/完成时)
         by_frn.sort_unstable_by_key(|&(f, _)| f);
-        let mut remap: HashMap<u32, u32> = HashMap::with_capacity(by_frn.len());
+        // old slot → new id 用 Vec(NO_PARENT 哨兵),比 HashMap 省 400MB 峰值
+        let mut remap: Vec<u32> = vec![u32::MAX; self.name_off.len()];
         for (new_id, &(_, old)) in by_frn.iter().enumerate() {
-            remap.insert(old, new_id as u32);
+            remap[old as usize] = new_id as u32;
         }
         // 5. 重建名字区(按新 id 序)
         let mut names = Vec::with_capacity(self.names.len());
@@ -426,7 +427,7 @@ impl VolumeStore {
         let mut parent = Vec::with_capacity(by_frn.len());
         for &(_, old) in &by_frn {
             let p = self.parent[old as usize];
-            parent.push(if p == NO_PARENT { NO_PARENT } else { remap.get(&p).copied().unwrap_or(NO_PARENT) });
+            parent.push(if p == NO_PARENT { NO_PARENT } else { remap[p as usize] });
         }
         // 7. attrs/frn
         let mut attrs = Vec::with_capacity(by_frn.len());
@@ -439,18 +440,23 @@ impl VolumeStore {
         //    否则旧有序列过滤重映射 + delta 按名排序后 O(n) 归并
         let mut offs: Vec<u32> = Vec::with_capacity(by_frn.len());
         if self.renames > 0 {
-            // live 里是旧 slot id,必须读旧列(self.* 此刻尚未换血)
-            offs = live.clone();
-            offs.sort_unstable_by(|&a, &b| {
+            // live 里是旧 slot id,按旧列名序重排,再映射到新 id
+            // (单测里 frn 序恰同旧序掩盖过这里的遗漏,属性测试抓出)
+            let mut sorted_old = live.clone();
+            sorted_old.sort_unstable_by(|&a, &b| {
                 slice_at(&self.names_lc, self.name_off[a as usize] as usize)
                     .cmp(slice_at(&self.names_lc, self.name_off[b as usize] as usize))
             });
+            offs = sorted_old
+                .into_iter()
+                .map(|old| remap[old as usize])
+                .collect();
         }
         let mut delta_sorted: Vec<u32> = self
             .delta
             .iter()
-            .filter(|&&s| remap.contains_key(&s))
-            .map(|&s| remap[&s])
+            .filter(|&&s| remap[s as usize] != u32::MAX)
+            .map(|&s| remap[s as usize])
             .collect();
         delta_sorted.sort_unstable_by(|&a, &b| {
             slice_at(&names_lc, name_off[a as usize] as usize)
@@ -463,7 +469,8 @@ impl VolumeStore {
             let base: Vec<u32> = self
                 .offs
                 .iter()
-                .filter_map(|&s| remap.get(&s).copied())
+                .filter(|&&s| remap[s as usize] != u32::MAX)
+                .map(|&s| remap[s as usize])
                 .collect();
             offs.reserve(base.len() + delta_sorted.len());
             let (mut i, mut j) = (0usize, 0usize);
@@ -502,7 +509,10 @@ impl VolumeStore {
         self.unresolved = self
             .unresolved
             .iter()
-            .filter_map(|(&old, &f)| remap.get(&old).map(|&new| (new, f)))
+            .filter_map(|(&old, &f)| {
+                let new = remap[old as usize];
+                (new != u32::MAX).then_some((new, f))
+            })
             .collect();
         self.base_len = self.name_off.len() as u32;
         self.dead_count = 0;

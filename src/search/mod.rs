@@ -263,7 +263,9 @@ fn run_worker(
         }
     };
     // —— 自研索引后端(方案 §4/§6):engine 由本线程独占;client 线程推 EngineMsg ——
-    let (engine_tx, engine_rx) = mpsc::channel::<EngineMsg>();
+    // 有界通道(背压):client 线程跑得快时会阻塞在 send,防止整个卷的记录
+    // 积压在通道内存里(实测无界时 UI 进程冲到 877MB)。
+    let (engine_tx, engine_rx) = mpsc::sync_channel::<EngineMsg>(16);
     let mut builtin: Option<builtin::BuiltinProvider> = None;
     let shutdown_client = Arc::new(AtomicBool::new(false));
     let handshake_slot: Arc<Mutex<Vec<(u128, u64, i64)>>> = Arc::new(Mutex::new(Vec::new()));

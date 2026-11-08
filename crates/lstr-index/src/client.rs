@@ -16,9 +16,8 @@ pub fn connect_and_handshake(
 ) -> Result<HANDLE, String> {
     let deadline = Instant::now() + timeout;
     let handshake = &handshake;
-    let mut last_err;
+    let mut last_err = String::new();
     loop {
-        last_err = String::from("unknown");
         match win::open_pipe_client(crate::PIPE_NAME) {
             Ok(client) => {
                 let hello = Frame::Hello { proto: crate::PROTO_VERSION, volumes: handshake.clone() };

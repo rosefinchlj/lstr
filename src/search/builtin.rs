@@ -210,7 +210,7 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
 /// 重连握手从快照位点续传)。返回是否已发起 worker 拉起。
 pub fn spawn_client_thread(
     handshake_slot: std::sync::Arc<std::sync::Mutex<Vec<(u128, u64, i64)>>>,
-    tx: Sender<EngineMsg>,
+    tx: std::sync::mpsc::SyncSender<EngineMsg>,
     shutdown: std::sync::Arc<AtomicBool>,
     launched_worker: bool,
 ) {
@@ -266,7 +266,7 @@ pub fn spawn_client_thread(
         .expect("spawn idx client");
 }
 
-fn frame_loop(client: windows::Win32::Foundation::HANDLE, tx: &Sender<EngineMsg>, shutdown: &AtomicBool) {
+fn frame_loop(client: windows::Win32::Foundation::HANDLE, tx: &std::sync::mpsc::SyncSender<EngineMsg>, shutdown: &AtomicBool) {
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
