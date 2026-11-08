@@ -321,8 +321,11 @@ impl Config {
             let _ = cfg.save();
             return cfg;
         };
-        match toml::from_str(&text) {
-            Ok(cfg) => cfg,
+        match toml::from_str::<Config>(&text) {
+            Ok(mut cfg) => {
+                cfg.index.backend = normalize_backend(&cfg.index.backend);
+                cfg
+            },
             Err(err) => {
                 eprintln!("lstr: config.toml 解析失败（使用默认值）: {err}");
                 Self::default()
@@ -335,6 +338,18 @@ impl Config {
         fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
         let text = toml::to_string_pretty(self).map_err(|e| format!("序列化配置失败: {e}"))?;
         fs::write(Self::path(), text).map_err(|e| format!("写入配置失败: {e}"))
+    }
+}
+
+/// 后端名归一化:只接受 auto/builtin/everything/off,未知值一律回 auto,
+/// 避免手写 config.toml 里的错拼被静默当成「建内置引擎」。
+pub fn normalize_backend(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => "auto".into(),
+        "builtin" => "builtin".into(),
+        "everything" => "everything".into(),
+        "off" => "off".into(),
+        _ => "auto".into(),
     }
 }
 
@@ -352,6 +367,17 @@ pub fn parse_hex(input: &str) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_names_are_normalized() {
+        assert_eq!(normalize_backend("auto"), "auto");
+        assert_eq!(normalize_backend("  BuIlTiN "), "builtin");
+        assert_eq!(normalize_backend("everything"), "everything");
+        assert_eq!(normalize_backend("off"), "off");
+        // 手写错拼不再静默创建内置引擎,回落 auto
+        assert_eq!(normalize_backend("bogus"), "auto");
+        assert_eq!(normalize_backend(""), "auto");
+    }
 
     #[test]
     fn default_config_round_trips_through_toml() {

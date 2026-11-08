@@ -140,7 +140,7 @@ impl BuiltinProvider {
                 continue;
             }
             let is_dir = self.engine.is_dir(hit);
-            let kind = kind_of(&name, is_dir);
+            let mut kind = kind_of(&name, is_dir);
             if !keep(kind) {
                 continue;
             }
@@ -150,7 +150,7 @@ impl BuiltinProvider {
             };
             if fs_dir != is_dir {
                 // 类型漂移(罕见):以文件系统为准
-                let kind = kind_of(&name, fs_dir);
+                kind = kind_of(&name, fs_dir);
                 if !keep(kind) {
                     continue;
                 }
@@ -217,7 +217,6 @@ pub fn spawn_client_thread(
     std::thread::Builder::new()
         .name("lstr-idx-client".to_string())
         .spawn(move || {
-            let mut launched = launched_worker;
             let mut first_connect = !launched_worker;
             let mut launch_declined = false;
             loop {
@@ -231,7 +230,6 @@ pub fn spawn_client_thread(
                         launch_declined = true;
                     }
                 }
-                launched = true;
                 // 首连给足 UAC 时间;重连短超时。握手位点每次现取:
                 // 引擎进度推进后,重连即从新位点续传(方案 §4.1)。
                 let snapshot = handshake_slot.lock().unwrap().clone();
@@ -239,8 +237,7 @@ pub fn spawn_client_thread(
                 first_connect = false;
                 match idx_client::connect_and_handshake(snapshot, timeout) {
                     Ok(client) => {
-                        launched = true;
-                        frame_loop(client, &tx, &shutdown);
+                                frame_loop(client, &tx, &shutdown);
                         let _ = tx.send(EngineMsg::WorkerLost);
                     }
                     Err(_err) => {
@@ -250,10 +247,12 @@ pub fn spawn_client_thread(
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                // 重连退避;worker 进程可能已死,再拉一次
-                if !launched || !pipe_exists() {
-                    launch_worker();
-                    launched = true;
+                // 重连退避;worker 进程可能已死,再拉一次。
+                // 但用户拒过 UAC 就不再弹(与上面的守卫一致),否则每 20s 骚扰一次。
+                if !launch_declined && !pipe_exists() {
+                    if !launch_worker() {
+                        launch_declined = true;
+                    }
                 }
                 for _ in 0..40 {
                     if shutdown.load(Ordering::Relaxed) {
@@ -267,26 +266,29 @@ pub fn spawn_client_thread(
 }
 
 fn frame_loop(client: windows::Win32::Foundation::HANDLE, tx: &std::sync::mpsc::SyncSender<EngineMsg>, shutdown: &AtomicBool) {
-    loop {
+    'frames: loop {
         if shutdown.load(Ordering::Relaxed) {
-            return;
+            break 'frames;
         }
         match idx_client::read_frame(client, Duration::from_secs(2)) {
             Some(frame) => {
                 if let Some(msg) = to_engine_msg(frame) {
                     if tx.send(msg).is_err() {
-                        return;
+                        break 'frames;
                     }
                 }
             }
             None => {
                 // 超时 → 探活;管道断开则退出本循环
                 if !pipe_alive(client) {
-                    return;
+                    break 'frames;
                 }
             }
         }
     }
+    // 句柄所有权在本函数:任何退出路径都关闭。旧实现直接 return,
+    // 每个会话/重连泄漏一个 HANDLE,还让 worker 的实例一直被占。
+    idx_win::close(client);
 }
 
 fn to_engine_msg(frame: lstr_index::proto::Frame) -> Option<EngineMsg> {
@@ -312,7 +314,10 @@ fn to_engine_msg(frame: lstr_index::proto::Frame) -> Option<EngineMsg> {
 }
 
 fn pipe_exists() -> bool {
-    idx_client::connect_and_handshake(Vec::new(), Duration::from_millis(800)).is_ok()
+    // 只探活,不建会话:旧实现 connect_and_handshake(Vec::new()) 会真的连上
+    // worker(空握手 → 每卷从 FRN 0 全量扫),且不关句柄 → 永久占住唯一实例
+    // (worker 卡在会话里,主进程从此连不上)。
+    idx_client::pipe_available()
 }
 
 fn pipe_alive(client: windows::Win32::Foundation::HANDLE) -> bool {

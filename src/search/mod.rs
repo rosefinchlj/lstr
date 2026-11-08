@@ -269,10 +269,13 @@ fn run_worker(
     let mut builtin: Option<builtin::BuiltinProvider> = None;
     let shutdown_client = Arc::new(AtomicBool::new(false));
     let handshake_slot: Arc<Mutex<Vec<(u128, u64, i64)>>> = Arc::new(Mutex::new(Vec::new()));
+    // 显式选择「仅内置索引」:此时无论引擎是否就绪,都不再回落 Everything,
+    // 否则与设置页文案矛盾(旧实现在 Fallback 时仍把查询发给 Everything)。
+    let force_builtin = config.index.backend == "builtin";
     match config.index.backend.as_str() {
         "off" => {}
         "everything" => {}
-        backend_kind => {
+        _ => {
             let engine = builtin::make_engine(&config.index);
             *handshake_slot.lock().unwrap() = engine.handshake_state();
             builtin::spawn_client_thread(
@@ -282,10 +285,6 @@ fn run_worker(
                 false,
             );
             builtin = Some(builtin::BuiltinProvider::new(engine));
-            let _ = backend_kind; // auto / builtin 同路径,显式 everything 时不建
-            if backend_kind == "builtin" {
-                // 强制内置:宁可空结果也不回落(用户显式选择)
-            }
         }
     }
     let publish_status = |builtin: Option<&builtin::BuiltinProvider>,
@@ -476,11 +475,12 @@ fn run_worker(
                         .as_ref()
                         .map(|b| b.engine.status().phase)
                         .unwrap_or(lstr_index::Phase::Fallback);
-                    let use_builtin = phase != lstr_index::Phase::Fallback;
+                    let use_builtin = force_builtin || phase != lstr_index::Phase::Fallback;
                     // 时间筛选依赖文件 mtime:USN 不含(方案 §3.2),降级走 Everything
                     let time_forced = request.filters.time.is_some();
                     // 构建期与 Everything 合并(方案 §5.2.2);Ready 后纯内置
                     let merge_everything = use_builtin
+                        && !force_builtin
                         && phase != lstr_index::Phase::Ready
                         && !time_forced
                         && everything.is_some();
@@ -511,7 +511,7 @@ fn run_worker(
                             }
                             needs_exact = truncation > 0;
                         }
-                    } else if let Some(provider) = &everything {
+                    } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
                         match provider.search_split(
                             &request.query,
                             &request.filters,
@@ -541,8 +541,11 @@ fn run_worker(
                         // 截断才需要 wfn 精确兜底；延后到第一版结果发出后再查。
                         needs_exact = truncation > 0;
                     } else if time_forced {
-                        error =
-                            Some("时间筛选需要 Everything(内置索引暂不含文件修改时间)".to_string());
+                        error = Some(if force_builtin {
+                            "仅内置索引模式不支持时间筛选(USN 不含修改时间)".to_string()
+                        } else {
+                            "时间筛选需要 Everything(内置索引暂不含文件修改时间)".to_string()
+                        });
                     } else {
                         error = Some("索引未启用且 Everything 未运行".to_string());
                     }
@@ -598,7 +601,7 @@ fn run_worker(
                             .map(|b| b.engine.status().phase)
                             .unwrap_or(lstr_index::Phase::Fallback);
                         if let Some(b) = &builtin {
-                            if phase != lstr_index::Phase::Fallback
+                            if (force_builtin || phase != lstr_index::Phase::Fallback)
                                 && request.filters.time.is_none()
                             {
                                 if let Ok((mut exact, _)) =
@@ -606,7 +609,7 @@ fn run_worker(
                                 {
                                     entries.append(&mut exact);
                                 }
-                            } else if let Some(provider) = &everything {
+                            } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
                                 if let Ok((mut exact, _)) =
                                     provider.search_exact(&request.query, &request.filters, 50)
                                 {
@@ -630,7 +633,7 @@ fn run_worker(
                         .unwrap_or(lstr_index::Phase::Fallback);
                     let time_forced = request.filters.time.is_some();
                     if let Some(b) = &builtin {
-                        if phase != lstr_index::Phase::Fallback && !time_forced {
+                        if (force_builtin || phase != lstr_index::Phase::Fallback) && !time_forced {
                             let fetch = fetch_count(&request.query, request.limit);
                             match b.search(&request.query, &request.filters, fetch) {
                                 Ok((mut files, count)) => {
@@ -640,7 +643,7 @@ fn run_worker(
                                 }
                                 Err(err) => error = Some(err),
                             }
-                        } else if let Some(provider) = &everything {
+                        } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
                             let fetch = fetch_count(&request.query, request.limit);
                             match provider.search(&request.query, &request.filters, fetch) {
                                 Ok((mut files, count)) => {
@@ -688,7 +691,7 @@ fn run_worker(
                             .map(|b| b.engine.status().phase)
                             .unwrap_or(lstr_index::Phase::Fallback);
                         if let Some(b) = &builtin {
-                            if phase != lstr_index::Phase::Fallback
+                            if (force_builtin || phase != lstr_index::Phase::Fallback)
                                 && request.filters.time.is_none()
                             {
                                 if let Ok((mut exact, _)) =
@@ -696,7 +699,7 @@ fn run_worker(
                                 {
                                     entries.append(&mut exact);
                                 }
-                            } else if let Some(provider) = &everything {
+                            } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
                                 if let Ok((mut exact, _)) =
                                     provider.search_exact(&request.query, &request.filters, 50)
                                 {

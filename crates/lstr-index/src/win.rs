@@ -4,7 +4,7 @@
 //! 都能连上拿全盘文件清单。措施 = 仅当前用户 SID 的 DACL + 对端进程映像校验。
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
 };
@@ -21,7 +21,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, NAMED_PIPE_MODE,
-    PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+    PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW, OpenProcessToken,
@@ -194,6 +194,23 @@ pub fn open_pipe_client(name: &str) -> Result<HANDLE, String> {
         )
         .map_err(|e| format!("connect pipe: {e}"))
     }
+}
+
+/// 管道是否有可用实例(零交互探活,不建立会话)。
+/// 不能拿 `open_pipe_client` 当探活:它会真的连上 worker,worker 随即按
+/// 空握手开一次全量扫描,且句柄不关闭时会永久占住唯一实例(worker 卡死)。
+/// 语义:有实例在监听 → true;实例全忙(worker 活着但会话占用) → 仍算 true;
+/// 管道不存在 → false。
+pub fn pipe_available(name: &str) -> bool {
+    const ERROR_SEM_TIMEOUT: u32 = 121; // 实例全忙(worker 活着)
+    const ERROR_PIPE_BUSY: u32 = 231; // 实例全忙
+    let wname = to_wide(name);
+    let ok = unsafe { WaitNamedPipeW(PCWSTR(wname.as_ptr()), 0) };
+    if ok.as_bool() {
+        return true;
+    }
+    let code = unsafe { GetLastError() }.0;
+    code == ERROR_SEM_TIMEOUT || code == ERROR_PIPE_BUSY
 }
 
 /// 阻塞等待客户端连接;客户端已就位时返回 ERROR_PIPE_CONNECTED 也算成功。

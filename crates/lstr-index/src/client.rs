@@ -66,3 +66,8 @@ pub fn pipe_alive(client: HANDLE) -> bool {
     use windows::Win32::System::Pipes::PeekNamedPipe;
     unsafe { PeekNamedPipe(client, None, 0, None, None, None).is_ok() }
 }
+
+/// 探活:是否有 worker 在监听(不建立会话、不动握手)。
+pub fn pipe_available() -> bool {
+    crate::win::pipe_available(crate::PIPE_NAME)
+}

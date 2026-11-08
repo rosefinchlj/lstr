@@ -362,6 +362,14 @@ impl VolumeStore {
     }
 
     /// 是否有未归并的 delta。
+    /// 自上次 compact 以来是否有就地改名。
+    /// 改名只在名字区追加新字节、name_off 重指,旧字节成幽灵 —— 此时
+    /// names 里的条目数 > name_off.len(),快照的「count==names 条目数」契约
+    /// 会被打破,所以落盘前必须 compact 清幽灵。
+    pub fn has_pending_rename(&self) -> bool {
+        self.renames > 0
+    }
+
     pub fn delta_is_empty(&self) -> bool {
         self.delta.is_empty()
     }

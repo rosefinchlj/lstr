@@ -67,7 +67,10 @@ pub fn save(
     header: &SnapshotHeader,
     store: &mut VolumeStore,
 ) -> std::io::Result<u64> {
-    if !store.delta_is_empty() || store.is_scanning() {
+    // 列一致契约:未归并 delta、扫描中、或有就地改名(名字区残留幽灵字节)
+    // 都必须先 compact,否则 count 与 names 条目数对不上,load 直接拒绝
+    // → 每次启动全量重扫(property 随机流里约 1/4 概率命中改名后落盘)。
+    if !store.delta_is_empty() || store.is_scanning() || store.has_pending_rename() {
         store.compact();
     }
     std::fs::create_dir_all(dir)?;
@@ -436,6 +439,34 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H1 回归(改名无 delta):compact 后只做一次就地改名,delta 为空。
+    /// 旧实现 save 的 compact 条件只看 delta/scanning → 不 compact 就落盘,
+    /// names 里的幽灵旧名使 name_off 条目数 != count,load 拒绝 → 启动全量重扫
+    /// (property 随机流约 1/4 概率踩中,表现为偶发 load=None)。
+    #[test]
+    fn rename_without_delta_survives_roundtrip() {
+        let mut s = VolumeStore::new(false);
+        s.insert(5, 0, 0x10, b"root");
+        s.insert(10, 5, 0, b"alpha.txt");
+        s.compact();
+        assert!(s.delta_is_empty());
+        assert!(s.insert(10, 5, 0, b"alpha-renamed.txt"));
+        assert!(s.delta_is_empty(), "就地改名不进 delta");
+        assert!(s.has_pending_rename());
+        let dir = tmpdir("h1-rename-no-delta");
+        let _ = std::fs::remove_dir_all(&dir);
+        let h = header(0xfeed, true);
+        save(&dir, &h, &mut s).unwrap();
+        let loaded = load(&dir, h.guid, false).expect("改名后落盘的快照必须可 load");
+        let ls = loaded.store;
+        assert_eq!(ls.len(), 2);
+        assert_eq!(
+            ls.find_slot(10).map(|x| ls.name(x).to_vec()),
+            Some(b"alpha-renamed.txt".to_vec())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
