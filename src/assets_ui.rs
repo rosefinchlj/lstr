@@ -1,34 +1,93 @@
-//! 设置页「资产」：可视化管理收藏 / 自定义动作 / 自定义命令。
+//! 设置页「资产」：收藏 / 自定义动作 / 自定义命令。
 //!
-//! 独立模块，只依赖 `config / assets / egui`，不碰 Win32，
-//! 这样 `app.rs` 里只需要一个分页入口，合并时冲突面最小。
-//!
-//! 可读性与可扩展性约定：
-//! - 不再叠加 `.small()` + `.weak()`（字号与对比度同时削弱会看不清）；
-//! - 三个可增长列表各自有独立限高滚动视口、计数与筛选，不会顶掉别的分区。
+//! 布局：顶部分类切换 → 中间单一列表（占满可用高度、可滚动）→ 底部固定编辑条。
+//! 一次只处理一类，避免三块 CRUD 纵向堆叠造成的留白与嵌套滚动。
+//! 视觉沿用项目设置页的 painter 手绘语言（圆角、主题色、自绘按钮），
+//! 不用 egui 原生 Grid / 斑马纹，风格与「噪声规则」等页一致。
 
 use crate::assets::{ActionDef, CommandDef, Favorite};
 use crate::config::Config;
-use eframe::egui::{self, RichText};
+use crate::ui::{self, Theme};
+use eframe::egui::{
+    self, Align2, CornerRadius, Id, Rect, Sense, Stroke, StrokeKind,
+};
 
-const BODY: f32 = 13.0;
-const SUB: f32 = 12.0;
-const LIST_H: f32 = 118.0;
+const ROW_H: f32 = 30.0;
+const TAB_H: f32 = 28.0;
+const EDITOR_H: f32 = 152.0;
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AssetTab {
+    #[default]
+    Favorite,
+    Action,
+    Command,
+}
+
+impl AssetTab {
+    const ALL: [AssetTab; 3] = [AssetTab::Favorite, AssetTab::Action, AssetTab::Command];
+
+    fn label(self) -> &'static str {
+        match self {
+            AssetTab::Favorite => "收藏",
+            AssetTab::Action => "动作",
+            AssetTab::Command => "命令",
+        }
+    }
+
+    fn count(self, cfg: &Config) -> usize {
+        match self {
+            AssetTab::Favorite => cfg.favorites.len(),
+            AssetTab::Action => cfg.actions.len(),
+            AssetTab::Command => cfg.commands.len(),
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            AssetTab::Favorite => "在搜索结果与快速切换中置顶常用目录",
+            AssetTab::Action => "对选中的搜索结果执行程序；{action_path} 会被替换为结果路径",
+            AssetTab::Command => "在搜索框用触发词调用程序；{query} 是触发词之后的内容",
+        }
+    }
+}
+
 pub struct AssetUiState {
-    favorite_name: String,
-    favorite_path: String,
-    favorite_filter: String,
-    action_title: String,
-    action_program: String,
-    action_args: String,
-    action_admin: bool,
-    command_trigger: String,
-    command_title: String,
-    command_program: String,
-    command_args: String,
+    pub tab: AssetTab,
+    selected: Option<usize>,
+    filter: String,
+    f_name: String,
+    f_path: String,
+    a_title: String,
+    a_program: String,
+    a_args: String,
+    a_admin: bool,
+    c_trigger: String,
+    c_title: String,
+    c_program: String,
+    c_args: String,
     notice: Option<String>,
+}
+
+impl Default for AssetUiState {
+    fn default() -> Self {
+        Self {
+            tab: AssetTab::Favorite,
+            selected: None,
+            filter: String::new(),
+            f_name: String::new(),
+            f_path: String::new(),
+            a_title: String::new(),
+            a_program: String::new(),
+            a_args: String::new(),
+            a_admin: false,
+            c_trigger: String::new(),
+            c_title: String::new(),
+            c_program: String::new(),
+            c_args: String::new(),
+            notice: None,
+        }
+    }
 }
 
 fn shorten(text: &str, max: usize) -> String {
@@ -40,380 +99,520 @@ fn shorten(text: &str, max: usize) -> String {
     format!("{head}…")
 }
 
-/// 返回 true 表示配置发生变更（调用方负责保存配置并同步搜索服务）。
-pub fn paint(ui: &mut egui::Ui, cfg: &mut Config, state: &mut AssetUiState) -> bool {
-    let mut changed = false;
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            changed |= favorite_section(ui, cfg, state);
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
-            changed |= action_section(ui, cfg, state);
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
-            changed |= command_section(ui, cfg, state);
-
-            ui.add_space(10.0);
-            if let Some(notice) = &state.notice {
-                ui.label(RichText::new(notice).size(SUB));
-            }
-        });
-    changed
+fn chip(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    theme: &Theme,
+    rect: Rect,
+    label: &str,
+    active: bool,
+    index: usize,
+) -> bool {
+    // Id 用固定下标，避免标签里的计数变化导致交互状态错位。
+    let response = ui.interact(rect, Id::new(("lstr-asset-tab", index)), Sense::click());
+    if active || response.hovered() {
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(6),
+            if active { theme.amber_soft } else { theme.hover },
+        );
+    }
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        ui::text_font(12.5),
+        if active { theme.amber } else { theme.sub },
+    );
+    if active {
+        let bar = Rect::from_min_size(
+            egui::pos2(rect.left() + 14.0, rect.bottom() - 3.0),
+            egui::vec2(rect.width() - 28.0, 2.0),
+        );
+        painter.rect_filled(bar, CornerRadius::same(1), theme.amber);
+    }
+    response.clicked()
 }
 
-fn favorite_section(ui: &mut egui::Ui, cfg: &mut Config, s: &mut AssetUiState) -> bool {
-    let mut changed = false;
-    ui.label(
-        RichText::new(format!("收藏文件夹   ·   {} 项", cfg.favorites.len()))
-            .size(14.0)
-            .strong(),
+fn action_button(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    theme: &Theme,
+    rect: Rect,
+    label: &str,
+    enabled: bool,
+) -> bool {
+    let response = ui.interact(rect, Id::new(("lstr-asset-btn", label)), Sense::click());
+    let fill = if !enabled {
+        theme.hover
+    } else if response.hovered() {
+        theme.surface_hi
+    } else {
+        theme.hover
+    };
+    painter.rect_filled(rect, CornerRadius::same(6), fill);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(6),
+        Stroke::new(1.0, theme.hair),
+        StrokeKind::Inside,
     );
-    ui.add_space(5.0);
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        ui::text_font(11.5),
+        if enabled { theme.text } else { theme.dim },
+    );
+    enabled && response.clicked()
+}
 
-    egui::Grid::new("lstr-assets-fav-form")
-        .num_columns(2)
-        .spacing([10.0, 7.0])
-        .show(ui, |ui| {
-            ui.label(RichText::new("名称").size(BODY));
-            ui.add(
-                egui::TextEdit::singleline(&mut s.favorite_name)
-                    .hint_text("可留空，自动取目录名")
-                    .desired_width(230.0),
-            );
-            ui.end_row();
+fn field_label(painter: &egui::Painter, theme: &Theme, x: f32, y: f32, text: &str) {
+    painter.text(
+        egui::pos2(x, y + 11.0),
+        Align2::LEFT_CENTER,
+        text,
+        ui::text_font(12.0),
+        theme.sub,
+    );
+}
 
-            ui.label(RichText::new("路径").size(BODY));
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut s.favorite_path)
-                        .hint_text(r"例如 D:\work")
-                        .desired_width(160.0),
-                );
-                if ui.button(RichText::new("添加").size(BODY)).clicked() {
-                    let path = s.favorite_path.trim().to_string();
-                    if path.is_empty() {
-                        s.notice = Some("请填写收藏路径".to_string());
-                    } else if cfg
-                        .favorites
-                        .iter()
-                        .any(|f| f.path.eq_ignore_ascii_case(&path))
+fn field(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    theme: &Theme,
+    x: f32,
+    y: f32,
+    width: f32,
+    label: &str,
+    value: &mut String,
+    hint: &str,
+) {
+    field_label(painter, theme, x, y, label);
+    let rect = Rect::from_min_size(egui::pos2(x + 46.0, y), egui::vec2(width - 46.0, 22.0));
+    ui.put(rect, egui::TextEdit::singleline(value).hint_text(hint));
+}
+
+/// 返回 true 表示配置发生变更（调用方负责保存配置并同步搜索服务）。
+pub fn paint(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    theme: &Theme,
+    area: Rect,
+    cfg: &mut Config,
+    state: &mut AssetUiState,
+) -> bool {
+    let mut changed = false;
+    let w = area.width();
+
+    // —— 顶部分类切换 ——
+    let tab_w = (w - 16.0) / 3.0;
+    for (index, tab) in AssetTab::ALL.iter().enumerate() {
+        let rect = Rect::from_min_size(
+            egui::pos2(area.left() + index as f32 * (tab_w + 8.0), area.top()),
+            egui::vec2(tab_w, TAB_H),
+        );
+        let label = format!("{}  {}", tab.label(), tab.count(cfg));
+        if chip(ui, painter, theme, rect, &label, state.tab == *tab, index) {
+            state.tab = *tab;
+            state.selected = None;
+            state.filter.clear();
+            clear_form(state);
+        }
+    }
+
+    // —— 筛选行 ——
+    let filter_y = area.top() + TAB_H + 8.0;
+    field_label(painter, theme, area.left(), filter_y, "筛选");
+    ui.put(
+        Rect::from_min_size(
+            egui::pos2(area.left() + 46.0, filter_y),
+            egui::vec2((w - 130.0).max(120.0), 22.0),
+        ),
+        egui::TextEdit::singleline(&mut state.filter).hint_text("输入名称或路径片段"),
+    );
+    if action_button(
+        ui,
+        painter,
+        theme,
+        Rect::from_min_size(
+            egui::pos2(area.right() - 74.0, filter_y),
+            egui::vec2(74.0, 22.0),
+        ),
+        "清除",
+        !state.filter.is_empty(),
+    ) {
+        state.filter.clear();
+    }
+
+    // —— 列表（占满剩余高度，单一滚动区） ——
+    // 窗口被拖小时也要给列表留出可读的高度。
+    let editor_top = (area.bottom() - EDITOR_H).max(area.top() + 190.0);
+    let list_rect = Rect::from_min_max(
+        egui::pos2(area.left(), filter_y + 32.0),
+        egui::pos2(area.right(), editor_top - 8.0),
+    );
+    let needle = state.filter.trim().to_lowercase();
+    let mut clicked: Option<usize> = None;
+    let mut shown = 0usize;
+
+    let rows = collect_rows(state.tab, cfg);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(list_rect), |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("lstr-assets-list")
+            .max_height(list_rect.height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(list_rect.width());
+                let p = ui.painter().clone();
+                for (index, (primary, secondary)) in rows.iter().enumerate() {
+                    if !needle.is_empty()
+                        && !primary.to_lowercase().contains(&needle)
+                        && !secondary.to_lowercase().contains(&needle)
                     {
-                        s.notice = Some("该路径已在收藏中".to_string());
-                    } else {
-                        let name = if s.favorite_name.trim().is_empty() {
-                            std::path::Path::new(&path)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.clone())
-                        } else {
-                            s.favorite_name.trim().to_string()
-                        };
-                        cfg.favorites.push(Favorite { name, path });
-                        s.favorite_name.clear();
-                        s.favorite_path.clear();
-                        s.notice = Some("已添加收藏".to_string());
-                        changed = true;
+                        continue;
+                    }
+                    shown += 1;
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(list_rect.width() - 6.0, ROW_H),
+                        Sense::click(),
+                    );
+                    let selected = state.selected == Some(index);
+                    if selected || response.hovered() {
+                        p.rect_filled(
+                            rect.shrink(2.0),
+                            CornerRadius::same(6),
+                            if selected { theme.sel } else { theme.hover },
+                        );
+                    }
+                    p.line_segment(
+                        [
+                            egui::pos2(rect.left() + 4.0, rect.bottom()),
+                            egui::pos2(rect.right() - 4.0, rect.bottom()),
+                        ],
+                        Stroke::new(1.0, theme.hair),
+                    );
+                    p.text(
+                        egui::pos2(rect.left() + 10.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        primary,
+                        ui::text_font(12.5),
+                        theme.text,
+                    );
+                    p.text(
+                        egui::pos2(rect.right() - 10.0, rect.center().y),
+                        Align2::RIGHT_CENTER,
+                        shorten(secondary, 34),
+                        ui::mono_font(10.5),
+                        theme.dim,
+                    );
+                    if response.clicked() {
+                        clicked = Some(index);
                     }
                 }
+                if shown == 0 {
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(list_rect.width() - 6.0, ROW_H),
+                        Sense::hover(),
+                    );
+                    p.text(
+                        egui::pos2(rect.left() + 10.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        if needle.is_empty() {
+                            "暂无条目，在下方添加"
+                        } else {
+                            "没有匹配的条目"
+                        },
+                        ui::text_font(12.0),
+                        theme.dim,
+                    );
+                }
             });
-            ui.end_row();
-        });
-
-    ui.add_space(7.0);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("筛选").size(BODY));
-        ui.add(
-            egui::TextEdit::singleline(&mut s.favorite_filter)
-                .hint_text("按名称或路径片段过滤")
-                .desired_width(180.0),
-        );
-        if ui.button(RichText::new("清除").size(SUB)).clicked() {
-            s.favorite_filter.clear();
-        }
     });
 
-    ui.add_space(5.0);
-    let needle = s.favorite_filter.trim().to_lowercase();
-    let mut remove = None;
-    egui::ScrollArea::vertical()
-        .id_salt("lstr-assets-fav-list")
-        .max_height(LIST_H)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            egui::Grid::new("lstr-assets-fav-grid")
-                .num_columns(3)
-                .striped(true)
-                .spacing([10.0, 5.0])
-                .show(ui, |ui| {
-                    let mut shown = 0usize;
-                    for (index, fav) in cfg.favorites.iter().enumerate() {
-                        if !needle.is_empty()
-                            && !fav.name.to_lowercase().contains(&needle)
-                            && !fav.path.to_lowercase().contains(&needle)
-                        {
-                            continue;
-                        }
-                        shown += 1;
-                        ui.label(RichText::new(&fav.name).size(BODY));
-                        ui.label(RichText::new(shorten(&fav.path, 34)).size(SUB));
-                        if ui.button(RichText::new("删除").size(SUB)).clicked() {
-                            remove = Some(index);
-                        }
-                        ui.end_row();
-                    }
-                    if shown == 0 {
-                        ui.label(RichText::new(if needle.is_empty() {
-                            "暂无收藏"
-                        } else {
-                            "没有匹配的收藏"
-                        })
-                        .size(SUB));
-                        ui.end_row();
-                    }
-                });
-        });
-    if let Some(index) = remove {
-        cfg.favorites.remove(index);
-        s.notice = Some("已移除收藏".to_string());
-        changed = true;
+    if let Some(index) = clicked {
+        state.selected = Some(index);
+        fill_form(state.tab, cfg, index, state);
+        state.notice = None;
+    }
+
+    // —— 底部编辑条 ——
+    painter.line_segment(
+        [
+            egui::pos2(area.left(), editor_top),
+            egui::pos2(area.right(), editor_top),
+        ],
+        Stroke::new(1.0, theme.hair),
+    );
+    let editing = state.selected.is_some();
+    painter.text(
+        egui::pos2(area.left(), editor_top + 6.0),
+        Align2::LEFT_TOP,
+        if editing { "编辑选中项" } else { "新增条目" },
+        ui::text_font(12.5),
+        theme.text,
+    );
+
+    let field_w = (w - 16.0) / 2.0;
+    let y1 = editor_top + 28.0;
+    let y2 = y1 + 28.0;
+    let right_x = area.left() + field_w + 16.0;
+    match state.tab {
+        AssetTab::Favorite => {
+            field(ui, painter, theme, area.left(), y1, field_w, "名称", &mut state.f_name, "可留空");
+            field(ui, painter, theme, right_x, y1, field_w, "路径", &mut state.f_path, r"D:\work");
+        }
+        AssetTab::Action => {
+            field(ui, painter, theme, area.left(), y1, field_w, "标题", &mut state.a_title, "菜单名称");
+            field(ui, painter, theme, right_x, y1, field_w, "程序", &mut state.a_program, "code");
+            field(ui, painter, theme, area.left(), y2, field_w, "参数", &mut state.a_args, r#""{action_path}""#);
+            ui.put(
+                Rect::from_min_size(egui::pos2(right_x + 46.0, y2), egui::vec2(field_w - 46.0, 22.0)),
+                egui::Checkbox::new(&mut state.a_admin, "管理员运行"),
+            );
+        }
+        AssetTab::Command => {
+            field(ui, painter, theme, area.left(), y1, field_w, "触发词", &mut state.c_trigger, "note");
+            field(ui, painter, theme, right_x, y1, field_w, "标题", &mut state.c_title, "新建笔记");
+            field(ui, painter, theme, area.left(), y2, field_w, "程序", &mut state.c_program, "notepad.exe");
+            field(ui, painter, theme, right_x, y2, field_w, "参数", &mut state.c_args, "{query}");
+        }
+    }
+
+    let hint_y = y2 + 26.0;
+    painter.text(
+        egui::pos2(area.left(), hint_y),
+        Align2::LEFT_TOP,
+        state.tab.hint(),
+        ui::mono_font(10.5),
+        theme.dim,
+    );
+
+    let btn_y = editor_top + EDITOR_H - 28.0;
+    let bw = 88.0;
+    if action_button(
+        ui, painter, theme,
+        Rect::from_min_size(egui::pos2(area.left(), btn_y), egui::vec2(bw, 24.0)),
+        if editing { "保存" } else { "添加" },
+        true,
+    ) {
+        match save_form(state.tab, cfg, state) {
+            Ok(()) => {
+                changed = true;
+                state.notice = Some(if editing { "已保存" } else { "已添加" }.to_string());
+                state.selected = None;
+                clear_form(state);
+            }
+            Err(err) => state.notice = Some(err),
+        }
+    }
+    if action_button(
+        ui, painter, theme,
+        Rect::from_min_size(egui::pos2(area.left() + bw + 8.0, btn_y), egui::vec2(bw, 24.0)),
+        "删除",
+        editing,
+    ) {
+        if let Some(index) = state.selected {
+            remove_at(state.tab, cfg, index);
+            changed = true;
+            state.selected = None;
+            clear_form(state);
+            state.notice = Some("已删除".to_string());
+        }
+    }
+    if action_button(
+        ui, painter, theme,
+        Rect::from_min_size(egui::pos2(area.left() + (bw + 8.0) * 2.0, btn_y), egui::vec2(bw, 24.0)),
+        "新建",
+        editing,
+    ) {
+        state.selected = None;
+        clear_form(state);
+        state.notice = None;
+    }
+    if let Some(notice) = &state.notice {
+        painter.text(
+            egui::pos2(area.right(), btn_y + 12.0),
+            Align2::RIGHT_CENTER,
+            notice,
+            ui::text_font(11.0),
+            theme.sub,
+        );
     }
     changed
 }
 
-fn action_section(ui: &mut egui::Ui, cfg: &mut Config, s: &mut AssetUiState) -> bool {
-    let mut changed = false;
-    ui.label(
-        RichText::new(format!("自定义动作   ·   {} 项", cfg.actions.len()))
-            .size(14.0)
-            .strong(),
-    );
-    ui.add_space(5.0);
-
-    egui::Grid::new("lstr-assets-action-form")
-        .num_columns(2)
-        .spacing([10.0, 7.0])
-        .show(ui, |ui| {
-            ui.label(RichText::new("标题").size(BODY));
-            ui.add(
-                egui::TextEdit::singleline(&mut s.action_title)
-                    .hint_text("菜单里显示的名称")
-                    .desired_width(230.0),
-            );
-            ui.end_row();
-
-            ui.label(RichText::new("程序").size(BODY));
-            ui.add(
-                egui::TextEdit::singleline(&mut s.action_program)
-                    .hint_text("例如 code / wt.exe")
-                    .desired_width(230.0),
-            );
-            ui.end_row();
-
-            ui.label(RichText::new("参数").size(BODY));
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut s.action_args)
-                        .hint_text(r#""{action_path}""#)
-                        .desired_width(160.0),
-                );
-                ui.checkbox(&mut s.action_admin, "提权");
-                if ui.button(RichText::new("添加").size(BODY)).clicked() {
-                    let program = s.action_program.trim().to_string();
-                    let title = s.action_title.trim().to_string();
-                    if program.is_empty() || title.is_empty() {
-                        s.notice = Some("动作需要填写标题和程序".to_string());
-                    } else {
-                        cfg.actions.push(ActionDef {
-                            title,
-                            program,
-                            args: s.action_args.trim().to_string(),
-                            workdir: String::new(),
-                            admin: s.action_admin,
-                            silent: false,
-                        });
-                        s.action_title.clear();
-                        s.action_program.clear();
-                        s.action_args.clear();
-                        s.notice = Some("已添加动作".to_string());
-                        changed = true;
-                    }
-                }
-            });
-            ui.end_row();
-        });
-
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new("变量：{action_path} / {action_path:parent} / {query} / {current_folder}")
-            .size(SUB),
-    );
-    ui.label(RichText::new("含空格的路径请用双引号包住").size(SUB));
-
-    ui.add_space(5.0);
-    let mut remove = None;
-    egui::ScrollArea::vertical()
-        .id_salt("lstr-assets-action-list")
-        .max_height(LIST_H)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            egui::Grid::new("lstr-assets-action-grid")
-                .num_columns(3)
-                .striped(true)
-                .spacing([10.0, 5.0])
-                .show(ui, |ui| {
-                    for (index, action) in cfg.actions.iter().enumerate() {
-                        ui.label(RichText::new(&action.title).size(BODY));
-                        let detail = format!(
-                            "{}{}  →  {}",
-                            action.program,
-                            if action.admin { " (提权)" } else { "" },
-                            shorten(&action.args, 24)
-                        );
-                        ui.label(RichText::new(detail).size(SUB));
-                        if ui.button(RichText::new("删除").size(SUB)).clicked() {
-                            remove = Some(index);
-                        }
-                        ui.end_row();
-                    }
-                    if cfg.actions.is_empty() {
-                        ui.label(RichText::new("暂无自定义动作").size(SUB));
-                        ui.end_row();
-                    }
-                });
-        });
-    if let Some(index) = remove {
-        cfg.actions.remove(index);
-        s.notice = Some("已移除动作".to_string());
-        changed = true;
+fn collect_rows(tab: AssetTab, cfg: &Config) -> Vec<(String, String)> {
+    match tab {
+        AssetTab::Favorite => cfg
+            .favorites
+            .iter()
+            .map(|f| (f.name.clone(), f.path.clone()))
+            .collect(),
+        AssetTab::Action => cfg
+            .actions
+            .iter()
+            .map(|a| {
+                (
+                    a.title.clone(),
+                    format!("{} {} {}", a.program, a.args, if a.admin { "· 提权" } else { "" }),
+                )
+            })
+            .collect(),
+        AssetTab::Command => cfg
+            .commands
+            .iter()
+            .map(|c| (c.trigger.clone(), format!("{} · {} {}", c.title, c.program, c.args)))
+            .collect(),
     }
-    changed
 }
 
-fn command_section(ui: &mut egui::Ui, cfg: &mut Config, s: &mut AssetUiState) -> bool {
-    let mut changed = false;
-    ui.label(
-        RichText::new(format!("自定义命令   ·   {} 项", cfg.commands.len()))
-            .size(14.0)
-            .strong(),
-    );
-    ui.add_space(5.0);
-
-    egui::Grid::new("lstr-assets-command-form")
-        .num_columns(2)
-        .spacing([10.0, 7.0])
-        .show(ui, |ui| {
-            ui.label(RichText::new("触发词").size(BODY));
-            ui.add(
-                egui::TextEdit::singleline(&mut s.command_trigger)
-                    .hint_text("例如 note")
-                    .desired_width(230.0),
-            );
-            ui.end_row();
-
-            ui.label(RichText::new("标题").size(BODY));
-            ui.add(
-                egui::TextEdit::singleline(&mut s.command_title)
-                    .hint_text("搜索结果里显示的名称")
-                    .desired_width(230.0),
-            );
-            ui.end_row();
-
-            ui.label(RichText::new("程序").size(BODY));
-            ui.add(
-                egui::TextEdit::singleline(&mut s.command_program)
-                    .hint_text("例如 notepad.exe")
-                    .desired_width(230.0),
-            );
-            ui.end_row();
-
-            ui.label(RichText::new("参数").size(BODY));
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut s.command_args)
-                        .hint_text("例如 {query}")
-                        .desired_width(160.0),
-                );
-                if ui.button(RichText::new("添加").size(BODY)).clicked() {
-                    let trigger = s.command_trigger.trim().to_string();
-                    let title = s.command_title.trim().to_string();
-                    let program = s.command_program.trim().to_string();
-                    if trigger.is_empty() || title.is_empty() || program.is_empty() {
-                        s.notice = Some("命令需要触发词、标题和程序".to_string());
-                    } else if cfg
-                        .commands
-                        .iter()
-                        .any(|c| c.trigger.eq_ignore_ascii_case(&trigger))
-                    {
-                        s.notice = Some("该触发词已被占用".to_string());
-                    } else {
-                        cfg.commands.push(CommandDef {
-                            trigger,
-                            title,
-                            program,
-                            args: s.command_args.trim().to_string(),
-                            workdir: String::new(),
-                        });
-                        s.command_trigger.clear();
-                        s.command_title.clear();
-                        s.command_program.clear();
-                        s.command_args.clear();
-                        s.notice = Some("已添加命令".to_string());
-                        changed = true;
-                    }
-                }
-            });
-            ui.end_row();
-        });
-
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new("变量：{query}（触发词之后的内容）、{current_folder}").size(SUB),
-    );
-
-    ui.add_space(5.0);
-    let mut remove = None;
-    egui::ScrollArea::vertical()
-        .id_salt("lstr-assets-command-list")
-        .max_height(LIST_H)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            egui::Grid::new("lstr-assets-command-grid")
-                .num_columns(3)
-                .striped(true)
-                .spacing([10.0, 5.0])
-                .show(ui, |ui| {
-                    for (index, command) in cfg.commands.iter().enumerate() {
-                        ui.label(RichText::new(&command.trigger).size(BODY));
-                        let detail = format!(
-                            "{}  →  {} {}",
-                            command.title,
-                            command.program,
-                            shorten(&command.args, 18)
-                        );
-                        ui.label(RichText::new(detail).size(SUB));
-                        if ui.button(RichText::new("删除").size(SUB)).clicked() {
-                            remove = Some(index);
-                        }
-                        ui.end_row();
-                    }
-                    if cfg.commands.is_empty() {
-                        ui.label(RichText::new("暂无自定义命令").size(SUB));
-                        ui.end_row();
-                    }
-                });
-        });
-    if let Some(index) = remove {
-        cfg.commands.remove(index);
-        s.notice = Some("已移除命令".to_string());
-        changed = true;
+fn fill_form(tab: AssetTab, cfg: &Config, index: usize, s: &mut AssetUiState) {
+    match tab {
+        AssetTab::Favorite => {
+            if let Some(f) = cfg.favorites.get(index) {
+                s.f_name = f.name.clone();
+                s.f_path = f.path.clone();
+            }
+        }
+        AssetTab::Action => {
+            if let Some(a) = cfg.actions.get(index) {
+                s.a_title = a.title.clone();
+                s.a_program = a.program.clone();
+                s.a_args = a.args.clone();
+                s.a_admin = a.admin;
+            }
+        }
+        AssetTab::Command => {
+            if let Some(c) = cfg.commands.get(index) {
+                s.c_trigger = c.trigger.clone();
+                s.c_title = c.title.clone();
+                s.c_program = c.program.clone();
+                s.c_args = c.args.clone();
+            }
+        }
     }
-    changed
+}
+
+fn clear_form(s: &mut AssetUiState) {
+    s.f_name.clear();
+    s.f_path.clear();
+    s.a_title.clear();
+    s.a_program.clear();
+    s.a_args.clear();
+    s.a_admin = false;
+    s.c_trigger.clear();
+    s.c_title.clear();
+    s.c_program.clear();
+    s.c_args.clear();
+}
+
+fn save_form(tab: AssetTab, cfg: &mut Config, s: &mut AssetUiState) -> Result<(), String> {
+    match tab {
+        AssetTab::Favorite => {
+            let path = s.f_path.trim().to_string();
+            if path.is_empty() {
+                return Err("请填写路径".to_string());
+            }
+            if cfg
+                .favorites
+                .iter()
+                .enumerate()
+                .any(|(i, f)| f.path.eq_ignore_ascii_case(&path) && s.selected != Some(i))
+            {
+                return Err("该路径已在收藏中".to_string());
+            }
+            let name = if s.f_name.trim().is_empty() {
+                std::path::Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone())
+            } else {
+                s.f_name.trim().to_string()
+            };
+            let item = Favorite { name, path };
+            if let Some(index) = s.selected {
+                if let Some(slot) = cfg.favorites.get_mut(index) {
+                    *slot = item;
+                }
+            } else {
+                cfg.favorites.push(item);
+            }
+        }
+        AssetTab::Action => {
+            let title = s.a_title.trim().to_string();
+            let program = s.a_program.trim().to_string();
+            if title.is_empty() || program.is_empty() {
+                return Err("需要标题和程序".to_string());
+            }
+            let item = ActionDef {
+                title,
+                program,
+                args: s.a_args.trim().to_string(),
+                workdir: String::new(),
+                admin: s.a_admin,
+                silent: false,
+            };
+            if let Some(index) = s.selected {
+                if let Some(slot) = cfg.actions.get_mut(index) {
+                    *slot = item;
+                }
+            } else {
+                cfg.actions.push(item);
+            }
+        }
+        AssetTab::Command => {
+            let trigger = s.c_trigger.trim().to_string();
+            let title = s.c_title.trim().to_string();
+            let program = s.c_program.trim().to_string();
+            if trigger.is_empty() || title.is_empty() || program.is_empty() {
+                return Err("需要触发词、标题和程序".to_string());
+            }
+            if cfg
+                .commands
+                .iter()
+                .enumerate()
+                .any(|(i, c)| c.trigger.eq_ignore_ascii_case(&trigger) && s.selected != Some(i))
+            {
+                return Err("触发词已被占用".to_string());
+            }
+            let item = CommandDef {
+                trigger,
+                title,
+                program,
+                args: s.c_args.trim().to_string(),
+                workdir: String::new(),
+            };
+            if let Some(index) = s.selected {
+                if let Some(slot) = cfg.commands.get_mut(index) {
+                    *slot = item;
+                }
+            } else {
+                cfg.commands.push(item);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_at(tab: AssetTab, cfg: &mut Config, index: usize) {
+    match tab {
+        AssetTab::Favorite => {
+            if index < cfg.favorites.len() {
+                cfg.favorites.remove(index);
+            }
+        }
+        AssetTab::Action => {
+            if index < cfg.actions.len() {
+                cfg.actions.remove(index);
+            }
+        }
+        AssetTab::Command => {
+            if index < cfg.commands.len() {
+                cfg.commands.remove(index);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -421,20 +620,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_state_has_empty_drafts() {
+    fn default_state_starts_on_favorites_without_selection() {
         let state = AssetUiState::default();
-        assert!(state.favorite_path.is_empty());
-        assert!(state.favorite_filter.is_empty());
-        assert!(state.command_trigger.is_empty());
-        assert!(!state.action_admin);
-    }
-
-    #[test]
-    fn config_starts_without_assets() {
-        let cfg = Config::default();
-        assert!(cfg.favorites.is_empty());
-        assert!(cfg.actions.is_empty());
-        assert!(cfg.commands.is_empty());
+        assert_eq!(state.tab, AssetTab::Favorite);
+        assert!(state.selected.is_none());
+        assert!(state.filter.is_empty());
     }
 
     #[test]
@@ -444,5 +634,34 @@ mod tests {
         let short = shorten(long, 20);
         assert!(short.chars().count() <= 20);
         assert!(short.ends_with('…'));
+    }
+
+    #[test]
+    fn save_form_adds_then_edits_a_favorite() {
+        let mut cfg = Config::default();
+        let mut s = AssetUiState::default();
+        s.f_path = "D:\\work".to_string();
+        assert!(save_form(AssetTab::Favorite, &mut cfg, &mut s).is_ok());
+        assert_eq!(cfg.favorites.len(), 1);
+        assert_eq!(cfg.favorites[0].name, "work");
+
+        s.selected = Some(0);
+        s.f_name = "工作".to_string();
+        s.f_path = "D:\\work".to_string();
+        assert!(save_form(AssetTab::Favorite, &mut cfg, &mut s).is_ok());
+        assert_eq!(cfg.favorites.len(), 1);
+        assert_eq!(cfg.favorites[0].name, "工作");
+    }
+
+    #[test]
+    fn duplicate_path_is_rejected_but_editing_self_is_allowed() {
+        let mut cfg = Config::default();
+        let mut s = AssetUiState::default();
+        s.f_path = "D:\\work".to_string();
+        assert!(save_form(AssetTab::Favorite, &mut cfg, &mut s).is_ok());
+        s.selected = None;
+        assert!(save_form(AssetTab::Favorite, &mut cfg, &mut s).is_err());
+        s.selected = Some(0);
+        assert!(save_form(AssetTab::Favorite, &mut cfg, &mut s).is_ok());
     }
 }

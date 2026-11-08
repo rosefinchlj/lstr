@@ -3218,14 +3218,14 @@ impl LstrApp {
         let theme = self.theme;
         Self::settings_heading(painter, &theme, area, "资产", "收藏、自定义动作与命令");
         let inner = Rect::from_min_max(
-            egui::pos2(area.left(), area.top() + 44.0),
+            egui::pos2(area.left(), area.top() + 46.0),
             egui::pos2(area.right(), area.bottom() - 6.0),
         );
         let cfg = &mut self.cfg;
         let state = &mut self.assets_ui;
         let mut changed = false;
-        ui.allocate_ui_at_rect(inner, |ui| {
-            changed = crate::assets_ui::paint(ui, cfg, state);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            changed = crate::assets_ui::paint(ui, painter, &theme, inner, cfg, state);
         });
         if changed {
             let _ = self.cfg.save();
