@@ -2756,6 +2756,10 @@ impl LstrApp {
         checked: &mut bool,
     ) -> bool {
         let response = ui.interact(rect, id, Sense::click());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
         let box_rect = Rect::from_center_size(
             egui::pos2(rect.left() + 11.0, rect.center().y),
             egui::vec2(18.0, 18.0),
@@ -2845,6 +2849,10 @@ impl LstrApp {
             egui::vec2(22.0, 22.0),
         );
         let close = ui.interact(close_rect, Id::new("lstr-settings-close"), Sense::click());
+        if close.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
         painter.text(
             close_rect.center(),
             Align2::CENTER_CENTER,
@@ -2885,6 +2893,10 @@ impl LstrApp {
                 Id::new(("lstr-settings-nav", tab as u8)),
                 Sense::click(),
             );
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
             let active = self.settings_tab == tab;
             if active {
                 painter.rect_filled(item, CornerRadius::same(7), theme.amber_soft);
@@ -2958,6 +2970,10 @@ impl LstrApp {
             );
             let selected = self.cfg.theme.mode == *value;
             let response = ui.interact(button, Id::new(("lstr-theme", index)), Sense::click());
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
             painter.rect_filled(
                 button,
                 CornerRadius::same(6),
@@ -3002,6 +3018,10 @@ impl LstrApp {
             );
             let selected = self.cfg.theme.accent.eq_ignore_ascii_case(hex);
             let response = ui.interact(swatch, Id::new(("lstr-accent", index)), Sense::click());
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
             let rgb = crate::config::parse_hex(hex).unwrap_or([224, 160, 64]);
             painter.circle_filled(
                 swatch.center(),
@@ -3328,6 +3348,10 @@ impl LstrApp {
             egui::vec2(92.0, 24.0),
         );
         let response = ui.interact(reset, Id::new("lstr-rank-reset"), Sense::click());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
         painter.rect_filled(reset, CornerRadius::same(6), theme.hover);
         painter.rect_stroke(
             reset,
@@ -3427,6 +3451,10 @@ impl LstrApp {
             egui::vec2(104.0, 24.0),
         );
         let response = ui.interact(add, Id::new("lstr-noise-add"), Sense::click());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
         painter.rect_filled(add, CornerRadius::same(6), theme.hover);
         painter.rect_stroke(
             add,
@@ -3454,6 +3482,10 @@ impl LstrApp {
             egui::vec2(92.0, 24.0),
         );
         let response = ui.interact(reset, Id::new("lstr-noise-reset"), Sense::click());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
         painter.rect_filled(reset, CornerRadius::same(6), theme.hover);
         painter.rect_stroke(
             reset,
@@ -3500,6 +3532,10 @@ impl LstrApp {
                       accent: bool|
          -> bool {
             let response = ui.interact(rect, Id::new(("lstr-maint", label)), Sense::click());
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
             painter.rect_filled(rect, CornerRadius::same(6), theme.hover);
             painter.rect_stroke(
                 rect,

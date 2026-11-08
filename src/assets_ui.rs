@@ -110,6 +110,10 @@ fn chip(
 ) -> bool {
     // Id 用固定下标，避免标签里的计数变化导致交互状态错位。
     let response = ui.interact(rect, Id::new(("lstr-asset-tab", index)), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
     if active || response.hovered() {
         painter.rect_filled(
             rect,
@@ -143,6 +147,10 @@ fn action_button(
     enabled: bool,
 ) -> bool {
     let response = ui.interact(rect, Id::new(("lstr-asset-btn", label)), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
     let fill = if !enabled {
         theme.hover
     } else if response.hovered() {
@@ -277,6 +285,10 @@ pub fn paint(
                         egui::vec2(list_rect.width() - 6.0, ROW_H),
                         Sense::click(),
                     );
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+
                     let selected = state.selected == Some(index);
                     if selected || response.hovered() {
                         p.rect_filled(
