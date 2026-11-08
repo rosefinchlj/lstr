@@ -219,13 +219,17 @@ pub fn spawn_client_thread(
         .spawn(move || {
             let mut launched = launched_worker;
             let mut first_connect = !launched_worker;
+            let mut launch_declined = false;
             loop {
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                // 先拉起 worker 再连接(UAC 一次/会话);已提权常驻时秒连
-                if !launched && !pipe_exists() {
-                    launch_worker();
+                // 先拉起 worker 再连接(UAC 一次/会话);已提权常驻时秒连。
+                // 用户拒绝过 UAC 就不再弹(防骚扰),保持 Fallback 走 Everything。
+                if !launch_declined && !pipe_exists() {
+                    if !launch_worker() {
+                        launch_declined = true;
+                    }
                 }
                 launched = true;
                 // 首连给足 UAC 时间;重连短超时。握手位点每次现取:
