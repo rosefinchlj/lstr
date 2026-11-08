@@ -260,7 +260,9 @@ fn random_op_stream_matches_model() {
             let needle = needles[rng.below(needles.len())];
             verify_query(&model, &store, needle);
         }
-        if step == 1500 {
+        if step == 1100 || step == 1500 {
+            // 两次往返:1100 步已攒 delta,1500 步刚 compact 后只差 1 条,
+            // 覆盖 base+delta 与纯 base 两种态。
             // 快照 roundtrip 后继续增量
             let dir = std::env::temp_dir().join(format!("lstr-prop-{}", std::process::id()));
             let header = snapshot::SnapshotHeader {

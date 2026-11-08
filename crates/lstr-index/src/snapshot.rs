@@ -16,7 +16,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::store::VolumeStore;
+use crate::store::{VolumeStore, NO_PARENT};
 
 pub const MAGIC: &[u8; 4] = b"LIDX";
 pub const VERSION: u32 = 1;
@@ -191,6 +191,16 @@ pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapsho
         ));
         return None;
     }
+    // 索引列必须落在 name 区/槽位范围内,否则后续 name(slot)/parent 追踪会越界。
+    // (offs 的元素还应是名字起点;由 save 先 compact 保证,这里只做廉价边界校验。)
+    if offs.iter().any(|&o| o as usize >= names.len()) {
+        debug_log(&format!("load {guid:032x}: offs out of range (names={})", names.len()));
+        return None;
+    }
+    if parent.iter().any(|&p| p != NO_PARENT && p as usize >= count) {
+        debug_log(&format!("load {guid:032x}: parent out of range (count={count})"));
+        return None;
+    }
     // name_off 由 names 重建(\0 结尾 → 偏移即条目起点)
     let mut name_off: Vec<u32> = Vec::with_capacity(count);
     let mut off = 0usize;
@@ -309,6 +319,7 @@ fn read_col_u16(cur: &mut &[u8]) -> Option<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::QuerySpec;
     use crate::store::VolumeStore;
 
     #[test]
@@ -347,6 +358,148 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lstr-idx-{tag}-{}", std::process::id()))
+    }
+
+    fn header(guid: u128, complete: bool) -> SnapshotHeader {
+        SnapshotHeader {
+            guid,
+            letter: 'C',
+            complete,
+            journal_id: 7,
+            next_usn: 900,
+            resume_frn: 0,
+            est_records: 0,
+        }
+    }
+
+    /// H1 回归:compact → insert×N(含就地改名)→ save → load,
+    /// 计数/FRN 定位/名字查询/继续插入/再次 compact 全部自洽。
+    ///
+    /// 旧实现 save 按 `name_off.len()` 写 count 却落未 compact 的 offs,
+    /// 增量 insert 后 load 因 `offs.len() != count` 永久拒绝。
+    #[test]
+    fn incremental_state_survives_roundtrip() {
+        let mut s = VolumeStore::new(false);
+        s.insert(5, 0, 0x10, b"root");
+        s.insert(10, 5, 0, b"alpha.txt");
+        s.compact();
+        for i in 0..5u64 {
+            s.insert(100 + i, 5, 0, format!("delta{i}.txt").as_bytes());
+        }
+        s.insert(10, 5, 0, b"alpha-renamed.txt"); // 就地改名:base 名序失效
+        let n = s.len();
+
+        let dir = tmpdir("h1-incr");
+        let _ = std::fs::remove_dir_all(&dir);
+        let h = header(0xabc, true);
+        save(&dir, &h, &mut s).unwrap();
+        let loaded = load(&dir, h.guid, false).unwrap();
+        let mut ls = loaded.store;
+        assert!(loaded.header.complete);
+        assert_eq!(ls.len(), n);
+        // save 接管列一致契约:delta/改名已归并,offs 覆盖全部 slot
+        assert_eq!(ls.offs.len(), ls.len());
+        assert_eq!(
+            ls.find_slot(10).map(|x| ls.name(x).to_vec()),
+            Some(b"alpha-renamed.txt".to_vec())
+        );
+        assert_eq!(
+            ls.find_slot(103).map(|x| ls.name(x).to_vec()),
+            Some(b"delta3.txt".to_vec())
+        );
+
+        // 名字查询:子串与精确都必须命中
+        let spec = QuerySpec { tokens: vec!["delta3".into()], ..Default::default() };
+        let (slots, total, _) = crate::query::query_volume(&ls, &spec, 100);
+        assert_eq!(total, 1);
+        assert_eq!(ls.name(slots[0]), b"delta3.txt");
+        let spec = QuerySpec {
+            tokens: vec!["delta4.txt".into()],
+            exact: Some("delta4.txt".into()),
+            ..Default::default()
+        };
+        let (_, total, _) = crate::query::query_volume(&ls, &spec, 100);
+        assert_eq!(total, 1);
+
+        // 再插入不 panic,FRN 定位可用;compact 后恢复全覆盖 offs
+        assert!(ls.insert(200, 5, 0, b"after-load.txt"));
+        assert!(ls.find_slot(200).is_some());
+        ls.insert(10, 5, 0, b"alpha.txt");
+        ls.compact();
+        assert_eq!(ls.offs.len(), ls.len());
+        let names: Vec<&[u8]> = ls.offs.iter().map(|&x| ls.name_lc(x)).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H1 回归:扫描中断的部分快照必须可落盘/可 load。
+    ///
+    /// ZCode 方案的语义:save 时先归并(compact),partial 快照被归一化成
+    /// ready 列布局;header.complete 仍为 false,重启握手拿不到增量位点,
+    /// worker 走全量重扫,已有 entry 按 FRN 去重。因此不需要还原
+    /// `is_scanning` 本身,但 count/名字/父链必须完整可用,后续 append 不坏。
+    #[test]
+    fn partial_scan_snapshot_roundtrip() {
+        let mut s = VolumeStore::new(false);
+        s.insert(5, 0, 0x10, b"root");
+        s.insert(10, 5, 0x10, b"users");
+        s.insert(11, 10, 0, b"a.txt");
+        assert!(s.is_scanning());
+        let dir = tmpdir("h1-partial");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut h = header(0xdef, false);
+        h.resume_frn = 1234;
+        save(&dir, &h, &mut s).unwrap();
+        let loaded = load(&dir, h.guid, false).unwrap();
+        assert!(!loaded.header.complete);
+        assert_eq!(loaded.header.resume_frn, 1234);
+        let mut ls = loaded.store;
+        // save-time 归一秒变 ready 布局(旧实现这里 offs 为空 → load 拒绝)
+        assert!(!ls.is_scanning());
+        assert_eq!(ls.len(), 3);
+        assert_eq!(ls.offs.len(), ls.len());
+        assert_eq!(ls.name(ls.find_slot(10).unwrap()), b"users");
+        // 继续 append:目录索引仍在,子项父链可解析
+        assert!(ls.insert(12, 10, 0, b"b.txt"));
+        assert_eq!(ls.len(), 4);
+        let b = ls.len() - 1;
+        assert_eq!(ls.parent[b as usize], ls.find_slot(10).unwrap());
+        ls.compact();
+        assert_eq!(ls.len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// save → load → insert → save → load:两轮往返后状态仍一致。
+    #[test]
+    fn snapshot_roundtrip_twice() {
+        let dir = tmpdir("h1-twice");
+        let _ = std::fs::remove_dir_all(&dir);
+        let guid = 0x5150;
+        let mut s = VolumeStore::new(false);
+        s.insert(5, 0, 0x10, b"root");
+        s.insert(10, 5, 0, b"one.txt");
+        s.compact();
+        save(&dir, &header(guid, true), &mut s).unwrap();
+        let mut s = load(&dir, guid, false).unwrap().store;
+        s.insert(11, 5, 0, b"two.txt");
+        save(&dir, &header(guid, true), &mut s).unwrap();
+        let ls = load(&dir, guid, false).unwrap().store;
+        assert_eq!(ls.len(), 3);
+        assert_eq!(
+            ls.find_slot(11).map(|x| ls.name(x).to_vec()),
+            Some(b"two.txt".to_vec())
+        );
+        assert_eq!(
+            ls.find_slot(10).map(|x| ls.name(x).to_vec()),
+            Some(b"one.txt".to_vec())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
