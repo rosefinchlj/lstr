@@ -309,19 +309,17 @@ fn run_worker(
     // 只用文件/文件夹搜索的用户，PowerShell 永远不会被拉起。
     let mut uwp_started = false;
 
-    while let Ok(mut request) = rx.recv() {
-        // 用户可能刚点了提示条启动 Everything；每次查询前尝试重连，
-        // 而不是启动时连不上就永久报错。
-        if everything.is_none() {
-            everything = everything::EverythingProvider::new().ok();
-        }
-        // 应用自研索引的增量(查询间隙批量消费,单轮上限防饿死查询)
+    // 主循环改为超时驱动:空闲时也要消费引擎消息、发布状态,
+    // 否则首装扫描期用户不击键 → 引擎停摆(实测抓出)。
+    let mut last_phase: Option<lstr_index::Phase> = None;
+    loop {
+        // 1. 应用自研索引的增量 + 维护(空闲路径也走)
         if let Some(b) = &mut builtin {
             let mut applied = 0usize;
             while let Ok(msg) = engine_rx.try_recv() {
                 b.engine.handle(msg);
                 applied += 1;
-                if applied >= 20 {
+                if applied >= 400 {
                     break;
                 }
             }
@@ -329,6 +327,27 @@ fn run_worker(
             *handshake_slot.lock().unwrap() = b.engine.handshake_state();
         }
         publish_status(builtin.as_ref(), everything.as_ref(), &status_slot);
+        // 状态变化时唤醒 UI(横幅进度条不击键也要动)
+        {
+            let st = status_slot.lock().unwrap();
+            let phase = st.as_ref().map(|s| s.phase);
+            if phase != last_phase {
+                last_phase = phase;
+                drop(st);
+                ctx.request_repaint();
+            }
+        }
+        // 2. 取请求(150ms 超时 → 回到维护)
+        let mut request = match rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        // 用户可能刚点了提示条启动 Everything；每次查询前尝试重连，
+        // 而不是启动时连不上就永久报错。
+        if everything.is_none() {
+            everything = everything::EverythingProvider::new().ok();
+        }
         while let Ok(uwp_entries) = uwp_rx.try_recv() {
             apps.append_uwp(uwp_entries);
         }

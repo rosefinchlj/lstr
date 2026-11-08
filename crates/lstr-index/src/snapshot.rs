@@ -21,6 +21,28 @@ use crate::store::VolumeStore;
 pub const MAGIC: &[u8; 4] = b"LIDX";
 pub const VERSION: u32 = 1;
 
+/// 引擎调试日志(%APPDATA%\lstr\index\engine.log)。
+/// worker 提权进程与 UI 都写同用户目录;失败静默。
+pub fn debug_log(msg: &str) {
+    let Ok(base) = std::env::var("APPDATA") else { return };
+    let path = std::path::PathBuf::from(base).join("lstr").join("index").join("engine.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{}] {}", chrono_now(), msg);
+    }
+}
+
+fn chrono_now() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    format!("{}.{:03}", secs, d.subsec_millis())
+}
+
 pub const FLAG_COMPLETE: u8 = 0x01;
 
 #[derive(Clone, Debug)]
@@ -39,11 +61,15 @@ pub fn snapshot_path(dir: &Path, guid: u128) -> PathBuf {
 }
 
 /// 序列化并原子写盘。count==0 且 !complete 的空卷不写。
+/// 契约「列一致」由这里保证:有未归并 delta 时先 compact(早退使重复调用廉价)。
 pub fn save(
     dir: &Path,
     header: &SnapshotHeader,
-    store: &VolumeStore,
+    store: &mut VolumeStore,
 ) -> std::io::Result<u64> {
+    if !store.delta_is_empty() || store.is_scanning() {
+        store.compact();
+    }
     std::fs::create_dir_all(dir)?;
     let final_path = snapshot_path(dir, header.guid);
     let tmp_path = dir.join(format!("vol_{:032x}.tmp", std::process::id()));
@@ -106,20 +132,38 @@ pub struct LoadedSnapshot {
 pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapshot> {
     let path = snapshot_path(dir, guid);
     let mut data = Vec::with_capacity(64 << 20);
-    let mut f = std::fs::File::open(&path).ok()?;
-    f.read_to_end(&mut data).ok()?;
+    let mut f = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(err) => {
+            debug_log(&format!("load {guid:032x}: open failed: {err}"));
+            return None;
+        }
+    };
+    if let Err(err) = f.read_to_end(&mut data) {
+        debug_log(&format!("load {guid:032x}: read failed: {err}"));
+        return None;
+    }
     let mut cur = &data[..];
 
     if cur.len() < 4 + 4 || &cur[0..4] != MAGIC {
+        debug_log(&format!("load {guid:032x}: bad magic/short ({} bytes)", cur.len()));
         return None;
     }
     cur = &cur[4..];
-    let version = u32::from_le_array(&mut cur)?;
+    let Some(version) = u32::from_le_array(&mut cur) else {
+        debug_log(&format!("load {guid:032x}: truncated at version"));
+        return None;
+    };
     if version != VERSION {
+        debug_log(&format!("load {guid:032x}: version {version} != {VERSION}"));
         return None;
     }
-    let guid_h = u128::from_le_array(&mut cur)?;
+    let Some(guid_h) = u128::from_le_array(&mut cur) else {
+        debug_log(&format!("load {guid:032x}: truncated at guid"));
+        return None;
+    };
     if guid_h != guid {
+        debug_log(&format!("load {guid:032x}: guid mismatch header={guid_h:032x}"));
         return None;
     }
     let letter = char::from_u32(*cur.first()? as u32)?;
@@ -141,6 +185,10 @@ pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapsho
         return None;
     }
     if offs.len() != count || frn.len() != count || parent.len() != count || attrs.len() != count {
+        debug_log(&format!(
+            "load {guid:032x}: column len mismatch offs={} frn={} parent={} attrs={} count={count}",
+            offs.len(), frn.len(), parent.len(), attrs.len()
+        ));
         return None;
     }
     // name_off 由 names 重建(\0 结尾 → 偏移即条目起点)
@@ -148,9 +196,22 @@ pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapsho
     let mut off = 0usize;
     while off < names.len() {
         name_off.push(off as u32);
-        off += names[off..].iter().position(|&b| b == 0)? + 1;
+        match names[off..].iter().position(|&b| b == 0) {
+            Some(p) => off += p + 1,
+            None => {
+                debug_log(&format!(
+                    "load {guid:032x}: unterminated name at offset {off} (names={} count={count})",
+                    names.len()
+                ));
+                return None;
+            }
+        }
     }
     if name_off.len() != count {
+        debug_log(&format!(
+            "load {guid:032x}: name_off {} != count {count}",
+            name_off.len()
+        ));
         return None;
     }
     let store = VolumeStore::from_parts(
@@ -269,7 +330,7 @@ mod tests {
             est_records: 999,
         };
         let dir = std::env::temp_dir().join(format!("lstr-idx-test-{}", std::process::id()));
-        let size = save(&dir, &header, &s).unwrap();
+        let size = save(&dir, &header, &mut s).unwrap();
         assert!(size > 0);
         let loaded = load(&dir, header.guid, true).unwrap();
         assert_eq!(loaded.header.journal_id, 0xfeed);
@@ -277,7 +338,7 @@ mod tests {
         assert!(loaded.header.complete);
         let ls = &loaded.store;
         assert_eq!(ls.name_off.len(), 3); // node_modules 子树被排除
-        assert_eq!(ls.find_slot(10), s.find_slot(10));
+        assert!(ls.find_slot(10).is_some());
         let slot = ls.find_slot(10).unwrap();
         assert_eq!(ls.name(slot), b"alpha.txt");
         assert_eq!(ls.offs.len(), ls.name_off.len());

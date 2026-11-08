@@ -335,6 +335,11 @@ impl VolumeStore {
         }
     }
 
+    /// 是否有未归并的 delta。
+    pub fn delta_is_empty(&self) -> bool {
+        self.delta.is_empty()
+    }
+
     /// 是否需要 compact。
     pub fn needs_compact(&self) -> bool {
         self.delta.len() >= COMPACT_DELTA
@@ -352,7 +357,16 @@ impl VolumeStore {
 
     /// 全量重建:解析父链、噪声分类、按 FRN 序重建列、归并排序。
     /// scan 模式的首次调用完成「scan → ready」转换。
+    /// 无事可做时早退(delta 空、无死项、非 scan),重复调用 O(1)。
     pub fn compact(&mut self) {
+        if !self.is_scanning()
+            && self.delta.is_empty()
+            && self.unresolved.is_empty()
+            && self.dead_count == 0
+            && self.renames == 0
+        {
+            return;
+        }
         // 0. 重试解析 journal 期未解析的父链,再补一次分类
         if !self.unresolved.is_empty() {
             let pairs: Vec<(u32, u64)> = self.unresolved.iter().map(|(&s, &f)| (s, f)).collect();

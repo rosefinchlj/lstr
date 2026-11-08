@@ -4,7 +4,7 @@
 //! 塞进 channel,worker 在查询间隙 try_recv 应用(渐进构建期可搜)。
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::pinyin::PinyinCache;
 use crate::query::{QueryOutcome, QuerySpec, Hit};
@@ -53,6 +53,8 @@ pub struct VolumeState {
     pub store: Option<VolumeStore>,
     /// 快照有未落盘变更。
     dirty: bool,
+    /// 上次落盘时间(节流:扫描期频繁保存会拖慢构建)。
+    last_save: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -113,6 +115,10 @@ impl Engine {
             let Ok(guid) = u128::from_str_radix(hex, 16) else { continue };
             if let Some(snap) = snapshot::load(&dir, guid, self.cfg.exclude_noise) {
                 let h = &snap.header;
+                snapshot::debug_log(&format!(
+                    "loaded {guid:032x} letter={} count={} complete={}",
+                    h.letter, snap.store.len(), h.complete
+                ));
                 self.volumes.push(VolumeState {
                     guid,
                     letter: h.letter,
@@ -123,6 +129,7 @@ impl Engine {
                     complete: h.complete,
                     store: Some(snap.store),
                     dirty: false,
+                    last_save: Some(Instant::now()),
                 });
             }
         }
@@ -148,6 +155,7 @@ impl Engine {
                 complete: false,
                 store: None,
                 dirty: false,
+                last_save: None,
             });
             self.pinyin.push(PinyinCache::empty());
             return Some(self.volumes.len() - 1);
@@ -218,6 +226,7 @@ impl Engine {
                 v.complete = true;
                 v.resume_frn = 0;
                 v.dirty = true;
+                v.last_save = None;
                 if let Some(store) = &mut v.store {
                     if store.is_scanning() || store.needs_compact() {
                         store.compact();
@@ -412,47 +421,70 @@ impl Engine {
             .get(slot)
     }
 
-    /// 空闲维护:需要的卷 compact + 落盘脏快照。返回是否做了事(调用方可据此让路)。
+    /// 空闲维护:需要的卷 compact + 落盘脏快照(节流)。
+    /// 保存前必须归并:快照格式假设列一致(offs 覆盖全部 slot),
+    /// 否则载入被拒 → 无谓重扫(实测抓出:扫描期保存 offs 短 200/2907)。
     pub fn maintain(&mut self) -> bool {
         let mut did = false;
-        for (i, v) in self.volumes.iter_mut().enumerate() {
-            let Some(store) = &mut v.store else { continue };
-            if store.is_scanning() {
-                continue; // scan 模式的 compact 由 VolumeReady 触发
-            }
-            if store.needs_compact() {
-                store.compact();
-                self.pinyin[i] = PinyinCache::rebuild(store);
-                v.dirty = true;
-                did = true;
+        let now = Instant::now();
+        // 先挑出待保存的卷(借用两段式:挑 → 处理)
+        let mut pending: Vec<usize> = Vec::new();
+        for (i, v) in self.volumes.iter().enumerate() {
+            let due = match v.last_save {
+                None => true,
+                Some(t) => now.duration_since(t) >= Duration::from_secs(10),
+            };
+            if v.dirty && due {
+                pending.push(i);
             }
         }
-        for (i, v) in self.volumes.iter().enumerate() {
-            if v.dirty {
-                self.save_volume(i);
-                did = true;
+        for i in pending {
+            let Some(store) = &mut self.volumes[i].store else { continue };
+            // 有未归并的 delta(无论模式)先 compact,保证列一致
+            if !store.delta_is_empty() {
+                store.compact();
+                self.pinyin[i] = PinyinCache::rebuild(store);
             }
+            self.save_volume(i);
+            did = true;
         }
         did
     }
 
-    fn save_volume(&self, i: usize) {
-        let v = &self.volumes[i];
-        let Some(store) = &v.store else { return };
-        if store.is_scanning() && v.resume_frn == 0 {
-            return; // 没有断点意义的空扫描不落盘
-        }
-        let header = SnapshotHeader {
-            guid: v.guid,
-            letter: v.letter,
-            complete: v.complete,
-            journal_id: v.journal_id,
-            next_usn: v.next_usn,
-            resume_frn: v.resume_frn,
-            est_records: v.est_records,
+    fn save_volume(&mut self, i: usize) {
+        let (header, has_store) = {
+            let v = &self.volumes[i];
+            let Some(store) = &v.store else { return };
+            if store.is_scanning() && v.resume_frn == 0 {
+                return; // 没有断点意义的空扫描不落盘
+            }
+            (
+                SnapshotHeader {
+                    guid: v.guid,
+                    letter: v.letter,
+                    complete: v.complete,
+                    journal_id: v.journal_id,
+                    next_usn: v.next_usn,
+                    resume_frn: v.resume_frn,
+                    est_records: v.est_records,
+                },
+                true,
+            )
         };
-        if let Err(err) = snapshot::save(&self.cfg.index_dir, &header, store) {
-            eprintln!("lstr-index: save snapshot failed: {err}");
+        if !has_store {
+            return;
+        }
+        let v = &mut self.volumes[i];
+        let store = v.store.as_mut().unwrap();
+        match snapshot::save(&self.cfg.index_dir, &header, store) {
+            Ok(_) => {
+                self.volumes[i].dirty = false;
+                self.volumes[i].last_save = Some(Instant::now());
+            }
+            Err(err) => {
+                eprintln!("lstr-index: save snapshot failed: {err}");
+                crate::snapshot::debug_log(&format!("save {} failed: {err}", header.guid));
+            }
         }
     }
 

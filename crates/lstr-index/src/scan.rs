@@ -178,6 +178,16 @@ pub fn read_journal(
     start_usn: i64,
 ) -> Result<Option<(Vec<Rec>, i64)>, JournalError> {
     let vol = VolumeHandle::open(letter).map_err(|_| JournalError::VolumeGone)?;
+    read_journal_handle(&vol, journal_id, start_usn)
+}
+
+/// journal 增量读取(复用已开句柄;长轮询场景省开/关句柄开销)。
+/// Ok(None) = 暂无数据;返回空记录 = 位点已到最新,调用方需休眠。
+pub fn read_journal_handle(
+    vol: &VolumeHandle,
+    journal_id: u64,
+    start_usn: i64,
+) -> Result<Option<(Vec<Rec>, i64)>, JournalError> {
     let Some((jid, first_usn, _next_usn)) = vol.journal_state() else {
         return Err(JournalError::Reset);
     };

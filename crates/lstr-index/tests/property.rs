@@ -272,7 +272,7 @@ fn random_op_stream_matches_model() {
                 resume_frn: 0,
                 est_records: 0,
             };
-            snapshot::save(&dir, &header, &store).unwrap();
+            snapshot::save(&dir, &header, &mut store).unwrap();
             let loaded = snapshot::load(&dir, 0xABC, false).unwrap();
             store = loaded.store;
             let _ = std::fs::remove_dir_all(&dir);
@@ -369,4 +369,46 @@ fn noise_subtree_never_visible() {
     }
     assert!(store.find_slot(100).is_some());
     assert_eq!(store.len(), 2); // volroot + project
+}
+
+#[test]
+fn mid_scan_compact_then_more_inserts_stay_consistent() {
+    // 复现真实时序:scan 流中途 delta≥32768 触发 maintain() 的 compact
+    // (base_len 归位 → store 切换到 journal 模式),后续继续插入。
+    let mut rng = Rng::new(0xCAFE_F00D_1234_5678);
+    let mut model = Model::new();
+    let mut store = VolumeStore::new(false);
+    store.insert(5, 0, 0x10, b"volroot");
+    model.entries.insert(5, ModelEntry { parent_frn: 0, name: "volroot".into(), is_dir: true });
+
+    let mut dirs: Vec<u64> = vec![5];
+    let mut next_frn = 100u64;
+    let mut step = 0usize;
+    // 第一段:目录流,期间主动 compact(模拟 maintain)
+    for _ in 0..40_000 {
+        let frn = next_frn;
+        next_frn += 1;
+        let parent = dirs[rng.below(dirs.len())];
+        let name = model.rand_name(&mut rng);
+        store.insert(frn, parent, 0x10, name.as_bytes());
+        model.entries.insert(frn, ModelEntry { parent_frn: parent, name, is_dir: true });
+        dirs.push(frn);
+        step += 1;
+        if step == 20_000 {
+            store.compact(); // mid-scan compact
+        }
+    }
+    // 第二段:文件流(journal 模式)
+    for _ in 0..60_000 {
+        let frn = next_frn;
+        next_frn += 1;
+        let parent = dirs[rng.below(dirs.len())];
+        let name = model.rand_name(&mut rng);
+        store.insert(frn, parent, 0, name.as_bytes());
+        model.entries.insert(frn, ModelEntry { parent_frn: parent, name, is_dir: false });
+    }
+    store.compact();
+    // offs 必须覆盖全部活 slot(列数一致即覆盖,verify 再对拍内容)
+    assert_eq!(store.offs.len(), store.name_off.len(), "offs vs columns");
+    verify(&model, &store);
 }

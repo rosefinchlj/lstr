@@ -201,13 +201,6 @@ fn volume_loop(
     stop: std::sync::Arc<AtomicBool>,
     tx: mpsc::Sender<Frame>,
 ) {
-    let _ = tx.send(Frame::VolumeMeta {
-        guid,
-        letter,
-        journal_id: 0,
-        next_usn: 0,
-        est_records: 0,
-    });
     // 握手位点判定:主进程快照的 next_usn 仍在 journal 范围内 → 增量
     let mut incremental_from: Option<(u64, i64)> = None;
     if let Some((jid, usn)) = req {
@@ -228,7 +221,15 @@ fn volume_loop(
             }
         }
     }
-    let (journal_id, mut next_usn) = match incremental_from {
+    // 卷句柄全程持有(避免每 50ms 开/关句柄 + 查询的三连内核调用)
+    let vol = match scan::VolumeHandle::open(letter) {
+        Ok(v) => v,
+        Err(err) => {
+            crate::snapshot::debug_log(&format!("volume open failed {letter}: {err}"));
+            return;
+        }
+    };
+    let (mut journal_id, mut next_usn) = match incremental_from {
         Some((jid, usn)) => (jid, usn),
         None => {
             // 全量扫描
@@ -251,55 +252,57 @@ fn volume_loop(
             );
             match result {
                 Ok((count, usn)) => {
-                    let _ = tx.send(Frame::VolumeReady { guid, journal_id: 0, next_usn: usn, count });
-                    (0u64, usn)
+                    crate::snapshot::debug_log(&format!("scan done {letter}: count={count} usn={usn:#x}"));
+                    // 真实 journal_id:否则引擎位点归零,下次重连全量重扫
+                    let jid = vol.journal_state().map(|(j, _, _)| j).unwrap_or(0);
+                    let _ = tx.send(Frame::VolumeMeta {
+                        guid,
+                        letter,
+                        journal_id: jid,
+                        next_usn: usn,
+                        est_records: 0,
+                    });
+                    let _ = tx.send(Frame::VolumeReady { guid, journal_id: jid, next_usn: usn, count });
+                    (jid, usn)
                 }
-                Err(_) => return, // 卷打不开(权限/被拔):主进程端状态停在 Scanning
+                Err(err) => {
+                    crate::snapshot::debug_log(&format!("scan failed {letter}: {err}"));
+                    return; // 卷打不开(权限/被拔):主进程端状态停在 Scanning
+                }
             }
         }
     };
 
-    // journal 轮询(非阻塞读 + 50ms 间隔;事件延迟 ≤100ms)
-    let mut journal_id = journal_id;
-    if journal_id == 0 {
-        if let Ok(vol) = scan::VolumeHandle::open(letter) {
-            if let Some((jid, _, _)) = vol.journal_state() {
-                journal_id = jid;
-            }
-        }
-    }
-    let mut idle = 0u32;
+    // journal 轮询(非阻塞读 + 50ms 间隔;事件延迟 ≤100ms)。
+    // 空读(含 0 记录返回)必须休眠,否则卷线程忙等烧 CPU(实测抓出)。
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
         }
         if journal_id == 0 {
             std::thread::sleep(Duration::from_millis(500));
-            if let Ok(vol) = scan::VolumeHandle::open(letter) {
-                if let Some((jid, _, _)) = vol.journal_state() {
-                    journal_id = jid;
-                }
+            if let Some((jid, _, _)) = vol.journal_state() {
+                journal_id = jid;
             }
             continue;
         }
-        match scan::read_journal(letter, journal_id, next_usn) {
+        match scan::read_journal_handle(&vol, journal_id, next_usn) {
             Ok(Some((recs, next))) => {
                 next_usn = next;
-                if !recs.is_empty() {
+                if recs.is_empty() {
+                    std::thread::sleep(Duration::from_millis(50));
+                } else {
                     for chunk in recs.chunks(4000) {
                         let _ = tx.send(Frame::Batch { guid, next_usn, recs: chunk.to_vec() });
                     }
                 }
-                idle = 0;
             }
             Ok(None) => {
-                idle += 1;
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(JournalError::Reset) => {
                 let _ = tx.send(Frame::JournalReset { guid });
-                return; // 主进程清掉该卷后,WorkerLost/重连会触发重扫;
-                        // 简化:直接重新全量扫描(同一会话内自愈)
+                return; // 主进程清掉该卷;重连握手(位点 0)会触发重扫自愈
             }
             Err(JournalError::VolumeGone) => {
                 let _ = tx.send(Frame::VolumeGone { guid });
@@ -309,7 +312,6 @@ fn volume_loop(
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
-        let _ = idle;
     }
 }
 

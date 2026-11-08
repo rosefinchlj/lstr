@@ -16,6 +16,7 @@ pub fn connect_and_handshake(
 ) -> Result<HANDLE, String> {
     let deadline = Instant::now() + timeout;
     let handshake = &handshake;
+    #[allow(unused_assignments)]
     let mut last_err = String::new();
     loop {
         match win::open_pipe_client(crate::PIPE_NAME) {
