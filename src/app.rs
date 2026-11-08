@@ -2139,17 +2139,47 @@ impl LstrApp {
             let is_path_row = matches!(entry.kind, Kind::File | Kind::Folder | Kind::Program);
             let full_path = entry.full_path();
             let lead = if entry.id.starts_with("qs:") { "已打开 · " } else { "" };
-            let two_line_path = is_path_row && full_path.chars().count() > sub_budget;
+            // meta（文件夹/大小）只在选中且开启时绘制；未选中行不预留 76px，
+            // 否则本可一行的长路径会被无谓地挤成两行。
+            let meta = if selected && self.cfg.show_meta {
+                match entry.kind {
+                    Kind::Folder => "文件夹".to_string(),
+                    Kind::Command => String::new(),
+                    _ => entry.size.map(ui::format_size).unwrap_or_default(),
+                }
+            } else {
+                String::new()
+            };
+            let meta_w = if meta.is_empty() { 0.0 } else { 76.0 };
+            // 是否折两行按「实际渲染宽度」判断而不是字符数：中文字符宽约为
+            // ASCII 的两倍，按字符数判断会让视觉上已超宽的路径仍被单行省略。
+            let mono = ui::mono_font(11.5);
+            let gap = 10.0;
+            let head_max = (row_rect.width() - 54.0 - meta_w - title_width - gap).max(24.0);
+            let mut path_text = String::new();
+            let mut two_line_path = false;
+            if is_path_row {
+                path_text = format!("{lead}{full_path}");
+                let path_w = painter
+                    .layout_no_wrap(path_text.clone(), mono.clone(), theme.sub)
+                    .size()
+                    .x;
+                two_line_path = path_w > head_max;
+            }
 
             if two_line_path {
-                let mono = ui::mono_font(11.5);
-                let text = format!("{lead}{full_path}");
                 let needle = if path_mode { "" } else { &query.text };
-                let gap = 10.0;
-                // 第一行右侧还要给选中行的 meta（文件夹/大小）留位置。
-                let head_max = (row_rect.width() - 54.0 - 76.0 - title_width - gap).max(24.0);
-                let cut = split_path_head(painter, &text, head_max, mono.clone());
-                let (head, tail) = split_at_chars(&text, cut);
+                let cut = split_path_head(
+                    |candidate| {
+                        painter
+                            .layout_no_wrap(candidate.to_string(), mono.clone(), theme.sub)
+                            .size()
+                            .x
+                    },
+                    &path_text,
+                    head_max,
+                );
+                let (head, tail) = split_at_chars(&path_text, cut);
 
                 if !head.is_empty() {
                     let mut head_job = ui::text_job(&head, needle, &mono, theme.sub, theme.amber);
@@ -2232,21 +2262,14 @@ impl LstrApp {
                 );
             }
 
-            if selected && self.cfg.show_meta {
-                let meta = match entry.kind {
-                    Kind::Folder => "文件夹".to_string(),
-                    Kind::Command => String::new(),
-                    _ => entry.size.map(ui::format_size).unwrap_or_default(),
-                };
-                if !meta.is_empty() {
-                    painter.text(
-                        egui::pos2(row_rect.right() - 10.0, row_rect.center().y),
-                        Align2::RIGHT_CENTER,
-                        meta,
-                        ui::mono_font(11.0),
-                        theme.dim,
-                    );
-                }
+            if !meta.is_empty() {
+                painter.text(
+                    egui::pos2(row_rect.right() - 10.0, row_rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    meta.as_str(),
+                    ui::mono_font(11.0),
+                    theme.dim,
+                );
             }
 
             if selected {
@@ -4139,24 +4162,24 @@ impl eframe::App for LstrApp {
 }
 
 /// 按像素宽度二分出「第一行能放下的字符数」：中文/西文混排也准，
-/// 不用假设等宽字体的字符宽度。
+/// 不用假设等宽字体的字符宽度。`measure` 注入测量函数（像素宽度），
+/// 便于在无 `Painter` 的单测里验证切分逻辑。
 fn split_path_head(
-    painter: &egui::Painter,
+    measure: impl Fn(&str) -> f32,
     text: &str,
     max_width: f32,
-    font: egui::FontId,
 ) -> usize {
     let chars: Vec<char> = text.chars().collect();
+    // 整串放得下就不必二分（常见短路径一帧只做这一次测量）。
+    if measure(text) <= max_width {
+        return chars.len();
+    }
     let mut lo = 0usize;
     let mut hi = chars.len();
     while lo < hi {
         let mid = (lo + hi + 1) / 2;
         let candidate: String = chars[..mid].iter().collect();
-        let width = painter
-            .layout_no_wrap(candidate, font.clone(), Color32::WHITE)
-            .size()
-            .x;
-        if width <= max_width {
+        if measure(&candidate) <= max_width {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -4229,5 +4252,34 @@ mod path_layout_tests {
     fn split_at_chars_handles_out_of_range_counts() {
         assert_eq!(split_at_chars("abc", 0), (String::new(), "abc".to_string()));
         assert_eq!(split_at_chars("abc", 99), ("abc".to_string(), String::new()));
+    }
+
+    /// 等宽字体的近似宽度：ASCII 10px，中文/全角 20px。
+    fn fake_measure(text: &str) -> f32 {
+        text.chars()
+            .map(|c| if c.is_ascii() { 10.0 } else { 20.0 })
+            .sum()
+    }
+
+    #[test]
+    fn split_path_head_returns_all_chars_when_text_fits() {
+        assert_eq!(split_path_head(fake_measure, "abcdef", 60.0), 6);
+        assert_eq!(split_path_head(fake_measure, "中文路径", 80.0), 4);
+    }
+
+    #[test]
+    fn split_path_head_respects_pixels_not_chars() {
+        // 同样的字符数，中文占两倍宽度：40px 只放得下 2 个汉字，或 4 个 ASCII。
+        assert_eq!(split_path_head(fake_measure, "中文路径abcd", 40.0), 2);
+        assert_eq!(split_path_head(fake_measure, "abcd中文路径", 40.0), 4);
+        // 35px：2 个 ASCII(20) 放得下，3 个 ASCII(30) 放不下但 1 汉字(20)+1 ASCII(10) 放得下。
+        assert_eq!(split_path_head(fake_measure, "中a中a", 35.0), 2);
+    }
+
+    #[test]
+    fn split_path_head_handles_zero_width() {
+        assert_eq!(split_path_head(fake_measure, "abc", 0.0), 0);
+        // 测出来恒为 0 时视为全部放得下，避免除零/死循环。
+        assert_eq!(split_path_head(|_| 0.0, "abc", 5.0), 3);
     }
 }
