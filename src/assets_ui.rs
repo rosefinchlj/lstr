@@ -557,13 +557,20 @@ fn save_form(tab: AssetTab, cfg: &mut Config, s: &mut AssetUiState) -> Result<()
             if title.is_empty() || program.is_empty() {
                 return Err("需要标题和程序".to_string());
             }
+            // 表单里没有 workdir/silent 字段：编辑既有条目时必须沿用原值，
+            // 否则只改标题也会把 config.toml 里手工配的 workdir/silent 抹掉。
+            let (workdir, silent) = s
+                .selected
+                .and_then(|index| cfg.actions.get(index))
+                .map(|prev| (prev.workdir.clone(), prev.silent))
+                .unwrap_or_default();
             let item = ActionDef {
                 title,
                 program,
                 args: s.a_args.trim().to_string(),
-                workdir: String::new(),
+                workdir,
                 admin: s.a_admin,
-                silent: false,
+                silent,
             };
             if let Some(index) = s.selected {
                 if let Some(slot) = cfg.actions.get_mut(index) {
@@ -588,12 +595,18 @@ fn save_form(tab: AssetTab, cfg: &mut Config, s: &mut AssetUiState) -> Result<()
             {
                 return Err("触发词已被占用".to_string());
             }
+            // 同 Action：表单不暴露 workdir，编辑时必须保留原值。
+            let workdir = s
+                .selected
+                .and_then(|index| cfg.commands.get(index))
+                .map(|prev| prev.workdir.clone())
+                .unwrap_or_default();
             let item = CommandDef {
                 trigger,
                 title,
                 program,
                 args: s.c_args.trim().to_string(),
-                workdir: String::new(),
+                workdir,
             };
             if let Some(index) = s.selected {
                 if let Some(slot) = cfg.commands.get_mut(index) {

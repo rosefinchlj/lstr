@@ -39,9 +39,9 @@ pub struct Config {
     #[serde(default)]
     pub commands: Vec<CommandDef>,
     // —— P0-2 / P0-3 开关 ——
-    /// Explorer 内「直接键入搜索」：全局低级键盘钩子，默认开启（对标 Listary）。
+    /// Explorer 内「直接键入搜索」：全局低级键盘钩子，默认关闭（需设置页显式开启）。
     /// 判定严格：仅 Explorer 前台 + 非编辑框 + 无修饰键/IME；设置页可随时关闭。
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub explorer_typing: bool,
     /// 文件对话框出现时自动跟随 Explorer 当前目录，默认关闭（会改动对话框路径）。
     #[serde(default)]
@@ -332,7 +332,13 @@ impl Config {
         let dir = attach_dir();
         fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
         let text = toml::to_string_pretty(self).map_err(|e| format!("序列化配置失败: {e}"))?;
-        fs::write(Self::path(), text).map_err(|e| format!("写入配置失败: {e}"))
+        // 原子写：先写同目录临时文件再 rename。直接 fs::write 会先截断目标文件，
+        // 写到一半崩溃/磁盘满会留下半截 TOML，下次 load 解析失败回落默认值，
+        // 用户的收藏/动作/命令会整体「消失」。
+        let path = Self::path();
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, text).map_err(|e| format!("写入配置失败: {e}"))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("替换配置失败: {e}"))
     }
 }
 

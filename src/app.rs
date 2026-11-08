@@ -247,7 +247,7 @@ impl LstrApp {
         let tray = crate::win::tray::create().ok();
         // P0-2：只有显式开启才安装全局低级键盘钩子。
         let typing = if cfg.explorer_typing {
-            match crate::win::typing::TypingWatch::start() {
+            match crate::win::typing::TypingWatch::start(cc.egui_ctx.clone()) {
                 Ok(service) => Some(service),
                 Err(err) => {
                     eprintln!("lstr: typing 启动失败: {err}");
@@ -328,7 +328,7 @@ impl LstrApp {
         // 先卸载旧实例（Drop 会反挂钩子并结束线程），再按需安装新的。
         self.typing = None;
         if enabled {
-            match crate::win::typing::TypingWatch::start() {
+            match crate::win::typing::TypingWatch::start(ctx.clone()) {
                 Ok(service) => self.typing = Some(service),
                 Err(err) => self.toast(ctx, format!("启动键入搜索失败: {err}")),
             }
@@ -339,10 +339,15 @@ impl LstrApp {
     /// P0-2：Explorer 里敲下的第一个字符唤出启动器并写入输入框。
     /// 之后前台不再是 Explorer，钩子自动停止接管，后续输入交回 egui。
     fn poll_typing(&mut self, ctx: &egui::Context) {
-        let ch = self.typing.as_ref().and_then(|service| service.poll());
-        let Some(ch) = ch else {
+        // 一次取走全部字符：快速连打时轮询周期可能跨过多个按键，只保留最后一个会丢字。
+        let chars = self
+            .typing
+            .as_ref()
+            .map(|service| service.poll())
+            .unwrap_or_default();
+        if chars.is_empty() {
             return;
-        };
+        }
         if self.hidden {
             // 必须在 show() 之前取：钩子吞键时前台还是 Explorer，
             // show() 一旦把窗口显示/激活，GetForegroundWindow 就变成 lstr 自己了。
@@ -352,7 +357,7 @@ impl LstrApp {
             self.typing_global = false;
             self.scope = Scope::All;
         }
-        self.input.push(ch);
+        self.input.extend(chars);
         Self::reset_input_cursor(ctx);
         self.selected = 0;
         self.trigger(ctx);
@@ -4114,7 +4119,10 @@ impl eframe::App for LstrApp {
         }
 
         if self.hidden {
-            ctx.request_repaint_after(Duration::from_millis(250));
+            // 键入即搜安装后降到 60ms 兜底节拍（钩子本身已 request_repaint，
+            // 这里只是防止某些窗口过程丢通知），否则维持 250ms 省电节拍。
+            let idle_ms = if self.typing.is_some() { 60 } else { 250 };
+            ctx.request_repaint_after(Duration::from_millis(idle_ms));
             return;
         }
 

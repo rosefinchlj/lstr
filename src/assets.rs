@@ -97,6 +97,9 @@ fn spawn_program(
     ctx: &ExpandContext<'_>,
 ) -> Result<(), String> {
     let parts = split_args(&expand(args, ctx));
+    // program 与 args/workdir 一样支持变量；之前只展开后两者，写 {current_folder}
+    // 之类的程序名会静默启动失败。
+    let program = expand(program, ctx);
     let mut command = std::process::Command::new(program);
     command.args(&parts);
     let cwd = expand(workdir, ctx);
@@ -136,7 +139,8 @@ pub fn run_action(
             return Err("提权执行不支持工作目录；请清空 workdir 或关闭 admin".to_string());
         }
         let args = expand(&def.args, &ctx);
-        return crate::win::shell::run_as_admin_with_args(&def.program, &args);
+        let program = expand(&def.program, &ctx);
+        return crate::win::shell::run_as_admin_with_args(&program, &args);
     }
     spawn_program(&def.program, &def.args, &def.workdir, def.silent, &ctx)
 }
