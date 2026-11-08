@@ -47,6 +47,8 @@ impl QuerySpec {
 pub struct Hit {
     pub vol: u32,
     pub slot: u32,
+    /// 卷索引代次:compact/重扫/重置/卷移除后校验,拒绝过期命中(H8)。
+    pub generation: u32,
 }
 
 #[derive(Clone, Debug, Default)]

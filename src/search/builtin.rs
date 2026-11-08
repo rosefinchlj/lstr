@@ -95,9 +95,9 @@ impl BuiltinProvider {
         let want_pinyin = query.text.is_ascii();
         let mut entries = Vec::with_capacity(outcome.hits.len());
         for hit in &outcome.hits {
-            let Some(path) = self.engine.path_of(hit.vol, hit.slot) else { continue };
-            let name = self.engine.entry_name(hit.vol, hit.slot);
-            let is_dir = self.engine.is_dir(hit.vol, hit.slot);
+            let Some(path) = self.engine.path_of(hit) else { continue };
+            let name = self.engine.entry_name(hit);
+            let is_dir = self.engine.is_dir(hit);
             let kind = kind_of(&name, is_dir);
             let Some((size, modified, fs_dir)) = idx_win::find_meta(&path) else { continue };
             let pinyin = (want_pinyin && pinyin::has_cjk(&name)).then(|| pinyin::keys(&name));
@@ -132,14 +132,14 @@ impl BuiltinProvider {
 
         let mut entries = Vec::with_capacity(outcome.hits.len());
         for hit in &outcome.hits {
-            let Some(path) = self.engine.path_of(hit.vol, hit.slot) else {
+            let Some(path) = self.engine.path_of(hit) else {
                 continue;
             };
-            let name = self.engine.entry_name(hit.vol, hit.slot);
+            let name = self.engine.entry_name(hit);
             if name.is_empty() {
                 continue;
             }
-            let is_dir = self.engine.is_dir(hit.vol, hit.slot);
+            let is_dir = self.engine.is_dir(hit);
             let kind = kind_of(&name, is_dir);
             if !keep(kind) {
                 continue;
