@@ -195,10 +195,26 @@ pub fn read_journal(
 
 /// journal 增量读取(复用已开句柄;长轮询场景省开/关句柄开销)。
 /// Ok(None) = 暂无数据;返回空记录 = 位点已到最新,调用方需休眠。
+/// ReasonMask 取全量(`u32::MAX`,旧 usn 首扫模式的既有行为)。
 pub fn read_journal_handle(
     vol: &VolumeHandle,
     journal_id: u64,
     start_usn: i64,
+) -> Result<Option<(Vec<Rec>, i64)>, JournalError> {
+    read_journal_masked(vol, journal_id, start_usn, u32::MAX)
+}
+
+/// journal 增量读取,ReasonMask 由调用方指定(USN 实时增量层用
+/// [`crate::usnwatch::REASON_MASK_WATCH`] 收敛内核回放量)。
+///
+/// FSCTL 参数固定:READ_USN_JOURNAL_DATA_V1 { MinMajorVersion:2,
+/// MaxMajorVersion:2, Timeout:0, BytesToWaitFor:0 },输出 64KB
+/// ([`JOURNAL_BUF`];历史教训:1MB buffer 会内核挂死)。
+pub fn read_journal_masked(
+    vol: &VolumeHandle,
+    journal_id: u64,
+    start_usn: i64,
+    reason_mask: u32,
 ) -> Result<Option<(Vec<Rec>, i64)>, JournalError> {
     let Some((jid, first_usn, _next_usn)) = vol.journal_state() else {
         return Err(JournalError::Reset);
@@ -211,7 +227,7 @@ pub fn read_journal_handle(
     }
     let rujd = READ_USN_JOURNAL_DATA_V1 {
         StartUsn: start_usn,
-        ReasonMask: u32::MAX,
+        ReasonMask: reason_mask,
         ReturnOnlyOnClose: 0,
         Timeout: 0,
         BytesToWaitFor: 0,

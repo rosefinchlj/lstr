@@ -16,6 +16,7 @@ pub mod scan;
 pub mod snapshot;
 pub mod store;
 pub mod usn;
+pub mod usnwatch;
 pub mod volmask;
 pub mod watch;
 pub mod win;
