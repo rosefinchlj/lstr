@@ -108,6 +108,12 @@ pub struct SearchService {
     volume_mask: Arc<AtomicU32>,
     /// 发给索引 worker 的控制指令(运行期切卷/重建),由 client 线程非阻塞写帧。
     index_cmd: mpsc::Sender<ClientCommand>,
+    /// 优雅退出标志:on_exit 置位后 client 线程给 worker 发 Shutdown 并等其
+    /// 退出;run_worker 的请求循环也据此提前收尾(flush_all 不再依赖通道断开)。
+    shutdown_client: Arc<AtomicBool>,
+    /// 优雅退出收尾完成标志:run_worker 在 flush_all + 等 client 线程收尾后
+    /// 置位;`graceful_shutdown` 轮询它给 eframe::App::on_exit 一个有界等待。
+    worker_collected: Arc<AtomicBool>,
 }
 
 impl SearchService {
@@ -125,6 +131,18 @@ impl SearchService {
         let volume_mask = Arc::new(AtomicU32::new(config.index.volume_mask()));
         let worker_volume_mask = Arc::clone(&volume_mask);
         let (index_cmd_tx, index_cmd_rx) = mpsc::channel::<ClientCommand>();
+        // 优雅退出三件套(缺陷修复:GUI 退出必须收提权 worker):
+        // shutdown_client → client 线程/请求循环的收尾信号;
+        // client_done    → client 线程确认 Shutdown 已发、worker 已退出;
+        // worker_collected → run_worker flush+收尾完成,on_exit 可返回。
+        let shutdown_client = Arc::new(AtomicBool::new(false));
+        let worker_collected = Arc::new(AtomicBool::new(false));
+        let client_done = Arc::new(AtomicBool::new(false));
+        let (done_s, done_w, done_c) = (
+            Arc::clone(&shutdown_client),
+            Arc::clone(&worker_collected),
+            Arc::clone(&client_done),
+        );
         std::thread::Builder::new()
             .name("lstr-search".to_string())
             .spawn(move || {
@@ -138,6 +156,9 @@ impl SearchService {
                     worker_status,
                     index_cmd_rx,
                     worker_volume_mask,
+                    done_s,
+                    done_w,
+                    done_c,
                 )
             })
             .expect("spawn search worker");
@@ -153,6 +174,23 @@ impl SearchService {
             index_status: status_slot,
             volume_mask,
             index_cmd: index_cmd_tx,
+            shutdown_client,
+            worker_collected,
+        }
+    }
+
+    /// 优雅退出(eframe::App::on_exit 调用):通知 client 线程给 worker 发
+    /// Shutdown 并等待其退出 + 引擎 flush 收尾。有界超时 —— worker 被强杀/
+    /// 卡死时放弃等待,协议容忍半开(残留 worker 由自身 idle 超时与
+    /// clean-exit 降级机制自愈),GUI 不因退出卡死。
+    pub fn graceful_shutdown(&self, timeout: Duration) {
+        self.shutdown_client.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + timeout;
+        while !self.worker_collected.load(Ordering::Relaxed) {
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -602,6 +640,7 @@ fn finalize_entries(
     entries
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     rx: Receiver<Request>,
     tx: Sender<Response>,
@@ -612,6 +651,9 @@ fn run_worker(
     status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
     index_cmd_rx: Receiver<ClientCommand>,
     volume_mask: Arc<AtomicU32>,
+    shutdown_client: Arc<AtomicBool>,
+    worker_collected: Arc<AtomicBool>,
+    client_done: Arc<AtomicBool>,
 ) {
     // 显式选择「仅内置索引」:此时无论引擎是否就绪,都不再回落 Everything,
     // 否则与设置页文案矛盾(旧实现在 Fallback 时仍把查询发给 Everything)。
@@ -640,9 +682,11 @@ fn run_worker(
     // 积压在通道内存里(实测无界时 UI 进程冲到 877MB)。
     let (engine_tx, engine_rx) = mpsc::sync_channel::<EngineMsg>(16);
     let mut builtin: Option<builtin::BuiltinProvider> = None;
-    let shutdown_client = Arc::new(AtomicBool::new(false));
     let handshake_slot: Arc<Mutex<Vec<(u128, u64, i64, u64, bool)>>> =
         Arc::new(Mutex::new(Vec::new()));
+    // client 线程是否在跑(优雅退出时要等它确认 worker 已收尾;off/everything
+    // 后端没有 client 线程,收尾等待直接跳过,退出不空转)。
+    let mut client_spawned = false;
     match config.index.backend.as_str() {
         // 这两个后端不拉 worker:控制通道直接丢弃(发送端失败即忽略)。
         "off" | "everything" => {
@@ -664,7 +708,9 @@ fn run_worker(
                 config.index.clone(),
                 index_cmd_rx,
                 volume_mask,
+                Arc::clone(&client_done),
             );
+            client_spawned = true;
             builtin = Some(builtin::BuiltinProvider::new(engine));
         }
     }
@@ -693,6 +739,12 @@ fn run_worker(
     // 否则首装扫描期用户不击键 → 引擎停摆(实测抓出)。
     let mut last_phase: Option<lstr_index::Phase> = None;
     loop {
+        // 优雅退出:shutdown 置位后立即结束请求循环 → flush_all → 等 client
+        // 线程确认 worker 已收尾。不再依赖「SearchService 被 drop → 通道断开」
+        // —— 进程退出时后台线程会被硬杀,断开路径常常来不及跑完。
+        if shutdown_client.load(Ordering::Relaxed) {
+            break;
+        }
         // 0. 先看有没有待处理请求:用户打字时优先查询。维护(整卷 compact 实测
         //    250 万条要 1-2s、落盘 120MB)让路到空闲再跑,否则「输入 bm 后列表
         //    卡几秒才刷」就是被这里堵住的。
@@ -1264,9 +1316,21 @@ send_response(&tx, &request, Response {
     if let Some(b) = builtin.as_mut() {
         b.engine.flush_all();
     }
-    // M4:服务线程结束(SearchService 被 drop)→ 让 client 线程把 Shutdown
-    // 发给 worker,提权进程随之退出,不再常驻等下一次连接。
+    // M4 + 退出收 worker:client 线程收到 shutdown 后会发 Shutdown 并等
+    // worker 退出(≤3s),随后置 client_done;这里给它一个略宽的有界等待
+    // (窗口还能覆盖管道半开/重连间隙的收尾),完成后向 on_exit 发出
+    // worker_collected。没有 client 线程(off/everything 后端)直接跳过。
     shutdown_client.store(true, Ordering::Relaxed);
+    if client_spawned {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !client_done.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !client_done.load(Ordering::Relaxed) {
+            lstr_index::snapshot::debug_log("search: client thread did not finish worker shutdown in time");
+        }
+    }
+    worker_collected.store(true, Ordering::Relaxed);
 }
 
 fn fetch_count(query: &Query, limit: usize) -> usize {

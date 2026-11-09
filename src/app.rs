@@ -4551,6 +4551,16 @@ impl eframe::App for LstrApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
+    /// 缺陷修复:GUI 优雅退出(WM_CLOSE/托盘退出/cmd:quit 都汇到这里)必须
+    /// 收提权 index worker —— 此前 run_native 返回即进程退出,后台线程被硬杀,
+    /// Shutdown 帧发不出去,提权 worker 残留占住唯一管道实例,下次启动撞上
+    /// 旧 worker(实测多次出现怪状态)。这里同步发关闭指令并等其退出(有
+    /// 超时);worker 收到 Shutdown 后走 write_clean_exit_flag 优雅退出。
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.service
+            .graceful_shutdown(std::time::Duration::from_secs(6));
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if !self.effects_applied {
             if let Some(hwnd) = window::hwnd_of_frame(frame) {

@@ -110,6 +110,36 @@ pub fn write_frame(client: HANDLE, frame: &Frame) -> bool {
     crate::worker::write_frame_pub(client, frame)
 }
 
+/// 等待 worker 进程退出:轮询管道探活,实例消失(或超时)即返回。
+/// worker 收到 `Frame::Shutdown` 后会退出并写 clean-exit 标记;它也可能被
+/// 强杀/卡在收尾 —— 超时兜底返回 false,调用方不得无限等(协议容忍半开,
+/// 残留 worker 靠自身 idle 超时与 clean-exit 降级机制自愈)。
+///
+/// 探活语义与 [`pipe_available`] 一致:实例存在(哪怕会话占用)→ worker
+/// 还没退;管道名消失 → worker 已退出并释放唯一管道实例。
+pub fn wait_worker_exit(pipe_name: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !win::pipe_available(pipe_name) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    !win::pipe_available(pipe_name)
+}
+
+/// 向 worker 发 `Frame::Shutdown` 并等待其退出(有超时)。
+/// 返回 true = worker 已确认退出(管道实例消失);false = 超时/写帧失败
+/// (半开状态,交由 worker 自身的 idle 超时兜底)。
+pub fn shutdown_and_wait(client: HANDLE, pipe_name: &str, timeout: Duration) -> bool {
+    let written = write_frame(client, &Frame::Shutdown);
+    if !written {
+        // 写失败多半是管道已断(worker 已死/半开):探活确认一次
+        return !win::pipe_available(pipe_name);
+    }
+    wait_worker_exit(pipe_name, timeout)
+}
+
 /// 控制指令 → 线上帧。主进程发指令的**唯一**映射点:新增指令只改这里,
 /// 避免各处手搓 `Frame` 与协议枚举漂移。
 pub fn command_frame(cmd: &crate::ClientCommand) -> Frame {

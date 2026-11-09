@@ -240,6 +240,21 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
     spec
 }
 
+/// worker 收到 Shutdown 后的退出等待上限:worker 要 join 各卷线程(对账批次
+/// 间检查 stop)、写 clean-exit 标记后才释放管道;超时即放弃 —— 协议容忍
+/// 半开,残留 worker 由自身的 idle 超时与 clean-exit 降级机制兜底。
+const WORKER_EXIT_WAIT: Duration = Duration::from_secs(3);
+
+/// client 线程任何退出路径都置位 `client_done`:run_worker 据此确认
+/// 「Shutdown 已发出/worker 已收尾」,GUI 的 on_exit 等待不会悬空。
+struct ClientDoneGuard(std::sync::Arc<AtomicBool>);
+
+impl Drop for ClientDoneGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// 启动客户端线程:连接 worker(runas 拉起含在内)→ 帧循环 → EngineMsg。
 /// UAC 等待由首次连接的 60s 超时覆盖;断线后按固定节奏重连(引擎状态保留,
 /// 重连握手从快照位点续传)。线程自管拉起与重连,便于调用方 fire-and-forget。
@@ -251,15 +266,34 @@ pub fn spawn_client_thread(
     index_cfg: crate::config::IndexConfig,
     index_cmd_rx: Receiver<ClientCommand>,
     volume_mask: Arc<AtomicU32>,
+    client_done: std::sync::Arc<AtomicBool>,
 ) {
     std::thread::Builder::new()
         .name("lstr-idx-client".to_string())
         .spawn(move || {
+            let _done_guard = ClientDoneGuard(client_done);
             let mut first_connect = !launched_worker;
             let mut launch_declined = false;
             let mut last_launch = std::time::Instant::now() - Duration::from_secs(60);
             loop {
                 if shutdown.load(Ordering::Relaxed) {
+                    // 退出收尾:worker 可能活着但当前无会话(重连间隙/重连退避)。
+                    // 必须带**真实握手状态**连一次 —— 空握手会让 worker 对每卷
+                    // 从头全量扫(pipe_exists 的历史踩坑)。连上后 frame_loop 同款
+                    // 语义:发 Shutdown 并等 worker 退出(有超时)。
+                    if idx_client::pipe_available() {
+                        let snapshot = handshake_slot.lock().unwrap().clone();
+                        if let Ok(client) =
+                            idx_client::connect_and_handshake(snapshot, Duration::from_secs(3))
+                        {
+                            let _ = idx_client::shutdown_and_wait(
+                                client,
+                                lstr_index::PIPE_NAME,
+                                WORKER_EXIT_WAIT,
+                            );
+                            idx_win::close(client);
+                        }
+                    }
                     return;
                 }
                 // 先拉起 worker 再连接(UAC 一次/会话);已提权常驻时秒连。
@@ -335,9 +369,11 @@ fn frame_loop(
     );
     'frames: loop {
         if shutdown.load(Ordering::Relaxed) {
-            // M4:主进程要退出时显式发 Shutdown,worker 收到后不再重建管道
-            // 并自行退出;否则提权的常驻 worker 会在 lstr 关闭后一直留着。
-            let _ = idx_client::write_frame(client, &lstr_index::proto::Frame::Shutdown);
+            // M4 + 退出收 worker:主进程要退出时显式发 Shutdown 并**等待
+            // worker 退出**(有超时)。旧实现只写一帧就断开,进程随即退出 ——
+            // 帧能不能到达全看线程调度,实测多次留下提权 worker 占住唯一
+            // 管道实例,下次启动撞上旧 worker 出现怪状态。
+            let _ = idx_client::shutdown_and_wait(client, lstr_index::PIPE_NAME, WORKER_EXIT_WAIT);
             break 'frames;
         }
         // 设置页指令(切卷/重建卷):非阻塞写帧,不打断下面的读循环。
@@ -362,10 +398,12 @@ fn frame_loop(
             Some(frame) => {
                 if let Some(msg) = to_engine_msg(frame) {
                     if tx.send(msg).is_err() {
-                        // 引擎线程已经收工(服务被 drop):顺手通知 worker 退出。
-                        let _ = idx_client::write_frame(
+                        // 引擎线程已经收工(服务被 drop):顺手通知 worker 退出
+                        // 并等其收尾(与退出路径同款语义)。
+                        let _ = idx_client::shutdown_and_wait(
                             client,
-                            &lstr_index::proto::Frame::Shutdown,
+                            lstr_index::PIPE_NAME,
+                            WORKER_EXIT_WAIT,
                         );
                         break 'frames;
                     }
