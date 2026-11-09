@@ -436,6 +436,9 @@ impl LstrApp {
     }
 
     fn trigger(&mut self, ctx: &egui::Context) {
+        // 一旦输入/筛选变化就进入「搜索中」：防抖的 150ms 里结果还没回来，
+        // 空列表不应该先闪一下「没有匹配项」。
+        self.waiting = true;
         // 30ms：只用来合并同一帧内的连击/粘贴，不再人为拖慢输入。
         // 请求在 worker 里是 latest-wins 合并的，逐键查询不会堆积。
         // 打字防抖:150ms 内还有击键就只搜最后的状态,避免每个字符都发一次
@@ -1864,6 +1867,21 @@ impl LstrApp {
         if entries.is_empty() {
             // 空查询（还没开始搜索）不显示任何文案——「暂无记录」会被误解成搜不到。
             if query.is_empty() {
+                self.needle_target = 0.0;
+                self.scrollable = false;
+                return;
+            }
+            // 查询在途（防抖/排队/执行中）时，不要立刻显示「没有匹配项」：
+            // 打字瞬间结果还没回来，先显示「搜索中…」，避免一帧空列表闪成
+            // 「没有匹配项」再被结果替换。
+            if self.waiting {
+                painter.text(
+                    egui::pos2(rect.center().x, list_top + 44.0),
+                    Align2::CENTER_CENTER,
+                    "搜索中…",
+                    ui::text_font(15.0),
+                    theme.dim,
+                );
                 self.needle_target = 0.0;
                 self.scrollable = false;
                 return;
