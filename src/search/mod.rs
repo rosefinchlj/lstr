@@ -1753,4 +1753,50 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(service.poll().is_none(), "不应再有第二版结果(两阶段遗留)");
     }
+
+    /// 真实快照端到端:程序 tab 不得混入文件夹/普通文件(2026-11-09 回归)。
+    /// 依赖本机内置索引快照;换机器或快照为空时该测试自跳过。
+    #[test]
+    #[ignore = "requires the machine's builtin index snapshot"]
+    fn program_scope_only_returns_programs() {
+        let mut config = crate::config::Config::default();
+        // 强制纯内置索引:Everything 合并会掩盖分类过滤的回归。
+        config.index.backend = "builtin".to_string();
+        config.max_results = 20;
+        let history = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::history::History::in_memory(),
+        ));
+        let ctx = eframe::egui::Context::default();
+        let mut service = SearchService::new(config, history, ctx);
+        let generation = service.search(
+            "remote",
+            crate::model::Scope::Program,
+            false,
+            &SearchFilters::default(),
+            &Default::default(),
+            false,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let first = loop {
+            if let Some(response) = service.poll() {
+                if response.generation == generation {
+                    break response;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "等待搜索结果超时");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        if first.entries.is_empty() {
+            return; // 快照里没有 remote 程序:换机器时自跳过
+        }
+        for entry in &first.entries {
+            assert_eq!(
+                entry.kind,
+                Kind::Program,
+                "程序 tab 混入了非程序条目: {:?} ({:?})",
+                entry.name,
+                entry.full_path()
+            );
+        }
+    }
 }
