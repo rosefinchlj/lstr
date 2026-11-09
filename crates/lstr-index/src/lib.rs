@@ -6,6 +6,7 @@
 //! - 握手携带 `{journal_id, next_usn}` 增量续传,仅 journal 回绕才全量重扫。
 
 pub mod client;
+pub mod dirscan;
 pub mod engine;
 pub mod noise;
 pub mod pinyin;

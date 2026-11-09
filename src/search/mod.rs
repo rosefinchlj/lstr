@@ -286,6 +286,7 @@ fn run_worker(
                 engine_tx.clone(),
                 Arc::clone(&shutdown_client),
                 false,
+                config.index.clone(),
             );
             builtin = Some(builtin::BuiltinProvider::new(engine));
         }

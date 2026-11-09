@@ -42,6 +42,13 @@ pub struct IndexConfig {
     pub exclude_noise: bool,
     /// 单次查询候选收集上限(total 仍精确)。
     pub candidate_cap: usize,
+    /// 首扫模式:`dir`(默认,目录枚举,零 USN FSCTL)/ `usn`(原 ENUM+journal)。
+    /// 2026-11-09 本机 0x3B/Ntfs.sys 蓝屏后默认切到 `dir`。
+    pub scan_mode: String,
+    /// `dir` 首扫完成后是否继续轮询 journal 做增量(阶段 2,默认关)。
+    pub journal_enabled: bool,
+    /// 只索引这些盘(如 `["F"]`);空 = 全部本机固定 NTFS 卷。
+    pub volumes: Vec<String>,
 }
 
 impl Default for IndexConfig {
@@ -50,6 +57,9 @@ impl Default for IndexConfig {
             backend: "auto".into(),
             exclude_noise: true,
             candidate_cap: 2000,
+            scan_mode: "dir".into(),
+            journal_enabled: false,
+            volumes: Vec::new(),
         }
     }
 }

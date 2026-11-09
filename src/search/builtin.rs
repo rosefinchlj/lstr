@@ -225,20 +225,29 @@ pub fn spawn_client_thread(
     tx: std::sync::mpsc::SyncSender<EngineMsg>,
     shutdown: std::sync::Arc<AtomicBool>,
     launched_worker: bool,
+    index_cfg: crate::config::IndexConfig,
 ) {
+    let extra_args = worker_launch_args(&index_cfg);
     std::thread::Builder::new()
         .name("lstr-idx-client".to_string())
         .spawn(move || {
             let mut first_connect = !launched_worker;
             let mut launch_declined = false;
+            let mut last_launch = std::time::Instant::now() - Duration::from_secs(60);
             loop {
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
                 // 先拉起 worker 再连接(UAC 一次/会话);已提权常驻时秒连。
                 // 用户拒绝过 UAC 就不再弹(防骚扰),保持 Fallback 走 Everything。
-                if !launch_declined && !pipe_exists() {
-                    if !launch_worker() {
+                // 守卫还要求距上次拉起 >1s:worker 启动后要一点时间建管道,
+                // 否则 HandShake 失败与「管道不存在」会在循环里空转重拉。
+                if !launch_declined
+                    && !pipe_exists()
+                    && last_launch.elapsed() > Duration::from_secs(1)
+                {
+                    last_launch = std::time::Instant::now();
+                    if !launch_worker(&extra_args) {
                         launch_declined = true;
                     }
                 }
@@ -261,8 +270,12 @@ pub fn spawn_client_thread(
                 }
                 // 重连退避;worker 进程可能已死,再拉一次。
                 // 但用户拒过 UAC 就不再弹(与上面的守卫一致),否则每 20s 骚扰一次。
-                if !launch_declined && !pipe_exists() {
-                    if !launch_worker() {
+                if !launch_declined
+                    && !pipe_exists()
+                    && last_launch.elapsed() > Duration::from_secs(1)
+                {
+                    last_launch = std::time::Instant::now();
+                    if !launch_worker(&extra_args) {
                         launch_declined = true;
                     }
                 }
@@ -341,16 +354,43 @@ fn pipe_alive(client: windows::Win32::Foundation::HANDLE) -> bool {
     idx_client::pipe_alive(client)
 }
 
+/// 组装 worker 启动参数:`--index-worker --index-token <hex>` 之后追加首扫模式、
+/// journal 开关与卷过滤(阶段 1 默认 `dir` = 零 USN FSCTL)。
+pub fn worker_launch_args(index: &crate::config::IndexConfig) -> String {
+    let mut extra = String::new();
+    // 阶段 1 默认就是 dir(worker 端默认值),只有显式 usn 时才追加开关
+    if index.scan_mode.eq_ignore_ascii_case("usn") {
+        extra.push_str(" --index-scan-mode usn");
+        if index.journal_enabled {
+            extra.push_str(" --index-journal");
+        }
+    }
+    let volumes: Vec<String> = index
+        .volumes
+        .iter()
+        .filter_map(|v| v.trim().chars().next())
+        .map(|c| c.to_ascii_uppercase().to_string())
+        .collect();
+    if !volumes.is_empty() {
+        extra.push_str(&format!(" --index-volumes {}", volumes.join(",")));
+    }
+    extra
+}
+
 /// ShellExecute runas 拉起提权 worker(UAC 一次/会话)。
 /// 能力令牌经命令行传给 worker:固定管道名 + 只比 exe 名的校验挡不住同用户
 /// 其它进程,worker 会用 Hello 里的令牌二次校验(L5)。
 /// 令牌通道取舍:主进程不提升,能传给提权 worker 的任何通道(用户目录文件/
 /// 环境变量/共享内存)对同用户非提权进程都更易读;命令行反而是最小暴露面。
 /// 属能力校验而非密码学防护,残余风险见 worker.rs 模块文档的威胁模型。
-pub fn launch_worker() -> bool {
+pub fn launch_worker(extra_args: &str) -> bool {
     let Some(exe) = std::env::current_exe().ok() else { return false };
     let exe_str = exe.display().to_string();
-    let params = format!("--index-worker --index-token {}", idx_client::session_token_hex());
+    let params = format!(
+        "--index-worker --index-token {}{}",
+        idx_client::session_token_hex(),
+        extra_args
+    );
     // 复用 lstr 的 shell_execute_with 语义:runas + 参数
     crate::win::shell::shell_execute_runas_with_args(&exe_str, &params).is_ok()
 }

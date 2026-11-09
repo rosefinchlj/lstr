@@ -51,6 +51,55 @@ static SCAN_GATE: Mutex<()> = Mutex::new(());
 /// 启动时命令行传入的能力令牌;None = 没带 `--index-token`,一律拒绝握手。
 static WORKER_TOKEN: OnceLock<[u8; TOKEN_LEN]> = OnceLock::new();
 
+/// 首扫模式。2026-11-09 本机两次 `SYSTEM_SERVICE_EXCEPTION(0x3B, Ntfs.sys)`
+/// 蓝屏,时段都落在 USN FSCTL 路径活跃期;Everything 直读 `$MFT` 不走 FSCTL,
+/// 长期运行无碍。因此把默认首扫切到目录枚举(`dirscan`),零 USN FSCTL;
+/// USN 首扫 + journal 增量降级为显式开关(`--index-scan-mode usn`)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanMode {
+    /// 目录枚举首扫(`NtQueryDirectoryFile`),不触碰任何 USN FSCTL。
+    Dir,
+    /// USN 首扫 + journal 增量(原路径;蓝屏后仅保留给显式开启)。
+    Usn,
+}
+
+/// worker 启动参数(命令行 → 静态配置)。
+#[derive(Clone, Debug)]
+pub struct WorkerOpts {
+    pub scan_mode: ScanMode,
+    /// dir 模式下首扫完成后是否继续轮询 journal(阶段 2;默认关闭)。
+    pub journal: bool,
+    /// 只处理这些卷;None = 全部本机固定 NTFS 卷。
+    pub volumes: Option<Vec<char>>,
+}
+
+impl Default for WorkerOpts {
+    fn default() -> Self {
+        Self {
+            scan_mode: ScanMode::Dir,
+            journal: false,
+            volumes: None,
+        }
+    }
+}
+
+static OPTS: OnceLock<WorkerOpts> = OnceLock::new();
+
+fn opts() -> &'static WorkerOpts {
+    OPTS.get_or_init(WorkerOpts::default)
+}
+
+/// 按 `--index-volumes` 过滤卷列表(阶段 1 先在单盘验收)。
+fn filter_volumes(list: Vec<(char, String)>) -> Vec<(char, String)> {
+    match &opts().volumes {
+        Some(allowed) => list
+            .into_iter()
+            .filter(|(letter, _)| allowed.contains(letter))
+            .collect(),
+        None => list,
+    }
+}
+
 /// 首次坏握手的时间点(进程启动后的纳秒数,0 = 尚无)。
 static BAD_HELLO_FIRST_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -92,20 +141,69 @@ fn note_good_hello() {
 
 /// worker 入口(lstr main 检测到 --index-worker 后调用)。不返回。
 pub fn worker_main() -> i32 {
+    let mut parsed = WorkerOpts::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--index-token" {
-            let Some(raw) = args.next() else {
-                crate::snapshot::debug_log("worker: missing --index-token value");
-                return 2;
-            };
-            let Some(token) = proto::token_from_hex(&raw) else {
-                crate::snapshot::debug_log("worker: malformed --index-token");
-                return 2;
-            };
-            let _ = WORKER_TOKEN.set(token);
+        match arg.as_str() {
+            "--index-token" => {
+                let Some(raw) = args.next() else {
+                    crate::snapshot::debug_log("worker: missing --index-token value");
+                    return 2;
+                };
+                let Some(token) = proto::token_from_hex(&raw) else {
+                    crate::snapshot::debug_log("worker: malformed --index-token");
+                    return 2;
+                };
+                let _ = WORKER_TOKEN.set(token);
+            }
+            "--index-scan-mode" => {
+                let Some(raw) = args.next() else {
+                    crate::snapshot::debug_log("worker: missing --index-scan-mode value");
+                    return 2;
+                };
+                parsed.scan_mode = match raw.to_ascii_lowercase().as_str() {
+                    "dir" => ScanMode::Dir,
+                    "usn" => ScanMode::Usn,
+                    other => {
+                        crate::snapshot::debug_log(&format!(
+                            "worker: unknown --index-scan-mode {other}"
+                        ));
+                        return 2;
+                    }
+                };
+            }
+            "--index-journal" => parsed.journal = true,
+            "--index-volumes" => {
+                let Some(raw) = args.next() else {
+                    crate::snapshot::debug_log("worker: missing --index-volumes value");
+                    return 2;
+                };
+                let letters: Vec<char> = raw
+                    .split(',')
+                    .filter_map(|s| s.trim().chars().next())
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect();
+                if letters.is_empty() {
+                    crate::snapshot::debug_log("worker: empty --index-volumes");
+                    return 2;
+                }
+                parsed.volumes = Some(letters);
+            }
+            _ => {}
         }
     }
+    let mode = parsed.scan_mode;
+    let journal = parsed.journal;
+    let volumes = parsed.volumes.as_ref().map(|v| {
+        v.iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    let _ = OPTS.set(parsed);
+    crate::snapshot::debug_log(&format!(
+        "worker: opts scan_mode={mode:?} journal={journal} volumes={volumes:?}"
+    ));
     let Ok(server) = win::create_pipe_server(PIPE_NAME) else {
         // 管道已存在 = 已有 worker 在跑(主进程重拉时可能撞上),静默退出
         return 0;
@@ -231,7 +329,7 @@ fn run_session(client: HANDLE) {
 
     // 卷线程表
     let mut threads: HashMap<u128, VolumeThread> = HashMap::new();
-    let volumes = win::fixed_ntfs_volumes();
+    let volumes = filter_volumes(win::fixed_ntfs_volumes());
     for (letter, guid_path) in &volumes {
         let Some(guid) = win::guid_to_u128(guid_path) else { continue };
         let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -284,7 +382,7 @@ fn run_session(client: HANDLE) {
             }
         }
         // 卷热插拔(轮询代替 WM_DEVICECHANGE:无窗口 worker 里更稳)
-        let now = win::fixed_ntfs_volumes();
+        let now = filter_volumes(win::fixed_ntfs_volumes());
         if now != last_drives {
             for (letter, g) in &now {
                 if last_drives.iter().any(|(_, g2)| g2 == g) {
@@ -449,6 +547,79 @@ fn scan_full_or_resume(
     }
 }
 
+/// dir 模式单卷循环:目录枚举首扫 → VolumeReady → 空闲(阶段 1 不轮询 journal)。
+/// 全程不打开卷句柄、不发任何 USN FSCTL —— 这是 2026-11-09 蓝屏后的安全路径。
+fn scan_dir_volume(
+    letter: char,
+    guid: u128,
+    tx: &mpsc::SyncSender<Frame>,
+    stop: &AtomicBool,
+) {
+    if !send_frame(
+        tx,
+        Frame::VolumeMeta {
+            guid,
+            letter,
+            journal_id: 0,
+            next_usn: 0,
+            est_records: 0,
+        },
+        stop,
+    ) {
+        return;
+    }
+    if !send_frame(tx, Frame::ScanBegin { guid, resume_frn: 0 }, stop) {
+        return;
+    }
+    // 与 USN 全量扫描共用串行闸门:多卷首次构建逐卷来,降低 IO/内核压力。
+    let _scan_slot = SCAN_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut count: u64 = 0;
+    let mut last_report = std::time::Instant::now();
+    let result = crate::dirscan::enumerate_volume(letter, stop, &mut |recs| {
+        count += recs.len() as u64;
+        let _ = send_frame(tx, Frame::Batch { guid, next_usn: 0, recs }, stop);
+        if last_report.elapsed() >= Duration::from_millis(500) {
+            last_report = std::time::Instant::now();
+            let _ = send_frame(
+                tx,
+                Frame::ScanProgress {
+                    guid,
+                    frn: 0,
+                    est: 0,
+                    count: count.min(u32::MAX as u64) as u32,
+                },
+                stop,
+            );
+        }
+    });
+    match result {
+        Ok(total) if !stop.load(Ordering::Relaxed) => {
+            if send_frame(
+                tx,
+                Frame::VolumeReady {
+                    guid,
+                    journal_id: 0,
+                    next_usn: 0,
+                    count: count.min(u32::MAX as u64) as u32,
+                },
+                stop,
+            ) {
+                crate::snapshot::debug_log(&format!(
+                    "dirscan {letter}: ready count={count} (enumerated={total})"
+                ));
+            }
+            // 阶段 1:不做 journal 轮询;阶段 2 打开 opts().journal 后再接。
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        Ok(_) => {}
+        Err(err) => crate::snapshot::debug_log(&format!("dirscan {letter} failed: {err}")),
+    }
+}
+
 /// 单卷循环:决定全量扫描或增量续传,随后进入 journal 轮询。
 fn volume_loop(
     letter: char,
@@ -457,6 +628,11 @@ fn volume_loop(
     stop: std::sync::Arc<AtomicBool>,
     tx: mpsc::SyncSender<Frame>,
 ) {
+    // 阶段 1:默认目录枚举首扫,完全不碰卷句柄/USN FSCTL(蓝屏后的安全路径)。
+    if opts().scan_mode == ScanMode::Dir {
+        scan_dir_volume(letter, guid, &tx, &stop);
+        return;
+    }
     // H2/H4:扫描开始前先取 journal 状态(journal_id / NextUsn),它是本次全量
     // 扫描的高水位;VolumeMeta / VolumeReady 都回传真实 journal_id。
     // 卷句柄全程持有(避免每 50ms 开/关句柄 + 查询的三连内核调用)。
