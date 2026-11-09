@@ -711,12 +711,15 @@ impl Engine {
                         v.sidecar_pending = false;
                         v.sidecar_base = (0, 0);
                         v.sidecar_cursor = 0;
+                        // 状态显示字段一并重置:旧断点/旧游标时间对已清空的
+                        // 卷没有意义(pct 进度条、游标 age 会显示陈旧值)。
+                        v.resume_frn = 0;
+                        v.cursor_at = None;
                     }
                     // 索引已清空,旧 Hit 一律失效(H8)
                     self.bump_generation(i);
                     self.pinyin[i] = PinyinCache::empty();
                     let dir = self.cfg.index_dir.clone();
-                    let _ = snapshot::snapshot_path(&dir, guid);
                     let _ = std::fs::remove_file(snapshot::snapshot_path(&dir, guid));
                     sidecar::remove(&dir, guid);
                 }
@@ -2010,6 +2013,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// JournalReset 清卷:store/游标清零之外,状态显示字段(resume_frn 进度、
+    /// cursor_at 游标 age)一并重置 —— 已清空的卷不应再显示陈旧进度/游标。
+    #[test]
+    fn journal_reset_clears_status_fields() {
+        const DIR: u32 = 0x0010;
+        let dir = temp_index_dir("journal-reset");
+        let (g_ready, g_scan) = (0x82u128, 0x83u128);
+        let mut engine = engine_with(&dir);
+        // 就绪卷:有游标 age
+        feed_ready(&mut engine, g_ready, 'C');
+        assert!(engine.maintain());
+        assert!(snapshot::snapshot_path(&dir, g_ready).is_file());
+        // 扫描中卷:有断点进度(50/100)
+        engine.handle(EngineMsg::VolumeMeta {
+            guid: g_scan,
+            letter: 'D',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: 100,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid: g_scan, resume_frn: 0 });
+        engine.handle(EngineMsg::Records {
+            guid: g_scan,
+            recs: vec![rec(10, 0, DIR, "docs")],
+            next_usn: 100,
+        });
+        engine.handle(EngineMsg::ScanProgress { guid: g_scan, frn: 50, est: 100, count: 1 });
+        let st = engine.status();
+        let (ready, scan) = (&st.volumes[0], &st.volumes[1]);
+        assert!(ready.cursor_age_secs.is_some());
+        assert_eq!(scan.pct, Some(0.5));
+
+        engine.handle(EngineMsg::JournalReset { guid: g_ready });
+        engine.handle(EngineMsg::JournalReset { guid: g_scan });
+        for guid in [g_ready, g_scan] {
+            let i = engine.volumes.iter().position(|v| v.guid == guid).unwrap();
+            let v = &engine.volumes[i];
+            assert!(!v.complete && v.store.is_none());
+            assert_eq!((v.journal_id, v.next_usn, v.resume_frn), (0, 0, 0));
+        }
+        let st = engine.status();
+        let (ready, scan) = (&st.volumes[0], &st.volumes[1]);
+        assert_eq!(ready.count, 0);
+        assert!(ready.cursor_age_secs.is_none(), "游标 age 应随重置清空");
+        assert_eq!(scan.pct, Some(0.0), "断点进度应随重置归零,不显示陈旧 50%");
+        assert!(!snapshot::snapshot_path(&dir, g_ready).is_file(), "快照文件应删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// index.volumes 非空时,未选中卷的快照不加载(文件保留);
     /// 空 vec = 全部加载。
     #[test]
@@ -3016,7 +3068,7 @@ mod tests {
         );
         // 结构性断言(避免绝对时间抖动 flaky):
         // - sidecar 模式 p90 至少比 full-save 模式好一倍(实测差一个数量级);
-        // - sidecar 模式 p90 上限 200ms(查询评估本身 ~60ms,余量 3 倍);
+        // - sidecar 模式 p90 上限 60ms(查询评估本身 ~10ms,余量数倍);
         // - sidecar 模式最大延迟 < full-save 模式 p50(整个分布移出保存窗口)。
         assert!(
             p90_b < p90_a / 2.0,

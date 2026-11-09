@@ -640,6 +640,13 @@ fn finalize_entries(
     entries
 }
 
+/// 内置索引能否自带时间筛选:目录枚举(dir 首扫)会把 mtime 写进快照;
+/// backend="usn" 实验后端固定走 dir 首扫(见 config 注释),同样有 mtime。
+/// 纯 USN 首扫(scan_mode="usn")没有 mtime,时间筛选仍需 Everything。
+fn builtin_index_has_mtime(index: &crate::config::IndexConfig) -> bool {
+    index.scan_mode == "dir" || index.backend == "usn"
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     rx: Receiver<Request>,
@@ -659,8 +666,8 @@ fn run_worker(
     // 否则与设置页文案矛盾(旧实现在 Fallback 时仍把查询发给 Everything)。
     let force_builtin = config.index.backend == "builtin";
     // 目录扫描(dir)会把 mtime 写进快照,所以内置索引自己能做时间筛选;
-    // USN 模式没有 mtime,时间筛选仍需 Everything(或直接报错)。
-    let builtin_time_ok = config.index.scan_mode == "dir";
+    // 纯 USN 首扫没有 mtime,时间筛选仍需 Everything(或直接报错)。
+    let builtin_time_ok = builtin_index_has_mtime(&config.index);
     // 严格模式:用户选了「仅内置索引」就完全不碰 Everything —— 连 IPC 探测
     // 都不做(既避免 IPC 超时拖慢首次查询,也保证观察不到一切 Everything 结果)。
     let mut everything = if force_builtin {
@@ -1544,6 +1551,18 @@ fn url_encode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 内置时间筛选的可用性:dir 首扫有 mtime;backend="usn" 固定走 dir
+    /// 首扫(同样带 mtime);纯 USN 首扫没有 mtime。
+    #[test]
+    fn builtin_time_filter_availability() {
+        let mut index = crate::config::IndexConfig::default(); // backend=auto, scan_mode=dir
+        assert!(builtin_index_has_mtime(&index), "dir 首扫写 mtime");
+        index.scan_mode = "usn".to_string();
+        assert!(!builtin_index_has_mtime(&index), "纯 USN 首扫无 mtime");
+        index.backend = "usn".to_string();
+        assert!(builtin_index_has_mtime(&index), "usn 实验后端固定 dir 首扫,有 mtime");
+    }
 
     /// 测试隔离:默认配置 backend=auto 会让服务线程真去探活/拉起 worker
     /// (runas → 可能弹 UAC),在测试机器上既慢又打扰用户。单测一律关掉

@@ -23,6 +23,7 @@ pub const USN_REASON_DATA_EXTEND: u32 = 0x0000_0002;
 pub const USN_REASON_DATA_TRUNCATION: u32 = 0x0000_0004;
 pub const USN_REASON_FILE_CREATE: u32 = 0x0000_0100;
 pub const USN_REASON_FILE_DELETE: u32 = 0x0000_0200;
+pub const USN_REASON_HARD_LINK_CHANGE: u32 = 0x0001_0000;
 pub const USN_REASON_RENAME_OLD_NAME: u32 = 0x0000_1000;
 pub const USN_REASON_RENAME_NEW_NAME: u32 = 0x0000_2000;
 pub const USN_REASON_CLOSE: u32 = 0x8000_0000;
@@ -125,7 +126,10 @@ impl RawRecord {
         }
         let op = if self.reason & USN_REASON_RENAME_NEW_NAME != 0
             || self.reason & USN_REASON_FILE_CREATE != 0
+            || self.reason & USN_REASON_HARD_LINK_CHANGE != 0
         {
+            // HARD_LINK_CHANGE:新硬链接以「同 FRN + 新名字」上报,并入 Upsert
+            // (原地更新语义);漏读会让经硬链接出现的文件长期搜不到。
             Op::Upsert
         } else if self.reason & USN_REASON_FILE_DELETE != 0 {
             Op::Remove
@@ -221,6 +225,11 @@ mod tests {
         assert_eq!(mk(USN_REASON_FILE_CREATE, "a").to_engine_op().unwrap().op, Op::Upsert);
         assert_eq!(
             mk(USN_REASON_RENAME_NEW_NAME, "a").to_engine_op().unwrap().op,
+            Op::Upsert
+        );
+        // 硬链接:新链接名以 HARD_LINK_CHANGE 上报,并入 Upsert(漏读=搜不到)
+        assert_eq!(
+            mk(USN_REASON_HARD_LINK_CHANGE, "a").to_engine_op().unwrap().op,
             Op::Upsert
         );
         assert_eq!(mk(USN_REASON_FILE_DELETE, "a").to_engine_op().unwrap().op, Op::Remove);

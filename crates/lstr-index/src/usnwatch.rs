@@ -182,7 +182,7 @@ pub fn cursor_trusted(saved_jid: u64, saved_usn: i64, live: Option<(u64, i64, i6
     jid == saved_jid && saved_usn >= first_usn && saved_usn <= next_usn
 }
 
-/// journal 轮询的 ReasonMask:lifecycle(建/删/改名)+ CLOSE + DATA 写类。
+/// journal 轮询的 ReasonMask:lifecycle(建/删/改名/硬链接)+ CLOSE + DATA 写类。
 ///
 /// - lifecycle 与 [`crate::usn::REASON_LIFECYCLE`] 的差别:这里按规格额外带上
 ///   `RENAME_OLD_NAME` —— FSCTL 层多收一条旧名记录无害(引擎侧 H3 规则会忽略
@@ -191,6 +191,7 @@ pub fn cursor_trusted(saved_jid: u64, saved_usn: i64, live: Option<(u64, i64, i6
 ///   读进来再丢是有意为之:合并记录(如 DATA_EXTEND|RENAME_NEW)不能在内核层裁掉。
 pub const REASON_MASK_WATCH: u32 = crate::usn::USN_REASON_FILE_CREATE
     | crate::usn::USN_REASON_FILE_DELETE
+    | crate::usn::USN_REASON_HARD_LINK_CHANGE
     | crate::usn::USN_REASON_RENAME_OLD_NAME
     | crate::usn::USN_REASON_RENAME_NEW_NAME
     | crate::usn::USN_REASON_CLOSE
@@ -327,18 +328,19 @@ mod tests {
         assert!(!cursor_trusted(7, 300, None));
     }
 
-    /// 监视掩码必须覆盖:lifecycle(建/删/改名,含 RENAME_OLD)+ CLOSE + DATA 写类。
+    /// 监视掩码必须覆盖:lifecycle(建/删/改名/硬链接,含 RENAME_OLD)+ CLOSE + DATA 写类。
     #[test]
     fn watch_reason_mask_covers_required_reasons() {
         use crate::usn::{
             USN_REASON_CLOSE, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
             USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
-            USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
+            USN_REASON_HARD_LINK_CHANGE, USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
         };
         let m = REASON_MASK_WATCH;
         for bit in [
             USN_REASON_FILE_CREATE,
             USN_REASON_FILE_DELETE,
+            USN_REASON_HARD_LINK_CHANGE,
             USN_REASON_RENAME_OLD_NAME,
             USN_REASON_RENAME_NEW_NAME,
             USN_REASON_CLOSE,

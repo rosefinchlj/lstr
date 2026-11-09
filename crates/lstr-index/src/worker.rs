@@ -38,9 +38,12 @@ const FRAME_CHANNEL_CAP: usize = 32;
 /// Shutdown」留下的提权 worker;正常关闭走 Shutdown 立即退出,不会等这么久。
 const IDLE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// 主进程在会话里显式发过 `Frame::Shutdown`(或握手被拒)后置位:
-/// 本次会话结束后不再重建管道,worker 直接退出。这样 lstr 正常关闭时不会
-/// 留下常驻的提权进程;主进程崩溃时则靠 [`IDLE_ACCEPT_TIMEOUT`] 兜底。
+/// 主进程在会话里显式发过 `Frame::Shutdown` 后置位(含 `try_read_frame`
+/// 在管道断开时合成的 Shutdown,以及握手被拒):本次会话结束后不再重建
+/// 管道,worker 直接退出。这样 lstr 正常关闭时不会留下常驻的提权进程。
+/// 若主进程崩溃且断开恰好落在读帧间隙(合成 Shutdown 未发出),会话循环
+/// 由 `pipe_alive` 兜底退出、不置位本标志 —— 只有这种窗口会走管道重建,
+/// 等新客户端,最终由 [`IDLE_ACCEPT_TIMEOUT`] 兜底退出。
 static EXIT_AFTER_SESSION: AtomicBool = AtomicBool::new(false);
 
 /// 全量/续扫的串行闸门:2026-11-09 本机蓝屏(0x3B / Ntfs.sys,时段与四卷并发
@@ -401,10 +404,15 @@ impl Worker {
             // run_session 只借用句柄、不关闭,外层不再复用已关闭的句柄(H5)。
             win::close(self.server);
             self.server = HANDLE(std::ptr::null_mut());
-            // M4:主进程显式关闭 / 握手被拒 → 不重建管道,直接退出。
+            // M4:主进程显式关闭(含 try_read_frame 在管道断开时合成的
+            // Shutdown)/ 握手被拒 → 不重建管道,直接退出。
             if EXIT_AFTER_SESSION.load(Ordering::Relaxed) {
                 return 0;
             }
+            // 触发窗口:仅在「会话结束但未置位 EXIT_AFTER_SESSION」时到达 ——
+            // 即主进程崩溃/被杀,管道断开恰落在 try_read_frame 读帧间隙、由
+            // 会话循环末尾的 pipe_alive 兜底检出。重建后等新主进程重连;
+            // 无客户端则 IDLE_ACCEPT_TIMEOUT 兜底退出。
             match win::create_pipe_server(PIPE_NAME) {
                 Ok(s) => self.server = s,
                 Err(_) => {
@@ -1311,6 +1319,12 @@ pub fn read_frame_pub(client: HANDLE, timeout: Duration) -> Option<Frame> {
     Frame::decode(&payload)
 }
 
+/// 非阻塞试探读一帧(peek 命名管道字节量)。返回 None = 暂无数据;
+/// 管道断开/帧异常时返回合成帧 `Some(Frame::Shutdown)` —— 会话循环据此
+/// 置位 EXIT_AFTER_SESSION 并退出(与主进程显式发 Shutdown 同路径,
+/// 回到 Worker::run 后不再重建管道)。注意主进程崩溃若恰落在两次
+/// try_read_frame 之间,也可能由会话循环末尾的 pipe_alive 先检出
+/// (那条路径不置位 EXIT_AFTER_SESSION,是管道重建分支的触发窗口)。
 fn try_read_frame(client: HANDLE) -> Option<Frame> {
     // 非阻塞试探:peek 命名管道字节量
     use windows::Win32::Storage::FileSystem::ReadFile;

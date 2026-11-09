@@ -99,6 +99,31 @@ impl VolumeHandle {
         }
         Some((jd.UsnJournalID, jd.FirstUsn, jd.NextUsn))
     }
+
+    /// 同 [`journal_state`],但 QUERY 失败按 GetLastError 分类返回
+    /// ([`classify_query_error`]):供 read 路径区分「卷没了」与「暂时性
+    /// IO」,而不是一律当成 journal 重置。
+    fn journal_state_or_err(&self) -> Result<(u64, i64, i64), JournalError> {
+        let mut jd = USN_JOURNAL_DATA_V0::default();
+        let mut ret: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                self.handle,
+                FSCTL_QUERY_USN_JOURNAL,
+                None,
+                0,
+                Some(&mut jd as *mut _ as *mut std::ffi::c_void),
+                std::mem::size_of::<USN_JOURNAL_DATA_V0>() as u32,
+                Some(&mut ret),
+                None,
+            )
+        };
+        if ok.is_err() {
+            let code = unsafe { windows::Win32::Foundation::GetLastError() };
+            return Err(classify_query_error(code.0));
+        }
+        Ok((jd.UsnJournalID, jd.FirstUsn, jd.NextUsn))
+    }
 }
 
 impl Drop for VolumeHandle {
@@ -216,9 +241,10 @@ pub fn read_journal_masked(
     start_usn: i64,
     reason_mask: u32,
 ) -> Result<Option<(Vec<Rec>, i64)>, JournalError> {
-    let Some((jid, first_usn, _next_usn)) = vol.journal_state() else {
-        return Err(JournalError::Reset);
-    };
+    // QUERY 失败不代表 journal 已重置(句柄失效/卷未就绪/暂时性 IO 都可能):
+    // 按 GetLastError 分类 —— Reset 只留给 READ 的 0x19C/19D/19E 与下面的
+    // 游标/jid 校验失败,避免一次暂时性 QUERY 失败就触发整卷对账。
+    let (jid, first_usn, _next_usn) = vol.journal_state_or_err()?;
     if jid != journal_id {
         return Err(JournalError::Reset);
     }
@@ -251,13 +277,7 @@ pub fn read_journal_masked(
     };
     if ok.is_err() {
         let code = unsafe { windows::Win32::Foundation::GetLastError() };
-        if code == windows::Win32::Foundation::WIN32_ERROR(0x19D)
-            || code == windows::Win32::Foundation::WIN32_ERROR(0x19E)
-            || code == windows::Win32::Foundation::WIN32_ERROR(0x19C)
-        {
-            return Err(JournalError::Reset);
-        }
-        return Err(JournalError::Io);
+        return Err(classify_read_error(code.0));
     }
     if ret < 8 {
         return Ok(None);
@@ -277,6 +297,31 @@ pub enum JournalError {
     Io,
 }
 
+/// QUERY_USN_JOURNAL 失败分类(纯函数便于单测):
+/// 句柄失效(ERROR_INVALID_HANDLE)/卷未就绪(ERROR_NOT_READY) → 卷已不可达
+/// (VolumeGone,走热插拔路径);其余一律暂时性 IO(调用方退避重试)。
+/// QUERY 失败不判 Reset:它不是「journal 已重置」的证据 —— Reset 只由
+/// READ 的 0x19C/19D/19E 与游标/jid 校验失败得出(见 [`read_journal_masked`]),
+/// 否则一次暂时性 QUERY 失败就会触发整卷 DirSync 对账。
+fn classify_query_error(code: u32) -> JournalError {
+    const ERROR_INVALID_HANDLE: u32 = 6;
+    const ERROR_NOT_READY: u32 = 21;
+    match code {
+        ERROR_INVALID_HANDLE | ERROR_NOT_READY => JournalError::VolumeGone,
+        _ => JournalError::Io,
+    }
+}
+
+/// READ_USN_JOURNAL 失败分类(纯函数便于单测):仅 journal 生命周期错误
+/// (0x19C 未激活 / 0x19D 条目已删 / 0x19E 删除中)判 Reset → 对账自愈;
+/// 其余一律暂时性 IO(退避重试)。
+fn classify_read_error(code: u32) -> JournalError {
+    match code {
+        0x19C | 0x19D | 0x19E => JournalError::Reset,
+        _ => JournalError::Io,
+    }
+}
+
 /// 打开卷句柄供外部持有(journal 长轮询可复用同一句柄)。
 pub fn keep_volume_open(letter: char) -> Option<VolumeHandle> {
     VolumeHandle::open(letter).ok()
@@ -285,4 +330,32 @@ pub fn keep_volume_open(letter: char) -> Option<VolumeHandle> {
 #[allow(dead_code)]
 pub fn close_handle(h: HANDLE) {
     win::close(h);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// QUERY 失败按 GetLastError 分类:卷不可达(句柄失效/未就绪)→ VolumeGone;
+    /// 其余(含 journal 未激活 0x19C)→ 暂时性 IO 退避,不误判 Reset 触发对账。
+    #[test]
+    fn query_failure_classified_by_last_error() {
+        assert!(matches!(classify_query_error(6), JournalError::VolumeGone)); // ERROR_INVALID_HANDLE
+        assert!(matches!(classify_query_error(21), JournalError::VolumeGone)); // ERROR_NOT_READY
+        assert!(matches!(classify_query_error(0x19C), JournalError::Io)); // JOURNAL_NOT_ACTIVE
+        assert!(matches!(classify_query_error(5), JournalError::Io)); // ACCESS_DENIED
+        assert!(matches!(classify_query_error(0), JournalError::Io));
+    }
+
+    /// READ 失败:仅 journal 生命周期错误(0x19C/19D/19E)判 Reset;
+    /// 其余一律 IO 退避。
+    #[test]
+    fn read_failure_only_journal_lifecycle_is_reset() {
+        for code in [0x19C, 0x19D, 0x19E] {
+            assert!(matches!(classify_read_error(code), JournalError::Reset));
+        }
+        assert!(matches!(classify_read_error(6), JournalError::Io));
+        assert!(matches!(classify_read_error(21), JournalError::Io));
+        assert!(matches!(classify_read_error(87), JournalError::Io)); // INVALID_PARAMETER
+    }
 }
