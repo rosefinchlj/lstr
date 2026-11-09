@@ -755,6 +755,12 @@ impl Engine {
         self.pending_applies.iter().any(|p| !p.recs.is_empty())
     }
 
+    /// 指定卷是否还有未消化完的分批记录(B-1 落盘守卫:缓冲非空时
+    /// resume_frn 可能已超前于 store 内容,落盘即持久化裂缝快照)。
+    fn has_pending_apply_for(&self, guid: u128) -> bool {
+        self.pending_applies.iter().any(|p| p.guid == guid && !p.recs.is_empty())
+    }
+
     /// 分批让路发生次数:批间检查到「有线程内等待中的查询」而收手的次数
     /// (诊断/基准断言:批间让路必须真的发生过)。
     pub fn apply_yield_count(&self) -> u64 {
@@ -1187,6 +1193,13 @@ impl Engine {
 
     /// 落盘单个卷。成功返回 true 并清 dirty;失败保留 dirty、指数退避(H6)。
     fn save_volume(&mut self, i: usize) -> bool {
+        // B-1:分批缓冲未消化完(首扫+让路压住)时禁止落盘 —— ScanProgress 已
+        // 推进 resume_frn,而 FRN < resume_frn 的一段还压在缓冲里,此刻保存
+        // 会持久化「游标超前于内容」的裂缝快照,崩溃重启后该段永久无声丢失。
+        // 保留 dirty、不动 save_retry_at:缓冲清空后的下一轮 maintain 即可保存。
+        if self.has_pending_apply_for(self.volumes[i].guid) {
+            return false;
+        }
         let save_result = {
             let v = &self.volumes[i];
             let Some(store) = &v.store else { return false };
@@ -1289,6 +1302,11 @@ impl Engine {
                 continue; // 对账中途退出:让下次启动重新对账,不落半态
             }
             if !self.volumes[i].dirty {
+                continue;
+            }
+            // B-1:分批缓冲未消化完时宁可不存 —— 落盘会持久化「resume_frn
+            // 超前于 store 内容」的裂缝快照;重启从上一份自洽快照续扫即可。
+            if self.has_pending_apply_for(self.volumes[i].guid) {
                 continue;
             }
             if self.volumes[i].sidecar_capture_ready() && self.volumes[i].sidecar_pending {
@@ -2244,6 +2262,126 @@ mod tests {
             );
             assert!(!e.has_pending_apply());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- B-1:首扫分批缓冲未消化完时,保存路径必须跳过该卷 ----------
+
+    /// 首扫 + 打字(让路钩子压住分批缓冲)+ 20s 断点保存窗口:resume_frn 已随
+    /// ScanProgress 推进,而 FRN < resume_frn 的一段记录还压在 pending_applies
+    /// 里没进 store —— 此刻落盘会持久化「游标超前于内容」的裂缝快照,崩溃重启
+    /// 后该段永久无声丢失。缓冲清空前:maintain / flush_all 都不得生成快照,
+    /// dirty 保留待下轮。
+    #[test]
+    fn save_skipped_while_first_scan_buffer_pending() {
+        const DIR: u32 = 0x0010;
+        let dir = temp_index_dir("b1-pending-skip");
+        let guid = 0xb1u128;
+        let mut engine = engine_with(&dir);
+        engine.set_apply_chunk_records(64);
+        let force = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook = force.clone();
+        engine.set_query_yield_hook(Some(Box::new(move || {
+            hook.load(std::sync::atomic::Ordering::Relaxed)
+        })));
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'C',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: 10,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        // 第一批正常消化(dirty=true),模拟断点已推进;第二批起压住缓冲。
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(10, 0, DIR, "docs"), rec(11, 10, 0, "alpha.txt")],
+            next_usn: 100,
+        });
+        engine.handle(EngineMsg::ScanProgress { guid, frn: 50, est: 100, count: 2 });
+        force.store(true, std::sync::atomic::Ordering::Relaxed);
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(12, 10, 0, "beta.txt"), rec(13, 10, 0, "gamma.txt")],
+            next_usn: 100,
+        });
+        assert!(engine.has_pending_apply(), "让路期间缓冲必须未消化完");
+        assert!(engine.volumes[0].dirty);
+
+        // 断点保存路径:缓冲非空 → 跳过,不生成快照(否则 resume_frn=50 与
+        // store(缺 frn=12/13 段)一起持久化,重启后该段永久丢失)。
+        assert!(!engine.maintain(), "缓冲未消化完时 maintain 不得落盘");
+        assert!(
+            !snapshot::snapshot_path(&dir, guid).is_file(),
+            "缓冲未消化完时不得生成快照文件"
+        );
+        assert!(engine.volumes[0].dirty, "dirty 保留,下轮再试");
+        assert_eq!(engine.volumes[0].save_retry_at, None, "不被退避推后:缓冲清空后立即可存");
+
+        // 退出收尾同样宁可不存(重启从上一份自洽快照续扫)。
+        engine.flush_all();
+        assert!(
+            !snapshot::snapshot_path(&dir, guid).is_file(),
+            "flush_all 也不得保存裂缝快照"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 缓冲消化完后再保存:快照内容与 store 逐列一致(复用 chunked 等价测试
+    /// 的指纹比较),resume_frn 断点正确持久化。
+    #[test]
+    fn save_after_buffer_drained_matches_store() {
+        const DIR: u32 = 0x0010;
+        let dir = temp_index_dir("b1-drained-save");
+        let guid = 0xb8u128;
+        let mut engine = engine_with(&dir);
+        engine.set_apply_chunk_records(2); // 小块,确保缓冲真的分多轮消化
+        let force = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook = force.clone();
+        engine.set_query_yield_hook(Some(Box::new(move || {
+            hook.load(std::sync::atomic::Ordering::Relaxed)
+        })));
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'C',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: 10,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![
+                rec(10, 0, DIR, "docs"),
+                rec(11, 10, 0, "alpha.txt"),
+                rec(12, 10, 0, "beta.txt"),
+                rec(13, 10, 0, "gamma.txt"),
+            ],
+            next_usn: 100,
+        });
+        engine.handle(EngineMsg::ScanProgress { guid, frn: 50, est: 100, count: 4 });
+        assert!(engine.has_pending_apply());
+        assert!(!engine.maintain(), "缓冲压着:不落盘");
+
+        // 放行并清空缓冲(宿主在查询间隙逐块消化的等价驱动)
+        force.store(false, std::sync::atomic::Ordering::Relaxed);
+        while engine.has_pending_apply() {
+            assert!(engine.advance_pending_apply() > 0);
+        }
+        assert!(engine.maintain(), "缓冲清空后部分快照应正常落盘");
+        assert!(snapshot::snapshot_path(&dir, guid).is_file());
+        assert!(!engine.volumes[0].dirty);
+
+        // 重启加载:快照内容与实际 store 逐列一致,断点正确恢复
+        let engine2 = engine_with(&dir);
+        assert_eq!(engine2.volumes.len(), 1);
+        assert!(!engine2.volumes[0].complete);
+        assert_eq!(engine2.volumes[0].resume_frn, 50, "resume_frn 须随快照持久化");
+        assert_eq!(
+            store_rows(&engine, 0),
+            store_rows(&engine2, 0),
+            "快照内容必须与实际 store 逐列一致"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
