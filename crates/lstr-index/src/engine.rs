@@ -11,6 +11,7 @@ use crate::query::{QueryOutcome, QuerySpec, Hit};
 use crate::snapshot::{self, SnapshotHeader};
 use crate::store::{VolumeStore, NO_PARENT, ROOT_FRN};
 use crate::usn::{Op, Rec};
+use crate::usnwatch::UsnWatchState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -31,6 +32,11 @@ pub struct VolumeProgress {
     /// 0.0~1.0,未知时为 None。
     pub pct: Option<f32>,
     pub count: u32,
+    /// USN 实时增量层状态(worker `UsnWatch` 帧上报;非 Off 才显示)。
+    pub usn_state: Option<UsnWatchState>,
+    /// 游标年龄(秒):自引擎上次推进该卷位点(journal 批次/Ready)以来;
+    /// 尚无位点信息时为 None。UI 拼成「游标 Ns 前」。
+    pub cursor_age_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +70,11 @@ pub struct VolumeState {
     /// (见 save_interval)。journal 每来一小批就整卷重写 120MB 会把查询线程
     /// 饿死(实测搜索要等几秒),必须节流。
     save_retry_at: Option<Instant>,
+    /// USN 实时增量层状态(usn 后端 worker 经 UsnWatch 帧上报;默认 Off,
+    /// 旧后端 worker 从不上报 → UI 不显示)。
+    pub usn_watch: UsnWatchState,
+    /// 游标上次推进时间(journal 批次 / VolumeReady):UI 的「游标 age」。
+    cursor_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -77,6 +88,8 @@ pub enum EngineMsg {
     DirSyncEnd { guid: u128, ok: bool },
     /// 运行期 watcher:某父目录的最新子项快照(替换该目录子项集合)。
     DirChildren { guid: u128, parent_frn: u64, recs: Vec<Rec> },
+    /// USN 实时增量层每卷状态上报(usn 后端 worker)。
+    UsnWatch { guid: u128, state: UsnWatchState },
     VolumeReady { guid: u128, journal_id: u64, next_usn: i64, count: u32 },
     JournalReset { guid: u128 },
     VolumeGone { guid: u128 },
@@ -176,6 +189,8 @@ impl Engine {
                     syncing: false,
                     save_backoff: 0,
                     save_retry_at: None,
+                    usn_watch: UsnWatchState::Off,
+                    cursor_at: None,
                 });
                 let i = self.volumes.len() - 1;
                 self.bump_generation(i);
@@ -207,6 +222,8 @@ impl Engine {
                 syncing: false,
                 save_backoff: 0,
                 save_retry_at: None,
+                usn_watch: UsnWatchState::Off,
+                cursor_at: None,
             });
             self.pinyin.push(PinyinCache::empty());
             let i = self.volumes.len() - 1;
@@ -282,7 +299,22 @@ impl Engine {
                 // 空/半 store 会被 worker 误判成可增量,丢文件。
                 if self.volumes[i].complete {
                     self.volumes[i].next_usn = next_usn;
+                    // 游标推进时间戳:设置页/横幅的「游标 age」依据。
+                    self.volumes[i].cursor_at = Some(Instant::now());
                 }
+            }
+            EngineMsg::UsnWatch { guid, state } => {
+                if let Some(i) = self.volumes.iter().position(|v| v.guid == guid) {
+                    if self.volumes[i].usn_watch != state {
+                        snapshot::debug_log(&format!(
+                            "usn watch {} → {}",
+                            self.volumes[i].letter,
+                            state.label()
+                        ));
+                        self.volumes[i].usn_watch = state;
+                    }
+                }
+                // 未知 guid(卷已移除/未出现在握手)直接忽略:不凭空建卷。
             }
             EngineMsg::VolumeReady { guid, journal_id, next_usn, count } => {
                 let Some(i) = self.volumes.iter().position(|v| v.guid == guid) else {
@@ -295,6 +327,7 @@ impl Engine {
                     v.complete = true;
                     v.resume_frn = 0;
                     v.dirty = true;
+                    v.cursor_at = Some(Instant::now());
                     // 扫完的卷立即落一次盘(不等 60s 节流):这是最值钱的快照。
                     v.save_retry_at = None;
                     let mut compacted = false;
@@ -462,7 +495,15 @@ impl Engine {
                 } else {
                     None
                 };
-                VolumeProgress { letter: v.letter, complete: v.complete, pct, count }
+                VolumeProgress {
+                    letter: v.letter,
+                    complete: v.complete,
+                    pct,
+                    count,
+                    // Off 是「worker 从未上报」的缺省:不显示,避免旧后端 UI 噪音。
+                    usn_state: (v.usn_watch != UsnWatchState::Off).then_some(v.usn_watch),
+                    cursor_age_secs: v.cursor_at.map(|t| t.elapsed().as_secs()),
+                }
             })
             .collect();
         // 内部顺序来自 read_dir / swap_remove(会乱),UI 要按盘符 C D E F
@@ -1158,6 +1199,46 @@ mod tests {
 
         let letters: Vec<char> = engine.status().volumes.iter().map(|v| v.letter).collect();
         assert_eq!(letters, vec!['C', 'F']);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UsnWatch 状态上报(usn 后端):只更新已知卷、变化才记;状态经 status()
+    /// 暴露给 UI,非 Off 才显示。Off 缺省下 UI 不显示,旧后端零噪音。
+    #[test]
+    fn usn_watch_state_updates_and_surfaces_in_status() {
+        let dir = temp_index_dir("usn-watch");
+        let guid = 0x81u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+
+        // 缺省 Off:status 不带 usn_state(旧后端/未上报时 UI 无此段)
+        // 游标 age 在 VolumeReady 后即存在(扫描完成的 Ready 也算一次推进)。
+        let st = engine.status();
+        assert_eq!(st.volumes.len(), 1);
+        assert!(st.volumes[0].usn_state.is_none());
+        assert!(st.volumes[0].cursor_age_secs.is_some());
+
+        // worker 上报进入轮询 → Watching
+        engine.handle(EngineMsg::UsnWatch { guid, state: UsnWatchState::Watching });
+        let st = engine.status();
+        assert_eq!(st.volumes[0].usn_state, Some(UsnWatchState::Watching));
+
+        // 游标推进(就绪卷的 Records)→ cursor age 出现且为刚发生
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(20, 10, 0, "usn-new.txt")],
+            next_usn: 120,
+        });
+        let st = engine.status();
+        let age = st.volumes[0].cursor_age_secs.expect("cursor age after records");
+        assert!(age <= 5, "刚推进的游标 age 应接近 0,实测 {age}s");
+
+        // 退避 → 上报;Disabled 未知 guid 被忽略,不建新卷
+        engine.handle(EngineMsg::UsnWatch { guid, state: UsnWatchState::Backoff });
+        let st = engine.status();
+        assert_eq!(st.volumes[0].usn_state, Some(UsnWatchState::Backoff));
+        engine.handle(EngineMsg::UsnWatch { guid: 0xdead, state: UsnWatchState::Disabled });
+        assert_eq!(engine.volumes.len(), 1, "未知 guid 不得凭空建卷");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -5,6 +5,7 @@
 //!      / JournalReset / VolumeGone / VolumeAppeared / WorkerExit
 
 use crate::usn::{Op, Rec};
+use crate::usnwatch::UsnWatchState;
 use crate::PROTO_VERSION;
 
 pub mod frame_type {
@@ -22,6 +23,8 @@ pub mod frame_type {
     /// 运行期切换索引卷:载荷 u32 位掩码(bit i = 盘符 `'A' + i`,0 = 未设置)。
     /// worker 只更新内存掩码,卷线程起停交给会话循环既有的 500ms 热插拔差异。
     pub const SET_VOLUMES: u8 = 17;
+    /// USN 实时增量层每卷状态上报(usn 后端):Off/Watching/Backoff/Disabled。
+    pub const USN_WATCH: u8 = 18;
     // W→C
     pub const WELCOME: u8 = 2;
     pub const VOLUME_META: u8 = 3;
@@ -126,6 +129,12 @@ pub enum Frame {
         guid: u128,
         parent_frn: u64,
         recs: Vec<Rec>,
+    },
+    /// USN 实时增量层每卷状态(usn 后端;worker 状态变化时上报,引擎据此
+    /// 在设置页/横幅展示 Watching/Backoff/Disabled 与游标 age)。
+    UsnWatch {
+        guid: u128,
+        state: UsnWatchState,
     },
     VolumeGone {
         guid: u128,
@@ -383,6 +392,12 @@ impl Frame {
                 w.u32(*mask);
                 w
             }
+            Frame::UsnWatch { guid, state } => {
+                let mut w = W::new(frame_type::USN_WATCH);
+                w.u128(*guid);
+                w.u8(state.to_u8());
+                w
+            }
             Frame::Shutdown => W::new(frame_type::SHUTDOWN),
         };
         // 前置长度(含类型字节)
@@ -468,6 +483,10 @@ impl Frame {
             frame_type::WORKER_EXIT => Frame::WorkerExit { reason: r.u32()? },
             frame_type::RESCAN => Frame::Rescan { guid: r.u128()? },
             frame_type::SET_VOLUMES => Frame::SetVolumes { mask: r.u32()? },
+            frame_type::USN_WATCH => Frame::UsnWatch {
+                guid: r.u128()?,
+                state: UsnWatchState::from_u8(r.u8()?),
+            },
             frame_type::SHUTDOWN => Frame::Shutdown,
             _ => return None,
         })
@@ -531,6 +550,8 @@ mod tests {
             Frame::Rescan { guid: 7 },
             Frame::SetVolumes { mask: (1 << 2) | (1 << 3) },
             Frame::SetVolumes { mask: u32::MAX },
+            Frame::UsnWatch { guid: 7, state: crate::usnwatch::UsnWatchState::Watching },
+            Frame::UsnWatch { guid: u128::MAX, state: crate::usnwatch::UsnWatchState::Disabled },
             Frame::Shutdown,
         ];
         for f in frames {

@@ -32,9 +32,10 @@ pub use usn::{Op, Rec};
 /// v3:Hello 每卷增加 resume_frn 与 complete 标记(中断续扫),布局不兼容 v2。
 /// v4:Rec 增加 mtime(目录枚举写入,内置时间筛选用)
 /// v5:新增 SetVolumes 控制帧(运行期切换索引卷,不重启 worker/不重弹 UAC)
+/// v6:新增 UsnWatch 状态帧(usn 后端的每卷 USN 层状态上报 W→C)
 /// worker/client 必须同版本;升级后残留的旧提权 worker 会握手失败并退出
 /// (见 worker::run_session),新客户端重拉即可。
-pub const PROTO_VERSION: u32 = 5;
+pub const PROTO_VERSION: u32 = 6;
 pub const PIPE_NAME: &str = r"\\.\pipe\lstr-index";
 
 /// 引擎请求(主进程 → worker 的控制指令,经管道)。

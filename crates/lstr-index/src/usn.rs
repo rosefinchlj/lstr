@@ -254,4 +254,70 @@ mod tests {
         assert_eq!(recs[0].op, Op::Upsert);
         assert_eq!(recs[0].name, "a.txt");
     }
+
+    /// V3(64 位文件名偏移等新布局)不在解析范围:跳过计数、继续解析后续 V2。
+    #[test]
+    fn parse_skips_v3_records_and_continues() {
+        let mut v3 = build_v2(1, 2, 0, 0, "future");
+        v3[4..6].copy_from_slice(&3u16.to_le_bytes()); // MajorVersion = 3
+        let mut buf = v3;
+        buf.extend_from_slice(&build_v2(
+            0x0100_0000_0022,
+            5,
+            0,
+            USN_REASON_FILE_CREATE,
+            "after.txt",
+        ));
+        let (recs, consumed, skipped) = parse_records(&buf);
+        assert_eq!(skipped, 1);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name, "after.txt");
+        assert_eq!(consumed, buf.len());
+        // 翻译层也必须只出 V2 这一条
+        let engine: Vec<_> = recs.iter().filter_map(|r| r.to_engine_op()).collect();
+        assert_eq!(engine.len(), 1);
+    }
+
+    /// 多条记录拼接解析:消费字节数与缓冲一致,字段各归各主。
+    #[test]
+    fn parse_concatenated_records() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&build_v2(100, 5, 0x10, USN_REASON_FILE_CREATE, "dirA"));
+        buf.extend_from_slice(&build_v2(101, 100, 0, USN_REASON_FILE_CREATE, "b.txt"));
+        buf.extend_from_slice(&build_v2(102, 100, 0, USN_REASON_RENAME_OLD_NAME, "old.txt"));
+        let (recs, consumed, skipped) = parse_records(&buf);
+        assert_eq!(skipped, 0);
+        assert_eq!(consumed, buf.len());
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].name, "dirA");
+        assert_eq!(recs[1].parent, 100);
+        assert_eq!(recs[2].reason, USN_REASON_RENAME_OLD_NAME);
+    }
+
+    /// 截断缓冲(尾部半条)→ 解析到完整边界为止,不 panic 不误读。
+    #[test]
+    fn parse_stops_at_truncated_tail() {
+        let mut buf = build_v2(0x0100_0000_0033, 5, 0, USN_REASON_FILE_CREATE, "ok.txt");
+        buf.extend_from_slice(&build_v2(0x0100_0000_0034, 5, 0, 0, "tail.txt"));
+        buf.truncate(buf.len() - 4); // 尾条名字缺 4 字节
+        let (recs, _consumed, skipped) = parse_records(&buf);
+        assert_eq!(skipped, 0);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name, "ok.txt");
+    }
+
+    /// 名字区越界(FileName 超出记录长度)→ 空名,翻译层过滤,不越界读。
+    #[test]
+    fn parse_out_of_range_name_yields_empty_and_is_filtered() {
+        let mut buf = build_v2(0x0100_0000_0044, 5, 0, USN_REASON_FILE_CREATE, "real.txt");
+        // 伪造 FileNameLength 超出 rec_len
+        buf[56..58].copy_from_slice(&4096u16.to_le_bytes());
+        let (recs, _consumed, _skipped) = parse_records(&buf);
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].name.is_empty());
+        assert!(
+            recs[0].to_engine_op().is_none(),
+            "空名记录必须被翻译层丢弃"
+        );
+    }
 }

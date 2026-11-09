@@ -24,8 +24,9 @@ use windows::Win32::System::Pipes::{
     PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW, OpenProcessToken,
-    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken,
+    QueryFullProcessImageNameW, SetThreadPriority, PROCESS_NAME_FORMAT,
+    PROCESS_QUERY_LIMITED_INFORMATION, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END,
 };
 
 /// UTF-16 (nul 结尾)。
@@ -263,6 +264,22 @@ pub fn flush_dir(dir: &std::path::Path) -> bool {
             }
             Err(_) => false,
         }
+    }
+}
+
+/// 把当前线程切到 Windows「后台模式」(`THREAD_MODE_BACKGROUND_BEGIN`):
+/// 该线程随后发起的 IO 优先级与 CPU 调度都降到最低档,用于整卷扫描/对账
+/// 这类重负载段(串行闸门之外的又一道负载整形)。
+/// 返回是否成功;失败(平台不支持/已处于后台模式)按原优先级继续,不致命。
+pub fn thread_io_background_begin() -> bool {
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN).is_ok() }
+}
+
+/// 退出后台模式(与 [`thread_io_background_begin`] 配对;调用方用 RAII guard
+/// 包住,保证 panic/早退也会恢复)。
+pub fn thread_io_background_end() {
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
     }
 }
 

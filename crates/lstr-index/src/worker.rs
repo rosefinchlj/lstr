@@ -67,10 +67,15 @@ pub enum ScanMode {
 #[derive(Clone, Debug)]
 pub struct WorkerOpts {
     pub scan_mode: ScanMode,
-    /// dir 模式下首扫完成后是否继续轮询 journal(阶段 2;默认关闭)。
+    /// dir 模式下首扫完成后是否继续轮询 journal(backend="usn" 时由
+    /// worker_launch_args 下发 `--index-journal`;等价 builtin 的旧手动开关)。
     pub journal: bool,
     /// 只处理这些卷;None = 全部本机固定 NTFS 卷。
     pub volumes: Option<Vec<char>>,
+    /// dirscan 批次间隔毫秒(0 = 不限;>0 时每个批次后 sleep,负载整形)。
+    pub scan_throttle_ms: u64,
+    /// journal 轮询间隔毫秒(usn 增量层;worker 侧二次兜底最小 100)。
+    pub journal_poll_ms: u64,
 }
 
 impl Default for WorkerOpts {
@@ -79,6 +84,8 @@ impl Default for WorkerOpts {
             scan_mode: ScanMode::Dir,
             journal: false,
             volumes: None,
+            scan_throttle_ms: 0,
+            journal_poll_ms: 500,
         }
     }
 }
@@ -171,6 +178,67 @@ fn note_good_hello() {
     BAD_HELLO_FIRST_NANOS.store(0, Ordering::Relaxed);
 }
 
+/// journal 轮询间隔下限(毫秒):worker 侧二次兜底,与配置归一化一致。
+const MIN_POLL_MS: u64 = 100;
+
+/// clean-exit 标记文件名(位于 %APPDATA%\lstr\index\)。
+///
+/// 崩溃自保护:worker 优雅退出时写,启动时「检查即消费」。启动时缺失 =
+/// 上次非正常退出(崩溃/被杀/断电)→ 本次 session 强制纯 dirscan(等价
+/// builtin,零 USN FSCTL),日志说明原因;正常退出后自动恢复。
+/// 防误伤:worker 被杀(用户关机/升级)属常见 —— 只降级一次 session,
+/// 不永久锁死(降级 session 正常退出即重写标记)。
+const CLEAN_EXIT_FLAG: &str = "worker_clean_exit";
+
+/// clean-exit 标记所在目录(与快照/engine.log 同一状态目录)。
+fn clean_exit_flag_dir() -> Option<std::path::PathBuf> {
+    std::env::var("APPDATA")
+        .ok()
+        .map(|base| std::path::PathBuf::from(base).join("lstr").join("index"))
+}
+
+/// 检查并清除标记(检查即消费:本次会话结束无论好坏都要重写)。
+/// 返回 true = 标记在(上次优雅退出);false = 缺失/无法删除(按缺失处理)。
+fn take_clean_exit_flag(dir: &std::path::Path) -> bool {
+    let path = dir.join(CLEAN_EXIT_FLAG);
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => false,
+    }
+}
+
+/// 写 clean-exit 标记(优雅退出路径)。内容带 unix 毫秒时间戳便于排查。
+fn write_clean_exit_flag(dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let _ = std::fs::write(dir.join(CLEAN_EXIT_FLAG), format!("clean {now}\n"));
+}
+
+/// 低 IO 优先级 RAII:进入即把当前线程切到 Windows 后台模式
+/// (`THREAD_MODE_BACKGROUND_BEGIN`,IO 与 CPU 都降到最低档),drop 时恢复。
+/// 包住整卷扫描/对账等重负载段;begin 失败(平台不支持)按原优先级继续。
+struct IoBackgroundGuard;
+
+impl IoBackgroundGuard {
+    fn enter() -> Self {
+        let ok = win::thread_io_background_begin();
+        if !ok {
+            crate::snapshot::debug_log("worker: thread background mode unavailable");
+        }
+        Self
+    }
+}
+
+impl Drop for IoBackgroundGuard {
+    fn drop(&mut self) {
+        win::thread_io_background_end();
+    }
+}
+
 /// worker 入口(lstr main 检测到 --index-worker 后调用)。不返回。
 pub fn worker_main() -> i32 {
     let mut parsed = WorkerOpts::default();
@@ -205,6 +273,32 @@ pub fn worker_main() -> i32 {
                 };
             }
             "--index-journal" => parsed.journal = true,
+            "--index-poll-ms" => {
+                let Some(raw) = args.next() else {
+                    crate::snapshot::debug_log("worker: missing --index-poll-ms value");
+                    return 2;
+                };
+                match raw.parse::<u64>() {
+                    Ok(ms) => parsed.journal_poll_ms = ms.max(MIN_POLL_MS),
+                    Err(_) => {
+                        crate::snapshot::debug_log(&format!("worker: bad --index-poll-ms {raw}"));
+                        return 2;
+                    }
+                }
+            }
+            "--index-throttle-ms" => {
+                let Some(raw) = args.next() else {
+                    crate::snapshot::debug_log("worker: missing --index-throttle-ms value");
+                    return 2;
+                };
+                match raw.parse::<u64>() {
+                    Ok(ms) => parsed.scan_throttle_ms = ms,
+                    Err(_) => {
+                        crate::snapshot::debug_log(&format!("worker: bad --index-throttle-ms {raw}"));
+                        return 2;
+                    }
+                }
+            }
             "--index-volumes" => {
                 let Some(raw) = args.next() else {
                     crate::snapshot::debug_log("worker: missing --index-volumes value");
@@ -225,6 +319,20 @@ pub fn worker_main() -> i32 {
         }
     }
     let mode = parsed.scan_mode;
+    // clean-exit 自保护(见模块下方 CLEAN_EXIT_FLAG 文档):上次非正常退出
+    // → 本次 session 强制纯 dirscan(等价 builtin,零 USN FSCTL),只降级一次。
+    if parsed.journal {
+        let unclean = clean_exit_flag_dir()
+            .map(|dir| !take_clean_exit_flag(&dir))
+            .unwrap_or(false); // 无法定位状态目录时不降级(防环境问题误伤)
+        if unclean {
+            crate::snapshot::debug_log(
+                "worker: clean-exit flag missing (last exit unclean) \
+                 → journal disabled this session (pure dirscan)",
+            );
+            parsed.journal = false;
+        }
+    }
     let journal = parsed.journal;
     let volumes = parsed.volumes.as_ref().map(|v| {
         v.iter()
@@ -234,14 +342,24 @@ pub fn worker_main() -> i32 {
     });
     let _ = OPTS.set(parsed);
     crate::snapshot::debug_log(&format!(
-        "worker: opts scan_mode={mode:?} journal={journal} volumes={volumes:?}"
+        "worker: opts scan_mode={mode:?} journal={journal} volumes={volumes:?} \
+         poll_ms={} throttle_ms={}",
+        opts().journal_poll_ms,
+        opts().scan_throttle_ms,
     ));
     let Ok(server) = win::create_pipe_server(PIPE_NAME) else {
         // 管道已存在 = 已有 worker 在跑(主进程重拉时可能撞上),静默退出
+        // (标记已被消费:残留 worker 若被杀,下次启动仍会正确降级一次)
         return 0;
     };
     let mut worker = Worker { server };
-    worker.run()
+    let code = worker.run();
+    // 优雅退出(Shutdown/idle 超时/管道重建失败):写回 clean-exit 标记,
+    // 下次启动恢复信任 USN 层。被杀/断电走不到这里 → 下次降级一次 session。
+    if let Some(dir) = clean_exit_flag_dir() {
+        write_clean_exit_flag(&dir);
+    }
+    code
 }
 
 struct Worker {
@@ -556,7 +674,9 @@ fn scan_full_or_resume(
         return None;
     }
     // 串行闸门:见 SCAN_GATE 注释。guard 持有到本函数返回(即整卷 ENUM 结束)。
+    // 低 IO 优先级(RAII):与 dir 路径同规格的负载整形。
     let _scan_slot = SCAN_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _io_bg = IoBackgroundGuard::enter();
     let mut last_report = std::time::Instant::now();
     let result = scan::scan_volume(
         letter,
@@ -600,7 +720,9 @@ fn scan_full_or_resume(
 /// - `sync=true`:引擎已有该卷快照(握手 complete=true)—— 后台对账,
 ///   逐批 patch 现有 store,结束时删除本轮没见到的条目(离线期间被删/移走)。
 ///
-/// 全程不打开卷句柄、不发任何 USN FSCTL —— 这是 2026-11-09 蓝屏后的安全路径。
+/// 全程不打开卷句柄、不发任何 USN FSCTL —— 这是 2026-11-09 蓝屏后的安全路径
+/// (backend=auto/builtin 恒走这里;backend=usn 走 [`journal_incremental_volume`],
+/// 首扫同样复用 [`dir_scan_pass`])。
 fn scan_dir_volume(
     letter: char,
     guid: u128,
@@ -608,9 +730,39 @@ fn scan_dir_volume(
     tx: &mpsc::SyncSender<Frame>,
     stop: &AtomicBool,
 ) {
+    let completed = dir_scan_pass(letter, guid, sync, None, tx, stop);
+    // 扫描完整完成后进入实时 watcher:ReadDirectoryChangesW 通知父目录变更
+    // 时重枚举该目录,经 DirChildren 帧 patch 内存索引。不碰 USN FSCTL。
+    if completed {
+        crate::watch::watch_volume(letter, guid, tx, stop);
+    }
+}
+
+/// dir 枚举一遍(首扫或 DirSync 对账),发对应帧;**不接 watcher** ——
+/// 调用方决定扫描完成后的实时层(watch.rs 目录通知 或 USN journal 轮询)。
+///
+/// - `sync=false`:首扫 —— VolumeMeta → ScanBegin → Batch… → VolumeReady。
+/// - `sync=true`:对账 —— DirSyncBegin → Batch… → DirSyncEnd(ok)。
+///
+/// `usn_cursor`:usn 增量层在**扫描前**采样的 (journal_id, 预扫描 NextUsn)
+/// (H4 同理:扫描窗口内的变更由 journal 回放补齐,不丢新建/改名)。
+/// 扫描完整完成后:
+/// - 首扫:VolumeReady 直接带该游标(引擎持久化,下次启动校验后可免扫直读);
+/// - 对账:DirSyncEnd 后补发一条 VolumeReady 重新握手(游标写回引擎);
+/// - `None` = 纯 dir 模式,VolumeReady 带 0(既有行为不变)。
+///
+/// 返回 true = 枚举完整结束(未被 stop 打断且未出错)。
+fn dir_scan_pass(
+    letter: char,
+    guid: u128,
+    sync: bool,
+    usn_cursor: Option<(u64, i64)>,
+    tx: &mpsc::SyncSender<Frame>,
+    stop: &AtomicBool,
+) -> bool {
     if sync {
         if !send_frame(tx, Frame::DirSyncBegin { guid }, stop) {
-            return;
+            return false;
         }
     } else {
         if !send_frame(
@@ -618,30 +770,38 @@ fn scan_dir_volume(
             Frame::VolumeMeta {
                 guid,
                 letter,
-                journal_id: 0,
-                next_usn: 0,
+                journal_id: usn_cursor.map(|(j, _)| j).unwrap_or(0),
+                next_usn: usn_cursor.map(|(_, u)| u).unwrap_or(0),
                 est_records: 0,
             },
             stop,
         ) {
-            return;
+            return false;
         }
         if !send_frame(tx, Frame::ScanBegin { guid, resume_frn: 0 }, stop) {
-            return;
+            return false;
         }
     }
     // 与 USN 全量扫描共用串行闸门:多卷首次构建逐卷来,降低 IO/内核压力。
     // 闸门只包住枚举本身:扫描完成后本卷会进入空闲等待,若把 guard 带到
     // 空闲循环里,下一卷会永远等不到锁(实测卡在「构建中(1/4)」)。
+    // 低 IO 优先级(RAII):扫描线程的元数据 IO/CPU 降到后台档,与
+    // scan_throttle_ms 一起构成负载整形(BSOD 取证的风险模型是高并发负载)。
     let mut count: u64 = 0;
     let mut last_report = std::time::Instant::now();
+    let throttle_ms = opts().scan_throttle_ms;
     let result = {
         let _scan_slot = SCAN_GATE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _io_bg = IoBackgroundGuard::enter();
         crate::dirscan::enumerate_volume(letter, stop, &mut |recs| {
             count += recs.len() as u64;
             let _ = send_frame(tx, Frame::Batch { guid, next_usn: 0, recs }, stop);
+            // 负载整形:批次间限流(0 = 不限;最后一次批次的空 sleep 无害)。
+            if throttle_ms > 0 {
+                std::thread::sleep(Duration::from_millis(throttle_ms));
+            }
             if !sync && last_report.elapsed() >= Duration::from_millis(500) {
                 last_report = std::time::Instant::now();
                 let _ = send_frame(
@@ -664,12 +824,20 @@ fn scan_dir_volume(
                 crate::snapshot::debug_log(&format!(
                     "dirsync {letter}: done count={count} (enumerated={total})"
                 ));
+                // 对账成功后重新握手 USN 游标(journal 生命周期错误自愈路径)。
+                if let Some((jid, usn)) = usn_cursor {
+                    let _ = send_frame(
+                        tx,
+                        Frame::VolumeReady { guid, journal_id: jid, next_usn: usn, count: 0 },
+                        stop,
+                    );
+                }
             } else if send_frame(
                 tx,
                 Frame::VolumeReady {
                     guid,
-                    journal_id: 0,
-                    next_usn: 0,
+                    journal_id: usn_cursor.map(|(j, _)| j).unwrap_or(0),
+                    next_usn: usn_cursor.map(|(_, u)| u).unwrap_or(0),
                     count: count.min(u32::MAX as u64) as u32,
                 },
                 stop,
@@ -678,22 +846,21 @@ fn scan_dir_volume(
                     "dirscan {letter}: ready count={count} (enumerated={total})"
                 ));
             }
-            // 首扫/对账完成后进入实时 watcher:ReadDirectoryChangesW 通知
-            // 父目录变更时重枚举该目录,经 DirChildren 帧 patch 内存索引。
-            // 不碰 USN FSCTL(蓝屏后收敛的安全路径)。
-            crate::watch::watch_volume(letter, guid, tx, stop);
+            true
         }
         Ok(_) => {
             if sync {
                 // 被抓停:只清引擎里的 SEEN 临时位,保留快照原样。
                 let _ = send_frame(tx, Frame::DirSyncEnd { guid, ok: false }, stop);
             }
+            false
         }
         Err(err) => {
             crate::snapshot::debug_log(&format!("dirscan {letter} failed: {err}"));
             if sync {
                 let _ = send_frame(tx, Frame::DirSyncEnd { guid, ok: false }, stop);
             }
+            false
         }
     }
 }
@@ -709,6 +876,12 @@ fn volume_loop(
     // 阶段 1:默认目录枚举首扫,完全不碰卷句柄/USN FSCTL(蓝屏后的安全路径)。
     // 握手 complete=true 表示引擎已加载该卷快照 → 不再整卷重扫,后台对账即可。
     if opts().scan_mode == ScanMode::Dir {
+        if opts().journal {
+            // backend="usn" 实验增量层:dirscan 首扫 → USN journal 轮询
+            // (熔断器/游标校验/clean-exit 护栏见 usnwatch 模块与 worker_main)。
+            journal_incremental_volume(letter, guid, req, &tx, &stop);
+            return;
+        }
         let sync = matches!(req, Some((_, _, _, true)));
         scan_dir_volume(letter, guid, sync, &tx, &stop);
         return;
@@ -799,6 +972,265 @@ fn volume_loop(
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
+    }
+}
+
+// ---------- USN 实时增量层(backend="usn";dirscan 首扫 → journal 轮询) ----------
+
+/// dir+journal 会话计划:快照 complete 且游标可信 → 免扫直读;否则先扫一遍。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirUsnPlan {
+    /// 游标可信:直接从 from_usn 进入 journal 轮询(离线窗口由 journal 覆盖)。
+    Watch { journal_id: u64, from_usn: i64 },
+    /// 先跑一遍 dirscan:sync=true = 引擎已有快照,走 DirSync 对账(删离线消失项);
+    /// sync=false = 全新首扫。
+    FullScan { sync: bool },
+}
+
+/// 纯函数:决定 dir+usn 会话从哪开始。
+/// 校验规则与 [`plan_volume_session`] 的 H2 一致:journal_id 匹配且
+/// FirstUsn <= saved_usn <= NextUsn 才信任游标(否则回退全量)。
+fn plan_dir_usn_session(
+    req: Option<(u64, i64, u64, bool)>,
+    live: Option<(u64, i64, i64)>,
+) -> DirUsnPlan {
+    if let Some((jid, usn, _resume_frn, true)) = req {
+        if crate::usnwatch::cursor_trusted(jid, usn, live) {
+            return DirUsnPlan::Watch { journal_id: jid, from_usn: usn };
+        }
+    }
+    DirUsnPlan::FullScan { sync: matches!(req, Some((_, _, _, true))) }
+}
+
+/// backend="usn" 的单卷增量层:dirscan 首扫 → journal 轮询(带熔断)。
+///
+/// 流程:
+/// 1. 开卷句柄(journal FSCTL 用);打不开 → 退回纯 dirscan 安全路径(不丢索引);
+/// 2. 快照 complete 且游标可信 → 免扫,直接从游标进入轮询;
+/// 3. 否则扫描前采样 (journal_id, NextUsn) 作为高水位 → dirscan(首扫或对账)
+///    → VolumeReady 宣告游标(引擎持久化进快照,下次启动校验后免扫直读)
+///    → 进入轮询。
+fn journal_incremental_volume(
+    letter: char,
+    guid: u128,
+    req: Option<(u64, i64, u64, bool)>,
+    tx: &mpsc::SyncSender<Frame>,
+    stop: &AtomicBool,
+) {
+    let poll_ms = opts().journal_poll_ms.max(MIN_POLL_MS);
+    let vol = match scan::VolumeHandle::open(letter) {
+        Ok(v) => v,
+        Err(err) => {
+            // 卷打不开(权限/被拔):退回纯 dirscan + 目录 watcher,索引能力不丢
+            crate::snapshot::debug_log(&format!("usn {letter}: volume open failed ({err}), fallback to dirscan"));
+            let sync = matches!(req, Some((_, _, _, true)));
+            scan_dir_volume(letter, guid, sync, tx, stop);
+            return;
+        }
+    };
+    let live = vol.journal_state();
+    match plan_dir_usn_session(req, live) {
+        DirUsnPlan::Watch { journal_id, from_usn } => {
+            crate::snapshot::debug_log(&format!(
+                "usn {letter}: cursor trusted (jid={journal_id} usn={from_usn}), skip scan"
+            ));
+            usn_watch_loop(&vol, letter, guid, journal_id, from_usn, tx, stop, poll_ms);
+        }
+        DirUsnPlan::FullScan { sync } => {
+            // 预扫描采样 journal 高水位:扫描窗口内的新建/改名由 journal 回放补齐(H4)
+            let cursor = live.map(|(jid, _first, next)| (jid, next));
+            crate::snapshot::debug_log(&format!(
+                "usn {letter}: {} scan then journal poll (cursor={cursor:?})",
+                if sync { "dirsync" } else { "full dirscan" },
+            ));
+            dir_scan_pass(letter, guid, sync, cursor, tx, stop);
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let (jid, usn) = cursor.unwrap_or((0, 0));
+            usn_watch_loop(&vol, letter, guid, jid, usn, tx, stop, poll_ms);
+        }
+    }
+}
+
+/// journal 实时增量轮询(每卷独立熔断;空读必须休眠 —— 历史踩坑:忙等烧 CPU)。
+///
+/// - `journal_id == 0`:卷上暂无活动 journal,循环内轻量 QUERY 等待;
+///   激活后宣告新游标(此时目录态刚扫完,无回放缺口)再开始读。
+/// - `JournalError::Reset`(0x19C/19D/19E):立即 DirSync 对账,成功后取新
+///   journal 状态重新握手(新游标),失败按熔断退避;连续失败达上限 → 本
+///   session 停用该卷(记日志后结束线程,不重试风暴)。
+/// - 其他 IO 错误:按 1s→2s→4s→…→60s 指数退避重试。
+fn usn_watch_loop(
+    vol: &scan::VolumeHandle,
+    letter: char,
+    guid: u128,
+    mut journal_id: u64,
+    mut next_usn: i64,
+    tx: &mpsc::SyncSender<Frame>,
+    stop: &AtomicBool,
+    poll_ms: u64,
+) {
+    let mut cb = crate::usnwatch::UsnCircuit::new();
+    let mut reported = Option::<crate::usnwatch::UsnWatchState>::None;
+    crate::snapshot::debug_log(&format!(
+        "usn {letter}: watch loop enter jid={journal_id} usn={next_usn} poll={poll_ms}ms"
+    ));
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            crate::snapshot::debug_log(&format!("usn {letter}: watch stopped ({:?})", cb.state));
+            return;
+        }
+        if journal_id == 0 {
+            // journal 未激活:仅 QUERY(轻量 FSCTL),激活后宣告游标再开始读
+            match vol.journal_state() {
+                Some((jid, _first, next)) => {
+                    journal_id = jid;
+                    next_usn = next;
+                    let _ = send_frame(
+                        tx,
+                        Frame::VolumeReady { guid, journal_id: jid, next_usn: next, count: 0 },
+                        stop,
+                    );
+                    cb.on_event(crate::usnwatch::UsnEvent::PollOk);
+                    report_usn_state(tx, guid, cb.state, stop, &mut reported);
+                    crate::snapshot::debug_log(&format!(
+                        "usn {letter}: journal now active jid={jid} usn={next}"
+                    ));
+                }
+                None => std::thread::sleep(Duration::from_millis(poll_ms)),
+            }
+            continue;
+        }
+        match scan::read_journal_masked(vol, journal_id, next_usn, crate::usnwatch::REASON_MASK_WATCH) {
+            Ok(Some((recs, next))) => {
+                cb.on_event(crate::usnwatch::UsnEvent::PollOk);
+                report_usn_state(tx, guid, cb.state, stop, &mut reported);
+                next_usn = next;
+                if recs.is_empty() {
+                    // 位点已到最新:空读必须休眠,否则卷线程忙等烧 CPU(实测踩坑)
+                    std::thread::sleep(Duration::from_millis(poll_ms));
+                } else {
+                    for chunk in recs.chunks(4000) {
+                        if !send_frame(
+                            tx,
+                            Frame::Batch { guid, next_usn, recs: chunk.to_vec() },
+                            stop,
+                        ) {
+                            return;
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                cb.on_event(crate::usnwatch::UsnEvent::PollOk);
+                report_usn_state(tx, guid, cb.state, stop, &mut reported);
+                std::thread::sleep(Duration::from_millis(poll_ms));
+            }
+            Err(scan::JournalError::Reset) => {
+                crate::snapshot::debug_log(&format!(
+                    "usn {letter}: journal reset (entry deleted / not active), scheduling dirsync"
+                ));
+                match cb.on_event(crate::usnwatch::UsnEvent::JournalGone) {
+                    crate::usnwatch::UsnDirective::RunDirSync => {
+                        report_usn_state(tx, guid, cb.state, stop, &mut reported);
+                        // 复用既有 dirscan 对账路径(串行闸门 + 低 IO 优先级内建)
+                        let ok = dir_scan_pass(letter, guid, true, None, tx, stop);
+                        let directive = cb.on_event(crate::usnwatch::UsnEvent::DirSyncDone { ok });
+                        if ok {
+                            // 重新握手:取新 journal 状态,宣告新游标后继续轮询
+                            match vol.journal_state() {
+                                Some((jid, _first, next)) => {
+                                    journal_id = jid;
+                                    next_usn = next;
+                                    let _ = send_frame(
+                                        tx,
+                                        Frame::VolumeReady {
+                                            guid,
+                                            journal_id: jid,
+                                            next_usn: next,
+                                            count: 0,
+                                        },
+                                        stop,
+                                    );
+                                    crate::snapshot::debug_log(&format!(
+                                        "usn {letter}: re-handshaked jid={jid} usn={next}"
+                                    ));
+                                }
+                                None => {
+                                    // journal 又没了:回到「等待激活」分支(游标清零)
+                                    journal_id = 0;
+                                    next_usn = 0;
+                                }
+                            }
+                        }
+                        match directive {
+                            crate::usnwatch::UsnDirective::Sleep(ms) => {
+                                std::thread::sleep(Duration::from_millis(ms));
+                            }
+                            crate::usnwatch::UsnDirective::Disable => {
+                                report_usn_state(tx, guid, cb.state, stop, &mut reported);
+                                crate::snapshot::debug_log(&format!(
+                                    "usn {letter}: disabled for this session (repeated dirsync failures)"
+                                ));
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    // 熔断器自锁:Disabled 后任何事件仍返回 Disable;理论上
+                    // JournalGone 不会走到这里,兜底防重试风暴。
+                    crate::usnwatch::UsnDirective::Disable => {
+                        report_usn_state(tx, guid, cb.state, stop, &mut reported);
+                        crate::snapshot::debug_log(&format!("usn {letter}: disabled for this session"));
+                        return;
+                    }
+                    other => {
+                        crate::snapshot::debug_log(&format!("usn {letter}: unexpected directive {other:?}"));
+                        return;
+                    }
+                }
+            }
+            Err(scan::JournalError::VolumeGone) => {
+                // 卷消失:通知引擎清掉该卷,线程退出(热插拔差异逻辑兜底)
+                let _ = tx.try_send(Frame::VolumeGone { guid });
+                return;
+            }
+            Err(scan::JournalError::Io) => {
+                crate::snapshot::debug_log(&format!(
+                    "usn {letter}: io error (failures={})",
+                    cb.failures + 1
+                ));
+                match cb.on_event(crate::usnwatch::UsnEvent::PollError) {
+                    crate::usnwatch::UsnDirective::Sleep(ms) => {
+                        report_usn_state(tx, guid, cb.state, stop, &mut reported);
+                        std::thread::sleep(Duration::from_millis(ms));
+                    }
+                    crate::usnwatch::UsnDirective::Disable => {
+                        report_usn_state(tx, guid, cb.state, stop, &mut reported);
+                        crate::snapshot::debug_log(&format!(
+                            "usn {letter}: disabled for this session (repeated io failures)"
+                        ));
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// 状态变化才上报(`UsnWatch` 帧);同一状态不重复发,避免通道噪音。
+fn report_usn_state(
+    tx: &mpsc::SyncSender<Frame>,
+    guid: u128,
+    state: crate::usnwatch::UsnWatchState,
+    stop: &AtomicBool,
+    last: &mut Option<crate::usnwatch::UsnWatchState>,
+) {
+    if *last != Some(state) {
+        *last = Some(state);
+        let _ = send_frame(tx, Frame::UsnWatch { guid, state }, stop);
     }
 }
 
@@ -1097,5 +1529,53 @@ mod tests {
         // 超过窗口:退出让位(旧令牌残留 worker 不会永久占着管道)
         assert!(bad_hello_expired(1_000, 1_000 + grace));
         assert!(bad_hello_expired(1_000, 1_000 + grace * 3));
+    }
+
+    /// dir+journal 会话计划:游标可信 → 免扫直读;journal_id 不匹配/越界/
+    /// 回退(无活动 journal)→ 先扫一遍(有快照走对账,无快照全新首扫)。
+    #[test]
+    fn dir_usn_plan_trusts_only_valid_cursor() {
+        let live = Some((7u64, 100i64, 500i64));
+        assert_eq!(
+            plan_dir_usn_session(Some((7, 300, 0, true)), live),
+            DirUsnPlan::Watch { journal_id: 7, from_usn: 300 }
+        );
+        // journal 已重建(jid 不匹配)→ 引擎有快照,走对账而非清空重扫
+        assert_eq!(
+            plan_dir_usn_session(Some((8, 300, 0, true)), live),
+            DirUsnPlan::FullScan { sync: true }
+        );
+        // 越界:早于 FirstUsn / 晚于 NextUsn
+        assert_eq!(
+            plan_dir_usn_session(Some((7, 99, 0, true)), live),
+            DirUsnPlan::FullScan { sync: true }
+        );
+        assert_eq!(
+            plan_dir_usn_session(Some((7, 501, 0, true)), live),
+            DirUsnPlan::FullScan { sync: true }
+        );
+        // 回退:卷上无活动 journal → 全量
+        assert_eq!(
+            plan_dir_usn_session(Some((7, 300, 0, true)), None),
+            DirUsnPlan::FullScan { sync: true }
+        );
+        // 无快照(complete=false)→ 全新首扫(即使位点碰巧有效也不跳过)
+        assert_eq!(
+            plan_dir_usn_session(Some((7, 300, 0, false)), live),
+            DirUsnPlan::FullScan { sync: false }
+        );
+        assert_eq!(plan_dir_usn_session(None, live), DirUsnPlan::FullScan { sync: false });
+    }
+
+    /// clean-exit 标记语义:缺失=上次非正常退出(降级);写→存在;检查即消费。
+    #[test]
+    fn clean_exit_flag_take_once() {
+        let dir = std::env::temp_dir().join(format!("lstr-worker-flag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!take_clean_exit_flag(&dir), "缺失 → 按上次非正常退出处理");
+        write_clean_exit_flag(&dir);
+        assert!(take_clean_exit_flag(&dir), "优雅退出写回 → 本 session 信任 USN");
+        assert!(!take_clean_exit_flag(&dir), "消费后必须消失:worker 被杀 → 下次降级一次");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

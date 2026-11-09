@@ -406,6 +406,7 @@ fn to_engine_msg(frame: lstr_index::proto::Frame) -> Option<EngineMsg> {
         }
         F::VolumeGone { guid } => EngineMsg::VolumeGone { guid },
         F::VolumeAppeared { guid, letter } => EngineMsg::VolumeAppeared { guid, letter },
+        F::UsnWatch { guid, state } => EngineMsg::UsnWatch { guid, state },
         F::WorkerExit { .. } | F::Shutdown => return None,
         F::Hello { .. } | F::Welcome { .. } | F::Rescan { .. } => return None,
         // C→W 控制帧(设置页切卷):worker 不会回给主进程,遇到即忽略。

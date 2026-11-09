@@ -326,4 +326,27 @@ mod tests {
         // 卷上没有活动 journal
         assert!(!cursor_trusted(7, 300, None));
     }
+
+    /// 监视掩码必须覆盖:lifecycle(建/删/改名,含 RENAME_OLD)+ CLOSE + DATA 写类。
+    #[test]
+    fn watch_reason_mask_covers_required_reasons() {
+        use crate::usn::{
+            USN_REASON_CLOSE, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
+            USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
+            USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
+        };
+        let m = REASON_MASK_WATCH;
+        for bit in [
+            USN_REASON_FILE_CREATE,
+            USN_REASON_FILE_DELETE,
+            USN_REASON_RENAME_OLD_NAME,
+            USN_REASON_RENAME_NEW_NAME,
+            USN_REASON_CLOSE,
+            USN_REASON_DATA_OVERWRITE,
+            USN_REASON_DATA_EXTEND,
+            USN_REASON_DATA_TRUNCATION,
+        ] {
+            assert!(m & bit != 0, "掩码缺少 reason 位 {bit:#x}");
+        }
+    }
 }
