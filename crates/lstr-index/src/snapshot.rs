@@ -109,12 +109,20 @@ pub fn save(
     w.flush()?;
     // 先 fsync 再 rename:否则崩溃/断电时 rename 可能先于数据落盘,
     // 留下「文件名在、内容空/截断」的快照(load 拒绝 → 全量重扫)。
-    // Windows 上 rename 在 NTFS 内是原子的,但目录项持久化不额外保证,
-    // 这里接受该残余风险(代价仍只是一次重扫)。
     let f = w.into_inner().map_err(|e| e.into_error())?;
     f.sync_all()?;
     drop(f);
     std::fs::rename(&tmp_path, &final_path)?;
+    // rename 改的是父目录项:再 flush 一次目录,缩小「文件名已改、目录项未持久」
+    // 的断电窗口。FAT/网络盘可能不支持,失败只记日志(最坏仍是一次重扫)。
+    if let Some(dir) = final_path.parent() {
+        if !crate::win::flush_dir(dir) {
+            debug_log(&format!(
+                "snapshot: flush_dir {} failed, dir entry may be non-durable",
+                dir.display()
+            ));
+        }
+    }
     Ok(std::fs::metadata(&final_path)?.len())
 }
 

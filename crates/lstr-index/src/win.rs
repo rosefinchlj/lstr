@@ -17,7 +17,7 @@ use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
     GetVolumeNameForVolumeMountPointW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_MODE,
-    FILE_TYPE_PIPE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_PIPE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, NAMED_PIPE_MODE,
@@ -232,6 +232,38 @@ pub fn close(h: HANDLE) {
 
 pub fn is_pipe(h: HANDLE) -> bool {
     unsafe { windows::Win32::Storage::FileSystem::GetFileType(h) == FILE_TYPE_PIPE }
+}
+
+/// 对目录做 FlushFileBuffers,让刚完成的 rename 目录项落盘。
+///
+/// fsync 只保证文件数据持久;rename 改的是父目录项,断电后可能出现
+/// 「文件名已改、目录项未持久」的窗口。目录句柄需要 FILE_FLAG_BACKUP_SEMANTICS,
+/// 且 FlushFileBuffers 要求 GENERIC_WRITE;FAT32/部分网络盘会拒绝,返回 false,
+/// 调用方只记日志(最坏结果仍只是一次全量重扫,不会读到坏数据)。
+pub fn flush_dir(dir: &std::path::Path) -> bool {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS,
+    };
+    let wide = to_wide(&dir.to_string_lossy());
+    unsafe {
+        let h = CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0),
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        );
+        match h {
+            Ok(h) => {
+                let ok = FlushFileBuffers(h).is_ok();
+                close(h);
+                ok
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 /// 懒填元数据(方案 §3.2 路线 A):FindFirstFileW 拿 size/mtime/精确名。

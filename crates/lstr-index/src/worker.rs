@@ -6,8 +6,17 @@
 //!
 //! 安全:管道名固定,启动时主进程用 runas 命令行传 16 字节能力令牌
 //! (`--index-token <hex>`),Hello 里回传后在这里校验;没有匹配令牌的进程
-//! 连上管道也会被拒。校验失败时 worker 直接退出(令牌不匹配 = 客户端是旧/
-//! 非本进程,让主进程重拉与新客户端匹配的 worker)。
+//! 连上管道也会被拒。
+//!
+//! 威胁模型(残余风险,不做「完整修复」):
+//! - 令牌走命令行是**能力校验**而非密码学防护:同用户进程只要能读到提权进程
+//!   的命令行就能拿到令牌。但主进程本身不提权,它传给提权 worker 的任何通道
+//!   (用户目录文件、环境变量、共享内存)对同用户非提权进程都更易读——命令行
+//!   反而是最小暴露面,故保持不变;令牌每进程随机、worker 退出即失效。
+//! - 令牌不符/帧型不符会关掉会话,累计 [`BAD_HELLO_GRACE`] 后 worker 退出。
+//!   退出本身是必需的:旧令牌 worker 必须让位(唯一管道实例 + FIRST_PIPE_INSTANCE),
+//!   否则新客户端永远连不上。陌生同用户进程反复发错 Hello 可让 worker 退出重拉,
+//!   属信任边界内的噪音级 DoS,不针对数据。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +45,45 @@ static EXIT_AFTER_SESSION: AtomicBool = AtomicBool::new(false);
 
 /// 启动时命令行传入的能力令牌;None = 没带 `--index-token`,一律拒绝握手。
 static WORKER_TOKEN: OnceLock<[u8; TOKEN_LEN]> = OnceLock::new();
+
+/// 首次坏握手的时间点(进程启动后的纳秒数,0 = 尚无)。
+static BAD_HELLO_FIRST_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 连续坏握手（令牌/帧型不符）容忍窗口:期内只丢会话、worker 留在原地;
+/// 超过则退出让主进程重拉。这样单个陌生包打不掉 worker,旧令牌残留 worker
+/// 也最多占管道 [`BAD_HELLO_GRACE`] 就会让位。
+const BAD_HELLO_GRACE: Duration = Duration::from_secs(30);
+
+/// 进程启动以来的纳秒数(单调时钟,只用于比较窗口)。
+fn now_nanos() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
+/// 纯函数:坏握手窗口是否已超时(first=0 表示尚未记录)。
+fn bad_hello_expired(first_nanos: u64, now_nanos: u64) -> bool {
+    first_nanos != 0
+        && now_nanos.saturating_sub(first_nanos) >= BAD_HELLO_GRACE.as_nanos() as u64
+}
+
+/// 记录一次坏握手;返回 true 表示应退出 worker。
+fn note_bad_hello() -> bool {
+    let now = now_nanos();
+    match BAD_HELLO_FIRST_NANOS.compare_exchange(
+        0,
+        now,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        Ok(_) => false, // 窗口刚开始,先留在原地
+        Err(first) => bad_hello_expired(first, now),
+    }
+}
+
+/// 握手成功:清空坏握手窗口。
+fn note_good_hello() {
+    BAD_HELLO_FIRST_NANOS.store(0, Ordering::Relaxed);
+}
 
 /// worker 入口(lstr main 检测到 --index-worker 后调用)。不返回。
 pub fn worker_main() -> i32 {
@@ -130,20 +178,27 @@ fn run_session(client: HANDLE) {
     let hello = match read_frame_pub(client, Duration::from_secs(30)) {
         Some(Frame::Hello { proto, token, volumes }) if proto == PROTO_VERSION => {
             if !token_ok(token) {
-                crate::snapshot::debug_log("worker: hello token mismatch, exiting");
-                // 令牌不符 = 旧客户端/旧 worker 混用或陌生进程:直接退出,
-                // 让主进程重拉与当前客户端匹配的 worker(否则窄管道会一直占着)。
-                EXIT_AFTER_SESSION.store(true, Ordering::Relaxed);
+                crate::snapshot::debug_log("worker: hello token mismatch, session dropped");
+                // 令牌不符 = 旧客户端/旧 worker 混用或陌生进程。单个包不直接退出,
+                // 等 BAD_HELLO_GRACE 累计后再让位(见模块文档的威胁模型)。
+                if note_bad_hello() {
+                    crate::snapshot::debug_log("worker: bad handshake window expired, exiting");
+                    EXIT_AFTER_SESSION.store(true, Ordering::Relaxed);
+                }
                 return;
             }
+            note_good_hello();
             volumes
         }
         Some(other) => {
             // 版本/帧型不符 = 与当前二进制不匹配的残留 worker(或陌生进程):
-            // 置 EXIT 让本次会话结束后退出,新客户端重拉同版本 worker,
-            // 否则旧 worker 会一直占着唯一管道实例,新 worker 永远起不来。
+            // 同样等窗口累计后退出,新客户端重拉同版本 worker;否则旧 worker
+            // 会一直占着唯一管道实例,新 worker 永远起不来。
             crate::snapshot::debug_log(&format!("worker: bad hello frame {other:?}"));
-            EXIT_AFTER_SESSION.store(true, Ordering::Relaxed);
+            if note_bad_hello() {
+                crate::snapshot::debug_log("worker: bad handshake window expired, exiting");
+                EXIT_AFTER_SESSION.store(true, Ordering::Relaxed);
+            }
             return;
         }
         None => return,
@@ -717,5 +772,17 @@ mod tests {
         let mut other = expected;
         other[0] ^= 0xff;
         assert!(!token_ok(other));
+    }
+
+    #[test]
+    fn bad_hello_expiry_keeps_single_packet_alive() {
+        let grace = BAD_HELLO_GRACE.as_nanos() as u64;
+        // 尚未记录 / 窗口内:都不退出(单个陌生包打不掉 worker)
+        assert!(!bad_hello_expired(0, 0));
+        assert!(!bad_hello_expired(1_000, 1_000));
+        assert!(!bad_hello_expired(1_000, 1_000 + grace - 1));
+        // 超过窗口:退出让位(旧令牌残留 worker 不会永久占着管道)
+        assert!(bad_hello_expired(1_000, 1_000 + grace));
+        assert!(bad_hello_expired(1_000, 1_000 + grace * 3));
     }
 }
