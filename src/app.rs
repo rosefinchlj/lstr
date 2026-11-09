@@ -201,6 +201,8 @@ pub struct LstrApp {
     last_width: f32,
     center_frames: u8,
     suppress_hide_until: Instant,
+    /// 按住 Esc 关闭窗口：记录按下起始时刻，超过阈值即隐藏。
+    esc_hold_since: Option<Instant>,
     icons: IconStore,
 }
 
@@ -303,6 +305,7 @@ impl LstrApp {
             last_width: 0.0,
             center_frames: 0,
             suppress_hide_until: Instant::now(),
+            esc_hold_since: None,
             icons: IconStore::new(),
         }
     }
@@ -609,6 +612,21 @@ impl LstrApp {
         self.ime_composing = preedit;
         if ime_active {
             return;
+        }
+
+        // 按住 Esc 关闭窗口（约 450ms）：短按仍走原有逻辑（清空输入、收起菜单、
+        // 退出设置页等），长按直接隐藏。窗口不再因为失焦自动关闭。
+        const ESC_HOLD_HIDE: Duration = Duration::from_millis(450);
+        if ctx.input(|i| i.key_down(Key::Escape)) {
+            let since = *self.esc_hold_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= ESC_HOLD_HIDE {
+                self.esc_hold_since = None;
+                self.hide(ctx);
+                return;
+            }
+            ctx.request_repaint_after(Duration::from_millis(25));
+        } else {
+            self.esc_hold_since = None;
         }
 
         if self.settings_open {
@@ -1046,26 +1064,6 @@ impl LstrApp {
     fn toast(&mut self, ctx: &egui::Context, message: String) {
         self.toast = Some((message, Instant::now() + Duration::from_millis(1300)));
         ctx.request_repaint_after(Duration::from_millis(1330));
-    }
-
-    fn update_focus(&mut self, ctx: &egui::Context) {
-        if self.hidden
-            || self.shown_at.elapsed() < Duration::from_millis(350)
-            || Instant::now() < self.suppress_hide_until
-            || ctx.input(|i| i.pointer.any_down())
-        {
-            return;
-        }
-        if let Some(hwnd) = self.hwnd {
-            if !window::is_foreground(hwnd) {
-                // 失焦隐藏时如果处于对话框模式，同样抑制该对话框的自动唤出，
-                // 否则用户点回对话框会触发一次无意义的再弹出。
-                if let Some(dialog) = &self.dialog {
-                    self.suppressed_dialog = Some(dialog.hwnd);
-                }
-                self.hide(ctx);
-            }
-        }
     }
 
     fn animate(&mut self, ctx: &egui::Context) {
@@ -4008,10 +4006,6 @@ impl eframe::App for LstrApp {
             self.pending_show = false;
         }
         self.handle_keys(ctx);
-        if self.hidden {
-            return;
-        }
-        self.update_focus(ctx);
         if self.hidden {
             return;
         }
