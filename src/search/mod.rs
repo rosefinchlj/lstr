@@ -16,7 +16,7 @@ use crate::model::{Entry, Kind, Query, Scope};
 use crate::search::filters::SearchFilters;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use eframe::egui;
@@ -25,6 +25,21 @@ use std::time::{Duration, Instant};
 /// 应用索引的刷新周期：新装/卸载应用后最多等这么久就能搜到/消失。
 /// 重建成本是枚举开始菜单 + App Paths（本机 200+ 应用，几十 ms），放 worker 线程无感。
 const APPS_RELOAD_INTERVAL: Duration = Duration::from_secs(90);
+
+/// 等待中的查询请求数:UI 线程发送前 +1,搜索线程出队后 -1。
+/// 引擎分批 apply 的块间让路钩子读它:>0 = 有打字请求在排队,对账/首扫的
+/// 记录 apply 立即收手——0294602「打字时查询优先于索引维护」的 apply 中段
+/// 扩展(此前只在 idle 轮边界检查,一轮 400 条大消息仍会把查询堵住秒级)。
+/// 计数而非布尔的理由:UI +1 与 send 之间、worker 出队与下一请求之间存在
+/// 窗口,布尔会出现「队列里有请求但标志已清」的假阴性;计数不会。
+static QUERY_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// 出队了一个请求:等待计数 -1(saturating,防 debug 断言下溢)。
+fn query_inflight_dec() {
+    let _ = QUERY_INFLIGHT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(1))
+    });
+}
 
 struct Request {
     generation: u64,
@@ -184,19 +199,29 @@ impl SearchService {
         lstr_index::query::CANCEL_GEN
             .store(self.generation, std::sync::atomic::Ordering::Relaxed);
         let query = query::parse(raw, scope);
-        let _ = self.tx.send(Request {
-            generation: self.generation,
-            sent_at: Instant::now(),
-            query,
-            limit: self.limit,
-            keywords: self.keywords.clone(),
-            dialog_quick,
-            filters: filters.clone(),
-            rank: rank.clone(),
-            show_history,
-            favorites: self.favorites.clone(),
-            base_folder,
-        });
+        // 先计数再发送:搜索线程的分批 apply 让路钩子据此提前收手,
+        // 查询不会再等一整轮消息消化(实测对账期一次最多等数百 ms)。
+        QUERY_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+        if self
+            .tx
+            .send(Request {
+                generation: self.generation,
+                sent_at: Instant::now(),
+                query,
+                limit: self.limit,
+                keywords: self.keywords.clone(),
+                dialog_quick,
+                filters: filters.clone(),
+                rank: rank.clone(),
+                show_history,
+                favorites: self.favorites.clone(),
+                base_folder,
+            })
+            .is_err()
+        {
+            // 搜索线程已退出:计数回退,避免遗留计数让后续会话误判
+            query_inflight_dec();
+        }
         self.generation
     }
 
@@ -624,7 +649,12 @@ fn run_worker(
             drop(index_cmd_rx);
         }
         _ => {
-            let engine = builtin::make_engine(&config.index);
+            let mut engine = builtin::make_engine(&config.index);
+            // 分批 apply 的块间让路检查:对账/首扫的记录按块消化,块间发现
+            // 等待中的查询(QUERY_INFLIGHT>0)立即收手,让主循环出队服务。
+            engine.set_query_yield_hook(Some(Box::new(|| {
+                QUERY_INFLIGHT.load(Ordering::Relaxed) > 0
+            })));
             *handshake_slot.lock().unwrap() = engine.handshake_state();
             builtin::spawn_client_thread(
                 Arc::clone(&handshake_slot),
@@ -667,7 +697,10 @@ fn run_worker(
         //    250 万条要 1-2s、落盘 120MB)让路到空闲再跑,否则「输入 bm 后列表
         //    卡几秒才刷」就是被这里堵住的。
         let pending = match rx.try_recv() {
-            Ok(r) => Some(r),
+            Ok(r) => {
+                query_inflight_dec();
+                Some(r)
+            }
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => break,
         };
@@ -675,11 +708,24 @@ fn run_worker(
             let idle_start = Instant::now();
             // 1. 应用自研索引的增量 + 维护(仅空闲路径)
             if let Some(b) = &mut builtin {
+                // 对账/首扫的分批记录:先消化引擎缓冲。advance 在块间查让路
+                // 钩子,有等待查询时返回 0 → 收手,让下面优先出队服务。
+                while b.engine.has_pending_apply() {
+                    if b.engine.advance_pending_apply() == 0 {
+                        break;
+                    }
+                }
                 let mut applied = 0usize;
                 while let Ok(msg) = engine_rx.try_recv() {
                     b.engine.handle(msg);
                     applied += 1;
                     if applied >= 400 {
+                        break;
+                    }
+                    // 打字优先(0294602 的 apply 中段扩展):消息间隙发现等待中
+                    // 的查询、或分批记录还没消化完 → 立即收手回到主循环出队;
+                    // 空闲时仍整轮消化,对账吞吐不受损。
+                    if QUERY_INFLIGHT.load(Ordering::Relaxed) > 0 || b.engine.has_pending_apply() {
                         break;
                     }
                 }
@@ -708,7 +754,10 @@ fn run_worker(
         let mut request = match pending {
             Some(r) => r,
             None => match rx.recv_timeout(Duration::from_millis(150)) {
-                Ok(r) => r,
+                Ok(r) => {
+                    query_inflight_dec();
+                    r
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             },
@@ -747,7 +796,9 @@ fn run_worker(
             apps_loaded = Instant::now();
         }
         while let Ok(next) = rx.try_recv() {
+            // 只保留最新请求(取消语义),每个出队的都要回退等待计数
             request = next;
+            query_inflight_dec();
         }
         // 诊断:区分「排队慢(worker 忙于引擎维护/落盘)」与「处理慢(IPC 探测等)」。
         {

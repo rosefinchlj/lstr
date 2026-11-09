@@ -77,6 +77,26 @@ pub struct VolumeState {
     cursor_at: Option<Instant>,
 }
 
+/// 对账/首扫 Records 分批 apply 的默认块大小(条)。
+///
+/// 依据:dirsync/dirscan 单条消息 4000 条、空闲一轮最多 400 条消息,整轮消化
+/// 会把同线程上的查询堵住数百 ms~秒级(实测对账期查询 execute p50=218ms、
+/// p90=512ms;稳态 0.4ms)。按 ~512 条(约 0.2-1ms 工作量)切块,块间让宿主
+/// 线程回去服务查询,打字期间的单次等待从「一整轮」降到「一块」。
+const DEFAULT_APPLY_CHUNK: usize = 512;
+
+/// 渐进 apply 缓冲:对账/首扫的 Records 不再一口气整条消息打完,而是按块
+/// 消化,块间让宿主线程回去服务查询。按卷分组,保证同卷记录的消费顺序与
+/// 到达顺序一致(跨卷本就无序,与现行为一致)。
+struct PendingApply {
+    guid: u128,
+    /// 待 apply 的剩余记录(FIFO)。
+    recs: std::collections::VecDeque<Rec>,
+    /// 缓冲内最后一条消息的 journal 位点:缓冲消化完时写入卷游标,
+    /// 与一次性路径「每条消息更新一次」的最终状态等价。
+    next_usn: i64,
+}
+
 #[derive(Debug)]
 pub enum EngineMsg {
     VolumeMeta { guid: u128, letter: char, journal_id: u64, next_usn: i64, est_records: u64 },
@@ -115,6 +135,16 @@ pub struct Engine {
     phase_since: Instant,
     /// 卷代次分配器(只增不减,跨卷唯一)。
     next_generation: u32,
+    /// 对账/首扫 Records 的分批缓冲(见 [`PendingApply`])。
+    pending_applies: Vec<PendingApply>,
+    /// 分批块大小(条);0 = 关闭分批(一次性 apply,与旧路径等价)。
+    apply_chunk_records: usize,
+    /// 让路钩子:分批块间调用;true = 本线程有等待中的查询,apply 立即收手,
+    /// 剩余块由宿主稍后继续消化。宿主(search worker)注入,复用 0294602
+    /// 「打字时查询优先于索引维护」的判定,把优先级检查扩展到 apply 中段。
+    query_yield: Option<Box<dyn Fn() -> bool + Send>>,
+    /// 让路发生次数(诊断/基准断言:批间让路必须真的发生过)。
+    apply_yields: u64,
 }
 
 impl Engine {
@@ -126,6 +156,10 @@ impl Engine {
             phase: Phase::Loading,
             phase_since: Instant::now(),
             next_generation: 1,
+            pending_applies: Vec::new(),
+            apply_chunk_records: DEFAULT_APPLY_CHUNK,
+            query_yield: None,
+            apply_yields: 0,
         };
         engine.load_snapshots();
         engine.recompute_phase();
@@ -276,31 +310,51 @@ impl Engine {
                 let Some(i) = self.volumes.iter().position(|v| v.guid == guid) else {
                     return;
                 };
-                let syncing = self.volumes[i].syncing;
-                if let Some(store) = &mut self.volumes[i].store {
-                    for rec in &recs {
-                        match rec.op {
-                            Op::Upsert => {
-                                store.insert_meta(rec.frn, rec.parent_frn, rec.attrs, rec.name.as_bytes(), rec.mtime);
-                                // 后台对账期间记「见过」,DirSyncEnd 据此删离线消失项。
-                                if syncing {
-                                    store.mark_seen(rec.frn);
-                                }
-                            }
-                            Op::Remove => {
-                                store.remove(rec.frn);
-                            }
+                // 对账(dirsync)/首扫(scan 模式)期间的大批 Records 分批 apply:
+                // 一轮 idle 最多 400 条消息 × 4000 条记录,整轮消化会把同线程上
+                // 的查询堵住数百 ms~秒级。按块消化,块间查让路钩子(0294602 的
+                // 打字优先扩展),钩子触发时剩余留待宿主下轮继续。
+                let chunked = self.apply_chunk_records > 0
+                    && (self.volumes[i].syncing
+                        || self.volumes[i]
+                            .store
+                            .as_ref()
+                            .map(|s| s.is_scanning())
+                            .unwrap_or(false));
+                if chunked {
+                    match self.pending_applies.iter_mut().find(|p| p.guid == guid) {
+                        Some(buf) => {
+                            // 同卷追加:消息顺序即消费顺序,保序
+                            buf.recs.extend(recs);
+                            buf.next_usn = next_usn;
+                        }
+                        None => {
+                            self.pending_applies.push(PendingApply {
+                                guid,
+                                recs: recs.into(),
+                                next_usn,
+                            });
                         }
                     }
-                    self.volumes[i].dirty = true;
-                }
-                // M2:记录批次的 journal 位点,重连握手从最新位点续传。
-                // 仅对就绪卷生效:扫描中的卷若提前写入 next_usn,
-                // 空/半 store 会被 worker 误判成可增量,丢文件。
-                if self.volumes[i].complete {
-                    self.volumes[i].next_usn = next_usn;
-                    // 游标推进时间戳:设置页/横幅的「游标 age」依据。
-                    self.volumes[i].cursor_at = Some(Instant::now());
+                    // 立即连续消化:无钩子(或无等待查询)时一口气消化完,
+                    // 最终状态与一次性 apply 完全一致;有等待查询则收手。
+                    self.drain_pending_applies();
+                } else {
+                    let syncing = self.volumes[i].syncing;
+                    if let Some(store) = &mut self.volumes[i].store {
+                        for rec in &recs {
+                            Self::apply_rec(store, rec, syncing);
+                        }
+                        self.volumes[i].dirty = true;
+                    }
+                    // M2:记录批次的 journal 位点,重连握手从最新位点续传。
+                    // 仅对就绪卷生效:扫描中的卷若提前写入 next_usn,
+                    // 空/半 store 会被 worker 误判成可增量,丢文件。
+                    if self.volumes[i].complete {
+                        self.volumes[i].next_usn = next_usn;
+                        // 游标推进时间戳:设置页/横幅的「游标 age」依据。
+                        self.volumes[i].cursor_at = Some(Instant::now());
+                    }
                 }
             }
             EngineMsg::UsnWatch { guid, state } => {
@@ -320,6 +374,9 @@ impl Engine {
                 let Some(i) = self.volumes.iter().position(|v| v.guid == guid) else {
                     return;
                 };
+                // 首扫的分批缓冲先消化完:compact / 拼音缓存重建的前提是
+                // 记录已全部 apply,分批路径必须先补齐再走原逻辑。
+                self.drain_pending_for(guid);
                 let compacted = {
                     let v = &mut self.volumes[i];
                     v.journal_id = journal_id;
@@ -366,6 +423,10 @@ impl Engine {
                 let Some(i) = self.volumes.iter().position(|v| v.guid == guid) else {
                     return;
                 };
+                // 分批缓冲先消化完(与一次性路径等价):ok=true 时 remove_unseen
+                // 依赖「所有记录已 apply 并标记 SEEN」;ok=false 时一次性路径同样
+                // 会把已到达的记录 apply 进 store(随后只清 SEEN、不删除)。
+                self.drain_pending_for(guid);
                 if !ok {
                     // 中途停止:只清临时位,绝不删除(否则会把没扫到的条目全判死)。
                     if let Some(store) = &mut self.volumes[i].store {
@@ -434,6 +495,8 @@ impl Engine {
             }
             EngineMsg::JournalReset { guid } => {
                 if let Some(i) = self.volumes.iter().position(|v| v.guid == guid) {
+                    // 索引将清空:未消化的分批缓冲随旧卷状态一起丢弃
+                    self.pending_applies.retain(|p| p.guid != guid);
                     {
                         let v = &mut self.volumes[i];
                         v.store = None;
@@ -451,6 +514,8 @@ impl Engine {
             }
             EngineMsg::VolumeGone { guid } => {
                 if let Some(i) = self.volumes.iter().position(|v| v.guid == guid) {
+                    // 未消化的分批缓冲随卷丢弃
+                    self.pending_applies.retain(|p| p.guid != guid);
                     // swap_remove:O(1) 收尾。代次跨卷唯一,旧 Hit 的 (vol,generation)
                     // 要么越界、要么代次不符,由访问器的校验拒绝(H8)。
                     self.volumes.swap_remove(i);
@@ -463,6 +528,134 @@ impl Engine {
             }
         }
         self.recompute_phase();
+    }
+
+    /// 注入查询让路钩子(见 [`Engine::query_yield`])。宿主(search worker)
+    /// 在线程内检查「是否有等待中的查询请求」并注入;测试/基准可注入任意判定。
+    pub fn set_query_yield_hook(&mut self, hook: Option<Box<dyn Fn() -> bool + Send>>) {
+        self.query_yield = hook;
+    }
+
+    /// 调整分批块大小(条);0 = 关闭分批(一次性 apply)。测试/基准用;
+    /// 生产路径用默认值([`DEFAULT_APPLY_CHUNK`])。
+    pub fn set_apply_chunk_records(&mut self, n: usize) {
+        self.apply_chunk_records = n;
+    }
+
+    /// 是否还有未消化完的分批记录(宿主在消化完之前不应消费后续消息,
+    /// 引擎内部已保证同卷顺序,这里供调度方判断何时让路)。
+    pub fn has_pending_apply(&self) -> bool {
+        self.pending_applies.iter().any(|p| !p.recs.is_empty())
+    }
+
+    /// 分批让路发生次数:批间检查到「有线程内等待中的查询」而收手的次数
+    /// (诊断/基准断言:批间让路必须真的发生过)。
+    pub fn apply_yield_count(&self) -> u64 {
+        self.apply_yields
+    }
+
+    /// 让路钩子是否触发(有线程内等待中的查询)。无钩子 = false。
+    fn query_pending(&self) -> bool {
+        self.query_yield.as_ref().map(|f| f()).unwrap_or(false)
+    }
+
+    /// 逐条 apply 语义(一次性路径与分批路径共用,保证最终状态一致):
+    /// Upsert = insert_meta,对账期间再记「本轮见过」(DirSyncEnd 据此删
+    /// 离线消失项);Remove = 打 DEAD 位(等 compact 回收)。
+    fn apply_rec(store: &mut VolumeStore, rec: &Rec, syncing: bool) {
+        match rec.op {
+            Op::Upsert => {
+                store.insert_meta(rec.frn, rec.parent_frn, rec.attrs, rec.name.as_bytes(), rec.mtime);
+                if syncing {
+                    store.mark_seen(rec.frn);
+                }
+            }
+            Op::Remove => {
+                store.remove(rec.frn);
+            }
+        }
+    }
+
+    /// 消化一块分批记录:从第一个非空缓冲取至多 [`Engine::apply_chunk_records`]
+    /// 条,逐条按一次性路径同款语义 apply;缓冲消化完即收尾——游标推进到
+    /// 缓冲内最后一条消息的位点(与一次性路径的最终状态等价)。
+    /// 返回实际 apply 的条数;0 = 没有待消化内容。
+    fn apply_one_chunk(&mut self) -> usize {
+        let Some(pi) = self.pending_applies.iter().position(|p| !p.recs.is_empty()) else {
+            return 0;
+        };
+        let guid = self.pending_applies[pi].guid;
+        let chunk = self.apply_chunk_records.max(1);
+        let batch: Vec<Rec> = {
+            let buf = &mut self.pending_applies[pi];
+            buf.recs.drain(..buf.recs.len().min(chunk)).collect()
+        };
+        let applied = batch.len();
+        let Some(i) = self.volumes.iter().position(|v| v.guid == guid) else {
+            // 卷已移除(热插拔兜底,正常不会走到):缓冲随卷丢弃
+            self.pending_applies.remove(pi);
+            return applied;
+        };
+        let syncing = self.volumes[i].syncing;
+        if let Some(store) = &mut self.volumes[i].store {
+            for rec in &batch {
+                Self::apply_rec(store, rec, syncing);
+            }
+            self.volumes[i].dirty = true;
+        }
+        if self.pending_applies[pi].recs.is_empty() {
+            let next_usn = self.pending_applies[pi].next_usn;
+            // 与一次性路径等价的游标推进:消化完这批消息后写最后位点
+            // (仅就绪卷生效,见 Records 处理的 M2 注释)。
+            if self.volumes[i].complete {
+                self.volumes[i].next_usn = next_usn;
+                self.volumes[i].cursor_at = Some(Instant::now());
+            }
+            self.pending_applies.remove(pi);
+        }
+        applied
+    }
+
+    /// 消化一个分批块;消费前先查让路钩子,「有线程内等待中的查询」时收手
+    /// 返回 0,剩余由宿主稍后继续(宿主服务完查询再调本方法续传)。
+    /// 返回本块实际 apply 的条数;0 = 无待消化内容或本次让路。
+    pub fn advance_pending_apply(&mut self) -> usize {
+        if !self.has_pending_apply() {
+            return 0;
+        }
+        if self.query_pending() {
+            self.apply_yields += 1;
+            return 0;
+        }
+        self.apply_one_chunk()
+    }
+
+    /// 连续消化直到清空或让路钩子触发(handle 内部驱动;无钩子或无等待查询时
+    /// 一口气消化完,与一次性 apply 等价)。
+    fn drain_pending_applies(&mut self) {
+        while self.has_pending_apply() {
+            if self.query_pending() {
+                self.apply_yields += 1;
+                return;
+            }
+            self.apply_one_chunk();
+        }
+    }
+
+    /// 把指定卷的分批缓冲全部消化完(无视让路钩子):控制消息
+    /// (DirSyncEnd/VolumeReady)的语义建立在「本卷记录已全部 apply」之上,
+    /// 必须先补齐再走原逻辑,保证最终状态与一次性 apply 完全一致。
+    fn drain_pending_for(&mut self, guid: u128) {
+        loop {
+            let Some(pi) = self.pending_applies.iter().position(|p| p.guid == guid) else {
+                return;
+            };
+            if self.pending_applies[pi].recs.is_empty() {
+                self.pending_applies.remove(pi);
+                return;
+            }
+            self.apply_one_chunk();
+        }
     }
 
     fn recompute_phase(&mut self) {
@@ -1274,4 +1467,242 @@ mod tests {
         assert_eq!(all.pinyin.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---------- 分批 apply 的正确性:分 1 批 vs 分 N 批,最终 store 完全一致 ----------
+
+    /// 最终状态指纹:(frn, 小写名, 父 frn, attrs, mtime) 按 slot 序。
+    /// 一次性 apply 与分批 apply 的逐条调用序列完全相同,故列内容(含
+    /// 未 compact 回收的 DEAD 槽)必须逐行一致。
+    fn store_rows(engine: &Engine, vol: usize) -> Vec<(u64, Vec<u8>, u64, u16, u32)> {
+        let store = engine.volumes[vol].store.as_ref().unwrap();
+        (0..store.len() as u32)
+            .map(|slot| {
+                let p = store.parent[slot as usize];
+                let parent_frn = if p == crate::store::NO_PARENT { 0 } else { store.frn[p as usize] };
+                (
+                    store.frn[slot as usize],
+                    store.name_lc(slot).to_vec(),
+                    parent_frn,
+                    store.attrs[slot as usize] & !crate::store::ATTR_INTERNAL,
+                    store.mtime[slot as usize],
+                )
+            })
+            .collect()
+    }
+
+    /// 同一记录流分别喂给两个引擎:engine_a 一次性(分批关闭,单条大
+    /// Records);engine_b 分数十条小消息 + 64 条/块,让路钩子中段强制触发
+    /// (证明分批可中断、可恢复)。卷 Ready 后逐列对比,并校验游标、
+    /// 拼音缓存有效性与查询结果一致。
+    #[test]
+    fn chunked_first_scan_apply_matches_one_shot() {
+        let dir = temp_index_dir("chunked-scan");
+        let guid = 0x91u128;
+        let mut engine_a = engine_with(&dir);
+        let mut engine_b = engine_with(&dir);
+        engine_a.set_apply_chunk_records(0);
+        engine_b.set_apply_chunk_records(64);
+        // 让路开关:开始放行(正常分批消化),中段强制让路(缓冲堆积),
+        // 消化阶段再放行(证明中断后可恢复)。
+        let force = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let force_hook = force.clone();
+        engine_b.set_query_yield_hook(Some(Box::new(move || {
+            force_hook.load(std::sync::atomic::Ordering::Relaxed)
+        })));
+
+        // 确定性记录流:目录先行 + 文件(部分父未消解)+ 重发(改名/属性/无变化)
+        let mut recs: Vec<Rec> = Vec::new();
+        for d in 0..40u64 {
+            recs.push(rec(100 + d, 0, 0x0010, &format!("dir{d:03}")));
+        }
+        for f in 0..460u64 {
+            let parent = 100 + (f % 40);
+            let name = format!("file{f:04}{}", [".txt", ".dat", ".md"][(f % 3) as usize]);
+            recs.push(rec(200 + f, parent, 0, &name));
+        }
+        // 后段重发:改名 / mtime / 完全一致(FRN 复用与就地更新路径)
+        for f in 0..60u64 {
+            recs.push(rec(200 + f, 100 + (f % 40), 0, &format!("renamed{f:04}.txt")));
+        }
+
+        for e in [&mut engine_a, &mut engine_b] {
+            e.handle(EngineMsg::VolumeMeta {
+                guid,
+                letter: 'C',
+                journal_id: 7,
+                next_usn: 100,
+                est_records: recs.len() as u64,
+            });
+            e.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        }
+        // a:一条大 Records(一次性)
+        engine_a.handle(EngineMsg::Records { guid, recs: recs.clone(), next_usn: 100 });
+        // b:同流切成数十条不等长小消息(分批引擎),前半段正常分批消化
+        let mut chunks = Vec::new();
+        let base = recs.len() / 20 + 1;
+        let mut rest = recs.as_slice();
+        while !rest.is_empty() {
+            let n = rest.len().min(base + (chunks.len() % 3) * 3);
+            chunks.push(&rest[..n]);
+            rest = &rest[n..];
+        }
+        for (k, part) in chunks.iter().enumerate() {
+            engine_b.handle(EngineMsg::Records {
+                guid,
+                recs: part.to_vec(),
+                next_usn: 100 + k as i64,
+            });
+            if k + 1 == chunks.len() / 2 {
+                // 中段起强制让路:后续消息整条留在缓冲(模拟查询持续等待)
+                force.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        assert!(chunks.len() >= 10);
+        assert!(
+            engine_b.apply_yield_count() > 0,
+            "让路钩子必须真的触发过"
+        );
+        assert!(
+            engine_b.has_pending_apply(),
+            "钩子触发期间部分记录应留在缓冲"
+        );
+        // 强制让路期间 advance 不得消费(把控制权完整交还宿主)
+        assert_eq!(engine_b.advance_pending_apply(), 0);
+        assert!(engine_b.has_pending_apply());
+        // 放行后逐块消化剩余缓冲直到清空(中断后可恢复)
+        force.store(false, std::sync::atomic::Ordering::Relaxed);
+        while engine_b.has_pending_apply() {
+            assert!(engine_b.advance_pending_apply() > 0, "钩子已放行,必须持续推进");
+        }
+        assert!(!engine_b.has_pending_apply());
+
+        for e in [&mut engine_a, &mut engine_b] {
+            e.handle(EngineMsg::VolumeReady { guid, journal_id: 7, next_usn: 100, count: 0 });
+        }
+        assert_eq!(store_rows(&engine_a, 0), store_rows(&engine_b, 0), "最终 store 必须逐列一致");
+        assert_eq!(
+            engine_a.handshake_state(),
+            engine_b.handshake_state(),
+            "游标状态必须一致"
+        );
+        // 拼音缓存有效(6b60e46 的越界回归护栏):所有 slot 都在界内
+        let len_b = engine_b.volumes[0].store.as_ref().unwrap().len();
+        assert!(len_b > 500);
+        assert!(engine_b.pinyin[0].slots.iter().all(|&s| s < len_b as u32));
+        // 查询结果一致(含 ASCII 拼音候选路径)
+        let mut spec = QuerySpec::default();
+        spec.tokens = vec!["file0001".to_string()];
+        let out_a = engine_a.query(&spec);
+        let out_b = engine_b.query(&spec);
+        assert_eq!(out_a.total, out_b.total);
+        assert_eq!(out_a.hits.len(), out_b.hits.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 对账(dirsync)路径:分 1 批 vs 分 N 批,含新增/改名/删除/属性更新;
+    /// DirSyncEnd(ok=true) 删除离线消失项的语义必须完全一致。中途中止
+    /// (ok=false)时缓冲先消化、只清 SEEN 不删除,同样与一次性等价。
+    #[test]
+    fn chunked_dirsync_apply_matches_one_shot() {
+        let dir = temp_index_dir("chunked-dirsync");
+        let guid = 0x92u128;
+        let mut engine_a = engine_with(&dir);
+        let mut engine_b = engine_with(&dir);
+        engine_a.set_apply_chunk_records(0);
+        engine_b.set_apply_chunk_records(2);
+        // 让路开关:第一轮放行(正常分批消化),中止轮强制让路,
+        // 用于验证 DirSyncEnd 时缓冲会被强制消化(控制消息语义前提)。
+        let force = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let force_hook = force.clone();
+        engine_b.set_query_yield_hook(Some(Box::new(move || {
+            force_hook.load(std::sync::atomic::Ordering::Relaxed)
+        })));
+
+        feed_ready(&mut engine_a, guid, 'C'); // docs/alpha.txt/beta.txt
+        feed_ready(&mut engine_b, guid, 'C');
+
+        // 完整对账流:alpha 更新(mtime)、gamma 新增、beta 删除、alpha 改名
+        let sync_recs = vec![
+            rec(10, 0, 0x0010, "docs"),
+            Rec { frn: 11, parent_frn: 10, attrs: 0, op: Op::Upsert, name: "alpha.txt".into(), mtime: 1_700_000_000 },
+            rec(13, 10, 0, "gamma.txt"),
+            Rec { frn: 12, parent_frn: 10, attrs: 0, op: Op::Remove, name: String::new(), mtime: 0 },
+            rec(11, 10, 0, "zeta.txt"),
+        ];
+        // a:一次性 apply
+        engine_a.handle(EngineMsg::DirSyncBegin { guid });
+        engine_a.handle(EngineMsg::Records { guid, recs: sync_recs.clone(), next_usn: 300 });
+        engine_a.handle(EngineMsg::DirSyncEnd { guid, ok: true });
+        // b:同流分批,全程强制让路(缓冲堆积),DirSyncEnd 前缓冲未消化完
+        // —— 验证控制消息会先强制消化缓冲再走原逻辑(ok=true 删除语义的前提)
+        engine_b.handle(EngineMsg::DirSyncBegin { guid });
+        force.store(true, std::sync::atomic::Ordering::Relaxed);
+        for part in sync_recs.chunks(2) {
+            engine_b.handle(EngineMsg::Records { guid, recs: part.to_vec(), next_usn: 300 });
+        }
+        assert!(
+            engine_b.has_pending_apply(),
+            "强制让路下,DirSyncEnd 前缓冲必须未消化完"
+        );
+        engine_b.handle(EngineMsg::DirSyncEnd { guid, ok: true });
+        force.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            engine_b.apply_yield_count() > 0,
+            "分批对账中让路钩子必须真的触发过"
+        );
+        assert!(!engine_b.has_pending_apply());
+        assert_eq!(
+            store_rows(&engine_a, 0),
+            store_rows(&engine_b, 0),
+            "对账后的 store 必须逐列一致(beta 删、gamma 增、alpha 改名)"
+        );
+        for e in [&engine_a, &engine_b] {
+            let s = e.volumes[0].store.as_ref().unwrap();
+            assert!(s.find_slot(12).is_none(), "beta 离线消失 → 删除");
+            assert!(s.find_slot(13).is_some(), "gamma 新增");
+            assert_eq!(s.name(s.find_slot(11).unwrap()), b"zeta.txt");
+            let len = s.len();
+            assert!(
+                e.pinyin[0].slots.iter().all(|&slot| (slot as usize) < len),
+                "拼音缓存必须全部指向有效 slot"
+            );
+        }
+
+        // 中途中止(ok=false):缓冲未消化的记录也要 apply(与一次性一致),
+        // 随后只清 SEEN、绝不删除。
+        let abort_recs = vec![rec(14, 10, 0, "mid.txt"), rec(15, 10, 0, "late.txt")];
+        for (e, split) in [(&mut engine_a, false), (&mut engine_b, true)] {
+            e.handle(EngineMsg::DirSyncBegin { guid });
+            if !split {
+                e.handle(EngineMsg::Records { guid, recs: abort_recs.clone(), next_usn: 400 });
+            } else {
+                // 强制让路:两条消息整条留在缓冲,DirSyncEnd 时强制消化
+                force.store(true, std::sync::atomic::Ordering::Relaxed);
+                e.handle(EngineMsg::Records { guid, recs: abort_recs[..1].to_vec(), next_usn: 400 });
+                e.handle(EngineMsg::Records { guid, recs: abort_recs[1..].to_vec(), next_usn: 400 });
+                assert!(
+                    e.has_pending_apply(),
+                    "强制让路下中止前的记录必须还在缓冲"
+                );
+            }
+            e.handle(EngineMsg::DirSyncEnd { guid, ok: false });
+            force.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        assert_eq!(
+            store_rows(&engine_a, 0),
+            store_rows(&engine_b, 0),
+            "中止路径的最终 store 也必须逐列一致"
+        );
+        for e in [&engine_a, &engine_b] {
+            let s = e.volumes[0].store.as_ref().unwrap();
+            assert!(s.find_slot(14).is_some() && s.find_slot(15).is_some());
+            assert!(
+                s.attrs.iter().all(|a| a & crate::store::ATTR_SEEN == 0),
+                "中止后不得残留 SEEN 临时位"
+            );
+            assert!(!e.has_pending_apply());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }
