@@ -958,24 +958,35 @@ impl LstrApp {
                 } else {
                     Some(known.iter().sum::<f32>() / known.len() as f32)
                 };
+                // Everything 未运行时不要声称「正与 Everything 合并」。
+                let suffix = if st.everything_ok {
+                    "（结果暂不完整，正与 Everything 合并）"
+                } else {
+                    "（结果暂不完整）"
+                };
                 note = Some(match pct {
                     Some(p) => format!(
-                        "正在构建索引 {:.0}% · 已收录 {} 万项（结果暂不完整，正与 Everything 合并）",
+                        "正在构建索引 {:.0}% · 已收录 {} 万项{}",
                         (p * 100.0).min(99.0),
-                        total / 10_000
+                        total / 10_000,
+                        suffix
                     ),
                     None => format!(
-                        "正在构建索引 · 已收录 {} 万项（结果暂不完整，正与 Everything 合并）",
-                        total / 10_000
+                        "正在构建索引 · 已收录 {} 万项{}",
+                        total / 10_000,
+                        suffix
                     ),
                 });
             } else if st.phase == lstr_index::Phase::Loading {
                 // 主界面不显示任何提示时，用户会以为「卡住了」：等 UAC、等 worker
                 // 连管道都可能停在这一阶段（旧 worker 占管道时甚至永久停住）。
-                note = Some(
+                note = Some(if st.everything_ok {
                     "索引准备中：等待管理员授权 / worker 连接（当前由 Everything 出结果）"
-                        .to_string(),
-                );
+                        .to_string()
+                } else {
+                    "索引准备中：等待管理员授权 / worker 连接（首次构建约 1~3 分钟）"
+                        .to_string()
+                });
             } else if st.phase == lstr_index::Phase::Fallback {
                 // 只有配置期望用内置索引时才提示；backend=everything/off 是用户主动选择。
                 let expect_builtin = matches!(
@@ -983,10 +994,13 @@ impl LstrApp {
                     "auto" | "builtin"
                 );
                 if expect_builtin {
-                    note = Some(
+                    note = Some(if st.everything_ok {
                         "内置索引不可用（未获管理员授权或 worker 未运行），当前结果来自 Everything"
-                            .to_string(),
-                    );
+                            .to_string()
+                    } else {
+                        "内置索引不可用（未获管理员授权或 worker 未运行），暂时没有搜索结果"
+                            .to_string()
+                    });
                 }
             }
         }
