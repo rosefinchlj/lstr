@@ -448,8 +448,14 @@ impl Engine {
                 if let Some(i) = self.volume_idx(guid, true, letter) {
                     let v = &mut self.volumes[i];
                     v.letter = letter;
-                    v.journal_id = journal_id;
-                    v.next_usn = next_usn;
+                    // 就绪卷不接受游标对 (journal_id, next_usn) 覆盖:Full 计划
+                    // 下该值是扫描起点高水位,与随后的 ScanBegin 之间存在「游标
+                    // 超前于内容」的窄落盘窗口;增量计划的 VolumeMeta 本就是握手
+                    // 回显,跳过不改变语义。未就绪卷(首扫/重扫窗口)正常接受。
+                    if !v.complete {
+                        v.journal_id = journal_id;
+                        v.next_usn = next_usn;
+                    }
                     v.est_records = est_records;
                 }
             }
@@ -1293,6 +1299,8 @@ impl Engine {
     /// 就绪卷的稳态变更以旁车收尾(毫秒级):游标+增量持久化语义与稳态完全
     /// 一致,退出不必等整卷重写 —— 旧实现每卷全量保存 1.6-2s,四卷退出要
     /// 卡 6s+;全量归档由下一会话的降频保存完成(dirty 保留,加载即恢复)。
+    /// 旁车已自洽(无待写变更)的卷直接跳过,不整卷重写;旁车写盘失败则
+    /// 回落全量保存,退出前变更必须以任一自洽形式落盘。
     /// 对账收尾/扫描断点(捕获未武装/扫描中)仍全量落盘。
     pub fn flush_all(&mut self) {
         for i in 0..self.volumes.len() {
@@ -1307,10 +1315,19 @@ impl Engine {
             if self.has_pending_apply_for(self.volumes[i].guid) {
                 continue;
             }
-            if self.volumes[i].sidecar_capture_ready() && self.volumes[i].sidecar_pending {
-                self.volumes[i].sidecar_retry_at = None;
-                self.write_sidecar(i);
-                continue;
+            if self.volumes[i].sidecar_capture_ready() {
+                if self.volumes[i].sidecar_pending {
+                    self.volumes[i].sidecar_retry_at = None;
+                    if self.write_sidecar(i) {
+                        continue;
+                    }
+                    // 旁车写盘失败:落到下面的整卷保存,变更不丢
+                } else {
+                    // 无待写旁车变更:盘上旁车本就自洽,跳过整卷重写
+                    // (每卷 1.6-2s 的退出卡顿);dirty 保留,全量归档由下一
+                    // 会话的降频保存完成。
+                    continue;
+                }
             }
             self.volumes[i].save_retry_at = None;
             let _ = self.save_volume(i);
@@ -2023,6 +2040,117 @@ mod tests {
         letters.sort();
         assert_eq!(letters, vec!['C', 'F']);
         assert_eq!(all.pinyin.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 就绪卷收到带高水位游标的 VolumeMeta(Full 计划的扫描起点高水位):
+    /// 游标对 (journal_id, next_usn) 不得被覆盖 —— 否则到随后的 ScanBegin
+    /// 之间存在「游标超前于内容」的窄落盘窗口。增量计划的 VolumeMeta 本就是
+    /// 握手回显,跳过不改变语义;未就绪卷(重扫窗口)仍正常接受。
+    #[test]
+    fn volume_meta_does_not_overwrite_cursor_of_ready_volume() {
+        let dir = temp_index_dir("meta-cursor");
+        let guid = 0xb3u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C'); // jid=7 usn=100,complete
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec_file(13, 10, "gamma.txt")],
+            next_usn: 900,
+        });
+        assert_eq!(engine.handshake_state(), vec![(guid, 7, 900, 0, true)]);
+
+        // Full 计划的 VolumeMeta(高水位 5000 + 新 journal_id):就绪卷跳过
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'C',
+            journal_id: 9,
+            next_usn: 5000,
+            est_records: 10,
+        });
+        let v = &engine.volumes[0];
+        assert_eq!((v.journal_id, v.next_usn), (7, 900), "就绪卷游标不得被覆盖");
+        assert_eq!(engine.handshake_state(), vec![(guid, 7, 900, 0, true)]);
+
+        // 未就绪卷(ScanBegin 之后的重扫窗口)仍接受覆盖:首扫/续扫语义不变
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'C',
+            journal_id: 9,
+            next_usn: 5000,
+            est_records: 10,
+        });
+        let v = &engine.volumes[0];
+        assert_eq!((v.journal_id, v.next_usn), (9, 5000), "未就绪卷仍接受游标");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// flush_all:就绪卷旁车写盘失败时必须回落全量保存 —— 退出前变更要以
+    /// 任一自洽形式落盘,不能因旁车失败而整卷丢掉。
+    #[test]
+    fn flush_all_falls_back_to_full_save_when_sidecar_fails() {
+        let dir = temp_index_dir("flush-sidecar-fail");
+        let guid = 0xb4u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain()); // 首次全量保存,武装旁车捕获
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec_file(13, 10, "gamma.txt")],
+            next_usn: 200,
+        });
+        assert!(engine.volumes[0].sidecar_pending);
+
+        // 阻断旁车写盘:把 tmp 路径占成目录,File::create 必失败
+        let tmp = dir.join(format!("cur_{guid:032x}.tmp"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        engine.flush_all();
+
+        // 回落全量:快照已含 gamma,重启直接读到;dirty 随全量成功清除
+        let engine2 = engine_with(&dir);
+        assert!(
+            engine2.volumes[0].store.as_ref().unwrap().find_slot(13).is_some(),
+            "旁车失败必须回落全量保存,变更不得丢"
+        );
+        assert!(!engine.volumes[0].dirty, "全量保存成功后 dirty 清");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// flush_all:就绪卷捕获已武装且无待写旁车变更时,跳过整卷全量保存
+    /// (旁车文件在盘上本就自洽;每卷 1.6-2s 的退出整卷重写是纯浪费),
+    /// dirty 保留给下一会话的降频保存归档;恢复语义不受影响。
+    #[test]
+    fn flush_all_skips_full_save_when_sidecar_already_persisted() {
+        let dir = temp_index_dir("flush-no-pending");
+        let guid = 0xb5u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain());
+        let snap_path = snapshot::snapshot_path(&dir, guid);
+        let before = std::fs::read(&snap_path).unwrap();
+
+        // 稳态变更已经旁车落盘(无待写):dirty 仍真(未归档),旁车自洽
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec_file(13, 10, "gamma.txt")],
+            next_usn: 200,
+        });
+        assert!(engine.maintain(), "旁车写盘");
+        assert!(!engine.volumes[0].sidecar_pending);
+        assert!(engine.volumes[0].dirty);
+
+        engine.flush_all();
+        assert_eq!(
+            std::fs::read(&snap_path).unwrap(),
+            before,
+            "无待写旁车变更:退出不得整卷重写"
+        );
+        assert!(engine.volumes[0].dirty, "dirty 保留,全量归档留给下一会话");
+
+        // 恢复语义:快照 + 旁车回放仍恢复出 gamma
+        let engine2 = engine_with(&dir);
+        assert!(engine2.volumes[0].store.as_ref().unwrap().find_slot(13).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
