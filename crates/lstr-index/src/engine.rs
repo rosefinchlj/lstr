@@ -618,7 +618,16 @@ impl Engine {
                     continue; // scan 模式的 compact 由 VolumeReady 触发
                 }
                 if store.needs_compact() {
+                    let started = Instant::now();
+                    let len = store.len();
                     store.compact();
+                    let ms = started.elapsed().as_millis();
+                    if ms > 50 {
+                        crate::snapshot::debug_log(&format!(
+                            "compact vol {} len={} took {}ms",
+                            self.volumes[i].letter, len, ms
+                        ));
+                    }
                     true
                 } else {
                     false
@@ -681,7 +690,20 @@ impl Engine {
                 resume_frn: v.resume_frn,
                 est_records: v.est_records,
             };
-            snapshot::save_report(&self.cfg.index_dir, &header, &mut self.volumes[i].store.as_mut().unwrap())
+            let started = Instant::now();
+            let result = snapshot::save_report(
+                &self.cfg.index_dir,
+                &header,
+                &mut self.volumes[i].store.as_mut().unwrap(),
+            );
+            let ms = started.elapsed().as_millis();
+            if ms > 100 {
+                crate::snapshot::debug_log(&format!(
+                    "save vol {} took {}ms",
+                    self.volumes[i].letter, ms
+                ));
+            }
+            result
         };
         match save_result {
             Ok(report) => {

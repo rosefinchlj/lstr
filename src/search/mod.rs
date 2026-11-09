@@ -353,18 +353,35 @@ fn run_worker(
     // 否则首装扫描期用户不击键 → 引擎停摆(实测抓出)。
     let mut last_phase: Option<lstr_index::Phase> = None;
     loop {
-        // 1. 应用自研索引的增量 + 维护(空闲路径也走)
-        if let Some(b) = &mut builtin {
-            let mut applied = 0usize;
-            while let Ok(msg) = engine_rx.try_recv() {
-                b.engine.handle(msg);
-                applied += 1;
-                if applied >= 400 {
-                    break;
+        // 0. 先看有没有待处理请求:用户打字时优先查询。维护(整卷 compact 实测
+        //    250 万条要 1-2s、落盘 120MB)让路到空闲再跑,否则「输入 bm 后列表
+        //    卡几秒才刷」就是被这里堵住的。
+        let pending = match rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        };
+        if pending.is_none() {
+            let idle_start = Instant::now();
+            // 1. 应用自研索引的增量 + 维护(仅空闲路径)
+            if let Some(b) = &mut builtin {
+                let mut applied = 0usize;
+                while let Ok(msg) = engine_rx.try_recv() {
+                    b.engine.handle(msg);
+                    applied += 1;
+                    if applied >= 400 {
+                        break;
+                    }
                 }
+                b.engine.maintain();
+                *handshake_slot.lock().unwrap() = b.engine.handshake_state();
             }
-            b.engine.maintain();
-            *handshake_slot.lock().unwrap() = b.engine.handshake_state();
+            let idle_ms = idle_start.elapsed().as_millis();
+            if idle_ms > 100 {
+                lstr_index::snapshot::debug_log(&format!(
+                    "search: idle maintenance took {idle_ms}ms"
+                ));
+            }
         }
         publish_status(builtin.as_ref(), everything.as_ref(), &status_slot);
         // 状态变化时唤醒 UI(横幅进度条不击键也要动)
@@ -377,11 +394,14 @@ fn run_worker(
                 ctx.request_repaint();
             }
         }
-        // 2. 取请求(150ms 超时 → 回到维护)
-        let mut request = match rx.recv_timeout(Duration::from_millis(150)) {
-            Ok(r) => r,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        // 2. 取请求(有 pending 直接用;否则 150ms 超时 → 回到维护)
+        let mut request = match pending {
+            Some(r) => r,
+            None => match rx.recv_timeout(Duration::from_millis(150)) {
+                Ok(r) => r,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
         };
         // 用户可能刚点了提示条启动 Everything；每次查询前尝试重连，
         // 而不是启动时连不上就永久报错。
@@ -397,7 +417,8 @@ fn run_worker(
             let need_everything = !force_builtin
                 && (config.index.backend == "everything"
                     || !phase_ready
-                    || request.filters.time.is_some());
+                    // dir 扫描的索引自己带 mtime:Ready 后时间筛选不再需要 Everything
+                    || (request.filters.time.is_some() && !builtin_time_ok));
             if need_everything && last_everything_probe.elapsed() >= Duration::from_secs(10) {
                 last_everything_probe = Instant::now();
                 everything = everything::EverythingProvider::new().ok();
