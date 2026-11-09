@@ -120,6 +120,12 @@ impl Engine {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
+            // 上次写快照中途崩溃/被杀留下的 temp 文件(vol_<pid>.tmp):清掉,
+            // 避免长期堆积;若仍有并发写者,它会在 rename 前重建/覆盖。
+            if name.strip_prefix("vol_").is_some_and(|s| s.ends_with(".tmp")) {
+                let _ = std::fs::remove_file(entry.path());
+                continue;
+            }
             let Some(hex) = name
                 .strip_prefix("vol_")
                 .and_then(|s| s.strip_suffix(".bin"))
@@ -349,15 +355,22 @@ impl Engine {
         IndexStatus { phase: self.phase, volumes, since: self.phase_since }
     }
 
-    /// 握手载荷:每卷 (guid, journal_id, next_usn)。未完成的卷 next_usn=0(要求全量)。
-    pub fn handshake_state(&self) -> Vec<(u128, u64, i64)> {
+    /// 握手载荷:每卷 (guid, journal_id, next_usn, resume_frn, complete)。
+    ///
+    /// - complete=true:next_usn 是 journal 位点,worker 走增量;jid/usn 无效时它自己退全量。
+    /// - complete=false 且 store 已建:带上次扫描的起点高水位与 resume_frn,
+    ///   worker 从 resume_frn 续扫(中断续扫),不用每次重启从头全量。
+    /// - 其它:全 0,要求 worker 从头全量。
+    pub fn handshake_state(&self) -> Vec<(u128, u64, i64, u64, bool)> {
         self.volumes
             .iter()
             .map(|v| {
                 if v.complete {
-                    (v.guid, v.journal_id, v.next_usn)
+                    (v.guid, v.journal_id, v.next_usn, 0, true)
+                } else if v.store.is_some() && v.journal_id > 0 && v.next_usn > 0 {
+                    (v.guid, v.journal_id, v.next_usn, v.resume_frn, false)
                 } else {
-                    (v.guid, 0, 0)
+                    (v.guid, 0, 0, 0, false)
                 }
             })
             .collect()
@@ -699,7 +712,10 @@ mod tests {
             recs: vec![rec(10, 0, DIR, "docs")],
             next_usn: 555,
         });
-        assert_eq!(engine.handshake_state(), vec![(guid, 0, 0)]);
+        assert_eq!(engine.handshake_state(), vec![(guid, 7, 100, 0, false)]);
+        // M9:有扫描进度后,未完成卷带 resume_frn 回传,worker 可续扫而非从头全量
+        engine.handle(EngineMsg::ScanProgress { guid, frn: 50, est: 100, count: 1 });
+        assert_eq!(engine.handshake_state(), vec![(guid, 7, 100, 50, false)]);
         engine.handle(EngineMsg::VolumeReady {
             guid,
             journal_id: 7,
@@ -712,7 +728,7 @@ mod tests {
             recs: vec![rec(11, 10, 0, "a.txt")],
             next_usn: 900,
         });
-        assert_eq!(engine.handshake_state(), vec![(guid, 7, 900)]);
+        assert_eq!(engine.handshake_state(), vec![(guid, 7, 900, 0, true)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

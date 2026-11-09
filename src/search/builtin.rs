@@ -221,7 +221,7 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
 /// UAC 等待由首次连接的 60s 超时覆盖;断线后按固定节奏重连(引擎状态保留,
 /// 重连握手从快照位点续传)。线程自管拉起与重连,便于调用方 fire-and-forget。
 pub fn spawn_client_thread(
-    handshake_slot: std::sync::Arc<std::sync::Mutex<Vec<(u128, u64, i64)>>>,
+    handshake_slot: std::sync::Arc<std::sync::Mutex<Vec<(u128, u64, i64, u64, bool)>>>,
     tx: std::sync::mpsc::SyncSender<EngineMsg>,
     shutdown: std::sync::Arc<AtomicBool>,
     launched_worker: bool,
@@ -342,11 +342,14 @@ fn pipe_alive(client: windows::Win32::Foundation::HANDLE) -> bool {
 }
 
 /// ShellExecute runas 拉起提权 worker(UAC 一次/会话)。
+/// 能力令牌经命令行传给 worker:固定管道名 + 只比 exe 名的校验挡不住同用户
+/// 其它进程,worker 会用 Hello 里的令牌二次校验(L5)。
 pub fn launch_worker() -> bool {
     let Some(exe) = std::env::current_exe().ok() else { return false };
     let exe_str = exe.display().to_string();
+    let params = format!("--index-worker --index-token {}", idx_client::session_token_hex());
     // 复用 lstr 的 shell_execute_with 语义:runas + 参数
-    crate::win::shell::shell_execute_runas_with_args(&exe_str, "--index-worker").is_ok()
+    crate::win::shell::shell_execute_runas_with_args(&exe_str, &params).is_ok()
 }
 
 /// 引擎构造(主进程内,加载快照)。

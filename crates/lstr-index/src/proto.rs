@@ -25,12 +25,47 @@ pub mod frame_type {
     pub const WORKER_EXIT: u8 = 11;
 }
 
+/// 握手令牌长度(字节)。主进程每次启动生成,经 runas 命令行传给 worker,
+/// Hello 里回传后由 worker 校验:管道名固定,只靠 exe 名挡不住同用户的其它进程。
+pub const TOKEN_LEN: usize = 16;
+
+/// 令牌转 32 位小写十六进制(用于 `--index-token` 参数)。
+pub fn token_hex(token: &[u8; TOKEN_LEN]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(TOKEN_LEN * 2);
+    for b in token {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// 解析 `--index-token` 的十六进制参数;长度/字符不合法返回 None。
+pub fn token_from_hex(s: &str) -> Option<[u8; TOKEN_LEN]> {
+    let s = s.trim();
+    if s.len() != TOKEN_LEN * 2 || !s.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; TOKEN_LEN];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out[i] = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     Hello {
         proto: u32,
-        /// (guid, journal_id, next_usn)
-        volumes: Vec<(u128, u64, i64)>,
+        /// 主进程启动时生成的能力令牌(worker 侧校验)。
+        token: [u8; TOKEN_LEN],
+        /// 每卷握手状态:(guid, journal_id, next_usn, resume_frn, complete)
+        ///
+        /// complete=false 且 resume_frn>0 表示「上次全量扫描中断」:worker 从
+        /// resume_frn 续扫 ENUM,到 next_usn(扫描起点高水位)后再接 journal,
+        /// 避免每次重启都从头全量扫(U 盘/大卷代价明显)。
+        volumes: Vec<(u128, u64, i64, u64, bool)>,
     },
     Welcome {
         proto: u32,
@@ -173,14 +208,17 @@ impl<'a> R<'a> {
 impl Frame {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = match self {
-            Frame::Hello { proto, volumes } => {
+            Frame::Hello { proto, token, volumes } => {
                 let mut w = W::new(frame_type::HELLO);
                 w.u32(*proto);
+                w.buf.extend_from_slice(token);
                 w.u32(volumes.len() as u32);
-                for (guid, jid, usn) in volumes {
+                for (guid, jid, usn, resume_frn, complete) in volumes {
                     w.u128(*guid);
                     w.u64(*jid);
                     w.i64(*usn);
+                    w.u64(*resume_frn);
+                    w.u8(u8::from(*complete));
                 }
                 w
             }
@@ -278,15 +316,23 @@ impl Frame {
         Some(match ty {
             frame_type::HELLO => {
                 let proto = r.u32()?;
+                if r.buf.len() < TOKEN_LEN {
+                    return None;
+                }
+                let mut token = [0u8; TOKEN_LEN];
+                token.copy_from_slice(&r.buf[..TOKEN_LEN]);
+                r.buf = &r.buf[TOKEN_LEN..];
                 let n = r.u32()? as usize;
                 let mut volumes = Vec::with_capacity(n.min(64));
                 for _ in 0..n {
                     let guid = r.u128()?;
                     let jid = r.u64()?;
                     let usn = r.i64()?;
-                    volumes.push((guid, jid, usn));
+                    let resume_frn = r.u64()?;
+                    let complete = r.u8()? != 0;
+                    volumes.push((guid, jid, usn, resume_frn, complete));
                 }
-                Frame::Hello { proto, volumes }
+                Frame::Hello { proto, token, volumes }
             }
             frame_type::WELCOME => Frame::Welcome { proto: r.u32()? },
             frame_type::VOLUME_META => Frame::VolumeMeta {
@@ -365,7 +411,11 @@ mod tests {
         let frames = vec![
             Frame::Hello {
                 proto: PROTO_VERSION,
-                volumes: vec![(1, 2, 3), (u128::MAX, u64::MAX, i64::MIN)],
+                token: [0x0f; TOKEN_LEN],
+                volumes: vec![
+                    (1, 2, 3, 4, true),
+                    (u128::MAX, u64::MAX, i64::MIN, u64::MAX, false),
+                ],
             },
             Frame::Welcome { proto: PROTO_VERSION },
             Frame::VolumeMeta { guid: 7, letter: 'C', journal_id: 9, next_usn: -5, est_records: 100 },
@@ -399,9 +449,21 @@ mod tests {
 
     #[test]
     fn proto_mismatch_survives_decode() {
-        let f = Frame::Hello { proto: 999, volumes: vec![] };
+        let f = Frame::Hello { proto: 999, token: [0u8; TOKEN_LEN], volumes: vec![] };
         let bytes = f.encode();
         let decoded = Frame::decode(&bytes[4..]).unwrap();
         assert!(!decoded.proto_ok());
+    }
+
+    #[test]
+    fn token_hex_roundtrip_and_rejects_bad_input() {
+        let t = [0x00u8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let hex = token_hex(&t);
+        assert_eq!(hex, "00112233445566778899aabbccddeeff");
+        assert_eq!(token_from_hex(&hex).unwrap(), t);
+        // 大写也接受
+        assert_eq!(token_from_hex(&hex.to_uppercase()).unwrap(), t);
+        assert!(token_from_hex("abcd").is_none());
+        assert!(token_from_hex(&"z".repeat(32)).is_none());
     }
 }

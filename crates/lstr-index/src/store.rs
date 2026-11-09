@@ -93,7 +93,9 @@ impl VolumeStore {
         }
     }
 
-    /// 从快照列构建(已处于 compact 后的有序态)。
+    /// 从快照列构建(已处于 compact 后的有序态)。`unresolved` = 保存时
+    /// 仍未消解的 (slot, parent_frn):父项要到后续 journal 事件补进来才能修复路径,
+    /// 不落盘会让这些条目在重启后永久退化为 NO_PARENT(路径只剩文件名)。
     pub fn from_parts(
         names: Vec<u8>,
         offs: Vec<u32>,
@@ -101,6 +103,7 @@ impl VolumeStore {
         parent: Vec<u32>,
         attrs: Vec<u16>,
         name_off: Vec<u32>,
+        unresolved: Vec<(u32, u64)>,
         noise_enabled: bool,
     ) -> Self {
         let names_lc = fold_ascii(&names);
@@ -121,7 +124,7 @@ impl VolumeStore {
             delta_frn: HashMap::new(),
             dead_count: 0,
             renames: 0,
-            unresolved: HashMap::new(),
+            unresolved: unresolved.into_iter().collect(),
             noise_anchors: std::collections::HashSet::new(),
             noise_enabled,
         }
@@ -368,6 +371,12 @@ impl VolumeStore {
     /// 会被打破,所以落盘前必须 compact 清幽灵。
     pub fn has_pending_rename(&self) -> bool {
         self.renames > 0
+    }
+
+    /// 快照要落盘的未消解父链接 (slot, parent_frn)。落盘前由 save 先 compact,
+    /// 此时 slot 已是最终编号。
+    pub fn unresolved_pairs(&self) -> Vec<(u32, u64)> {
+        self.unresolved.iter().map(|(&slot, &p)| (slot, p)).collect()
     }
 
     pub fn delta_is_empty(&self) -> bool {

@@ -2,7 +2,7 @@
 //!
 //! 格式(小端):
 //! ```text
-//! magic "LIDX" | u32 version | u128 guid | u8 letter | u8 flags(complete=1)
+//! magic "LIDX" | u32 version | u128 guid | u8 letter | u8 flags(complete=1,noise=2)
 //! u64 journal_id | i64 next_usn | u64 resume_frn | u64 est_records
 //! u64 count
 //! names  : u64 len + bytes(\0 结尾打包;name_off 由此重建,不落盘)
@@ -10,6 +10,7 @@
 //! frn    : u64 len + u64×  (按 FRN 序)
 //! parent : u64 len + u32×
 //! attrs  : u64 len + u16×
+//! unres  : u64 len + (u32 slot, u64 parent_frn)×
 //! ```
 //! 只在 compact 后落盘(列处于一致有序态)。写盘走 tmp+rename 原子替换。
 
@@ -19,7 +20,8 @@ use std::path::{Path, PathBuf};
 use crate::store::{VolumeStore, NO_PARENT};
 
 pub const MAGIC: &[u8; 4] = b"LIDX";
-pub const VERSION: u32 = 2;
+/// v3:未消解父链接 (slot, parent_frn) 也落盘(v2 没有,重启后这些条目永久退化)。
+pub const VERSION: u32 = 3;
 
 /// 引擎调试日志(%APPDATA%\lstr\index\engine.log)。
 /// worker 提权进程与 UI 都写同用户目录;失败静默。
@@ -97,8 +99,21 @@ pub fn save(
     write_col_u64(&mut w, &store.frn)?;
     write_col_u32(&mut w, &store.parent)?;
     write_col_u16(&mut w, &store.attrs)?;
+    // 未消解父链接:compact 会把 slot 重映射到最终编号,此时写入可直接恢复
+    let pairs = store.unresolved_pairs();
+    w.write_all(&(pairs.len() as u64).to_le_bytes())?;
+    for (slot, parent_frn) in &pairs {
+        w.write_all(&slot.to_le_bytes())?;
+        w.write_all(&parent_frn.to_le_bytes())?;
+    }
     w.flush()?;
-    drop(w);
+    // 先 fsync 再 rename:否则崩溃/断电时 rename 可能先于数据落盘,
+    // 留下「文件名在、内容空/截断」的快照(load 拒绝 → 全量重扫)。
+    // Windows 上 rename 在 NTFS 内是原子的,但目录项持久化不额外保证,
+    // 这里接受该残余风险(代价仍只是一次重扫)。
+    let f = w.into_inner().map_err(|e| e.into_error())?;
+    f.sync_all()?;
+    drop(f);
     std::fs::rename(&tmp_path, &final_path)?;
     Ok(std::fs::metadata(&final_path)?.len())
 }
@@ -162,7 +177,11 @@ pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapsho
         return None;
     };
     if version != VERSION {
-        debug_log(&format!("load {guid:032x}: version {version} != {VERSION}"));
+        debug_log(&format!(
+            "load {guid:032x}: version {version} != {VERSION}, stale snapshot removed (full rescan)"
+        ));
+        // 旧格式不做迁移:删掉它,避免每次启动都尝试加载;新扫描会重写。
+        let _ = std::fs::remove_file(&path);
         return None;
     }
     let Some(guid_h) = u128::from_le_array(&mut cur) else {
@@ -195,6 +214,13 @@ pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapsho
     let frn = read_col_u64(&mut cur)?;
     let parent = read_col_u32(&mut cur)?;
     let attrs = read_col_u16(&mut cur)?;
+    let n_unresolved = u64::from_le_array(&mut cur)? as usize;
+    let mut unresolved: Vec<(u32, u64)> = Vec::with_capacity(n_unresolved.min(1 << 20));
+    for _ in 0..n_unresolved {
+        let slot = u32::from_le_array(&mut cur)?;
+        let parent_frn = u64::from_le_array(&mut cur)?;
+        unresolved.push((slot, parent_frn));
+    }
     if !cur.is_empty() {
         return None;
     }
@@ -202,6 +228,14 @@ pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapsho
         debug_log(&format!(
             "load {guid:032x}: column len mismatch offs={} frn={} parent={} attrs={} count={count}",
             offs.len(), frn.len(), parent.len(), attrs.len()
+        ));
+        return None;
+    }
+    if n_unresolved > count
+        || unresolved.iter().any(|&(slot, p)| slot as usize >= count || p == 0)
+    {
+        debug_log(&format!(
+            "load {guid:032x}: invalid unresolved table (n={n_unresolved} count={count})"
         ));
         return None;
     }
@@ -245,6 +279,7 @@ pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapsho
         parent,
         attrs,
         name_off,
+        unresolved,
         noise_enabled,
     );
     Some(LoadedSnapshot {
@@ -377,6 +412,29 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v3:未消解父链接落盘。旧实现 load 后 unresolved 为空,父项永远等不到、
+    /// 子项路径永久退化为 NO_PARENT,只能靠一次全量重扫碰运气。
+    #[test]
+    fn unresolved_parents_survive_roundtrip() {
+        let dir = tmpdir("unres");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = VolumeStore::new(false);
+        s.insert(5, 0, 0x10, b"root");
+        // 子项先到、父 FRN 99 未到 → 进 unresolved
+        s.insert(20, 99, 0, b"orphan.txt");
+        s.compact();
+        assert_eq!(s.unresolved_pairs().len(), 1);
+        let h = header(0x1234, false);
+        save(&dir, &h, &mut s).unwrap();
+        let mut ls = load(&dir, h.guid, false).expect("load").store;
+        assert_eq!(ls.unresolved_pairs().len(), 1);
+        // 父项在后续 journal 事件里补到 → compact 消解,不需要全量重扫
+        ls.insert(99, 5, 0x10, b"late-dir");
+        ls.compact();
+        assert!(ls.unresolved_pairs().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -553,9 +611,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v1 等旧格式不迁移:load 拒绝并删除文件,避免每次启动重复尝试。
     #[test]
-    fn load_rejects_garbage() {
-        let dir = std::env::temp_dir().join(format!("lstr-idx-bad-{}", std::process::id()));
+    fn stale_version_snapshot_is_removed() {
+        let dir = tmpdir("stale-ver");
+        let _ = std::fs::remove_dir_all(&dir);
+        let guid = 0x7777;
+        let mut s = VolumeStore::new(false);
+        s.insert(5, 0, 0x10, b"root");
+        s.insert(10, 5, 0, b"a.txt");
+        s.compact();
+        let h = header(guid, true);
+        save(&dir, &h, &mut s).unwrap();
+        let p = snapshot_path(&dir, guid);
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes()); // 伪造成 v1
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(load(&dir, guid, false).is_none());
+        assert!(!p.exists(), "旧版本快照加载失败后应被删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rejects_garbage() {        let dir = std::env::temp_dir().join(format!("lstr-idx-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let guid = 42u128;
         let p = snapshot_path(&dir, guid);

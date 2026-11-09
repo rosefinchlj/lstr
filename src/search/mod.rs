@@ -270,7 +270,8 @@ fn run_worker(
     let (engine_tx, engine_rx) = mpsc::sync_channel::<EngineMsg>(16);
     let mut builtin: Option<builtin::BuiltinProvider> = None;
     let shutdown_client = Arc::new(AtomicBool::new(false));
-    let handshake_slot: Arc<Mutex<Vec<(u128, u64, i64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let handshake_slot: Arc<Mutex<Vec<(u128, u64, i64, u64, bool)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     // 显式选择「仅内置索引」:此时无论引擎是否就绪,都不再回落 Everything,
     // 否则与设置页文案矛盾(旧实现在 Fallback 时仍把查询发给 Everything)。
     let force_builtin = config.index.backend == "builtin";
