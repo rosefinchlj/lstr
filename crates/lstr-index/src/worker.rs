@@ -547,29 +547,41 @@ fn scan_full_or_resume(
     }
 }
 
-/// dir 模式单卷循环:目录枚举首扫 → VolumeReady → 空闲(阶段 1 不轮询 journal)。
+/// dir 模式单卷循环。
+///
+/// - `sync=false`:首次构建 —— 目录枚举首扫 → VolumeReady → 空闲。
+/// - `sync=true`:引擎已有该卷快照(握手 complete=true)—— 后台对账,
+///   逐批 patch 现有 store,结束时删除本轮没见到的条目(离线期间被删/移走)。
+///
 /// 全程不打开卷句柄、不发任何 USN FSCTL —— 这是 2026-11-09 蓝屏后的安全路径。
 fn scan_dir_volume(
     letter: char,
     guid: u128,
+    sync: bool,
     tx: &mpsc::SyncSender<Frame>,
     stop: &AtomicBool,
 ) {
-    if !send_frame(
-        tx,
-        Frame::VolumeMeta {
-            guid,
-            letter,
-            journal_id: 0,
-            next_usn: 0,
-            est_records: 0,
-        },
-        stop,
-    ) {
-        return;
-    }
-    if !send_frame(tx, Frame::ScanBegin { guid, resume_frn: 0 }, stop) {
-        return;
+    if sync {
+        if !send_frame(tx, Frame::DirSyncBegin { guid }, stop) {
+            return;
+        }
+    } else {
+        if !send_frame(
+            tx,
+            Frame::VolumeMeta {
+                guid,
+                letter,
+                journal_id: 0,
+                next_usn: 0,
+                est_records: 0,
+            },
+            stop,
+        ) {
+            return;
+        }
+        if !send_frame(tx, Frame::ScanBegin { guid, resume_frn: 0 }, stop) {
+            return;
+        }
     }
     // 与 USN 全量扫描共用串行闸门:多卷首次构建逐卷来,降低 IO/内核压力。
     // 闸门只包住枚举本身:扫描完成后本卷会进入空闲等待,若把 guard 带到
@@ -583,7 +595,7 @@ fn scan_dir_volume(
         crate::dirscan::enumerate_volume(letter, stop, &mut |recs| {
             count += recs.len() as u64;
             let _ = send_frame(tx, Frame::Batch { guid, next_usn: 0, recs }, stop);
-            if last_report.elapsed() >= Duration::from_millis(500) {
+            if !sync && last_report.elapsed() >= Duration::from_millis(500) {
                 last_report = std::time::Instant::now();
                 let _ = send_frame(
                     tx,
@@ -600,7 +612,12 @@ fn scan_dir_volume(
     };
     match result {
         Ok(total) if !stop.load(Ordering::Relaxed) => {
-            if send_frame(
+            if sync {
+                let _ = send_frame(tx, Frame::DirSyncEnd { guid, ok: true }, stop);
+                crate::snapshot::debug_log(&format!(
+                    "dirsync {letter}: done count={count} (enumerated={total})"
+                ));
+            } else if send_frame(
                 tx,
                 Frame::VolumeReady {
                     guid,
@@ -619,8 +636,18 @@ fn scan_dir_volume(
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
-        Ok(_) => {}
-        Err(err) => crate::snapshot::debug_log(&format!("dirscan {letter} failed: {err}")),
+        Ok(_) => {
+            if sync {
+                // 被抓停:只清引擎里的 SEEN 临时位,保留快照原样。
+                let _ = send_frame(tx, Frame::DirSyncEnd { guid, ok: false }, stop);
+            }
+        }
+        Err(err) => {
+            crate::snapshot::debug_log(&format!("dirscan {letter} failed: {err}"));
+            if sync {
+                let _ = send_frame(tx, Frame::DirSyncEnd { guid, ok: false }, stop);
+            }
+        }
     }
 }
 
@@ -633,8 +660,10 @@ fn volume_loop(
     tx: mpsc::SyncSender<Frame>,
 ) {
     // 阶段 1:默认目录枚举首扫,完全不碰卷句柄/USN FSCTL(蓝屏后的安全路径)。
+    // 握手 complete=true 表示引擎已加载该卷快照 → 不再整卷重扫,后台对账即可。
     if opts().scan_mode == ScanMode::Dir {
-        scan_dir_volume(letter, guid, &tx, &stop);
+        let sync = matches!(req, Some((_, _, _, true)));
+        scan_dir_volume(letter, guid, sync, &tx, &stop);
         return;
     }
     // H2/H4:扫描开始前先取 journal 状态(journal_id / NextUsn),它是本次全量

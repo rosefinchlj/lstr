@@ -28,6 +28,8 @@ const APPS_RELOAD_INTERVAL: Duration = Duration::from_secs(90);
 
 struct Request {
     generation: u64,
+    /// 诊断用：UI 发出时刻。worker 出队时用它区分「排队慢」还是「执行慢」。
+    sent_at: Instant,
     query: Query,
     limit: usize,
     keywords: Vec<KeywordConfig>,
@@ -48,6 +50,25 @@ pub struct Response {
     pub total: usize,
     pub elapsed_ms: f32,
     pub error: Option<String>,
+}
+
+/// 诊断：响应发出时距请求发出的总耗时（含排队）。仅慢查询写 engine.log。
+/// 与 UI 侧 `search: ui total=` 对照可区分「worker 慢」与「UI 帧等待慢」。
+fn send_response(tx: &Sender<Response>, request: &Request, response: Response) {
+    // 最新查询已经换人:被取消/已过期的结果直接丢弃,避免 UI 先闪一版
+    // 部分结果(total 也偏小),也避免无谓的序列化。
+    if lstr_index::query::CANCEL_GEN.load(std::sync::atomic::Ordering::Relaxed) != request.generation
+    {
+        return;
+    }
+    let total_ms = request.sent_at.elapsed().as_millis();
+    if total_ms > 200 {
+        lstr_index::snapshot::debug_log(&format!(
+            "search: worker send gen={} total={}ms execute={:.1}ms entries={} total={}",
+            response.generation, total_ms, response.elapsed_ms, response.entries.len(), response.total
+        ));
+    }
+    let _ = tx.send(response);
 }
 
 pub struct SearchService {
@@ -109,9 +130,13 @@ impl SearchService {
         show_history: bool,
     ) -> u64 {
         self.generation += 1;
+        // 通知查询线程:更旧的查询可以立即放弃(打字时 "a"→"ai" 不再排队 600ms)。
+        lstr_index::query::CANCEL_GEN
+            .store(self.generation, std::sync::atomic::Ordering::Relaxed);
         let query = query::parse(raw, scope);
         let _ = self.tx.send(Request {
             generation: self.generation,
+            sent_at: Instant::now(),
             query,
             limit: self.limit,
             keywords: self.keywords.clone(),
@@ -257,13 +282,25 @@ fn run_worker(
     apps_dirty: Arc<AtomicBool>,
     status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
 ) {
-    let mut everything = match everything::EverythingProvider::new() {
-        Ok(provider) => Some(provider),
-        Err(err) => {
-            eprintln!("lstr: Everything 不可用: {err}");
-            None
+    // 显式选择「仅内置索引」:此时无论引擎是否就绪,都不再回落 Everything,
+    // 否则与设置页文案矛盾(旧实现在 Fallback 时仍把查询发给 Everything)。
+    let force_builtin = config.index.backend == "builtin";
+    // 严格模式:用户选了「仅内置索引」就完全不碰 Everything —— 连 IPC 探测
+    // 都不做(既避免 IPC 超时拖慢首次查询,也保证观察不到一切 Everything 结果)。
+    let mut everything = if force_builtin {
+        None
+    } else {
+        match everything::EverythingProvider::new() {
+            Ok(provider) => Some(provider),
+            Err(err) => {
+                eprintln!("lstr: Everything 不可用: {err}");
+                None
+            }
         }
     };
+    // 「Everything 不可用」的重试节流：首次探测可能等 IPC 超时(~2s)，
+    // 未运行时常驻用户每次查询都重试会把交互拖慢；最多 10s 试一次。
+    let mut last_everything_probe = Instant::now();
     // —— 自研索引后端(方案 §4/§6):engine 由本线程独占;client 线程推 EngineMsg ——
     // 有界通道(背压):client 线程跑得快时会阻塞在 send,防止整个卷的记录
     // 积压在通道内存里(实测无界时 UI 进程冲到 877MB)。
@@ -272,9 +309,6 @@ fn run_worker(
     let shutdown_client = Arc::new(AtomicBool::new(false));
     let handshake_slot: Arc<Mutex<Vec<(u128, u64, i64, u64, bool)>>> =
         Arc::new(Mutex::new(Vec::new()));
-    // 显式选择「仅内置索引」:此时无论引擎是否就绪,都不再回落 Everything,
-    // 否则与设置页文案矛盾(旧实现在 Fallback 时仍把查询发给 Everything)。
-    let force_builtin = config.index.backend == "builtin";
     match config.index.backend.as_str() {
         "off" => {}
         "everything" => {}
@@ -348,8 +382,23 @@ fn run_worker(
         };
         // 用户可能刚点了提示条启动 Everything；每次查询前尝试重连，
         // 而不是启动时连不上就永久报错。
+        // 但 IPC 探测在 Everything 未运行时要等超时(实测 ~2s)，而 UI 显示的
+        // elapsed_ms 从请求出队后才开始计，用户就会看到「显示 70ms、实际等 2s」。
+        // 因此：只有可能用到 Everything 的阶段才重试，且最多 10s 一次。
         if everything.is_none() {
-            everything = everything::EverythingProvider::new().ok();
+            let phase_ready = builtin
+                .as_ref()
+                .map(|b| b.status().phase == lstr_index::Phase::Ready)
+                .unwrap_or(false);
+            // 严格「仅内置索引」模式:任何阶段都不探测/回落 Everything。
+            let need_everything = !force_builtin
+                && (config.index.backend == "everything"
+                    || !phase_ready
+                    || request.filters.time.is_some());
+            if need_everything && last_everything_probe.elapsed() >= Duration::from_secs(10) {
+                last_everything_probe = Instant::now();
+                everything = everything::EverythingProvider::new().ok();
+            }
         }
         while let Ok(uwp_entries) = uwp_rx.try_recv() {
             apps.append_uwp(uwp_entries);
@@ -365,6 +414,32 @@ fn run_worker(
         }
         while let Ok(next) = rx.try_recv() {
             request = next;
+        }
+        // 诊断:区分「排队慢(worker 忙于引擎维护/落盘)」与「处理慢(IPC 探测等)」。
+        {
+            let queued_ms = request.sent_at.elapsed().as_millis();
+            if queued_ms > 200 {
+                lstr_index::snapshot::debug_log(&format!(
+                    "search: worker begin gen={} queued={}ms",
+                    request.generation, queued_ms
+                ));
+            }
+        }
+        // 诊断:记录本次请求的解析结果与索引阶段,用来解释「为什么走了 Everything」。
+        {
+            let phase = builtin
+                .as_ref()
+                .map(|b| b.status().phase)
+                .unwrap_or(lstr_index::Phase::Fallback);
+            lstr_index::snapshot::debug_log(&format!(
+                "search: req gen={} text={:?} scope={:?} phase={:?} builtin={} everything={}",
+                request.generation,
+                request.query.text,
+                request.query.scope,
+                phase,
+                builtin.is_some(),
+                everything.is_some()
+            ));
         }
 
         // 路径模式（D:\foo\bar、\\server\share）：直接列目录，
@@ -398,14 +473,13 @@ fn run_worker(
             }
             // 浏览目录不是「搜索前 N 条」：放宽上限，列表靠 UI 滚动查看。
             entries.truncate(request.limit.max(200));
-            let _ = tx.send(Response {
+            send_response(&tx, &request, Response {
                 generation: request.generation,
                 entries,
                 total,
                 elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
                 error: None,
-            });
-            ctx.request_repaint();
+            });            ctx.request_repaint();
             continue;
         }
 
@@ -603,7 +677,7 @@ fn run_worker(
                             &config,
                             keyword_rows.clone(),
                         );
-                        let _ = tx.send(Response {
+                        send_response(&tx, &request, Response {
                             generation: request.generation,
                             entries: first,
                             total,
@@ -713,7 +787,7 @@ fn run_worker(
                             &config,
                             Vec::new(),
                         );
-                        let _ = tx.send(Response {
+                        send_response(&tx, &request, Response {
                             generation: request.generation,
                             entries: first,
                             total,
@@ -755,7 +829,7 @@ fn run_worker(
 
         let entries = finalize_entries(entries, &request, &history, &config, keyword_rows);
 
-let _ = tx.send(Response {
+send_response(&tx, &request, Response {
             generation: request.generation,
             entries,
             total,
@@ -991,6 +1065,7 @@ mod tests {
         }
         let request = Request {
             generation: 1,
+            sent_at: Instant::now(),
             query: Query {
                 raw: "abc".to_string(),
                 scope: Scope::All,

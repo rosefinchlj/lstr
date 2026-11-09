@@ -336,6 +336,8 @@ fn to_engine_msg(frame: lstr_index::proto::Frame) -> Option<EngineMsg> {
             EngineMsg::VolumeReady { guid, journal_id, next_usn, count }
         }
         F::JournalReset { guid } => EngineMsg::JournalReset { guid },
+        F::DirSyncBegin { guid } => EngineMsg::DirSyncBegin { guid },
+        F::DirSyncEnd { guid, ok } => EngineMsg::DirSyncEnd { guid, ok },
         F::VolumeGone { guid } => EngineMsg::VolumeGone { guid },
         F::VolumeAppeared { guid, letter } => EngineMsg::VolumeAppeared { guid, letter },
         F::WorkerExit { .. } | F::Shutdown => return None,

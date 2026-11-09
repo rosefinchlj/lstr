@@ -19,6 +19,10 @@ pub const ATTR_DEAD: u16 = 0x8000;
 pub const ATTR_NOISE: u16 = 0x4000;
 /// 内部位掩码:对外不可见的 slot。
 pub const ATTR_INTERNAL: u16 = ATTR_DEAD | ATTR_NOISE;
+/// 对账扫描的「本次见过」临时位(仅内存,不落盘)。DirSync 结束时未被标记的
+/// 存活槽就是离线期间消失的条目,标 DEAD;这与 DEAD/NOISE 不同,不参与
+/// [`ATTR_INTERNAL`] 的可见性过滤,也不会被持久化(落盘前会清掉)。
+pub const ATTR_SEEN: u16 = 0x2000;
 /// parent 列的「卷根/未解析」标记。
 pub const NO_PARENT: u32 = u32::MAX;
 /// NTFS 卷根目录的固定 FRN。根记录本身会被 USN 过滤器丢弃,但顶层条目的
@@ -221,6 +225,40 @@ impl VolumeStore {
             }
         }
         None
+    }
+
+    /// 后台对账:标记「本轮扫描见到过」的槽位。仅内存位,不落盘。
+    pub fn mark_seen(&mut self, frn: u64) {
+        if let Some(slot) = self.find_slot(frn) {
+            self.attrs[slot as usize] |= ATTR_SEEN;
+        }
+    }
+
+    /// 后台对账中途中止:只清掉 SEEN 临时位,不删除任何条目。
+    pub fn clear_seen(&mut self) {
+        for a in self.attrs.iter_mut() {
+            *a &= !ATTR_SEEN;
+        }
+    }
+
+    /// 后台对账结束:把本轮没见过且仍存活的槽位标 DEAD(离线期间被删除/移走),
+    /// 清掉所有 SEEN 位,返回新标死的条数。槽位不立即回收,交给 compact 重排。
+    pub fn remove_unseen(&mut self) -> usize {
+        let mut dead = 0usize;
+        for slot in 0..self.attrs.len() {
+            let a = self.attrs[slot as usize];
+            if a & ATTR_SEEN == 0 {
+                if a & ATTR_DEAD == 0 {
+                    self.attrs[slot as usize] = a | ATTR_DEAD;
+                    dead += 1;
+                }
+            } else {
+                self.attrs[slot as usize] = a & !ATTR_SEEN;
+            }
+        }
+        self.dead_count = self.dead_count.saturating_add(dead as u32);
+        // 删除改变了存活集:compact 会重排并回收死槽;调用方(DirSyncEnd)随后触发。
+        dead
     }
 
     /// 追加式插入(scan 模式主路径 / journal upsert)。

@@ -12,6 +12,11 @@ pub mod frame_type {
     pub const HELLO: u8 = 1;
     pub const RESCAN: u8 = 12;
     pub const SHUTDOWN: u8 = 13;
+    /// 运行期对账开始:引擎已有该卷快照,worker 在后台重扫并逐批 patch,
+    /// 结束后删除本轮没见到的条目(离线期间被删/移走)。
+    pub const DIR_SYNC_BEGIN: u8 = 14;
+    /// 运行期对账结束:引擎删除未标记 SEEN 的槽位并 compact/落盘。
+    pub const DIR_SYNC_END: u8 = 15;
     // W→C
     pub const WELCOME: u8 = 2;
     pub const VOLUME_META: u8 = 3;
@@ -100,6 +105,16 @@ pub enum Frame {
     },
     JournalReset {
         guid: u128,
+    },
+    /// 运行期对账:已有快照时不重置 store,逐批 patch 现有条目。
+    DirSyncBegin {
+        guid: u128,
+    },
+    DirSyncEnd {
+        guid: u128,
+        /// true = 枚举完整结束,可以删除本轮没见到的条目;
+        /// false = 中途停止/出错,只清 SEEN 位,不做删除。
+        ok: bool,
     },
     VolumeGone {
         guid: u128,
@@ -280,6 +295,17 @@ impl Frame {
                 w.u128(*guid);
                 w
             }
+            Frame::DirSyncBegin { guid } => {
+                let mut w = W::new(frame_type::DIR_SYNC_BEGIN);
+                w.u128(*guid);
+                w
+            }
+            Frame::DirSyncEnd { guid, ok } => {
+                let mut w = W::new(frame_type::DIR_SYNC_END);
+                w.u128(*guid);
+                w.u8(u8::from(*ok));
+                w
+            }
             Frame::VolumeGone { guid } => {
                 let mut w = W::new(frame_type::VOLUME_GONE);
                 w.u128(*guid);
@@ -381,6 +407,8 @@ impl Frame {
                 Frame::Batch { guid, next_usn, recs }
             }
             frame_type::JOURNAL_RESET => Frame::JournalReset { guid: r.u128()? },
+            frame_type::DIR_SYNC_BEGIN => Frame::DirSyncBegin { guid: r.u128()? },
+            frame_type::DIR_SYNC_END => Frame::DirSyncEnd { guid: r.u128()?, ok: r.u8()? != 0 },
             frame_type::VOLUME_GONE => Frame::VolumeGone { guid: r.u128()? },
             frame_type::VOLUME_APPEARED => Frame::VolumeAppeared {
                 guid: r.u128()?,
@@ -431,6 +459,8 @@ mod tests {
                 ],
             },
             Frame::JournalReset { guid: 7 },
+            Frame::DirSyncBegin { guid: 7 },
+            Frame::DirSyncEnd { guid: 7, ok: true },
             Frame::VolumeGone { guid: 7 },
             Frame::VolumeAppeared { guid: 7, letter: 'E' },
             Frame::WorkerExit { reason: 0 },

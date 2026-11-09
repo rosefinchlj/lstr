@@ -55,6 +55,9 @@ pub struct VolumeState {
     pub generation: u32,
     /// 快照有未落盘变更。
     dirty: bool,
+    /// 后台对账(DirSync)进行中:逐批 patch 现有 store,期间禁止落盘
+    /// (SEEN 位是临时态,写进快照会让下次启动误删条目)。
+    pub syncing: bool,
     /// 连续落盘失败次数(指数退避)。
     save_backoff: u32,
     /// 下次允许落盘的时间:失败时按指数退避往后推,成功后加节流间隔
@@ -69,6 +72,9 @@ pub enum EngineMsg {
     ScanBegin { guid: u128, resume_frn: u64 },
     ScanProgress { guid: u128, frn: u64, est: u64, count: u32 },
     Records { guid: u128, recs: Vec<Rec>, next_usn: i64 },
+    /// 后台对账:已有快照时逐批 patch 现有条目,而不是清空重扫。
+    DirSyncBegin { guid: u128 },
+    DirSyncEnd { guid: u128, ok: bool },
     VolumeReady { guid: u128, journal_id: u64, next_usn: i64, count: u32 },
     JournalReset { guid: u128 },
     VolumeGone { guid: u128 },
@@ -152,6 +158,7 @@ impl Engine {
                     store: Some(snap.store),
                     generation: 0,
                     dirty: false,
+                    syncing: false,
                     save_backoff: 0,
                     save_retry_at: None,
                 });
@@ -182,6 +189,7 @@ impl Engine {
                 store: None,
                 generation: 0,
                 dirty: false,
+                syncing: false,
                 save_backoff: 0,
                 save_retry_at: None,
             });
@@ -236,11 +244,16 @@ impl Engine {
                 let Some(i) = self.volumes.iter().position(|v| v.guid == guid) else {
                     return;
                 };
+                let syncing = self.volumes[i].syncing;
                 if let Some(store) = &mut self.volumes[i].store {
                     for rec in &recs {
                         match rec.op {
                             Op::Upsert => {
                                 store.insert(rec.frn, rec.parent_frn, rec.attrs, rec.name.as_bytes());
+                                // 后台对账期间记「见过」,DirSyncEnd 据此删离线消失项。
+                                if syncing {
+                                    store.mark_seen(rec.frn);
+                                }
                             }
                             Op::Remove => {
                                 store.remove(rec.frn);
@@ -289,6 +302,61 @@ impl Engine {
                     .as_ref()
                     .map(|s| PinyinCache::rebuild(s))
                     .unwrap_or_else(PinyinCache::empty);
+            }
+            EngineMsg::DirSyncBegin { guid } => {
+                if let Some(i) = self.volume_idx(guid, true, '?') {
+                    if self.volumes[i].store.is_none() {
+                        self.volumes[i].store = Some(VolumeStore::new(self.cfg.exclude_noise));
+                        self.pinyin[i] = PinyinCache::empty();
+                        self.bump_generation(i);
+                    }
+                    self.volumes[i].syncing = true;
+                    snapshot::debug_log(&format!("dirsync begin {guid:032x}"));
+                }
+            }
+            EngineMsg::DirSyncEnd { guid, ok } => {
+                let Some(i) = self.volumes.iter().position(|v| v.guid == guid) else {
+                    return;
+                };
+                if !ok {
+                    // 中途停止:只清临时位,绝不删除(否则会把没扫到的条目全判死)。
+                    if let Some(store) = &mut self.volumes[i].store {
+                        store.clear_seen();
+                    }
+                    self.volumes[i].syncing = false;
+                    snapshot::debug_log(&format!(
+                        "dirsync end {guid:032x} aborted, kept snapshot as-is"
+                    ));
+                    return;
+                }
+                let removed = {
+                    let Some(store) = &mut self.volumes[i].store else {
+                        self.volumes[i].syncing = false;
+                        return;
+                    };
+                    let n = store.remove_unseen();
+                    if store.needs_compact() {
+                        store.compact();
+                    }
+                    n
+                };
+                self.bump_generation(i);
+                if let Some(store) = &self.volumes[i].store {
+                    self.pinyin[i] = PinyinCache::rebuild(store);
+                }
+                self.volumes[i].syncing = false;
+                self.volumes[i].dirty = true;
+                // 对账结果立即落盘:这是本轮启动后最值钱的快照。
+                self.volumes[i].save_retry_at = None;
+                self.recompute_phase();
+                let (count, letter) = self
+                    .volumes
+                    .get(i)
+                    .map(|v| (v.store.as_ref().map(|s| s.len()).unwrap_or(0), v.letter))
+                    .unwrap_or((0, '?'));
+                snapshot::debug_log(&format!(
+                    "dirsync end {guid:032x} letter={letter} removed={removed} count={count}"
+                ));
             }
             EngineMsg::JournalReset { guid } => {
                 if let Some(i) = self.volumes.iter().position(|v| v.guid == guid) {
@@ -382,7 +450,15 @@ impl Engine {
 
     pub fn query(&self, spec: &QuerySpec) -> QueryOutcome {
         let mut out = QueryOutcome::default();
+        // 查询取消:UI 每发新搜索就刷新 CANCEL_GEN;这里取快照,热循环发现
+        // 代次变化即中止(旧查询如单字符 "a" 命中 200 万条要 600ms+,
+        // 不中止会把后续击键堵在队列里)。
+        let cancel_my = crate::query::CANCEL_GEN.load(std::sync::atomic::Ordering::Relaxed);
         for (i, v) in self.volumes.iter().enumerate() {
+            if crate::query::CANCEL_GEN.load(std::sync::atomic::Ordering::Relaxed) != cancel_my {
+                out.aborted = true;
+                break;
+            }
             // 路径前缀带盘符 → 只查对应卷
             if let Some(prefix) = &spec.path_prefix {
                 if prefix.len() >= 2 && prefix.as_bytes()[1] == b':' {
@@ -402,7 +478,12 @@ impl Engine {
             } else {
                 self.cfg.candidate_cap
             };
-            let (slots, total, capped) = crate::query::query_volume(store, spec, cap);
+            let (slots, total, capped, aborted) =
+                crate::query::query_volume_cancel(store, spec, cap, Some(cancel_my));
+            if aborted {
+                out.aborted = true;
+                break;
+            }
             out.total += total;
             out.capped |= capped;
             let mut hits: Vec<Hit> = slots
@@ -500,6 +581,9 @@ impl Engine {
         let mut did = false;
         // 先归并(compact 会 remap,旧 Hit 失效),再落盘
         for i in 0..self.volumes.len() {
+            if self.volumes[i].syncing {
+                continue; // 对账期间不 compact/落盘:SEEN 位是临时态
+            }
             let compacted = {
                 let Some(store) = &mut self.volumes[i].store else { continue };
                 if store.is_scanning() {
@@ -526,6 +610,9 @@ impl Engine {
         // 卡住数秒(用户可见的「搜索要好几秒,但显示只要 0.08s」)。
         let now = Instant::now();
         for i in 0..self.volumes.len() {
+            if self.volumes[i].syncing {
+                continue; // 对账期间不落盘
+            }
             if !self.volumes[i].dirty {
                 continue;
             }
@@ -547,6 +634,10 @@ impl Engine {
         let save_result = {
             let v = &self.volumes[i];
             let Some(store) = &v.store else { return false };
+            if v.syncing {
+                // SEEN 位是内存临时态,落盘会让下次启动把未见条目误删。
+                return false;
+            }
             if store.is_scanning() && v.resume_frn == 0 {
                 // 还没有任何扫描进度时落盘只会反复写空卷;等扫描推进后再保存
                 // 部分快照(ZCode 9d93786 的行为),让重启后能先搜到已扫到的部分。
@@ -600,6 +691,9 @@ impl Engine {
     /// 退出前把所有脏快照落盘(忽略节流)。失败留给下次启动的重扫/增量流程。
     pub fn flush_all(&mut self) {
         for i in 0..self.volumes.len() {
+            if self.volumes[i].syncing {
+                continue; // 对账中途退出:让下次启动重新对账,不落半态
+            }
             if self.volumes[i].dirty {
                 self.volumes[i].save_retry_at = None;
                 let _ = self.save_volume(i);
@@ -839,6 +933,74 @@ mod tests {
         let stale = Hit { vol: 0, slot: 0, generation: hit.generation.wrapping_add(1) };
         assert!(engine.path_of(&stale).is_none());
         assert!(engine.pinyin_of(&stale).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 步:启动加载快照后,worker 只用 DirSync 逐批 patch;本轮没见到的条目
+    /// 视为离线期间被删除,DirSyncEnd(ok=true) 后消失;中途停止(ok=false)
+    /// 绝不能删条目。
+    #[test]
+    fn dir_sync_patches_snapshot_and_removes_vanished_entries() {
+        const DIR: u32 = 0x0010;
+        let dir = temp_index_dir("dirsync");
+        let guid = 0x3333u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.volumes[0].complete);
+        assert_eq!(engine.volumes[0].store.as_ref().unwrap().len(), 3);
+
+        // 模拟启动对账:docs/alpha 仍在,beta.txt 已被删除,新增 gamma.txt。
+        engine.handle(EngineMsg::DirSyncBegin { guid });
+        assert!(engine.volumes[0].syncing);
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![
+                rec(10, 0, DIR, "docs"),
+                rec(11, 10, 0, "alpha.txt"),
+                rec(13, 10, 0, "gamma.txt"),
+            ],
+            next_usn: 100,
+        });
+        // 对账期间不允许落盘(SEEN 位是临时态)
+        assert!(engine.volumes[0].dirty);
+        assert!(!engine.maintain(), "maintain must not save while syncing");
+
+        engine.handle(EngineMsg::DirSyncEnd { guid, ok: false });
+        assert!(!engine.volumes[0].syncing);
+        {
+            let store = engine.volumes[0].store.as_ref().unwrap();
+            assert_eq!(store.len(), 4, "aborted sync must not delete anything");
+            assert!(store.find_slot(12).is_some(), "beta must survive an aborted sync");
+        }
+
+        // 完整对账:beta 未见到 → 删除;gamma 新增;docs/alpha 保留。
+        engine.handle(EngineMsg::DirSyncBegin { guid });
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![
+                rec(10, 0, DIR, "docs"),
+                rec(11, 10, 0, "alpha.txt"),
+                rec(13, 10, 0, "gamma.txt"),
+            ],
+            next_usn: 100,
+        });
+        engine.handle(EngineMsg::DirSyncEnd { guid, ok: true });
+        assert!(!engine.volumes[0].syncing);
+        {
+            let store = engine.volumes[0].store.as_ref().unwrap();
+            assert!(store.find_slot(12).is_none(), "beta.txt vanished offline → removed");
+            assert!(store.find_slot(10).is_some());
+            assert!(store.find_slot(11).is_some());
+            assert!(store.find_slot(13).is_some(), "gamma.txt added offline → present");
+        }
+
+        // 对账结果应能落盘并被下一次启动读回
+        assert!(engine.maintain());
+        let engine2 = engine_with(&dir);
+        assert_eq!(engine2.volumes.len(), 1);
+        let store2 = engine2.volumes[0].store.as_ref().unwrap();
+        assert_eq!(store2.len(), 3);
+        assert!(store2.find_slot(12).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

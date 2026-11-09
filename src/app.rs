@@ -149,6 +149,8 @@ pub struct LstrApp {
     /// 状态行首次出现时间(>300ms 才显示,避免闪烁)。
     index_note_since: Option<std::time::Instant>,
     pending_gen: u64,
+    /// 诊断用：请求发出时刻（定位「显示 70ms、实际等 2s」的排队来源）。
+    search_sent_at: Option<Instant>,
     waiting: bool,
     dirty_at: Option<Instant>,
     hidden: bool,
@@ -260,6 +262,7 @@ impl LstrApp {
             index_note: None,
             index_note_since: None,
             pending_gen,
+            search_sent_at: None,
             waiting: true,
             dirty_at: None,
             hidden: true,
@@ -392,6 +395,7 @@ impl LstrApp {
         if let Some(deadline) = self.dirty_at {
             if Instant::now() >= deadline {
                 self.pending_gen = self.service.search(&self.input, self.scope, self.dialog.is_some(), &self.filters, &self.cfg.rank, self.cfg.show_history);
+                self.search_sent_at = Some(Instant::now());
                 self.waiting = true;
                 self.dirty_at = None;
             } else {
@@ -401,6 +405,19 @@ impl LstrApp {
         self.poll_index_status(ctx);
         if let Some(response) = self.service.poll() {
             if response.generation == self.pending_gen {
+                // 诊断：总延迟 vs 服务端执行时间。差值 = 排队/唤醒开销。
+                if let Some(sent) = self.search_sent_at.take() {
+                    let total_ms = sent.elapsed().as_millis();
+                    if total_ms > 250 {
+                        lstr_index::snapshot::debug_log(&format!(
+                            "search: ui total={}ms execute={:.1}ms entries={} total={}",
+                            total_ms,
+                            response.elapsed_ms,
+                            response.entries.len(),
+                            response.total
+                        ));
+                    }
+                }
                 self.entries = response.entries;
                 self.total = response.total;
                 self.elapsed_ms = response.elapsed_ms;
@@ -421,7 +438,9 @@ impl LstrApp {
     fn trigger(&mut self, ctx: &egui::Context) {
         // 30ms：只用来合并同一帧内的连击/粘贴，不再人为拖慢输入。
         // 请求在 worker 里是 latest-wins 合并的，逐键查询不会堆积。
-        self.dirty_at = Some(Instant::now() + Duration::from_millis(30));
+        // 打字防抖:150ms 内还有击键就只搜最后的状态,避免每个字符都发一次
+        // 全量查询(单字符 "a" 在 600 万条索引里是几百毫秒级的扫描)。
+        self.dirty_at = Some(Instant::now() + Duration::from_millis(150));
         ctx.request_repaint_after(Duration::from_millis(35));
     }
 
@@ -2271,8 +2290,13 @@ impl LstrApp {
             )
         } else {
             format!(
+                // total 计数在 10 万处截断(见 query::TOTAL_CAP),显示为近似值。
                 "{} 个结果 · {:.2}s{}",
-                self.total,
+                if self.total >= 100_000 {
+                    "10万+".to_string()
+                } else {
+                    self.total.to_string()
+                },
                 self.elapsed_ms / 1000.0,
                 if self.scrollable { " · 滚轮查看更多" } else { "" }
             )

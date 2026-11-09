@@ -8,9 +8,26 @@
 //! - scan 模式(未 compact,无 offs)同样适用,渐进搜索白拿;
 //! - 名字区 `\0` 结尾保证命中不跨条目,仍按起点校验兜底。
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::store::{fold_ascii, VolumeStore, ATTR_INTERNAL};
 
 pub const FILE_ATTRIBUTE_DIRECTORY_U16: u16 = 0x0010;
+
+/// 查询取消代次:UI 每次发出新搜索前写入最新 generation;查询线程在
+/// 热循环里每 4096 个命中读一次,发现代次变化即提前中止,避免旧查询
+/// (如单字符 "a" 命中 200 万条要 600ms+)把新击键堵在队列里。
+pub static CANCEL_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// total 精确计数的上限:单字符/高频 token(如 "a")能命中 200 万条,
+/// 逐条计数是 600ms 级的成本,而 UI 也只会显示「10万+」。
+/// 到达上限即停止计数(收集仍照常封顶 candidate_cap)。
+pub const TOTAL_CAP: usize = 100_000;
+
+#[inline]
+fn cancelled(cancel: Option<u64>) -> bool {
+    matches!(cancel, Some(my) if CANCEL_GEN.load(Ordering::Relaxed) != my)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KindFilter {
@@ -57,6 +74,8 @@ pub struct QueryOutcome {
     pub total: usize,
     /// 因 candidate_cap 提前截断(total 仍精确,仅收集截断)。
     pub capped: bool,
+    /// 新查询已到达,本次查询被提前中止(hits/total 均为部分结果,调用方应丢弃)。
+    pub aborted: bool,
 }
 
 /// 判断 slot 是否通过 kind/ext/组 过滤(不含路径)。
@@ -95,6 +114,18 @@ pub fn passes_filters(store: &VolumeStore, slot: u32, spec: &QuerySpec) -> bool 
 
 /// 单卷候选收集。返回 (slots, total, capped)。
 pub fn query_volume(store: &VolumeStore, spec: &QuerySpec, cap: usize) -> (Vec<u32>, usize, bool) {
+    let (slots, total, capped, _) = query_volume_cancel(store, spec, cap, None);
+    (slots, total, capped)
+}
+
+/// 可取消版本:返回 `(slots, total, capped, aborted)`。查询线程传入发查询时
+/// 的 `CANCEL_GEN` 快照,UI 每次新搜索都会刷新该代次,热循环据此提前中止。
+pub(crate) fn query_volume_cancel(
+    store: &VolumeStore,
+    spec: &QuerySpec,
+    cap: usize,
+    cancel: Option<u64>,
+) -> (Vec<u32>, usize, bool, bool) {
     let tokens: Vec<Vec<u8>> = spec
         .tokens
         .iter()
@@ -109,6 +140,9 @@ pub fn query_volume(store: &VolumeStore, spec: &QuerySpec, cap: usize) -> (Vec<u
         let mut total = 0usize;
         let mut capped = false;
         for slot in 0..store.name_off.len() as u32 {
+            if slot & 4095 == 0 && cancelled(cancel) {
+                return (slots, total, capped, true);
+            }
             if store.attrs[slot as usize] & ATTR_INTERNAL != 0 {
                 continue;
             }
@@ -116,15 +150,21 @@ pub fn query_volume(store: &VolumeStore, spec: &QuerySpec, cap: usize) -> (Vec<u
                 continue;
             }
             total += 1;
+            if total >= TOTAL_CAP {
+                break;
+            }
             if slots.len() < cap {
                 slots.push(slot);
             } else {
                 capped = true;
             }
         }
-        return (slots, total, capped);
+        return (slots, total, capped, false);
     }
     // 精确模式:wfn 语义,直接二分 offs(ready 模式);scan 模式退化为逐项比对
+    if cancelled(cancel) {
+        return (Vec::new(), 0, false, true);
+    }
     if let Some(ex) = &spec.exact {
         let exb = ex.as_bytes();
         let mut slots = Vec::new();
@@ -140,7 +180,7 @@ pub fn query_volume(store: &VolumeStore, spec: &QuerySpec, cap: usize) -> (Vec<u
                 }
             }
             let total = slots.len();
-            return (slots, total, false);
+            return (slots, total, false, false);
         }
         for slot in 0..store.name_off.len() as u32 {
             if store.name_lc(slot) == exb && passes_filters(store, slot, spec) {
@@ -148,7 +188,7 @@ pub fn query_volume(store: &VolumeStore, spec: &QuerySpec, cap: usize) -> (Vec<u
             }
         }
         let total = slots.len();
-        return (slots, total, false);
+        return (slots, total, false, false);
     }
 
     // 生成 token 取最长(一般最稀有)
@@ -166,7 +206,12 @@ pub fn query_volume(store: &VolumeStore, spec: &QuerySpec, cap: usize) -> (Vec<u
     let mut last_slot: Option<u32> = None; // 同一条目内多次命中只算一次
 
     let finder = memchr::memmem::Finder::new(gen);
+    let mut seen = 0usize;
     for off in finder.find_iter(&store.names_lc) {
+        seen += 1;
+        if seen & 4095 == 0 && cancelled(cancel) {
+            return (slots, total, capped, true);
+        }
         // 命中偏移 → slot(off_index 二分 + 陈项过滤;就地改名的幽灵命中在此被丢弃)
         let Some(slot) = store.slot_at_offset(off) else {
             continue;
@@ -193,13 +238,16 @@ pub fn query_volume(store: &VolumeStore, spec: &QuerySpec, cap: usize) -> (Vec<u
             continue;
         }
         total += 1;
+        if total >= TOTAL_CAP {
+            break;
+        }
         if slots.len() < cap {
             slots.push(slot);
         } else {
             capped = true;
         }
     }
-    (slots, total, capped)
+    (slots, total, capped, false)
 }
 
 /// 拼音候选匹配:全部 token 命中 initials 或 full(前缀或子串)。
@@ -213,6 +261,27 @@ pub fn pinyin_match(initials: &[u8], full: &[u8], tokens: &[Vec<u8>]) -> bool {
 mod tests {
     use super::*;
     use crate::store::VolumeStore;
+
+    #[test]
+    fn query_is_cancelled_when_newer_generation_arrives() {
+        let mut s = VolumeStore::new(false);
+        for i in 0..50_000u32 {
+            s.insert(1000 + i as u64, 0, 0, format!("file{i}.txt").as_bytes());
+        }
+        s.compact();
+        let spec = QuerySpec {
+            tokens: vec!["file".into()],
+            ..Default::default()
+        };
+        let my = CANCEL_GEN.load(Ordering::Relaxed);
+        let (_, total, _, aborted) = query_volume_cancel(&s, &spec, 2000, Some(my));
+        assert_eq!(total, 50_000);
+        assert!(!aborted, "代次未变时不应中止");
+        CANCEL_GEN.store(my + 1, Ordering::Relaxed);
+        let (_, _, _, aborted) = query_volume_cancel(&s, &spec, 2000, Some(my));
+        assert!(aborted, "代次变化后旧查询应提前中止");
+        CANCEL_GEN.store(my, Ordering::Relaxed);
+    }
 
     fn setup() -> VolumeStore {
         let mut s = VolumeStore::new(false);
