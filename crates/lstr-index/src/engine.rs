@@ -493,13 +493,11 @@ impl Engine {
                 // 一轮 idle 最多 400 条消息 × 4000 条记录,整轮消化会把同线程上
                 // 的查询堵住数百 ms~秒级。按块消化,块间查让路钩子(0294602 的
                 // 打字优先扩展),钩子触发时剩余留待宿主下轮继续。
+                // 条件取「!complete」而非存储扫描态(H-1):首扫第一次部分保存
+                // 必做 compact,之后 is_scanning() 翻 false,按存储态判定会让
+                // 扫描剩余阶段退回一次性 apply,让路优化失效。
                 let chunked = self.apply_chunk_records > 0
-                    && (self.volumes[i].syncing
-                        || self.volumes[i]
-                            .store
-                            .as_ref()
-                            .map(|s| s.is_scanning())
-                            .unwrap_or(false));
+                    && (self.volumes[i].syncing || !self.volumes[i].complete);
                 if chunked {
                     match self.pending_applies.iter_mut().find(|p| p.guid == guid) {
                         Some(buf) => {
@@ -2262,6 +2260,67 @@ mod tests {
             );
             assert!(!e.has_pending_apply());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H-1 回归:首扫第一次部分保存必做 compact(save 的列一致契约),
+    /// compact 后 base_len 写满、store.is_scanning() 翻 false;分批条件若挂在
+    /// 存储扫描态上,首扫剩余阶段会退回一次性 apply,让路优化失效。条件按
+    /// 「!complete」判定后,部分保存之后的 Records 仍走分批路径。
+    #[test]
+    fn chunked_survives_partial_save_compact() {
+        const DIR: u32 = 0x0010;
+        let dir = temp_index_dir("h1-chunked-after-save");
+        let guid = 0xb2u128;
+        let mut engine = engine_with(&dir);
+        engine.set_apply_chunk_records(64);
+        let force = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook = force.clone();
+        engine.set_query_yield_hook(Some(Box::new(move || {
+            hook.load(std::sync::atomic::Ordering::Relaxed)
+        })));
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'C',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: 10,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        // 第一批正常消化 → dirty;推进断点后做一次部分保存(内部必 compact)。
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(10, 0, DIR, "docs"), rec(11, 10, 0, "alpha.txt")],
+            next_usn: 100,
+        });
+        engine.handle(EngineMsg::ScanProgress { guid, frn: 50, est: 100, count: 2 });
+        assert!(engine.maintain(), "首扫中途的部分保存应发生");
+        assert!(snapshot::snapshot_path(&dir, guid).is_file());
+        // 前提确认:compact 已把存储态翻出「扫描中」—— 旧条件在这里即失效。
+        assert!(
+            !engine.volumes[0].store.as_ref().unwrap().is_scanning(),
+            "前提:部分保存后 base_len 写满,is_scanning() 翻 false"
+        );
+
+        // 首扫未完(complete=false):压住让路钩子,后续 Records 仍必须进
+        // 分批缓冲而不是一次性 apply 把查询线程堵住。
+        force.store(true, std::sync::atomic::Ordering::Relaxed);
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(12, 10, 0, "beta.txt"), rec(13, 10, 0, "gamma.txt")],
+            next_usn: 100,
+        });
+        assert!(
+            engine.has_pending_apply(),
+            "部分保存后首扫剩余 Records 仍应走分批路径(让路时留在缓冲)"
+        );
+        // 放行消化,语义不受影响:记录最终落进 store
+        force.store(false, std::sync::atomic::Ordering::Relaxed);
+        while engine.has_pending_apply() {
+            assert!(engine.advance_pending_apply() > 0);
+        }
+        let store = engine.volumes[0].store.as_ref().unwrap();
+        assert!(store.find_slot(12).is_some() && store.find_slot(13).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
