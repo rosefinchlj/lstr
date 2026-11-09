@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use windows::Win32::Foundation::HANDLE;
@@ -42,6 +42,11 @@ const IDLE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
 /// 本次会话结束后不再重建管道,worker 直接退出。这样 lstr 正常关闭时不会
 /// 留下常驻的提权进程;主进程崩溃时则靠 [`IDLE_ACCEPT_TIMEOUT`] 兜底。
 static EXIT_AFTER_SESSION: AtomicBool = AtomicBool::new(false);
+
+/// 全量/续扫的串行闸门:2026-11-09 本机蓝屏(0x3B / Ntfs.sys,时段与四卷并发
+/// USN 扫描重合)后的触发面收敛措施。卷线程仍在、journal 轮询不受影响,只是
+/// 全量 ENUM 一次只放行一卷;首次构建的墙钟时间变长,但 IO 压力显著降低。
+static SCAN_GATE: Mutex<()> = Mutex::new(());
 
 /// 启动时命令行传入的能力令牌;None = 没带 `--index-token`,一律拒绝握手。
 static WORKER_TOKEN: OnceLock<[u8; TOKEN_LEN]> = OnceLock::new();
@@ -405,6 +410,8 @@ fn scan_full_or_resume(
     if !send_frame(tx, Frame::ScanBegin { guid, resume_frn }, stop) {
         return None;
     }
+    // 串行闸门:见 SCAN_GATE 注释。guard 持有到本函数返回(即整卷 ENUM 结束)。
+    let _scan_slot = SCAN_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut last_report = std::time::Instant::now();
     let result = scan::scan_volume(
         letter,

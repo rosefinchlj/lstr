@@ -2,6 +2,11 @@
 //!
 //! 实测注意(P0 spike):E: 卷在 1MB 输出 buffer 下出现过内核态挂死,
 //! 64KB buffer 正常(~44 万条/秒)—— worker 统一用 64KB。
+//!
+//! 2026-11-09 本机出现 SYSTEM_SERVICE_EXCEPTION(0x3B, Ntfs.sys) 蓝屏,时段与
+//! 四卷并发 USN 扫描重合。用户态只读 FSCTL 不应崩内核,但本机 Ntfs.sys 对大
+//! buffer 的 FSCTL 已有已知异常(P0 spike 挂死),因此 journal 读取 buffer 也收
+//! 回到 64KB,worker 全量扫描改串行(见 worker::SCAN_GATE),以降低触发面。
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
@@ -18,6 +23,10 @@ use crate::usn::{self, Rec};
 use crate::win;
 
 pub const ENUM_BUF: usize = 64 << 10;
+/// journal 增量读取的输出 buffer。原为 256KB,2026-11-09 蓝屏后与 ENUM 统一到
+/// 64KB:本机 Ntfs.sys 对大输出 buffer 的 FSCTL 出现过内核态挂死/异常,小 buffer
+/// 只多几次 IO,换来更低的触发面。
+pub const JOURNAL_BUF: usize = 64 << 10;
 
 fn open_volume(letter: char) -> Result<HANDLE, String> {
     let path = win::to_wide(&format!(r"\\.\{letter}:"));
@@ -210,7 +219,7 @@ pub fn read_journal_handle(
         MinMajorVersion: 2,
         MaxMajorVersion: 2,
     };
-    let mut buf = vec![0u8; 1 << 18];
+    let mut buf = vec![0u8; JOURNAL_BUF];
     let mut ret: u32 = 0;
     let ok = unsafe {
         DeviceIoControl(
