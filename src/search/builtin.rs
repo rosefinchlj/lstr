@@ -40,6 +40,21 @@ pub struct BuiltinProvider {
 }
 
 impl BuiltinProvider {
+    /// 包一层 panic 隔离:查询路径上的任何 bug 都只能让这一次查询返回空,
+    /// 不能把 run_worker 线程打死(否则 UI 会永远停在「搜索中…」)。
+    /// 根因修复见 engine::save_volume 的 pinyin 重建;这里是兜底。
+    fn query_spec(&self, spec: &QuerySpec) -> lstr_index::QueryOutcome {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.engine.query(spec))) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                lstr_index::snapshot::debug_log("search: engine.query panicked, returning empty");
+                lstr_index::QueryOutcome::default()
+            }
+        }
+    }
+}
+
+impl BuiltinProvider {
     pub fn new(engine: Engine) -> Self {
         Self { engine }
     }
@@ -92,7 +107,7 @@ impl BuiltinProvider {
     ) -> Result<(Vec<Entry>, usize), String> {
         let mut spec = build_spec(query, filters);
         spec.exact = Some(query.text.to_lowercase());
-        let outcome = self.engine.query(&spec);
+        let outcome = self.query_spec(&spec);
         let want_pinyin = query.text.is_ascii();
         let mut entries = Vec::with_capacity(outcome.hits.len());
         for hit in &outcome.hits {
@@ -130,7 +145,7 @@ impl BuiltinProvider {
     ) -> Result<(Vec<Entry>, usize), String> {
         let mut spec = build_spec(query, filters);
         spec.kind = kind_filter;
-        let outcome = self.engine.query(&spec);
+        let outcome = self.query_spec(&spec);
         let want_pinyin = query.text.is_ascii();
 
         let mut entries = Vec::with_capacity(outcome.hits.len().min(limit));

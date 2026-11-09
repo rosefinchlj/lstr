@@ -53,7 +53,6 @@ impl PinyinCache {
         let i = self.slots.binary_search(&slot).ok()?;
         Some((&self.initials[i], &self.full[i]))
     }
-
     /// 拼音候选:全部 token 命中(前缀或子串)。
     pub fn search<'a>(
         &'a self,
@@ -67,8 +66,14 @@ impl PinyinCache {
                 if hits.len() >= cap {
                     break;
                 }
+                // 缓存与 store 的 slot 编号可能短暂不同步(例如 save 内部 compact
+                // 之后、调用方重建缓存之前)。宁可漏掉这一条,也不能越界 panic:
+                // 搜索线程一 panic,整个搜索服务就永久失联(m04259)。
+                let Some(&attrs) = store.attrs.get(slot as usize) else {
+                    continue;
+                };
                 // 拼音命中还须通过 store 位过滤(DEAD/NOISE 可能晚于缓存更新)
-                if store.attrs[slot as usize] & crate::store::ATTR_INTERNAL != 0 {
+                if attrs & crate::store::ATTR_INTERNAL != 0 {
                     continue;
                 }
                 let ini = self.initials[i].as_bytes();

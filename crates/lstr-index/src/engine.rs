@@ -681,10 +681,19 @@ impl Engine {
                 resume_frn: v.resume_frn,
                 est_records: v.est_records,
             };
-            snapshot::save(&self.cfg.index_dir, &header, &mut self.volumes[i].store.as_mut().unwrap())
+            snapshot::save_report(&self.cfg.index_dir, &header, &mut self.volumes[i].store.as_mut().unwrap())
         };
         match save_result {
-            Ok(_) => {
+            Ok(report) => {
+                if report.compacted {
+                    // save 内部可能 compact(未归并 delta/扫描中/待处理改名)→ slot 重排。
+                    // 拼音缓存以 slot 为键,必须同步重建,并把旧 Hit 代次作废,
+                    // 否则下一次查询会拿旧 slot 越界 panic(m04259)。
+                    self.bump_generation(i);
+                    if let Some(store) = &self.volumes[i].store {
+                        self.pinyin[i] = PinyinCache::rebuild(store);
+                    }
+                }
                 let next_at = Instant::now() + Self::save_interval(&self.volumes[i]);
                 let v = &mut self.volumes[i];
                 v.dirty = false;
@@ -838,6 +847,67 @@ mod tests {
         });
         engine.flush_all();
         assert!(!engine.volumes[0].dirty);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// m04259: save 内部 compact(未归并 delta / 改名 / 扫描中)会重排 slot,
+    /// engine 的拼音缓存必须随之重建,否则下一次查询按旧 slot 索引 → 越界 panic。
+    #[test]
+    fn pinyin_cache_is_rebuilt_after_save_time_compact() {
+        const DIR: u32 = 0x0010;
+        let dir = temp_index_dir("pinyin-save-compact");
+        let guid = 0x4444u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+
+        // VolumeReady 已 compact 过,这次落盘不会 compact。
+        assert!(engine.maintain());
+
+        // 删掉一条(dead→compact 时丢弃)+ 就地改名(renames>0,触发 save 内部 compact)。
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![Rec {
+                frn: 12,
+                parent_frn: 10,
+                attrs: 0,
+                op: Op::Remove,
+                name: String::new(),
+                mtime: 0,
+            }],
+            next_usn: 150,
+        });
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(11, 10, 0, "alpaca.txt")],
+            next_usn: 160,
+        });
+        assert!(engine.volumes[0]
+            .store
+            .as_ref()
+            .unwrap()
+            .has_pending_rename());
+
+        // 跳过落盘节流窗口(第一次 maintain 刚保存过)。
+        engine.volumes[0].save_retry_at = None;
+        assert!(engine.maintain(), "save-time compact should still write the snapshot");
+
+        let store = engine.volumes[0].store.as_ref().unwrap();
+        assert_eq!(store.len(), 2, "dead entry dropped by save-time compact");
+        assert!(
+            engine.pinyin[0]
+                .slots
+                .iter()
+                .all(|&slot| (slot as usize) < store.len()),
+            "pinyin cache must be rebuilt after save-time compact"
+        );
+
+        // 查询(ASCII token 会走拼音候选)不得 panic,total 仍能找到改名后的条目。
+        let mut spec = QuerySpec::default();
+        spec.tokens = vec!["alp".to_string()];
+        let outcome = engine.query(&spec);
+        assert!(outcome.total >= 1, "renamed entry should still be found");
+        assert!(!outcome.aborted);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

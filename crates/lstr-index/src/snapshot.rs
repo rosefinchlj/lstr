@@ -68,19 +68,47 @@ pub fn snapshot_path(dir: &Path, guid: u128) -> PathBuf {
     dir.join(format!("vol_{guid:032x}.bin"))
 }
 
+/// `save` 的附加结果。
+///
+/// `compacted` 表示保存期间执行了 compact —— 那会重排/收缩 slot 编号。
+/// 调用方只要持有以 slot 为键的缓存(engine 里的拼音候选缓存),就必须在
+/// 保存成功后重建缓存;否则缓存里的旧 slot 会越界或指向别的条目
+/// (m04259: `PinyinCache::search` 越界 panic,整个搜索线程死掉)。
+pub struct SaveReport {
+    pub bytes: u64,
+    pub compacted: bool,
+}
+
 /// 序列化并原子写盘。count==0 且 !complete 的空卷不写。
 /// 契约「列一致」由这里保证:有未归并 delta 时先 compact(早退使重复调用廉价)。
+///
+/// 需要知道保存期间是否发生过 compact 的调用方用 [`save_report`]。
 pub fn save(
     dir: &Path,
     header: &SnapshotHeader,
     store: &mut VolumeStore,
 ) -> std::io::Result<u64> {
+    save_report(dir, header, store).map(|report| report.bytes)
+}
+
+/// 同 [`save`],但把「保存期间是否 compact 过」一并返回,供缓存维护使用。
+pub fn save_report(
+    dir: &Path,
+    header: &SnapshotHeader,
+    store: &mut VolumeStore,
+) -> std::io::Result<SaveReport> {
     // 列一致契约:未归并 delta、扫描中、或有就地改名(名字区残留幽灵字节)
     // 都必须先 compact,否则 count 与 names 条目数对不上,load 直接拒绝
     // → 每次启动全量重扫(property 随机流里约 1/4 概率命中改名后落盘)。
-    if !store.delta_is_empty() || store.is_scanning() || store.has_pending_rename() {
+    let compacted = if !store.delta_is_empty()
+        || store.is_scanning()
+        || store.has_pending_rename()
+    {
         store.compact();
-    }
+        true
+    } else {
+        false
+    };
     std::fs::create_dir_all(dir)?;
     let final_path = snapshot_path(dir, header.guid);
     let tmp_path = dir.join(format!("vol_{:032x}.tmp", std::process::id()));
@@ -126,7 +154,10 @@ pub fn save(
             ));
         }
     }
-    Ok(std::fs::metadata(&final_path)?.len())
+    Ok(SaveReport {
+        bytes: std::fs::metadata(&final_path)?.len(),
+        compacted,
+    })
 }
 
 fn flags_of(complete: bool, exclude_noise: bool) -> u8 {
