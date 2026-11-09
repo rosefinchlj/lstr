@@ -1211,7 +1211,7 @@ impl LstrApp {
                 // 只有配置期望用内置索引时才提示；backend=everything/off 是用户主动选择。
                 let expect_builtin = matches!(
                     self.cfg.index.backend.as_str(),
-                    "auto" | "builtin"
+                    "auto" | "builtin" | "usn"
                 );
                 if expect_builtin {
                     note = Some(if st.everything_ok {
@@ -1221,6 +1221,26 @@ impl LstrApp {
                         "内置索引不可用（未获管理员授权或 worker 未运行），暂时没有搜索结果"
                             .to_string()
                     });
+                }
+            } else if st.phase == lstr_index::Phase::Ready {
+                // usn 后端:USN 层异常状态要浮出来(退避/停用 = 实时增量不可靠,
+                // worker 正在自动对账或已停用该卷);正常 Watching 不打扰(安静原则)。
+                if self.cfg.index.backend == "usn" {
+                    let degraded: Vec<String> = st
+                        .volumes
+                        .iter()
+                        .filter_map(|v| {
+                            let s = v.usn_state?;
+                            (s != lstr_index::usnwatch::UsnWatchState::Watching)
+                                .then(|| format!("{} 卷 USN:{}", v.letter, s.label()))
+                        })
+                        .collect();
+                    if !degraded.is_empty() {
+                        note = Some(format!(
+                            "USN 实时增量部分降级:{}(索引仍可用,worker 自动对账恢复)",
+                            degraded.join(" · ")
+                        ));
+                    }
                 }
             }
         }
@@ -3913,10 +3933,21 @@ impl LstrApp {
             for v in &st.volumes {
                 let mark = if v.complete { "✓" } else { "…" };
                 let pct = v.pct.map(|p| format!(" {:.0}%", p * 100.0)).unwrap_or_default();
+                let mut line = format!("{} 卷 {}:{}  {} 万项", mark, v.letter, pct, v.count / 10_000);
+                // USN 实时增量层状态(usn 后端 worker 经 UsnWatch 帧上报;
+                // 非 Off 才显示,旧后端零噪音)。游标 age 说明增量新鲜度。
+                if let Some(usn) = v.usn_state {
+                    match v.cursor_age_secs {
+                        Some(age) => {
+                            line.push_str(&format!(" · USN:{}(游标 {age}s 前)", usn.label()))
+                        }
+                        None => line.push_str(&format!(" · USN:{}", usn.label())),
+                    }
+                }
                 painter.text(
                     egui::pos2(area.left() + 130.0, y2 + 6.0),
                     Align2::LEFT_CENTER,
-                    format!("{} 卷 {}:{}  {} 万项", mark, v.letter, pct, v.count / 10_000),
+                    line,
                     ui::text_font(11.0),
                     if v.complete { theme.sub } else { theme.text },
                 );
@@ -4018,7 +4049,9 @@ impl LstrApp {
 
         // —— 后端选择 ——
         Self::settings_label(painter, &theme, area.left(), y, "索引后端");
-        let backends = [("auto", "自动(内置优先+兜底)"), ("builtin", "仅内置索引(不碰 Everything)"), ("everything", "仅 Everything"), ("off", "关闭内置索引")];
+        // usn = 实验后端:目录扫描首扫 + USN journal 实时增量(带熔断/对账护栏);
+        // 文案风格与其余四项一致(短句括注)。
+        let backends = [("auto", "自动(内置优先+兜底)"), ("builtin", "仅内置索引(不碰 Everything)"), ("usn", "实验:目录扫描+USN 实时增量"), ("everything", "仅 Everything"), ("off", "关闭内置索引")];
         let current = self.cfg_index_backend();
         let mut x = area.left() + 130.0;
         for (key, label) in backends {
@@ -4052,6 +4085,7 @@ impl LstrApp {
         // 这里用 layout+wrap 按 area 宽度自动折行:文案再长也不会跑出右边界
         // (painter.text 是 no-wrap,旧版单行长段落其实早就被窗口右侧裁掉了)。
         let help = "自动:内置索引未就绪时用 Everything 兜底合并;仅内置:完全不读取 Everything;仅 Everything:只用 Everything 后端。\n\
+实验 usn:目录扫描首扫 + USN journal 实时增量(带熔断/自动对账护栏;journal 重置或连续出错时该卷自动退回目录扫描对账)。\n\
 索引卷勾选立即生效(worker 自动起停该盘扫描);索引后端与噪声目录仍需重启 lstr 生效。\n\
 时间筛选在内置索引(目录扫描)模式下可用。\n\
 内置索引只覆盖本机固定 NTFS 卷;网络盘/FAT32/exFAT 等需 Everything。";
@@ -4067,6 +4101,7 @@ impl LstrApp {
     fn cfg_index_backend(&self) -> &'static str {
         match self.cfg.index.backend.as_str() {
             "builtin" => "builtin",
+            "usn" => "usn",
             "everything" => "everything",
             "off" => "off",
             _ => "auto",
