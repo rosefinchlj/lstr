@@ -8,6 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 7 天衰减常数：每过 7 天，最近使用奖励衰减到约 37%（e^-1）。
 const DECAY_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
+/// query_hits 的时间衰减：3 天减半，让「上次选了什么」保持新鲜。
+const QUERY_DECAY_SECS: f64 = 3.0 * 24.0 * 60.0 * 60.0;
+/// 单个查询词命中能带来的最高加权，避免盖过「名称完全一致」档位。
+const QUERY_BOOST_CAP: f64 = 240.0;
 /// history 条目数上限；超过后按 frecency 砍掉一半。
 const MAX_ITEMS: i64 = 1000;
 
@@ -19,6 +23,18 @@ CREATE TABLE IF NOT EXISTS history (
     entry TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_history_last ON history(last DESC);
+
+-- P1-1：记录「某个查询词下用户最终选了哪个结果」。
+-- 与 history 的全局 frecency 分开：frecency 回答「这个条目常用吗」，
+-- query_hits 回答「搜这个词时，用户上次要的是哪一个」。
+CREATE TABLE IF NOT EXISTS query_hits (
+    query    TEXT NOT NULL,
+    entry_id TEXT NOT NULL,
+    hits     INTEGER NOT NULL,
+    last     INTEGER NOT NULL,
+    PRIMARY KEY (query, entry_id)
+);
+CREATE INDEX IF NOT EXISTS idx_query_hits_lookup ON query_hits(query, hits DESC);
 ";
 
 fn now_secs() -> u64 {
@@ -144,6 +160,43 @@ impl History {
         self.evict(now);
     }
 
+    /// P1-1：记录「搜索 query 时用户选了这个条目」。
+    /// 空查询不记录——零查询推荐本来就是历史列表，记了没有区分度。
+    pub fn record_query(&mut self, query: &str, entry: &Entry) {
+        let key = query.trim().to_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        let now = now_secs();
+        let _ = self.db.execute(
+            "INSERT INTO query_hits (query, entry_id, hits, last) VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(query, entry_id) DO UPDATE SET hits = hits + 1, last = ?3",
+            params![key, entry.id, now as i64],
+        );
+    }
+
+    /// P1-1：同一查询词下的历史选择加成。次数越多、越近，分越高。
+    /// 上限 240，保证不会盖过「名称完全一致 = 1000」这类匹配档位。
+    pub fn query_boost(&self, query: &str, entry_id: &str) -> i32 {
+        let key = query.trim().to_lowercase();
+        if key.is_empty() {
+            return 0;
+        }
+        let result = self.db.query_row(
+            "SELECT hits, last FROM query_hits WHERE query = ?1 AND entry_id = ?2",
+            params![key, entry_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        );
+        let Ok((hits, last)) = result else {
+            return 0;
+        };
+        let age = now_secs().saturating_sub(last.max(0) as u64) as f64;
+        let recency = (-(age / QUERY_DECAY_SECS)).exp();
+        (hits as f64 * 60.0 * recency)
+            .round()
+            .clamp(0.0, QUERY_BOOST_CAP) as i32
+    }
+
     /// frecency 分数：`count + 2 * e^(-age_days / 7)`；未知条目返回 0。
     pub fn score(&self, id: &str) -> f32 {
         let result = self.db.query_row(
@@ -176,9 +229,15 @@ impl History {
         }
     }
 
-    /// 清空全部历史（设置里的「清空历史」用）。
+    /// 清空全部历史（设置里的「清空历史」用），连带清空查询词学习数据。
     pub fn clear(&mut self) {
         let _ = self.db.execute("DELETE FROM history", []);
+        let _ = self.db.execute("DELETE FROM query_hits", []);
+    }
+
+    /// 清空查询词学习数据，保留打开历史。
+    pub fn clear_queries(&mut self) {
+        let _ = self.db.execute("DELETE FROM query_hits", []);
     }
 
     /// 从历史里移除单条（结果动作菜单「从最近使用中移除」用）。
@@ -186,6 +245,9 @@ impl History {
         let _ = self
             .db
             .execute("DELETE FROM history WHERE id = ?1", params![id]);
+        let _ = self
+            .db
+            .execute("DELETE FROM query_hits WHERE entry_id = ?1", params![id]);
     }
 
     fn evict(&mut self, now: u64) {
@@ -226,6 +288,9 @@ impl History {
             .collect();
         for id in delete {
             let _ = self.db.execute("DELETE FROM history WHERE id = ?1", params![id]);
+            let _ = self
+                .db
+                .execute("DELETE FROM query_hits WHERE entry_id = ?1", params![id]);
         }
     }
 
@@ -298,6 +363,30 @@ mod tests {
         history.seed(&entry("often"), 10, now);
         assert!(history.score("recent") > history.score("old"));
         assert!(history.score("often") > history.score("recent"));
+    }
+
+    #[test]
+    fn query_boost_only_applies_to_matching_query() {
+        let mut history = History::in_memory();
+        let target = entry("report");
+        history.record_query("rep", &target);
+        history.record_query("rep", &target);
+        assert!(history.query_boost("rep", "report") > 0);
+        assert_eq!(history.query_boost("rep", "other"), 0);
+        assert_eq!(history.query_boost("zzz", "report"), 0);
+        assert_eq!(history.query_boost("", "report"), 0);
+    }
+
+    #[test]
+    fn query_boost_is_capped_and_clearable() {
+        let mut history = History::in_memory();
+        let target = entry("report");
+        for _ in 0..50 {
+            history.record_query("rep", &target);
+        }
+        assert!(history.query_boost("rep", "report") <= QUERY_BOOST_CAP as i32);
+        history.clear_queries();
+        assert_eq!(history.query_boost("rep", "report"), 0);
     }
 
     #[test]

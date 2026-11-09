@@ -202,6 +202,14 @@ pub struct LstrApp {
     center_frames: u8,
     suppress_hide_until: Instant,
     icons: IconStore,
+    /// P0-2：Explorer 内直接键入搜索（默认关闭）。
+    typing: Option<crate::win::typing::TypingWatch>,
+    /// 设置页「资产」的草稿输入状态。
+    assets_ui: crate::assets_ui::AssetUiState,
+    /// P0-2：这次唤出锁定的 Explorer 当前目录（None = 普通全局启动器）。
+    typing_folder: Option<std::path::PathBuf>,
+    /// 目录上下文里临时切到全局搜索（Ctrl+Shift+G）。
+    typing_global: bool,
 }
 
 impl LstrApp {
@@ -243,6 +251,18 @@ impl LstrApp {
             }
         };
         let tray = crate::win::tray::create().ok();
+        // P0-2：只有显式开启才安装全局低级键盘钩子。
+        let typing = if cfg.explorer_typing {
+            match crate::win::typing::TypingWatch::start(cc.egui_ctx.clone()) {
+                Ok(service) => Some(service),
+                Err(err) => {
+                    eprintln!("lstr: typing 启动失败: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let manual_size = cfg
             .height
             .map(|height| egui::vec2(cfg.width.clamp(420.0, 1000.0), height.clamp(160.0, 800.0)));
@@ -304,7 +324,52 @@ impl LstrApp {
             center_frames: 0,
             suppress_hide_until: Instant::now(),
             icons: IconStore::new(),
+            typing,
+            assets_ui: crate::assets_ui::AssetUiState::default(),
+            typing_folder: None,
+            typing_global: false,
         }
+    }
+
+    /// 设置页开关：即时安装/卸载全局键盘钩子，不必重启程序。
+    fn set_explorer_typing(&mut self, enabled: bool, ctx: &egui::Context) {
+        self.cfg.explorer_typing = enabled;
+        // 先卸载旧实例（Drop 会反挂钩子并结束线程），再按需安装新的。
+        self.typing = None;
+        if enabled {
+            match crate::win::typing::TypingWatch::start(ctx.clone()) {
+                Ok(service) => self.typing = Some(service),
+                Err(err) => self.toast(ctx, format!("启动键入搜索失败: {err}")),
+            }
+        }
+        let _ = self.cfg.save();
+    }
+
+    /// P0-2：Explorer 里敲下的第一个字符唤出启动器并写入输入框。
+    /// 之后前台不再是 Explorer，钩子自动停止接管，后续输入交回 egui。
+    fn poll_typing(&mut self, ctx: &egui::Context) {
+        // 一次取走全部字符：快速连打时轮询周期可能跨过多个按键，只保留最后一个会丢字。
+        let chars = self
+            .typing
+            .as_ref()
+            .map(|service| service.poll())
+            .unwrap_or_default();
+        if chars.is_empty() {
+            return;
+        }
+        if self.hidden {
+            // 必须在 show() 之前取：钩子吞键时前台还是 Explorer，
+            // show() 一旦把窗口显示/激活，GetForegroundWindow 就变成 lstr 自己了。
+            let folder = crate::win::explorer::foreground_explorer_folder();
+            self.show(ctx);
+            self.typing_folder = folder;
+            self.typing_global = false;
+            self.scope = Scope::All;
+        }
+        self.input.extend(chars);
+        Self::reset_input_cursor(ctx);
+        self.selected = 0;
+        self.trigger(ctx);
     }
 
     fn poll_hotkey(&mut self, ctx: &egui::Context) {
@@ -321,7 +386,21 @@ impl LstrApp {
                 }
                 HotkeyEvent::DialogSearch => {
                     if let Some(info) = dialog::active_dialog() {
-                        self.open_dialog_mode(ctx, info);
+                        // P0-3：有活动 Explorer 目录就零输入直跳，否则退回文件夹搜索。
+                        let target = crate::win::explorer::active_explorer_folder();
+                        if let Some(folder) = target {
+                            match dialog::navigate_to_folder(&info, &folder.to_string_lossy()) {
+                                Ok(()) => {
+                                    self.suppressed_dialog = Some(info.hwnd);
+                                    self.dialog = None;
+                                    self.hide(ctx);
+                                    dialog::restore_focus(&info);
+                                }
+                                Err(err) => self.toast(ctx, err),
+                            }
+                        } else {
+                            self.open_dialog_mode(ctx, info);
+                        }
                     } else if !self.hidden {
                         self.toast(ctx, "请先打开「打开/保存」对话框，再按 Ctrl+G".to_string());
                     }
@@ -368,6 +447,15 @@ impl LstrApp {
             return;
         }
         self.suppressed_dialog = None;
+        // P0-3：自动跟随 Explorer 当前目录（默认关闭，会改动对话框路径）。
+        if self.cfg.dialog_auto_follow {
+            if let Some(folder) = crate::win::explorer::active_explorer_folder() {
+                if dialog::navigate_to_folder(&info, &folder.to_string_lossy()).is_ok() {
+                    self.suppressed_dialog = Some(info.hwnd);
+                    return;
+                }
+            }
+        }
         self.open_dialog_mode(ctx, info);
     }
 
@@ -394,7 +482,20 @@ impl LstrApp {
     fn poll_search(&mut self, ctx: &egui::Context) {
         if let Some(deadline) = self.dirty_at {
             if Instant::now() >= deadline {
-                self.pending_gen = self.service.search(&self.input, self.scope, self.dialog.is_some(), &self.filters, &self.cfg.rank, self.cfg.show_history);
+                let base_folder = if self.typing_global {
+                    None
+                } else {
+                    self.typing_folder.clone()
+                };
+                self.pending_gen = self.service.search_in(
+                    &self.input,
+                    self.scope,
+                    self.dialog.is_some(),
+                    &self.filters,
+                    &self.cfg.rank,
+                    self.cfg.show_history,
+                    base_folder,
+                );
                 self.search_sent_at = Some(Instant::now());
                 self.waiting = true;
                 self.dirty_at = None;
@@ -455,6 +556,15 @@ impl LstrApp {
         }
     }
 
+    /// 外部改写 input 后，TextEdit 的持久光标状态还停在旧位置（通常是 0），
+    /// 清掉它，下一帧就会按 cursor_at_end 把光标放到文本末尾。
+    fn reset_input_cursor(ctx: &egui::Context) {
+        let id = egui::Id::new("lstr-search-input");
+        ctx.data_mut(|data| {
+            let _ = data.remove::<egui::widgets::text_edit::TextEditState>(id);
+        });
+    }
+
     fn show(&mut self, ctx: &egui::Context) {
         self.dialog = None;
         self.settings_open = false;
@@ -469,11 +579,15 @@ impl LstrApp {
         self.mouse_moved = false;
         self.needle_ready = false;
         self.input.clear();
+        Self::reset_input_cursor(ctx);
         self.selected = 0;
         self.scroll_y = 0.0;
         self.scroll_to_selection = false;
         self.filters = SearchFilters::default();
         self.filter_menu = None;
+        // 普通唤出（双击 Space / 托盘）不携带 Explorer 目录上下文。
+        self.typing_folder = None;
+        self.typing_global = false;
         self.apply_size(ctx);
         if let Some(hwnd) = self.hwnd {
             window::position_center(hwnd);
@@ -486,6 +600,8 @@ impl LstrApp {
 
     fn open_dialog_mode(&mut self, ctx: &egui::Context, info: DialogInfo) {
         self.dialog = Some(info.clone());
+        self.typing_folder = None;
+        self.typing_global = false;
         self.menu_open = false;
         self.center_frames = 0;
         self.pending_show = true;
@@ -539,6 +655,9 @@ impl LstrApp {
         self.menu_open = false;
         self.center_frames = 0;
         self.focus_requested = false;
+        // 下次在 Explorer 里打字会重新读取当时浏览的目录。
+        self.typing_folder = None;
+        self.typing_global = false;
     }
 
     fn apply_size(&mut self, ctx: &egui::Context) {
@@ -655,6 +774,27 @@ impl LstrApp {
             self.preview_open = !self.preview_open;
             self.cfg.preview = self.preview_open;
             let _ = self.cfg.save();
+            return;
+        }
+
+        // P0-2：目录上下文里一键切到全局搜索 / 切回来。
+        if self.typing_folder.is_some()
+            && ctx.input_mut(|i| {
+                i.consume_key(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::G)
+            })
+        {
+            self.typing_global = !self.typing_global;
+            self.selected = 0;
+            self.trigger(ctx);
+            self.toast(
+                ctx,
+                if self.typing_global {
+                    "已切换到全局搜索"
+                } else {
+                    "已切回当前目录"
+                }
+                .to_string(),
+            );
             return;
         }
 
@@ -871,6 +1011,9 @@ impl LstrApp {
             match result {
                 Ok(()) => {
                     self.service.record_open(&entry);
+                    if let Ok(mut history) = self.history.lock() {
+                        history.record_query(&self.input, &entry);
+                    }
                     // 焦点马上还给对话框：抑制它的自动唤出，不然会循环弹窗。
                     self.suppressed_dialog = Some(dialog.hwnd);
                     self.dialog = None;
@@ -891,9 +1034,25 @@ impl LstrApp {
             self.run_command(ctx, &entry);
             return;
         }
+        // P0-2：从 Explorer 唤起时，文件夹结果让原窗口直接跳过去，
+        // 而不是 shell::open_entry 再开一个新资源管理器窗口。
+        if entry.kind == Kind::Folder && self.typing_folder.is_some() && !self.typing_global {
+            if crate::win::explorer::navigate_active_to(&entry.full_path()).is_ok() {
+                self.service.record_open(&entry);
+                if let Ok(mut history) = self.history.lock() {
+                    history.record_query(&self.input, &entry);
+                }
+                self.hide(ctx);
+                return;
+            }
+        }
         match shell::open_entry(&entry) {
             Ok(()) => {
                 self.service.record_open(&entry);
+                // P1-1：记住「搜这个词时选了它」。
+                if let Ok(mut history) = self.history.lock() {
+                    history.record_query(&self.input, &entry);
+                }
                 self.hide(ctx);
             }
             Err(err) => self.toast(ctx, format!("打开失败: {err}")),
@@ -937,6 +1096,25 @@ impl LstrApp {
     }
 
     fn run_command(&mut self, ctx: &egui::Context, entry: &Entry) {
+        // P0-1：自定义命令，{query} = 触发词之后的内容，{current_folder} = 最近浏览目录。
+        if let Some(trigger) = entry.id.strip_prefix("usercmd:") {
+            let Some(def) = self.cfg.commands.iter().find(|c| c.trigger == trigger).cloned() else {
+                return;
+            };
+            let query = self
+                .input
+                .split_once(char::is_whitespace)
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or("");
+            let current_folder = crate::win::explorer::active_explorer_folder()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match crate::assets::run_command(&def, query, &current_folder) {
+                Ok(()) => self.hide(ctx),
+                Err(err) => self.toast(ctx, err),
+            }
+            return;
+        }
         if entry.id.starts_with("kwurl:") {
             let Some(path) = &entry.path else { return };
             match shell::open_url(&path.to_string_lossy()) {
@@ -1155,9 +1333,19 @@ impl LstrApp {
                     egui::vec2(rect.width() - 2.0 * PAD, 28.0),
                 );
                 let hint = if self.dialog.is_some() {
-                    dialog_hint(query.scope)
+                    dialog_hint(query.scope).to_string()
+                } else if let Some(folder) = &self.typing_folder {
+                    if self.typing_global {
+                        "全局搜索中（Ctrl+Shift+G 回到当前目录）…".to_string()
+                    } else {
+                        let name = folder
+                            .file_name()
+                            .map(|part| part.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| folder.to_string_lossy().into_owned());
+                        format!("在 {name} 中搜索（Ctrl+Shift+G 全局）…")
+                    }
                 } else {
-                    hint_for(query.scope)
+                    hint_for(query.scope).to_string()
                 };
                 let response = ui.put(
                     search_rect,
@@ -1166,7 +1354,7 @@ impl LstrApp {
                         .margin(egui::Margin::same(0))
                         .font(ui::text_font(22.0))
                         .text_color(theme.text)
-                        .hint_text(hint)
+                        .hint_text(hint.as_str())
                         .desired_width(f32::INFINITY)
                         .id(egui::Id::new("lstr-search-input")),
                 );
@@ -1897,6 +2085,8 @@ impl LstrApp {
                     Scope::Folder => "输入文件夹名，Enter 跳转",
                     _ => "输入文件名，Enter 填入",
                 }
+            } else if self.typing_folder.is_some() && !self.typing_global {
+                "当前目录内无匹配 · Ctrl+Shift+G 全局搜索"
             } else {
                 "试试 ext:rs、path: 或 a 微信"
             };
@@ -2087,83 +2277,151 @@ impl LstrApp {
             // 一个连字符在第 5 个字符，会被截成 "lstr-…"。break_anywhere 让
             // 它在真实宽度边缘截断，窗口拉宽就能多看几个字。
             title_job.wrap.break_anywhere = true;
+            let title_galley = painter.layout_job(title_job);
+            let title_width = title_galley.size().x;
+            let title_height = title_galley.size().y;
             painter.galley(
                 egui::pos2(row_rect.left() + 54.0, row_rect.top() + 5.0),
-                painter.layout_job(title_job),
+                title_galley,
                 theme.text,
             );
 
-            let subtitle = match entry.kind {
-                Kind::App => {
-                    if pinyin_hit {
-                        format!("应用 · 拼音 {}", query.text)
-                    } else if fuzzy_hit.is_some() {
-                        format!("应用 · 模糊 {}", query.text)
-                    } else if entry.id.starts_with("sys:") {
-                        format!("系统功能 · {}", ui::display_path(entry))
-                    } else {
-                        "应用".to_string()
-                    }
-                }
-                Kind::Command => {
-                    if entry.id.starts_with("kwurl:") {
-                        let host = entry
-                            .path
-                            .as_ref()
-                            .map(|p| ui::url_host(&p.to_string_lossy()).to_string())
-                            .unwrap_or_default();
-                        format!("网络搜索 · {host}")
-                    } else if entry.id.starts_with("kwexec:") {
-                        "关键字 · Enter 运行".to_string()
-                    } else {
-                        "命令 · Enter 执行".to_string()
-                    }
-                }
-                _ => {
-                    // 按实际可用像素换算字符预算：以前固定 72 字符 + 只留两段尾，
-                    // 两条不同的深路径会显示成同一串，同名结果无法区分。
-                    let path_text = ui::middle_ellipsis(&entry.full_path(), sub_budget);
-                    if entry.id.starts_with("qs:") {
-                        format!("已打开 · {path_text}")
-                    } else {
-                        path_text
-                    }
-                }
-            };
-            let mut sub_job = ui::text_job(
-                &subtitle,
-                if path_mode { "" } else { &query.text },
-                &ui::mono_font(11.5),
-                theme.sub,
-                theme.amber,
-            );
-            sub_job.wrap.max_width = row_rect.width() - 54.0 - 10.0;
-            sub_job.wrap.max_rows = 1;
-            sub_job.wrap.overflow_character = Some('…');
-            // 同上：路径里大量 "\\" / "." 会被当断行点，加 break_anywhere 才会
-            // 在宽度边缘截断。
-            sub_job.wrap.break_anywhere = true;
-            painter.galley(
-                egui::pos2(row_rect.left() + 54.0, row_rect.top() + 25.0),
-                painter.layout_job(sub_job),
-                theme.sub,
-            );
-
-            if selected && self.cfg.show_meta {
-                let meta = match entry.kind {
+            // 长路径不再中段省略：从第一行「文件名之后」开始接排，
+            // 放不下的部分折到第二行行首继续，两行合起来是完整路径，行高不变。
+            let is_path_row = matches!(entry.kind, Kind::File | Kind::Folder | Kind::Program);
+            let full_path = entry.full_path();
+            let lead = if entry.id.starts_with("qs:") { "已打开 · " } else { "" };
+            // meta（文件夹/大小）只在选中且开启时绘制；未选中行不预留 76px，
+            // 否则本可一行的长路径会被无谓地挤成两行。
+            let meta = if selected && self.cfg.show_meta {
+                match entry.kind {
                     Kind::Folder => "文件夹".to_string(),
                     Kind::Command => String::new(),
                     _ => entry.size.map(ui::format_size).unwrap_or_default(),
-                };
-                if !meta.is_empty() {
-                    painter.text(
-                        egui::pos2(row_rect.right() - 10.0, row_rect.center().y),
-                        Align2::RIGHT_CENTER,
-                        meta,
-                        ui::mono_font(11.0),
-                        theme.dim,
+                }
+            } else {
+                String::new()
+            };
+            let meta_w = if meta.is_empty() { 0.0 } else { 76.0 };
+            // 是否折两行按「实际渲染宽度」判断而不是字符数：中文字符宽约为
+            // ASCII 的两倍，按字符数判断会让视觉上已超宽的路径仍被单行省略。
+            let mono = ui::mono_font(11.5);
+            let gap = 10.0;
+            let head_max = (row_rect.width() - 54.0 - meta_w - title_width - gap).max(24.0);
+            let mut path_text = String::new();
+            let mut two_line_path = false;
+            if is_path_row {
+                path_text = format!("{lead}{full_path}");
+                let path_w = painter
+                    .layout_no_wrap(path_text.clone(), mono.clone(), theme.sub)
+                    .size()
+                    .x;
+                two_line_path = path_w > head_max;
+            }
+
+            if two_line_path {
+                let needle = if path_mode { "" } else { &query.text };
+                let cut = split_path_head(
+                    |candidate| {
+                        painter
+                            .layout_no_wrap(candidate.to_string(), mono.clone(), theme.sub)
+                            .size()
+                            .x
+                    },
+                    &path_text,
+                    head_max,
+                );
+                let (head, tail) = split_at_chars(&path_text, cut);
+
+                if !head.is_empty() {
+                    let mut head_job = ui::text_job(&head, needle, &mono, theme.sub, theme.amber);
+                    // 切分按纯文本测量，高亮分段可能带来极小宽度差，留几像素防裁字。
+                    head_job.wrap.max_width = head_max + 6.0;
+                    head_job.wrap.max_rows = 1;
+                    head_job.wrap.break_anywhere = true;
+                    let head_galley = painter.layout_job(head_job);
+                    let y = row_rect.top() + 5.0 + (title_height - head_galley.size().y).max(0.0);
+                    painter.galley(
+                        egui::pos2(row_rect.left() + 54.0 + title_width + gap, y),
+                        head_galley,
+                        theme.sub,
                     );
                 }
+                if !tail.is_empty() {
+                    let mut tail_job = ui::text_job(&tail, needle, &mono, theme.sub, theme.amber);
+                    tail_job.wrap.max_width = row_rect.width() - 54.0 - 10.0;
+                    tail_job.wrap.max_rows = 1;
+                    tail_job.wrap.break_anywhere = true;
+                    // 极端超长路径的兜底：正常窗口宽度两行足够，不会走到省略。
+                    tail_job.wrap.overflow_character = Some('…');
+                    painter.galley(
+                        egui::pos2(row_rect.left() + 54.0, row_rect.top() + 25.0),
+                        painter.layout_job(tail_job),
+                        theme.sub,
+                    );
+                }
+            } else {
+                let subtitle = match entry.kind {
+                    Kind::App => {
+                        if pinyin_hit {
+                            format!("应用 · 拼音 {}", query.text)
+                        } else if fuzzy_hit.is_some() {
+                            format!("应用 · 模糊 {}", query.text)
+                        } else if entry.id.starts_with("sys:") {
+                            format!("系统功能 · {}", ui::display_path(entry))
+                        } else {
+                            "应用".to_string()
+                        }
+                    }
+                    Kind::Command => {
+                        if entry.id.starts_with("kwurl:") {
+                            let host = entry
+                                .path
+                                .as_ref()
+                                .map(|p| ui::url_host(&p.to_string_lossy()).to_string())
+                                .unwrap_or_default();
+                            format!("网络搜索 · {host}")
+                        } else if entry.id.starts_with("kwexec:") {
+                            "关键字 · Enter 运行".to_string()
+                        } else {
+                            "命令 · Enter 执行".to_string()
+                        }
+                    }
+                    _ => {
+                        let path_text = ui::middle_ellipsis(&full_path, sub_budget);
+                        if lead.is_empty() {
+                            path_text
+                        } else {
+                            format!("{lead}{path_text}")
+                        }
+                    }
+                };
+                let mut sub_job = ui::text_job(
+                    &subtitle,
+                    if path_mode { "" } else { &query.text },
+                    &ui::mono_font(11.5),
+                    theme.sub,
+                    theme.amber,
+                );
+                sub_job.wrap.max_width = row_rect.width() - 54.0 - 10.0;
+                sub_job.wrap.max_rows = 1;
+                sub_job.wrap.overflow_character = Some('…');
+                sub_job.wrap.break_anywhere = true;
+                painter.galley(
+                    egui::pos2(row_rect.left() + 54.0, row_rect.top() + 25.0),
+                    painter.layout_job(sub_job),
+                    theme.sub,
+                );
+            }
+
+            if !meta.is_empty() {
+                painter.text(
+                    egui::pos2(row_rect.right() - 10.0, row_rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    meta.as_str(),
+                    ui::mono_font(11.0),
+                    theme.dim,
+                );
             }
 
             if selected {
@@ -2293,7 +2551,7 @@ impl LstrApp {
             Stroke::new(1.0, theme.hair),
         );
 
-        let default_text = if query.is_empty() {
+        let mut default_text = if query.is_empty() {
             format!(
                 "{} 项{}",
                 entries.len(),
@@ -2316,6 +2574,17 @@ impl LstrApp {
                 if self.scrollable { " · 滚轮查看更多" } else { "" }
             )
         };
+        if let Some(folder) = &self.typing_folder {
+            if self.typing_global {
+                default_text.push_str(" · 全局");
+            } else {
+                let name = folder
+                    .file_name()
+                    .map(|part| part.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| folder.to_string_lossy().into_owned());
+                default_text.push_str(&format!(" · 目录: {name}"));
+            }
+        }
         let now = Instant::now();
         let active_toast = match &self.toast {
             Some((message, until)) if now < *until => Some(message.clone()),
@@ -2491,7 +2760,8 @@ impl LstrApp {
             self.menu_open = false;
             return;
         };
-        let items = menu_items(entry);
+        let actions = self.cfg.actions.clone();
+        let items = menu_items(entry, &actions);
         if items.is_empty() {
             self.menu_open = false;
             return;
@@ -2512,7 +2782,8 @@ impl LstrApp {
             self.menu_open = false;
             return;
         };
-        let items = menu_items(entry);
+        let actions = self.cfg.actions.clone();
+        let items = menu_items(entry, &actions);
         if let Some(item) = items.get(self.menu_index) {
             if item.enabled {
                 let action = item.action;
@@ -2526,6 +2797,39 @@ impl LstrApp {
     fn run_menu_action(&mut self, ctx: &egui::Context, action: MenuAction) {
         self.menu_open = false;
         match action {
+            MenuAction::AddFavorite => {
+                let Some(entry) = self.entries.get(self.selected).cloned() else {
+                    return;
+                };
+                if entry.kind == Kind::Command {
+                    self.toast(ctx, "命令不能收藏".to_string());
+                    return;
+                }
+                match crate::assets::add_favorite(&mut self.cfg, &entry.name, &entry.full_path()) {
+                    Ok(true) => {
+                        self.service.set_favorites(self.cfg.favorites.clone());
+                        self.toast(ctx, "已加入收藏".to_string());
+                    }
+                    Ok(false) => self.toast(ctx, "已在收藏中".to_string()),
+                    Err(err) => self.toast(ctx, err),
+                }
+                self.trigger(ctx);
+            }
+            MenuAction::CustomAction(index) => {
+                let Some(entry) = self.entries.get(self.selected).cloned() else {
+                    return;
+                };
+                let Some(def) = self.cfg.actions.get(index).cloned() else {
+                    return;
+                };
+                let current_folder = crate::win::explorer::active_explorer_folder()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match crate::assets::run_action(&def, &entry, &self.input, &current_folder) {
+                    Ok(()) => self.hide(ctx),
+                    Err(err) => self.toast(ctx, err),
+                }
+            }
             MenuAction::Open => self.activate_selected(ctx),
             MenuAction::Reveal => self.reveal_selected(ctx),
             MenuAction::CopyPath => {
@@ -2571,7 +2875,7 @@ impl LstrApp {
             self.menu_open = false;
             return;
         };
-        let items = menu_items(&entry);
+        let items = menu_items(&entry, &self.cfg.actions);
         let theme = self.theme;
         let item_h = 30.0;
         let width = 236.0;
@@ -2629,7 +2933,7 @@ impl LstrApp {
                         ui.painter().text(
                             egui::pos2(row_rect.left() + 8.0, row_rect.center().y),
                             Align2::LEFT_CENTER,
-                            item.label,
+                            item.label.as_str(),
                             ui::text_font(13.0),
                             color,
                         );
@@ -2777,6 +3081,10 @@ impl LstrApp {
         checked: &mut bool,
     ) -> bool {
         let response = ui.interact(rect, id, Sense::click());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
         let box_rect = Rect::from_center_size(
             egui::pos2(rect.left() + 11.0, rect.center().y),
             egui::vec2(18.0, 18.0),
@@ -2866,6 +3174,10 @@ impl LstrApp {
             egui::vec2(22.0, 22.0),
         );
         let close = ui.interact(close_rect, Id::new("lstr-settings-close"), Sense::click());
+        if close.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
         painter.text(
             close_rect.center(),
             Align2::CENTER_CENTER,
@@ -2894,6 +3206,7 @@ impl LstrApp {
             (SettingsTab::Ranking, "排序规则"),
             (SettingsTab::Noise, "噪声规则"),
             (SettingsTab::Maintenance, "维护"),
+            (SettingsTab::Assets, "资产"),
         ];
         let mut y = rect.top() + 60.0;
         for (tab, label) in tabs {
@@ -2906,6 +3219,10 @@ impl LstrApp {
                 Id::new(("lstr-settings-nav", tab as u8)),
                 Sense::click(),
             );
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
             let active = self.settings_tab == tab;
             if active {
                 painter.rect_filled(item, CornerRadius::same(7), theme.amber_soft);
@@ -2952,6 +3269,7 @@ impl LstrApp {
             SettingsTab::Ranking => self.paint_settings_ranking(ui, ctx, &painter, area),
             SettingsTab::Noise => self.paint_settings_noise(ui, ctx, &painter, area),
             SettingsTab::Maintenance => self.paint_settings_maintenance(ui, ctx, &painter, area),
+            SettingsTab::Assets => self.paint_settings_assets(ui, ctx, &painter, area),
         }
     }
 
@@ -2979,6 +3297,10 @@ impl LstrApp {
             );
             let selected = self.cfg.theme.mode == *value;
             let response = ui.interact(button, Id::new(("lstr-theme", index)), Sense::click());
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
             painter.rect_filled(
                 button,
                 CornerRadius::same(6),
@@ -3023,6 +3345,10 @@ impl LstrApp {
             );
             let selected = self.cfg.theme.accent.eq_ignore_ascii_case(hex);
             let response = ui.interact(swatch, Id::new(("lstr-accent", index)), Sense::click());
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
             let rgb = crate::config::parse_hex(hex).unwrap_or([224, 160, 64]);
             painter.circle_filled(
                 swatch.center(),
@@ -3173,13 +3499,98 @@ impl LstrApp {
             }
         }
 
+        y += ROW;
+
+        Self::settings_label(painter, &theme, area.left(), y, "资源管理器键入即搜");
+        let mut explorer_typing = self.cfg.explorer_typing;
+        if Self::settings_checkbox(
+            ui,
+            painter,
+            &theme,
+            Id::new("lstr-typing-check"),
+            Rect::from_min_size(egui::pos2(ctrl_x, y), egui::vec2(60.0, 22.0)),
+            &mut explorer_typing,
+        ) {
+            self.set_explorer_typing(explorer_typing, ctx);
+            self.toast(
+                ctx,
+                if explorer_typing {
+                    "已启用：在资源管理器里直接打字即可搜索".to_string()
+                } else {
+                    "已停用键入搜索".to_string()
+                },
+            );
+        }
+        // 钩子实际状态可见：避免「开关开着但钩子没起来」变成黑盒。
         painter.text(
-            egui::pos2(area.left(), area.bottom() - 26.0),
+            egui::pos2(ctrl_x + 70.0, y + 14.0),
+            Align2::LEFT_CENTER,
+            if self.typing.is_some() {
+                "钩子运行中"
+            } else {
+                "未启动（见 typing.log）"
+            },
+            ui::mono_font(10.5),
+            if self.typing.is_some() { theme.sub } else { theme.dim },
+        );
+        y += ROW;
+
+        Self::settings_label(painter, &theme, area.left(), y, "对话框自动跟随目录");
+        let mut dialog_auto_follow = self.cfg.dialog_auto_follow;
+        if Self::settings_checkbox(
+            ui,
+            painter,
+            &theme,
+            Id::new("lstr-follow-check"),
+            Rect::from_min_size(egui::pos2(ctrl_x, y), egui::vec2(60.0, 22.0)),
+            &mut dialog_auto_follow,
+        ) {
+            self.cfg.dialog_auto_follow = dialog_auto_follow;
+            let _ = self.cfg.save();
+        }
+
+        painter.text(
+            egui::pos2(area.left(), area.bottom() - 40.0),
             Align2::LEFT_TOP,
-            "最大结果数决定窗口一屏的行数，超出部分用滚轮查看",
+            "键入即搜：资源管理器内直接打字；自动跟随：对话框跳到刚浏览的目录",
             ui::mono_font(10.0),
             theme.dim,
         );
+        painter.text(
+            egui::pos2(area.left(), area.bottom() - 24.0),
+            Align2::LEFT_TOP,
+            "收藏 / 动作 / 命令见 config.toml 的 [[favorite]] [[action]] [[command]]",
+            ui::mono_font(10.0),
+            theme.dim,
+        );
+    }
+
+    /// 设置页「资产」：收藏 / 动作 / 命令的可视化增删改。
+    /// 渲染放在独立模块里，这里只负责分页区域、保存配置与同步搜索服务。
+    fn paint_settings_assets(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        area: Rect,
+    ) {
+        let theme = self.theme;
+        Self::settings_heading(painter, &theme, area, "资产", "收藏、自定义动作与命令");
+        let inner = Rect::from_min_max(
+            egui::pos2(area.left(), area.top() + 46.0),
+            egui::pos2(area.right(), area.bottom() - 6.0),
+        );
+        let cfg = &mut self.cfg;
+        let state = &mut self.assets_ui;
+        let mut changed = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            changed = crate::assets_ui::paint(ui, painter, &theme, inner, cfg, state);
+        });
+        if changed {
+            let _ = self.cfg.save();
+            self.service.set_favorites(self.cfg.favorites.clone());
+            self.trigger(ctx);
+        }
     }
 
     fn paint_settings_ranking(
@@ -3276,6 +3687,10 @@ impl LstrApp {
             egui::vec2(92.0, 24.0),
         );
         let response = ui.interact(reset, Id::new("lstr-rank-reset"), Sense::click());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
         painter.rect_filled(reset, CornerRadius::same(6), theme.hover);
         painter.rect_stroke(
             reset,
@@ -3375,6 +3790,10 @@ impl LstrApp {
             egui::vec2(104.0, 24.0),
         );
         let response = ui.interact(add, Id::new("lstr-noise-add"), Sense::click());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
         painter.rect_filled(add, CornerRadius::same(6), theme.hover);
         painter.rect_stroke(
             add,
@@ -3402,6 +3821,10 @@ impl LstrApp {
             egui::vec2(92.0, 24.0),
         );
         let response = ui.interact(reset, Id::new("lstr-noise-reset"), Sense::click());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
         painter.rect_filled(reset, CornerRadius::same(6), theme.hover);
         painter.rect_stroke(
             reset,
@@ -3605,6 +4028,10 @@ impl LstrApp {
                       accent: bool|
          -> bool {
             let response = ui.interact(rect, Id::new(("lstr-maint", label)), Sense::click());
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
             painter.rect_filled(rect, CornerRadius::same(6), theme.hover);
             painter.rect_stroke(
                 rect,
@@ -3833,6 +4260,8 @@ enum MenuAction {
     Admin,
     OpenWith,
     RemoveHistory,
+    AddFavorite,
+    CustomAction(usize),
 }
 
 /// 设置面板的分页。
@@ -3844,6 +4273,7 @@ enum SettingsTab {
     Ranking = 3,
     Noise = 4,
     Maintenance = 5,
+    Assets = 6,
 }
 
 /// 筛选条上的三个按钮。
@@ -3877,62 +4307,78 @@ enum FilterChoice {
     Group(Option<FileGroup>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MenuItem {
-    label: &'static str,
+    label: String,
     shortcut: &'static str,
     enabled: bool,
     action: MenuAction,
 }
 
-fn menu_items(entry: &Entry) -> Vec<MenuItem> {
+fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef]) -> Vec<MenuItem> {
     let is_command = entry.kind == Kind::Command;
     let is_program = entry.kind == Kind::Program;
     let is_file = entry.kind == Kind::File;
-    vec![
+    let mut items = vec![
         MenuItem {
-            label: "打开",
+            label: "打开".to_string(),
             shortcut: "↵",
             enabled: true,
             action: MenuAction::Open,
         },
         MenuItem {
-            label: "在资源管理器中定位",
+            label: "在资源管理器中定位".to_string(),
             shortcut: "Ctrl ↵",
             enabled: !is_command,
             action: MenuAction::Reveal,
         },
         MenuItem {
-            label: "复制路径",
+            label: "复制路径".to_string(),
             shortcut: "Ctrl C",
             enabled: !is_command,
             action: MenuAction::CopyPath,
         },
         MenuItem {
-            label: "复制文件名",
+            label: "复制文件名".to_string(),
             shortcut: "",
             enabled: true,
             action: MenuAction::CopyName,
         },
         MenuItem {
-            label: "以管理员身份运行",
+            label: "以管理员身份运行".to_string(),
             shortcut: "Ctrl ⇧ ↵",
             enabled: is_program || is_file,
             action: MenuAction::Admin,
         },
         MenuItem {
-            label: "打开方式…",
+            label: "打开方式…".to_string(),
             shortcut: "",
             enabled: is_file || is_program,
             action: MenuAction::OpenWith,
         },
         MenuItem {
-            label: "从最近使用中移除",
+            label: "从最近使用中移除".to_string(),
             shortcut: "",
             enabled: !is_command,
             action: MenuAction::RemoveHistory,
         },
-    ]
+        MenuItem {
+            label: "加入收藏".to_string(),
+            shortcut: "",
+            enabled: !is_command,
+            action: MenuAction::AddFavorite,
+        },
+    ];
+    // P0-1：自定义动作作用于选中的结果，模板可引用 {action_path}。
+    for (index, action) in actions.iter().enumerate() {
+        items.push(MenuItem {
+            label: action.title.clone(),
+            shortcut: "",
+            enabled: !is_command,
+            action: MenuAction::CustomAction(index),
+        });
+    }
+    items
 }
 
 impl eframe::App for LstrApp {
@@ -3966,6 +4412,8 @@ impl eframe::App for LstrApp {
             }
         }
 
+        crate::win::explorer::note_foreground_explorer();
+        self.poll_typing(ctx);
         self.poll_hotkey(ctx);
         self.poll_dialog_watch(ctx);
         self.poll_tray(ctx);
@@ -3983,7 +4431,10 @@ impl eframe::App for LstrApp {
         }
 
         if self.hidden {
-            ctx.request_repaint_after(Duration::from_millis(250));
+            // 键入即搜安装后降到 60ms 兜底节拍（钩子本身已 request_repaint，
+            // 这里只是防止某些窗口过程丢通知），否则维持 250ms 省电节拍。
+            let idle_ms = if self.typing.is_some() { 60 } else { 250 };
+            ctx.request_repaint_after(Duration::from_millis(idle_ms));
             return;
         }
 
@@ -4026,6 +4477,41 @@ impl eframe::App for LstrApp {
     }
 }
 
+/// 按像素宽度二分出「第一行能放下的字符数」：中文/西文混排也准，
+/// 不用假设等宽字体的字符宽度。`measure` 注入测量函数（像素宽度），
+/// 便于在无 `Painter` 的单测里验证切分逻辑。
+fn split_path_head(
+    measure: impl Fn(&str) -> f32,
+    text: &str,
+    max_width: f32,
+) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    // 整串放得下就不必二分（常见短路径一帧只做这一次测量）。
+    if measure(text) <= max_width {
+        return chars.len();
+    }
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let candidate: String = chars[..mid].iter().collect();
+        if measure(&candidate) <= max_width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+/// 按字符数把完整路径切成「第一行接排段」与「第二行续段」。
+fn split_at_chars(text: &str, count: usize) -> (String, String) {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(count).collect();
+    let tail: String = chars.collect();
+    (head, tail)
+}
+
 fn dialog_hint(scope: Scope) -> &'static str {
     match scope {
         Scope::Folder => "搜索文件夹并跳转…",
@@ -4055,5 +4541,61 @@ fn strip_prefix(input: &mut String) {
     let lower = value.to_lowercase();
     if lower.starts_with("a ") || lower.starts_with("f ") {
         *input = value[2..].trim_start().to_string();
+    }
+}
+
+#[cfg(test)]
+mod path_layout_tests {
+    use super::*;
+
+    #[test]
+    fn split_at_chars_keeps_the_full_path() {
+        let (head, tail) = split_at_chars("abcdef", 2);
+        assert_eq!(head, "ab");
+        assert_eq!(tail, "cdef");
+        assert_eq!(format!("{head}{tail}"), "abcdef");
+    }
+
+    #[test]
+    fn split_at_chars_is_unicode_safe() {
+        let (head, tail) = split_at_chars("中文路径", 2);
+        assert_eq!(head, "中文");
+        assert_eq!(tail, "路径");
+        assert_eq!(format!("{head}{tail}"), "中文路径");
+    }
+
+    #[test]
+    fn split_at_chars_handles_out_of_range_counts() {
+        assert_eq!(split_at_chars("abc", 0), (String::new(), "abc".to_string()));
+        assert_eq!(split_at_chars("abc", 99), ("abc".to_string(), String::new()));
+    }
+
+    /// 等宽字体的近似宽度：ASCII 10px，中文/全角 20px。
+    fn fake_measure(text: &str) -> f32 {
+        text.chars()
+            .map(|c| if c.is_ascii() { 10.0 } else { 20.0 })
+            .sum()
+    }
+
+    #[test]
+    fn split_path_head_returns_all_chars_when_text_fits() {
+        assert_eq!(split_path_head(fake_measure, "abcdef", 60.0), 6);
+        assert_eq!(split_path_head(fake_measure, "中文路径", 80.0), 4);
+    }
+
+    #[test]
+    fn split_path_head_respects_pixels_not_chars() {
+        // 同样的字符数，中文占两倍宽度：40px 只放得下 2 个汉字，或 4 个 ASCII。
+        assert_eq!(split_path_head(fake_measure, "中文路径abcd", 40.0), 2);
+        assert_eq!(split_path_head(fake_measure, "abcd中文路径", 40.0), 4);
+        // 35px：2 个 ASCII(20) 放得下，3 个 ASCII(30) 放不下但 1 汉字(20)+1 ASCII(10) 放得下。
+        assert_eq!(split_path_head(fake_measure, "中a中a", 35.0), 2);
+    }
+
+    #[test]
+    fn split_path_head_handles_zero_width() {
+        assert_eq!(split_path_head(fake_measure, "abc", 0.0), 0);
+        // 测出来恒为 0 时视为全部放得下，避免除零/死循环。
+        assert_eq!(split_path_head(|_| 0.0, "abc", 5.0), 3);
     }
 }

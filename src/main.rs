@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod assets;
+mod assets_ui;
 mod config;
 mod history;
 mod model;

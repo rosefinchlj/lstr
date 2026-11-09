@@ -8,4 +8,5 @@ pub mod icons;
 pub mod shell;
 pub mod single_instance;
 pub mod tray;
+pub mod typing;
 pub mod window;

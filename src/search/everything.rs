@@ -204,9 +204,21 @@ fn push_filters(
         parts.push(text);
     }
     if let Some(path) = &query.path_filter {
-        parts.push(format!("path:{path}"));
+        parts.push(format!("path:{}", quote_path_token(path)));
     }
     parts.extend(filters.query_parts(query.ext.is_some(), query.path_filter.is_some()));
+}
+
+/// Everything 的 path: 参数含空格时必须整体加引号；结尾不留路径分隔符，
+/// 否则引号前的分隔符会被解析成转义引号，整条查询语法失效。
+fn quote_path_token(path: &str) -> String {
+    // 92 = 反斜杠，47 = 正斜杠；用码点避免与 shell / 字符串转义打架。
+    let trimmed = path.trim_end_matches(|c: char| c as u32 == 92 || c as u32 == 47);
+    if trimmed.chars().any(char::is_whitespace) {
+        format!("\"{trimmed}\"")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 pub(crate) fn kept_in_scope(scope: Scope, kind: Kind) -> bool {
@@ -262,6 +274,19 @@ fn filetime_ticks_to_unix(ticks: u64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_tokens_are_quoted_and_have_no_trailing_separator() {
+        let s = char::from(92);
+        let plain = format!("D:{s}work{s}src");
+        assert_eq!(quote_path_token(&plain), plain);
+        assert_eq!(quote_path_token(&format!("{plain}{s}")), plain);
+        let spaced = format!("C:{s}Program Files{s}");
+        assert_eq!(
+            quote_path_token(&spaced),
+            format!("\"C:{s}Program Files\"")
+        );
+    }
 
     fn query(scope: Scope, text: &str, ext: Option<&str>, path: Option<&str>) -> Query {
         Query {

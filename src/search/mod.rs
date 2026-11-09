@@ -41,6 +41,10 @@ struct Request {
     rank: RankConfig,
     /// 空查询是否显示「最近使用」历史（输入框右侧的历史开关）。
     show_history: bool,
+    /// P0-1：收藏列表（Quick Switch 数据源）。
+    favorites: Vec<crate::assets::Favorite>,
+    /// P0-2：「Explorer 内键入即搜」锁定的当前目录（None = 全局搜索）。
+    base_folder: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +82,8 @@ pub struct SearchService {
     history: Arc<Mutex<History>>,
     limit: usize,
     keywords: Vec<KeywordConfig>,
+    /// P0-1：收藏列表，新增收藏后由 UI 同步进来。
+    favorites: Vec<crate::assets::Favorite>,
     /// 「重新加载」命令置位，worker 下一请求立即重建应用索引。
     apps_dirty: Arc<AtomicBool>,
     /// 自研索引状态(设置页/状态行用);worker 线程随时刷新。
@@ -115,6 +121,7 @@ impl SearchService {
             history,
             limit: config.max_results,
             keywords: config.keywords,
+            favorites: config.favorites,
             apps_dirty,
             index_status: status_slot,
         }
@@ -128,6 +135,21 @@ impl SearchService {
         filters: &SearchFilters,
         rank: &RankConfig,
         show_history: bool,
+    ) -> u64 {
+        self.search_in(raw, scope, dialog_quick, filters, rank, show_history, None)
+    }
+
+    /// P0-2：带目录上下文的搜索。base_folder 由「Explorer 内键入即搜」提供，
+    /// worker 把它作为隐含的 path: 过滤；用户显式输入路径模式时自动忽略。
+    pub fn search_in(
+        &mut self,
+        raw: &str,
+        scope: Scope,
+        dialog_quick: bool,
+        filters: &SearchFilters,
+        rank: &RankConfig,
+        show_history: bool,
+        base_folder: Option<PathBuf>,
     ) -> u64 {
         self.generation += 1;
         // 通知查询线程:更旧的查询可以立即放弃(打字时 "a"→"ai" 不再排队 600ms)。
@@ -144,6 +166,8 @@ impl SearchService {
             filters: filters.clone(),
             rank: rank.clone(),
             show_history,
+            favorites: self.favorites.clone(),
+            base_folder,
         });
         self.generation
     }
@@ -156,6 +180,11 @@ impl SearchService {
     /// 「重新加载」命令后同步最新关键字，不必重启进程。
     pub fn set_keywords(&mut self, keywords: Vec<KeywordConfig>) {
         self.keywords = keywords;
+    }
+
+    /// P0-1：收藏变更后同步给 worker，Quick Switch 立即生效，无需重载配置。
+    pub fn set_favorites(&mut self, favorites: Vec<crate::assets::Favorite>) {
+        self.favorites = favorites;
     }
 
     /// 应用索引立刻重建：新装/卸载应用后不想等 TTL 就执行「重新加载」命令。
@@ -181,6 +210,244 @@ impl SearchService {
 
 /// 收尾管线：排序 → 去重 → 截断 → 置顶（关键字 / Quick Switch）。
 /// 抽成函数是为了「两阶段返回」：先发不含精确补齐的一版，再补发最终版。
+/// 名称与查询词完全一致的结果钉在最前（不依赖任何权重调参）。
+/// 打分是多信号加和：历史、query 学习、位置启发式都可能把精确同名挤下去。
+/// 实测搜 `ai` 时，cwd 下名称蹭到 ai 的 Rust 构建产物靠 +500 环境加权压过了
+/// 名叫 ai 的目录。精确同名是「用户就是打的名字」，属于产品语义而非启发式，
+/// 因此在排序 + 去重之后做一次稳定置顶，keyword 行仍在它上面。
+///
+/// 命令的别名也算精确命中：`cmd:settings` 的名字是「打开设置」、别名才是「设置」，
+/// 用户打「设置」时期望的是设置命令，而不是同名的 app/文件。只按 name 置顶会让
+/// 同名 app 靠历史分把命令顶下去（见 rank 的
+/// `settings_alias_outranks_frequently_used_app_named_settings`）。
+fn pin_exact_name_matches(entries: &mut Vec<Entry>, needle: &str) {
+    if needle.is_empty() {
+        return;
+    }
+    // needle 由调用方统一 to_lowercase 过，这里也用 to_lowercase 比较，
+    // 与去重/rank 的归一化保持一致（eq_ignore_ascii_case 只覆盖 ASCII）。
+    let is_exact = |entry: &Entry| {
+        if entry.name.to_lowercase() == needle {
+            return true;
+        }
+        entry.kind == Kind::Command
+            && command_aliases(&entry.id)
+                .iter()
+                .any(|alias| alias.to_lowercase() == needle)
+    };
+    // 没有命中就不搬动元素：短查询每次都全量 drain 没有必要。
+    if !entries.iter().any(|entry| is_exact(entry)) {
+        return;
+    }
+    let mut exact = Vec::new();
+    let mut rest = Vec::with_capacity(entries.len());
+    for entry in entries.drain(..) {
+        if is_exact(&entry) {
+            exact.push(entry);
+        } else {
+            rest.push(entry);
+        }
+    }
+    // 组内保持原有分数顺序（exact.append 不重排）。
+    exact.append(&mut rest);
+    *entries = exact;
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    fn item(id: &str, name: &str) -> Entry {
+        Entry {
+            id: id.to_string(),
+            kind: Kind::Folder,
+            name: name.to_string(),
+            path: None,
+            size: None,
+            modified: None,
+            pinyin: None,
+            initial: String::new(),
+            tone: 0,
+        }
+    }
+
+    #[test]
+    fn exact_name_matches_are_pinned_in_stable_order() {
+        let mut entries = vec![
+            item("sub", "num-traits"),
+            item("exact1", "ai"),
+            item("other", "trailer"),
+            item("exact2", "AI"),
+        ];
+        pin_exact_name_matches(&mut entries, "ai");
+        assert_eq!(
+            entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["exact1", "exact2", "sub", "other"]
+        );
+    }
+
+    #[test]
+    fn empty_needle_keeps_the_original_order() {
+        let mut entries = vec![item("a", "a"), item("b", "b")];
+        pin_exact_name_matches(&mut entries, "");
+        assert_eq!(entries[0].id, "a");
+    }
+
+    #[test]
+    fn pin_uses_unicode_lowercase_not_ascii_only() {
+        // L2：去重/rank 都按 to_lowercase 归一化，置顶也必须一致。
+        let mut entries = vec![item("sub", "x"), item("exact", "ÄI")];
+        pin_exact_name_matches(&mut entries, "äi");
+        assert_eq!(entries[0].id, "exact");
+    }
+
+    fn command(id: &str, name: &str) -> Entry {
+        let mut entry = item(id, name);
+        entry.kind = Kind::Command;
+        entry
+    }
+
+    fn entry_at(id: &str, name: &str, kind: Kind, path: &str) -> Entry {
+        let mut entry = item(id, name);
+        entry.kind = kind;
+        entry.path = Some(PathBuf::from(path));
+        entry
+    }
+
+    fn request(text: &str, limit: usize) -> Request {
+        Request {
+            generation: 1,
+            sent_at: Instant::now(),
+            query: Query {
+                raw: text.to_string(),
+                scope: Scope::All,
+                text: text.to_string(),
+                ext: None,
+                path_filter: None,
+            },
+            limit,
+            keywords: Vec::new(),
+            dialog_quick: false,
+            filters: SearchFilters::default(),
+            rank: RankConfig::default(),
+            show_history: true,
+            favorites: Vec::new(),
+            base_folder: None,
+        }
+    }
+
+    #[test]
+    fn finalize_pins_command_alias_above_same_name_app() {
+        // H1 回归：命令别名「设置」精确命中，必须压过同名的 app/文件。
+        // 旧置顶只看 name，会把同名的 app（即使分数更低）移到命令前面。
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let app = entry_at(
+            "app:settings",
+            "设置",
+            Kind::App,
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\设置.lnk",
+        );
+        let file = entry_at("file:settings", "设置", Kind::File, r"D:\docs\设置");
+        {
+            let mut hist = history.lock().unwrap();
+            hist.seed(&app, 20, 0);
+        }
+        let entries = vec![app, file, command("cmd:settings", "打开设置")];
+        let out = finalize_entries(
+            entries,
+            &request("设置", 8),
+            &history,
+            &Config::default(),
+            Vec::new(),
+        );
+        assert_eq!(out[0].id, "cmd:settings", "命令别名精确命中应置顶");
+        assert_eq!(out[1].id, "app:settings");
+    }
+
+    #[test]
+    fn keyword_row_stays_above_pinned_command_alias() {
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let mut keyword = item("kwurl:g", "用 Google 搜索：设置");
+        keyword.kind = Kind::Command;
+        let out = finalize_entries(
+            vec![command("cmd:settings", "打开设置")],
+            &request("设置", 8),
+            &history,
+            &Config::default(),
+            vec![keyword],
+        );
+        assert_eq!(out[0].id, "kwurl:g");
+        assert_eq!(out[1].id, "cmd:settings");
+    }
+
+    #[test]
+    fn finalize_keeps_at_most_six_exact_names_and_pins_them() {
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let mut entries: Vec<Entry> = (0..8)
+            .map(|i| {
+                entry_at(
+                    &format!("exact{i}"),
+                    "ai",
+                    Kind::File,
+                    &format!(r"D:\work\{i}\ai"),
+                )
+            })
+            .collect();
+        // 前缀命中先排在前面，确保置顶不是「本来就在最前」。
+        entries.push(entry_at("prefix", "ai-notes", Kind::File, r"D:\work\ai-notes"));
+        let out = finalize_entries(
+            entries,
+            &request("ai", 8),
+            &history,
+            &Config::default(),
+            Vec::new(),
+        );
+        let exact_count = out.iter().filter(|entry| entry.name == "ai").count();
+        assert_eq!(exact_count, 6, "同名精确命中最多保留 6 条");
+        assert!(
+            out.iter().take(6).all(|entry| entry.name == "ai"),
+            "6 条精确同名都应被置顶"
+        );
+    }
+
+    #[test]
+    fn exact_name_pin_survives_candidate_truncation() {
+        // 105 条前缀命中靠历史分压过 3 条噪声路径里的精确同名：
+        // 若不先置顶再截断，精确同名会被 deliver=100 截掉。
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let mut entries = Vec::new();
+        {
+            let mut hist = history.lock().unwrap();
+            for i in 0..105 {
+                let name = format!("ai-extra-{i:03}");
+                let entry = entry_at(&format!("p{i}"), &name, Kind::File, &format!(r"D:\work\{i}\{name}"));
+                hist.seed(&entry, 20, 0);
+                entries.push(entry);
+            }
+        }
+        for i in 0..3 {
+            entries.push(entry_at(
+                &format!("exact{i}"),
+                "ai",
+                Kind::Folder,
+                &format!(r"D:\work\node_modules\{i}\ai"),
+            ));
+        }
+        let out = finalize_entries(
+            entries,
+            &request("ai", 8),
+            &history,
+            &Config::default(),
+            Vec::new(),
+        );
+        assert_eq!(out.len(), 100, "候选上限仍是 100");
+        assert!(
+            out.iter().take(3).all(|entry| entry.name == "ai"),
+            "截断前必须先把精确同名移到最前"
+        );
+    }
+}
+
 fn finalize_entries(
     mut entries: Vec<Entry>,
     request: &Request,
@@ -234,6 +501,8 @@ fn finalize_entries(
     };
     let mut keep_iter = keep_names.into_iter();
     entries.retain(|_| keep_iter.next().unwrap_or(false));
+    // 名称完全一致的结果硬置顶：档位权重可能被用户调整，或被历史/位置加权翻过。
+    pin_exact_name_matches(&mut entries, &needle_lower);
     // 列表可滚动：多送一些候选（最多 100 条），UI 只按窗口高度展示前几条，
     // 滚轮可以继续往下看——不再一屏截断。
     let deliver = request.limit.max(100);
@@ -251,11 +520,18 @@ fn finalize_entries(
     // 对话框模式空查询：已打开的 Explorer 文件夹置顶（Quick Switch）。
     // 同样不参与打分——历史 frecency 会把它们压下去。
     if request.query.is_empty() && request.dialog_quick && request.query.scope == Scope::Folder {
-        let mut quick: Vec<Entry> = crate::win::explorer::open_explorer_folders()
-            .into_iter()
-            .take(6)
-            .map(quick_switch_entry)
-            .collect();
+        // P0-3：活动目录 → 收藏 → 历史文件夹 → 已打开 Explorer 目录。
+        // 由 assets 统一生成并去重，取代原来「只列已打开窗口」的单一来源。
+        let mut quick: Vec<Entry> = if let Ok(history) = history.lock() {
+            crate::assets::quick_switch_entries(
+                &request.favorites,
+                &history,
+                crate::win::explorer::open_explorer_folders(),
+                crate::win::explorer::active_explorer_folder(),
+            )
+        } else {
+            Vec::new()
+        };
         // 和历史结果、quick 内部都按路径去重，避免同一目录出现两行。
         quick.retain(|q| {
             !entries
@@ -466,6 +742,19 @@ fn run_worker(
             ));
         }
 
+        // P0-2：目录上下文。用户显式输入路径模式时退出，手输 path: 时以用户为准，
+        // 避免把「在当前目录里搜」悄悄套到用户指定的另一个目录上。
+        let in_folder_context =
+            request.base_folder.is_some() && browse::parse(&request.query.raw).is_none();
+        if in_folder_context && request.query.path_filter.is_none() {
+            if let Some(folder) = &request.base_folder {
+                let dir = folder.to_string_lossy().into_owned();
+                if !dir.is_empty() {
+                    request.query.path_filter = Some(dir);
+                }
+            }
+        }
+
         // 路径模式（D:\foo\bar、\\server\share）：直接列目录，
         // 不碰 Everything，也不必为它懒启动 PowerShell 枚举 UWP。
         if let Some(path_query) = browse::parse(&request.query.raw) {
@@ -507,9 +796,32 @@ fn run_worker(
             continue;
         }
 
+        // P0-2：目录上下文下清空输入时直接列当前目录的子项（就地浏览），
+        // 而不是「最近使用」。查询时仍有隐含 path:，范围始终是这个目录。
+        if in_folder_context && request.query.is_empty() {
+            let started = Instant::now();
+            let dir = request
+                .base_folder
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut entries: Vec<Entry> = dir_cache.children(&dir).to_vec();
+            let total = entries.len();
+            entries.truncate(request.limit.max(200));
+            let _ = tx.send(Response {
+                generation: request.generation,
+                entries,
+                total,
+                elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
+                error: None,
+            });
+            ctx.request_repaint();
+            continue;
+        }
+
         let needs_uwp = match request.query.scope {
             Scope::App => true,
-            Scope::All => !request.query.is_empty(),
+            Scope::All => !request.query.is_empty() && !in_folder_context,
             _ => false,
         };
         if needs_uwp && !uwp_started {
@@ -553,7 +865,7 @@ fn run_worker(
             if request.query.scope == Scope::App {
                 entries = apps.top(request.limit);
             } else if request.query.scope == Scope::Command {
-                entries = commands("");
+                entries = commands("", &config.commands);
             }
             total = entries.len();
         } else {
@@ -563,13 +875,13 @@ fn run_worker(
                     total = entries.len();
                 }
                 Scope::Command => {
-                    entries = commands(&request.query.text);
+                    entries = commands(&request.query.text, &config.commands);
                     total = entries.len();
                 }
                 Scope::All => {
                     // 有筛选时只搜文件：位置/时间/类型对应用和命令没有意义，
                     // 硬塞进来只会让人疑惑「选了 D 盘怎么还出现微信」。
-                    if request.filters.is_empty() {
+                    if request.filters.is_empty() && !in_folder_context {
                         keyword_rows = keyword_entries(&request.keywords, &request.query.text);
                     }
                     let mut needs_exact = false;
@@ -679,12 +991,12 @@ fn run_worker(
                             }
                         }
                     }
-                    if request.filters.is_empty() {
+                    if request.filters.is_empty() && !in_folder_context {
                         let mut app_hits = apps.search(&request.query.text, request.limit);
                         total += app_hits.len();
                         entries.append(&mut app_hits);
                         // 内置命令也参与“全部”搜索（打开设置等）。
-                        let mut command_hits = commands(&request.query.text);
+                        let mut command_hits = commands(&request.query.text, &config.commands);
                         total += command_hits.len();
                         entries.append(&mut command_hits);
                     }
@@ -928,7 +1240,7 @@ pub fn command_aliases(id: &str) -> &'static [&'static str] {
     }
 }
 
-fn commands(q: &str) -> Vec<Entry> {
+fn commands(q: &str, custom: &[crate::assets::CommandDef]) -> Vec<Entry> {
     let all = [
         ("cmd:settings", "打开设置"),
         ("cmd:reload", "重新加载"),
@@ -936,7 +1248,8 @@ fn commands(q: &str) -> Vec<Entry> {
         ("cmd:quit", "退出 lstr"),
     ];
     let needle = q.to_lowercase();
-    all.into_iter()
+    let mut out: Vec<Entry> = all
+        .into_iter()
         .filter(|(id, name)| {
             if needle.is_empty() {
                 return true;
@@ -969,7 +1282,28 @@ fn commands(q: &str) -> Vec<Entry> {
             initial: ">".to_string(),
             tone: 0xE0A040,
         })
-        .collect()
+        .collect();
+    // P0-1：自定义命令（{query} / {current_folder}）与内置命令同榜。
+    for def in custom {
+        if !needle.is_empty()
+            && !def.trigger.to_lowercase().contains(&needle)
+            && !def.title.to_lowercase().contains(&needle)
+        {
+            continue;
+        }
+        out.push(Entry {
+            id: format!("usercmd:{}", def.trigger),
+            kind: Kind::Command,
+            name: def.title.clone(),
+            path: None,
+            size: None,
+            modified: None,
+            pinyin: Some(pinyin::keys(&def.title)),
+            initial: ">".to_string(),
+            tone: 0xE0A040,
+        });
+    }
+    out
 }
 
 /// 自定义关键字：查询形如 "trigger 剩余词"（或刚好是 trigger）时，
@@ -1104,6 +1438,8 @@ mod tests {
             filters: SearchFilters::default(),
             rank: RankConfig::default(),
             show_history: false,
+            favorites: Vec::new(),
+            base_folder: None,
         };
         let history = std::sync::Arc::new(std::sync::Mutex::new(
             crate::history::History::in_memory(),

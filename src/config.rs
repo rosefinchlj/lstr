@@ -1,3 +1,4 @@
+use crate::assets::{ActionDef, CommandDef, Favorite};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -26,6 +27,26 @@ pub struct Config {
     /// 排序规则（设置面板「排序」页可视化编辑）。
     #[serde(default)]
     pub rank: RankConfig,
+
+    // —— P0-1 可积累资产 ——
+    /// 收藏的文件夹/文件，Quick Switch 与菜单的数据源。
+    #[serde(default)]
+    pub favorites: Vec<Favorite>,
+    /// 自定义动作：作用于选中的搜索结果，支持 {action_path}。
+    #[serde(default)]
+    pub actions: Vec<ActionDef>,
+    /// 自定义命令：作用于搜索词/当前文件夹，支持 {query}/{current_folder}。
+    #[serde(default)]
+    pub commands: Vec<CommandDef>,
+    // —— P0-2 / P0-3 开关 ——
+    /// Explorer 内「直接键入搜索」：全局低级键盘钩子，默认关闭（需设置页显式开启）。
+    /// 判定严格：仅 Explorer 前台 + 非编辑框 + 无修饰键/IME；设置页可随时关闭。
+    #[serde(default)]
+    pub explorer_typing: bool,
+    /// 文件对话框出现时自动跟随 Explorer 当前目录，默认关闭（会改动对话框路径）。
+    #[serde(default)]
+    pub dialog_auto_follow: bool,
+
     /// 自研索引引擎（设置面板「搜索」页）。
     #[serde(default)]
     pub index: IndexConfig,
@@ -151,6 +172,17 @@ pub fn default_noise_rules() -> Vec<NoiseRule> {
         (".parcel-cache/", 100),
         // —— Rust ——
         ("/target/", 120),
+        // 目录名带后缀时 /target/ 匹配不到（lstr-wt-p0-target/）。
+        // 不能写成裸 `-target/`：那会误伤 `acme-target/`、`build-target/` 这类
+        // 正常源码目录。只列出 Cargo 真正会生成产物的子目录。
+        ("-target/debug/", 120),
+        ("-target/release/", 120),
+        ("-target/deps/", 120),
+        ("-target/.fingerprint/", 120),
+        ("-target/incremental/", 120),
+        ("-target/doc/", 120),
+        // Cargo 指纹目录：num-traits-xxx 之类纯构建产物，短查询极易误命中。
+        (".fingerprint/", 140),
         (".cargo/registry/", 120),
         (".cargo/git/", 120),
         (".rustup/toolchains/", 120),
@@ -212,6 +244,25 @@ pub fn default_noise_rules() -> Vec<NoiseRule> {
 }
 
 impl RankConfig {
+    /// 老配置文件不会自动获得新增的内置噪声规则：`noise_rules` 是持久化字段，
+    /// 直接反序列化只会拿到旧列表。加载后按 pattern（忽略大小写、斜杠方向）补齐
+    /// 缺失的内置规则；用户已有规则连同调过的强度原样保留。
+    /// 这样存量用户也能拿到 `-target/debug/`、`.fingerprint/` 等后来新增的规则。
+    pub fn backfill_missing_noise_rules(&mut self) {
+        use std::collections::HashSet;
+        let existing: HashSet<String> = self
+            .noise_rules
+            .iter()
+            .map(|rule| rule.pattern.trim().to_lowercase().replace('\\', "/"))
+            .collect();
+        for rule in default_noise_rules() {
+            let key = rule.pattern.trim().to_lowercase().replace('\\', "/");
+            if !existing.contains(&key) {
+                self.noise_rules.push(rule);
+            }
+        }
+    }
+
     /// 当前档位从高到低的展示顺序（设置面板里用来「一眼看明白规则」）。
     pub fn ladder(&self) -> Vec<(&'static str, i32)> {
         let mut tiers = vec![
@@ -285,6 +336,11 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             keywords: default_keywords(),
             rank: RankConfig::default(),
+            favorites: Vec::new(),
+            actions: Vec::new(),
+            commands: Vec::new(),
+            explorer_typing: true,
+            dialog_auto_follow: false,
             index: IndexConfig::default(),
         }
     }
@@ -332,7 +388,9 @@ impl Config {
             return cfg;
         };
         match toml::from_str::<Config>(&text) {
+            // 补齐旧配置缺少的内置噪声规则（新增规则不靠用户手动「恢复默认」）。
             Ok(mut cfg) => {
+                cfg.rank.backfill_missing_noise_rules();
                 cfg.index.backend = normalize_backend(&cfg.index.backend);
                 cfg
             },
@@ -347,7 +405,13 @@ impl Config {
         let dir = attach_dir();
         fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
         let text = toml::to_string_pretty(self).map_err(|e| format!("序列化配置失败: {e}"))?;
-        fs::write(Self::path(), text).map_err(|e| format!("写入配置失败: {e}"))
+        // 原子写：先写同目录临时文件再 rename。直接 fs::write 会先截断目标文件，
+        // 写到一半崩溃/磁盘满会留下半截 TOML，下次 load 解析失败回落默认值，
+        // 用户的收藏/动作/命令会整体「消失」。
+        let path = Self::path();
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, text).map_err(|e| format!("写入配置失败: {e}"))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("替换配置失败: {e}"))
     }
 }
 
@@ -395,5 +459,54 @@ mod tests {
         let parsed: Config = toml::from_str(&text).expect("deserialize config");
         assert!(parsed.height.is_none());
         assert_eq!(parsed.theme.mode, "frost");
+        assert!(parsed.explorer_typing);
+        assert!(parsed.favorites.is_empty());
+    }
+
+    #[test]
+    fn legacy_config_without_noise_rules_gets_builtin_rules() {
+        // M3：模拟存量配置——rank 段存在但没有规则（新规则从未写入过）。
+        // load 走的是同一个 backfill 调用，因此这里覆盖「加载后补齐」。
+        let mut value = toml::Value::try_from(Config::default()).expect("config → toml value");
+        value["rank"]["noise_rules"] = toml::Value::Array(Vec::new());
+        let text = toml::to_string(&value).expect("serialize legacy config");
+        let mut cfg: Config = toml::from_str(&text).expect("deserialize legacy config");
+        assert!(cfg.rank.noise_rules.is_empty());
+
+        cfg.rank.backfill_missing_noise_rules();
+
+        let defaults = default_noise_rules();
+        for rule in &defaults {
+            assert!(
+                cfg.rank
+                    .noise_rules
+                    .iter()
+                    .any(|existing| existing.pattern.eq_ignore_ascii_case(&rule.pattern)),
+                "加载后缺少内置规则: {}",
+                rule.pattern
+            );
+        }
+        assert_eq!(cfg.rank.noise_rules.len(), defaults.len());
+    }
+
+    #[test]
+    fn backfill_keeps_user_rules_and_adjusted_strength() {
+        let mut cfg = RankConfig::default();
+        cfg.noise_rules.clear();
+        cfg.noise_rules.push(NoiseRule {
+            pattern: "node_modules/".to_string(),
+            penalty: 42,
+        });
+
+        cfg.backfill_missing_noise_rules();
+        cfg.backfill_missing_noise_rules();
+
+        let hits: Vec<i32> = cfg
+            .noise_rules
+            .iter()
+            .filter(|rule| rule.pattern == "node_modules/")
+            .map(|rule| rule.penalty)
+            .collect();
+        assert_eq!(hits, vec![42], "用户调过的强度必须保留且不重复追加");
     }
 }
