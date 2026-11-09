@@ -25,18 +25,37 @@ pub const MAGIC: &[u8; 4] = b"LIDX";
 /// v4:增加 mtime 列(unix 秒),内置时间筛选/结果元数据使用。
 pub const VERSION: u32 = 4;
 
-/// 引擎调试日志(%APPDATA%\lstr\index\engine.log)。
-/// worker 提权进程与 UI 都写同用户目录;失败静默。
+/// 覆盖日志目录的环境变量(集成测试/诊断隔离用)。
+const LOG_DIR_ENV: &str = "LSTR_INDEX_LOG_DIR";
+
+/// 引擎调试日志(默认 %APPDATA%\lstr\index\engine.log;[`LOG_DIR_ENV`] 可
+/// 覆盖目录)。worker 提权进程与 UI 都写同用户目录;失败静默。
+///
+/// 单元测试默认旁路:引擎/snapshot 的单测高频经过这里,不得污染真实日志
+/// (线上排障依据);显式设了 [`LOG_DIR_ENV`] 的用例写覆盖目录。
 pub fn debug_log(msg: &str) {
-    let Ok(base) = std::env::var("APPDATA") else { return };
-    let path = std::path::PathBuf::from(base).join("lstr").join("index").join("engine.log");
+    #[cfg(test)]
+    if std::env::var_os(LOG_DIR_ENV).is_none() {
+        return;
+    }
+    let Some(dir) = log_dir() else { return };
+    let path = dir.join("engine.log");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "[{}] {}", chrono_now(), msg);
     }
+}
+
+fn log_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(LOG_DIR_ENV) {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    let base = std::env::var("APPDATA").ok()?;
+    Some(PathBuf::from(base).join("lstr").join("index"))
 }
 
 fn chrono_now() -> String {
@@ -415,6 +434,37 @@ mod tests {
     use super::*;
     use crate::query::QuerySpec;
     use crate::store::VolumeStore;
+
+    /// 单测旁路:未设 LSTR_INDEX_LOG_DIR 时 debug_log 不得写真实
+    /// %APPDATA%\lstr\index\engine.log(引擎/snapshot 单测高频经过,
+    /// 每次 cargo test 都污染真实日志会淹没线上排障依据)。
+    #[test]
+    fn debug_log_is_bypassed_in_tests() {
+        let marker = format!("debug_log-bypass-marker-{}", std::process::id());
+        debug_log(&marker);
+        // 无论覆盖变量是否恰好被并行用例设置,真实日志都不得出现 marker:
+        // 覆盖激活时 marker 落在覆盖目录,未激活时整体旁路。
+        let Ok(base) = std::env::var("APPDATA") else { return };
+        let real = PathBuf::from(base).join("lstr").join("index").join("engine.log");
+        if let Ok(content) = std::fs::read_to_string(real) {
+            assert!(!content.contains(&marker), "单元测试不得写真实 engine.log");
+        }
+    }
+
+    /// 覆盖变量生效:设了 LSTR_INDEX_LOG_DIR 时写到覆盖目录(集成测试隔离用)。
+    #[test]
+    fn debug_log_honors_override_dir() {
+        let dir = std::env::temp_dir().join(format!("lstr-log-override-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var(LOG_DIR_ENV, &dir);
+        debug_log("hello-override");
+        let content = std::fs::read_to_string(dir.join("engine.log")).unwrap();
+        assert!(content.contains("hello-override"));
+        // 先撤变量再清目录:并行的其他测试线程在变量撤掉后即回旁路,
+        // 不会往已删除目录里重建文件。
+        std::env::remove_var(LOG_DIR_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn snapshot_roundtrip() {
