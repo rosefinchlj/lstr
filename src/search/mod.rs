@@ -763,6 +763,10 @@ let _ = tx.send(Response {
         });
         ctx.request_repaint();
     }
+    // 退出前把脏快照落盘(忽略节流),避免最后一次 journal 增量白丢。
+    if let Some(b) = builtin.as_mut() {
+        b.engine.flush_all();
+    }
     // M4:服务线程结束(SearchService 被 drop)→ 让 client 线程把 Shutdown
     // 发给 worker,提权进程随之退出,不再常驻等下一次连接。
     shutdown_client.store(true, Ordering::Relaxed);

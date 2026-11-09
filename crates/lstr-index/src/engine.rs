@@ -57,7 +57,9 @@ pub struct VolumeState {
     dirty: bool,
     /// 连续落盘失败次数(指数退避)。
     save_backoff: u32,
-    /// 退避期内不重试落盘。
+    /// 下次允许落盘的时间:失败时按指数退避往后推,成功后加节流间隔
+    /// (见 save_interval)。journal 每来一小批就整卷重写 120MB 会把查询线程
+    /// 饿死(实测搜索要等几秒),必须节流。
     save_retry_at: Option<Instant>,
 }
 
@@ -265,6 +267,8 @@ impl Engine {
                     v.complete = true;
                     v.resume_frn = 0;
                     v.dirty = true;
+                    // 扫完的卷立即落一次盘(不等 60s 节流):这是最值钱的快照。
+                    v.save_retry_at = None;
                     let mut compacted = false;
                     if let Some(store) = &mut v.store {
                         if store.is_scanning() || store.needs_compact() {
@@ -517,7 +521,9 @@ impl Engine {
                 did = true;
             }
         }
-        // 落盘:成功清 dirty;失败保留 dirty 并按指数退避重试(H6)
+        // 落盘:成功清 dirty;失败保留 dirty 并按指数退避重试(H6)。
+        // 每轮最多落一个卷:一次 maintain 写 3×120MB 会把同一线程上的查询请求
+        // 卡住数秒(用户可见的「搜索要好几秒,但显示只要 0.08s」)。
         let now = Instant::now();
         for i in 0..self.volumes.len() {
             if !self.volumes[i].dirty {
@@ -530,6 +536,7 @@ impl Engine {
             }
             if self.save_volume(i) {
                 did = true;
+                break;
             }
         }
         did
@@ -559,10 +566,11 @@ impl Engine {
         };
         match save_result {
             Ok(_) => {
+                let next_at = Instant::now() + Self::save_interval(&self.volumes[i]);
                 let v = &mut self.volumes[i];
                 v.dirty = false;
                 v.save_backoff = 0;
-                v.save_retry_at = None;
+                v.save_retry_at = Some(next_at);
                 true
             }
             Err(err) => {
@@ -574,6 +582,27 @@ impl Engine {
                 let secs = (1u64 << v.save_backoff.min(6)).min(60);
                 v.save_retry_at = Some(Instant::now() + Duration::from_secs(secs));
                 false
+            }
+        }
+    }
+
+    /// 两次落盘的最小间隔:就绪卷只随 journal 增量变化,60s 一次足够;
+    /// 扫描中的卷保留 20s 粒度作为断点(崩溃后最多重扫 20s)。
+    fn save_interval(v: &VolumeState) -> Duration {
+        let scanning = v.store.as_ref().map(|s| s.is_scanning()).unwrap_or(false);
+        if scanning {
+            Duration::from_secs(20)
+        } else {
+            Duration::from_secs(60)
+        }
+    }
+
+    /// 退出前把所有脏快照落盘(忽略节流)。失败留给下次启动的重扫/增量流程。
+    pub fn flush_all(&mut self) {
+        for i in 0..self.volumes.len() {
+            if self.volumes[i].dirty {
+                self.volumes[i].save_retry_at = None;
+                let _ = self.save_volume(i);
             }
         }
     }
@@ -651,6 +680,43 @@ mod tests {
         let engine2 = engine_with(&dir);
         assert_eq!(engine2.volumes.len(), 1);
         assert_eq!(engine2.volumes[0].store.as_ref().unwrap().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// journal 每 500ms 一批时,不能每批都整卷重写快照(会卡查询线程);
+    /// 退出路径的 flush_all 必须无视节流。
+    #[test]
+    fn snapshot_saves_are_throttled_but_flushable() {
+        let dir = temp_index_dir("throttle");
+        let guid = 0x2222u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+
+        assert!(engine.maintain(), "first maintain should save the completed volume");
+
+        // journal 又推来一条记录 → dirty,但节流窗口未到不应重写整卷。
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(13, 10, 0, "gamma.txt")],
+            next_usn: 200,
+        });
+        assert!(engine.volumes[0].dirty);
+        assert!(!engine.maintain(), "saves must be throttled while the interval is pending");
+
+        // 节流窗口到期后才再次落盘。
+        engine.volumes[0].save_retry_at = None;
+        assert!(engine.maintain(), "save should run once the throttle expires");
+        assert!(!engine.volumes[0].dirty);
+
+        // 退出前 flush_all 忽略节流,保证最后一次 journal 增量不丢。
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(14, 10, 0, "delta.txt")],
+            next_usn: 300,
+        });
+        engine.flush_all();
+        assert!(!engine.volumes[0].dirty);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
