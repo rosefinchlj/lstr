@@ -21,6 +21,11 @@ pub const ATTR_NOISE: u16 = 0x4000;
 pub const ATTR_INTERNAL: u16 = ATTR_DEAD | ATTR_NOISE;
 /// parent 列的「卷根/未解析」标记。
 pub const NO_PARENT: u32 = u32::MAX;
+/// NTFS 卷根目录的固定 FRN。根记录本身会被 USN 过滤器丢弃,但顶层条目的
+/// parent 就是它;若按普通父项去 find_slot,每条顶层条目都会进 unresolved,
+/// 而 unresolved>=4096 又让 needs_compact 恒真 —— 实测每轮 maintain 全量
+/// compact 250 万条,CPU 单核打满、查询被饿死。根目录必须当作 NO_PARENT。
+pub const ROOT_FRN: u64 = 5;
 
 /// compact 触发阈值:delta 新 slot 数。
 const COMPACT_DELTA: usize = 32_768;
@@ -124,7 +129,12 @@ impl VolumeStore {
             delta_frn: HashMap::new(),
             dead_count: 0,
             renames: 0,
-            unresolved: unresolved.into_iter().collect(),
+            // 旧快照里根父条目也被登记过(旧实现),加载时直接丢弃:卷根就是 NO_PARENT,
+        // 没有可解析的目标,留着只会白占内存。
+        unresolved: unresolved
+            .into_iter()
+            .filter(|&(_, parent_frn)| parent_frn != 0 && parent_frn != ROOT_FRN)
+            .collect(),
             noise_anchors: std::collections::HashSet::new(),
             noise_enabled,
         }
@@ -304,8 +314,9 @@ impl VolumeStore {
         } else {
             self.delta_frn.insert(frn, slot);
         }
-        // 立即按父链做噪声分类;父未解析则登记,compact 时重试
-        if parent_frn != 0 && !anchored && p == NO_PARENT {
+        // 立即按父链做噪声分类;父未解析则登记,compact 时重试。
+        // 根目录父(FRN 5)不算未解析:它永远不在索引里,登记只会让 compact 死循环。
+        if parent_frn != 0 && parent_frn != ROOT_FRN && !anchored && p == NO_PARENT {
             self.unresolved.insert(slot, parent_frn);
         }
         if self.noise_enabled {
@@ -384,10 +395,11 @@ impl VolumeStore {
     }
 
     /// 是否需要 compact。
+    ///
+    /// unresolved 不计入触发条件:未解析父链只有在 delta 带来新记录时才可能被
+    /// 修好,单凭 unresolved 会让「每轮 maintain 全量 compact」变成活锁。
     pub fn needs_compact(&self) -> bool {
-        self.delta.len() >= COMPACT_DELTA
-            || self.dead_count >= COMPACT_DEAD
-            || self.unresolved.len() >= 4096
+        self.delta.len() >= COMPACT_DELTA || self.dead_count >= COMPACT_DEAD
     }
 
     pub fn pending_work(&self) -> usize {
@@ -401,10 +413,10 @@ impl VolumeStore {
     /// 全量重建:解析父链、噪声分类、按 FRN 序重建列、归并排序。
     /// scan 模式的首次调用完成「scan → ready」转换。
     /// 无事可做时早退(delta 空、无死项、非 scan),重复调用 O(1)。
+    /// 未解析父链不算「有工作」:它只可能被 delta 里的新父项修好。
     pub fn compact(&mut self) {
         if !self.is_scanning()
             && self.delta.is_empty()
-            && self.unresolved.is_empty()
             && self.dead_count == 0
             && self.renames == 0
         {
@@ -592,6 +604,24 @@ mod tests {
 
     fn insert(s: &mut VolumeStore, frn: u64, parent: u64, attrs: u32, name: &str) {
         s.insert(frn, parent, attrs, name.as_bytes());
+    }
+
+    /// 顶层条目的父是卷根 FRN 5(根记录被 USN 过滤掉)。必须当作 NO_PARENT:
+    /// 若登记进 unresolved,unresolved 会长期 >=4096,needs_compact 恒真,
+    /// maintain 每轮全量 compact 250 万条(实测 CPU 单核打满、查询被饿死)。
+    #[test]
+    fn root_parent_never_becomes_unresolved() {
+        let mut s = VolumeStore::new(false);
+        insert(&mut s, 100, 5, 0x10, "Users");
+        insert(&mut s, 101, 100, 0, "readme.txt");
+        assert_eq!(s.parent[s.find_slot(100).unwrap() as usize], NO_PARENT);
+        assert!(s.unresolved_pairs().is_empty());
+        assert!(!s.needs_compact());
+        s.compact();
+        assert!(s.unresolved_pairs().is_empty());
+        // 反复 compact 不应再有任何工作(旧实现在这里会永远重建)
+        s.compact();
+        assert!(!s.needs_compact());
     }
 
     #[test]
