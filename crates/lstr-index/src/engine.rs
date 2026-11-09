@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::pinyin::PinyinCache;
 use crate::query::{QueryOutcome, QuerySpec, Hit};
 use crate::snapshot::{self, SnapshotHeader};
-use crate::store::VolumeStore;
+use crate::store::{VolumeStore, NO_PARENT, ROOT_FRN};
 use crate::usn::{Op, Rec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +75,8 @@ pub enum EngineMsg {
     /// 后台对账:已有快照时逐批 patch 现有条目,而不是清空重扫。
     DirSyncBegin { guid: u128 },
     DirSyncEnd { guid: u128, ok: bool },
+    /// 运行期 watcher:某父目录的最新子项快照(替换该目录子项集合)。
+    DirChildren { guid: u128, parent_frn: u64, recs: Vec<Rec> },
     VolumeReady { guid: u128, journal_id: u64, next_usn: i64, count: u32 },
     JournalReset { guid: u128 },
     VolumeGone { guid: u128 },
@@ -357,6 +359,32 @@ impl Engine {
                 snapshot::debug_log(&format!(
                     "dirsync end {guid:032x} letter={letter} removed={removed} count={count}"
                 ));
+            }
+            EngineMsg::DirChildren { guid, parent_frn, recs } => {
+                let Some(i) = self.volumes.iter().position(|v| v.guid == guid) else {
+                    return;
+                };
+                let (added, removed) = {
+                    let Some(store) = &mut self.volumes[i].store else {
+                        return;
+                    };
+                    let parent_slot = if parent_frn == ROOT_FRN {
+                        NO_PARENT
+                    } else {
+                        store.find_slot(parent_frn).unwrap_or(NO_PARENT)
+                    };
+                    if parent_frn == ROOT_FRN {
+                        store.apply_root_children(&recs)
+                    } else {
+                        store.apply_children(parent_slot, &recs)
+                    }
+                };
+                self.volumes[i].dirty = true;
+                if added > 0 || removed > 0 {
+                    snapshot::debug_log(&format!(
+                        "watch {guid:032x} parent={parent_frn} added={added} removed={removed}"
+                    ));
+                }
             }
             EngineMsg::JournalReset { guid } => {
                 if let Some(i) = self.volumes.iter().position(|v| v.guid == guid) {

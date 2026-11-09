@@ -17,6 +17,8 @@ pub mod frame_type {
     pub const DIR_SYNC_BEGIN: u8 = 14;
     /// 运行期对账结束:引擎删除未标记 SEEN 的槽位并 compact/落盘。
     pub const DIR_SYNC_END: u8 = 15;
+    /// watcher 目录刷新:该父目录的最新子项集合。
+    pub const DIR_CHILDREN: u8 = 16;
     // W→C
     pub const WELCOME: u8 = 2;
     pub const VOLUME_META: u8 = 3;
@@ -116,6 +118,12 @@ pub enum Frame {
         /// false = 中途停止/出错,只清 SEEN 位,不做删除。
         ok: bool,
     },
+    /// 运行期 watcher:某个父目录的最新子项快照(替换该目录的子项集合)。
+    DirChildren {
+        guid: u128,
+        parent_frn: u64,
+        recs: Vec<Rec>,
+    },
     VolumeGone {
         guid: u128,
     },
@@ -162,6 +170,36 @@ impl W {
         self.u16(v.len() as u16);
         self.buf.extend_from_slice(v);
     }
+}
+
+fn write_rec(w: &mut W, r: &Rec) {
+    w.u8(match r.op {
+        Op::Upsert => 1,
+        Op::Remove => 2,
+    });
+    w.u32(r.attrs);
+    w.u64(r.frn);
+    w.u64(r.parent_frn);
+    w.bytes(r.name.as_bytes());
+}
+
+fn read_rec(r: &mut R) -> Option<Rec> {
+    let op = match r.u8()? {
+        1 => Op::Upsert,
+        2 => Op::Remove,
+        _ => return None,
+    };
+    let attrs = r.u32()?;
+    let frn = r.u64()?;
+    let parent_frn = r.u64()?;
+    let name = r.bytes()?;
+    Some(Rec {
+        frn,
+        parent_frn,
+        attrs,
+        op,
+        name: String::from_utf8_lossy(name).into_owned(),
+    })
 }
 
 struct R<'a> {
@@ -279,14 +317,7 @@ impl Frame {
                 w.i64(*next_usn);
                 w.u32(recs.len() as u32);
                 for r in recs {
-                    w.u8(match r.op {
-                        Op::Upsert => 1,
-                        Op::Remove => 2,
-                    });
-                    w.u32(r.attrs);
-                    w.u64(r.frn);
-                    w.u64(r.parent_frn);
-                    w.bytes(r.name.as_bytes());
+                    write_rec(&mut w, r);
                 }
                 w
             }
@@ -304,6 +335,16 @@ impl Frame {
                 let mut w = W::new(frame_type::DIR_SYNC_END);
                 w.u128(*guid);
                 w.u8(u8::from(*ok));
+                w
+            }
+            Frame::DirChildren { guid, parent_frn, recs } => {
+                let mut w = W::new(frame_type::DIR_CHILDREN);
+                w.u128(*guid);
+                w.u64(*parent_frn);
+                w.u32(recs.len() as u32);
+                for r in recs {
+                    write_rec(&mut w, r);
+                }
                 w
             }
             Frame::VolumeGone { guid } => {
@@ -387,24 +428,19 @@ impl Frame {
                 let n = r.u32()? as usize;
                 let mut recs = Vec::with_capacity(n.min(100_000));
                 for _ in 0..n {
-                    let op = match r.u8()? {
-                        1 => Op::Upsert,
-                        2 => Op::Remove,
-                        _ => return None,
-                    };
-                    let attrs = r.u32()?;
-                    let frn = r.u64()?;
-                    let parent = r.u64()?;
-                    let name = r.bytes()?;
-                    recs.push(Rec {
-                        frn,
-                        parent_frn: parent,
-                        attrs,
-                        op,
-                        name: String::from_utf8_lossy(name).into_owned(),
-                    });
+                    recs.push(read_rec(&mut r)?);
                 }
                 Frame::Batch { guid, next_usn, recs }
+            }
+            frame_type::DIR_CHILDREN => {
+                let guid = r.u128()?;
+                let parent_frn = r.u64()?;
+                let n = r.u32()? as usize;
+                let mut recs = Vec::with_capacity(n.min(100_000));
+                for _ in 0..n {
+                    recs.push(read_rec(&mut r)?);
+                }
+                Frame::DirChildren { guid, parent_frn, recs }
             }
             frame_type::JOURNAL_RESET => Frame::JournalReset { guid: r.u128()? },
             frame_type::DIR_SYNC_BEGIN => Frame::DirSyncBegin { guid: r.u128()? },
@@ -461,6 +497,17 @@ mod tests {
             Frame::JournalReset { guid: 7 },
             Frame::DirSyncBegin { guid: 7 },
             Frame::DirSyncEnd { guid: 7, ok: true },
+            Frame::DirChildren {
+                guid: 7,
+                parent_frn: 5,
+                recs: vec![Rec {
+                    frn: 9,
+                    parent_frn: 5,
+                    attrs: 0x20,
+                    op: Op::Upsert,
+                    name: "new.txt".into(),
+                }],
+            },
             Frame::VolumeGone { guid: 7 },
             Frame::VolumeAppeared { guid: 7, letter: 'E' },
             Frame::WorkerExit { reason: 0 },

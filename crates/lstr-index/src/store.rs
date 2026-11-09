@@ -13,6 +13,8 @@
 
 use std::collections::HashMap;
 
+use crate::usn::Rec;
+
 /// 内部位:已删除(等待 compact 回收)。
 pub const ATTR_DEAD: u16 = 0x8000;
 /// 内部位:命中噪声排除规则(等待 compact 回收)。
@@ -23,6 +25,10 @@ pub const ATTR_INTERNAL: u16 = ATTR_DEAD | ATTR_NOISE;
 /// 存活槽就是离线期间消失的条目,标 DEAD;这与 DEAD/NOISE 不同,不参与
 /// [`ATTR_INTERNAL`] 的可见性过滤,也不会被持久化(落盘前会清掉)。
 pub const ATTR_SEEN: u16 = 0x2000;
+/// 卷根子项标记(持久化)。根记录被过滤器丢弃,顶层条目的 parent 只能记为
+/// [`NO_PARENT`];watcher 刷新卷根时需要能把「根子项」与「父未消解」区分开,
+/// 否则根目录删除无法实时处理(会被当成未消解条目而不敢删)。
+pub const ATTR_ROOT_CHILD: u16 = 0x1000;
 /// parent 列的「卷根/未解析」标记。
 pub const NO_PARENT: u32 = u32::MAX;
 /// NTFS 卷根目录的固定 FRN。根记录本身会被 USN 过滤器丢弃,但顶层条目的
@@ -241,6 +247,85 @@ impl VolumeStore {
         }
     }
 
+    /// watcher 目录刷新:用 `recs` 替换 `parent_slot` 下的子项集合。
+    /// 返回 (新增/更新数, 标死数)。
+    ///
+    /// 只有父 slot 可解析时才做删除;`NO_PARENT`(卷根,或父项尚未消解)
+    /// 无法与其它未消解条目区分,只做 upsert —— 卷根删除交给下次启动对账。
+    pub fn apply_children(&mut self, parent_slot: u32, recs: &[Rec]) -> (usize, usize) {
+        if parent_slot == NO_PARENT {
+            self.clear_seen();
+        } else {
+            for slot in 0..self.parent.len() {
+                if self.parent[slot] == parent_slot && self.attrs[slot] & ATTR_DEAD == 0 {
+                    self.attrs[slot] &= !ATTR_SEEN;
+                }
+            }
+        }
+        let mut added = 0usize;
+        for r in recs {
+            if self.insert(r.frn, r.parent_frn, r.attrs, r.name.as_bytes()) {
+                added += 1;
+            }
+            if let Some(slot) = self.find_slot(r.frn) {
+                self.attrs[slot as usize] |= ATTR_SEEN;
+            }
+        }
+        if parent_slot == NO_PARENT {
+            self.clear_seen();
+            return (added, 0);
+        }
+        let mut removed = 0usize;
+        for slot in 0..self.parent.len() {
+            let a = self.attrs[slot];
+            if self.parent[slot] == parent_slot && a & ATTR_DEAD == 0 {
+                if a & ATTR_SEEN == 0 {
+                    self.attrs[slot] = a | ATTR_DEAD;
+                    removed += 1;
+                } else {
+                    self.attrs[slot] = a & !ATTR_SEEN;
+                }
+            }
+        }
+        self.dead_count = self.dead_count.saturating_add(removed as u32);
+        (added, removed)
+    }
+
+    /// watcher 刷新卷根子项:根记录不在索引里,顶层条目的 parent 一律是
+    /// [`NO_PARENT`],必须靠 [`ATTR_ROOT_CHILD`] 与「父未消解」条目区分开;
+    /// 否则不敢删除,根目录下的删除要等下次启动对账。
+    pub fn apply_root_children(&mut self, recs: &[Rec]) -> (usize, usize) {
+        for slot in 0..self.attrs.len() {
+            let a = self.attrs[slot];
+            if a & ATTR_ROOT_CHILD != 0 && a & ATTR_DEAD == 0 {
+                self.attrs[slot] = a & !ATTR_SEEN;
+            }
+        }
+        let mut added = 0usize;
+        for r in recs {
+            if self.insert(r.frn, r.parent_frn, r.attrs, r.name.as_bytes()) {
+                added += 1;
+            }
+            if let Some(slot) = self.find_slot(r.frn) {
+                self.attrs[slot as usize] |= ATTR_SEEN | ATTR_ROOT_CHILD;
+            }
+        }
+        let mut removed = 0usize;
+        for slot in 0..self.attrs.len() {
+            let a = self.attrs[slot];
+            if a & ATTR_ROOT_CHILD != 0 && a & ATTR_DEAD == 0 {
+                if a & ATTR_SEEN == 0 {
+                    self.attrs[slot] = a | ATTR_DEAD;
+                    removed += 1;
+                } else {
+                    self.attrs[slot] = a & !ATTR_SEEN;
+                }
+            }
+        }
+        self.dead_count = self.dead_count.saturating_add(removed as u32);
+        (added, removed)
+    }
+
     /// 后台对账结束:把本轮没见过且仍存活的槽位标 DEAD(离线期间被删除/移走),
     /// 清掉所有 SEEN 位,返回新标死的条数。槽位不立即回收,交给 compact 重排。
     pub fn remove_unseen(&mut self) -> usize {
@@ -297,8 +382,9 @@ impl VolumeStore {
                 let old_parent = self.parent[old as usize];
                 if same_name && old_parent == new_p {
                     // 完全一致:仅同步属性位
-                    self.attrs[old as usize] =
-                        (self.attrs[old as usize] & ATTR_INTERNAL) | (attrs as u16 & !ATTR_INTERNAL);
+                    self.attrs[old as usize] = (self.attrs[old as usize] & ATTR_INTERNAL)
+                        | (attrs as u16 & !ATTR_INTERNAL)
+                        | if parent_frn == ROOT_FRN { ATTR_ROOT_CHILD } else { 0 };
                     return false;
                 }
                 // 就地更新:slot 身份不变 —— 目录改名后子项的父指针仍然有效
@@ -315,8 +401,9 @@ impl VolumeStore {
                     self.off_index.push((self.name_off[old as usize], old));
                 }
                 self.parent[old as usize] = new_p;
-                self.attrs[old as usize] =
-                    (self.attrs[old as usize] & ATTR_INTERNAL) | (attrs as u16 & !ATTR_INTERNAL);
+                self.attrs[old as usize] = (self.attrs[old as usize] & ATTR_INTERNAL)
+                    | (attrs as u16 & !ATTR_INTERNAL)
+                    | if parent_frn == ROOT_FRN { ATTR_ROOT_CHILD } else { 0 };
                 if self.noise_enabled {
                     // 父/名变了,重新判噪(结果可能解除或加深)
                     self.attrs[old as usize] &= !ATTR_NOISE;
@@ -341,7 +428,11 @@ impl VolumeStore {
             self.find_slot(parent_frn).unwrap_or(NO_PARENT)
         };
         self.parent.push(p);
-        self.attrs.push((attrs as u16) & !ATTR_INTERNAL);
+        let mut a = (attrs as u16) & !ATTR_INTERNAL;
+        if parent_frn == ROOT_FRN {
+            a |= ATTR_ROOT_CHILD;
+        }
+        self.attrs.push(a);
         self.delta.push(slot);
         // 索引策略:scan 模式只索引目录(父查找只需要目录,内存省 78%);
         // journal 模式索引全部(改名/删除要按 FRN 定位)。
@@ -660,6 +751,33 @@ mod tests {
         // 反复 compact 不应再有任何工作(旧实现在这里会永远重建)
         s.compact();
         assert!(!s.needs_compact());
+    }
+
+    /// watcher 刷新卷根:根目录的删除必须靠 ATTR_ROOT_CHILD 识别,
+    /// 不能把「父未消解」条目一起删掉。
+    #[test]
+    fn root_child_refresh_removes_root_level_deletes_only() {
+        let mut s = VolumeStore::new(false);
+        insert(&mut s, 100, 5, 0x10, "folder");
+        insert(&mut s, 101, 5, 0, "keep.txt");
+        insert(&mut s, 200, 99, 0, "orphan.txt"); // 父未消解,不是根子项
+        // 真实 watcher 只会在首扫完成(compact 过)后运行;这里先归并成就绪态。
+        s.compact();
+        assert!(s.attrs[s.find_slot(100).unwrap() as usize] & ATTR_ROOT_CHILD != 0);
+        let recs = vec![
+            Rec { frn: 101, parent_frn: 5, attrs: 0, op: crate::usn::Op::Upsert, name: "keep.txt".into() },
+            Rec { frn: 102, parent_frn: 5, attrs: 0, op: crate::usn::Op::Upsert, name: "new.txt".into() },
+        ];
+        let (added, removed) = s.apply_root_children(&recs);
+        assert_eq!(removed, 1);
+        assert_eq!(added, 1);
+        assert_eq!(s.find_slot(100), None);
+        assert!(s.find_slot(101).is_some());
+        assert!(s.find_slot(102).is_some());
+        // 孤儿条目不受根刷新影响
+        assert!(s.find_slot(200).is_some());
+        s.compact();
+        assert!(s.find_slot(200).is_some());
     }
 
     #[test]

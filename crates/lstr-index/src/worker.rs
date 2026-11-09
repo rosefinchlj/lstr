@@ -631,10 +631,10 @@ fn scan_dir_volume(
                     "dirscan {letter}: ready count={count} (enumerated={total})"
                 ));
             }
-            // 阶段 1:不做 journal 轮询;阶段 2 打开 opts().journal 后再接。
-            while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(500));
-            }
+            // 首扫/对账完成后进入实时 watcher:ReadDirectoryChangesW 通知
+            // 父目录变更时重枚举该目录,经 DirChildren 帧 patch 内存索引。
+            // 不碰 USN FSCTL(蓝屏后收敛的安全路径)。
+            crate::watch::watch_volume(letter, guid, tx, stop);
         }
         Ok(_) => {
             if sync {

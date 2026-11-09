@@ -17,8 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
 use crate::usn::{Op, Rec};
@@ -73,7 +74,7 @@ extern "system" {
     ) -> i32;
 }
 
-fn open_dir(path: &str) -> Result<HANDLE, String> {
+pub(crate) fn open_dir(path: &str) -> Result<HANDLE, String> {
     // `\\?\` 前缀支持超过 MAX_PATH 的路径
     let wide = crate::win::to_wide(&format!(r"\\?\{path}"));
     unsafe {
@@ -248,6 +249,112 @@ pub fn enumerate_volume(
 ) -> Result<u64, String> {
     enumerate_dir(&format!("{letter}:\\"), ROOT_FRN, stop, batch)
 }
+
+/// 只枚举一层目录(不递归):watcher 收到变更后用它刷新单个父目录。
+pub fn enumerate_children(
+    dir_path: &str,
+    dir_frn: u64,
+    stop: &AtomicBool,
+) -> Result<Vec<Rec>, String> {
+    let handle = open_dir(dir_path)?;
+    let mut buf = vec![0u8; QUERY_BUF];
+    let mut out: Vec<Rec> = Vec::new();
+    let mut restart = true;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let used = match query_dir(handle, &mut buf, restart) {
+            Ok(n) => n,
+            Err(err) => {
+                crate::win::close(handle);
+                return Err(err);
+            }
+        };
+        restart = false;
+        if used == 0 {
+            break;
+        }
+        let mut off = 0usize;
+        while off + ENTRY_HEAD <= used {
+            let next = u32_at(&buf, off).unwrap_or(0) as usize;
+            let attrs = u32_at(&buf, off + 56).unwrap_or(0);
+            let name_len = u32_at(&buf, off + 60).unwrap_or(0) as usize;
+            let file_id = u64_at(&buf, off + 96).unwrap_or(0);
+            let name_start = off + ENTRY_HEAD;
+            if name_len == 0 || name_len % 2 != 0 || name_start + name_len > used {
+                break;
+            }
+            let units: Vec<u16> = (0..name_len / 2)
+                .map(|i| {
+                    u16::from_le_bytes(
+                        buf[name_start + i * 2..name_start + i * 2 + 2]
+                            .try_into()
+                            .unwrap(),
+                    )
+                })
+                .collect();
+            let name = String::from_utf16_lossy(&units);
+            if name != "." && name != ".." {
+                let mfrn = file_id & 0x0000_FFFF_FFFF_FFFF;
+                let is_meta = mfrn < 0x100 && name.starts_with('$');
+                if !is_meta {
+                    out.push(Rec {
+                        frn: file_id,
+                        parent_frn: dir_frn,
+                        attrs,
+                        op: Op::Upsert,
+                        name,
+                    });
+                }
+            }
+            if next == 0 || next >= used {
+                break;
+            }
+            off += next;
+        }
+    }
+    crate::win::close(handle);
+    Ok(out)
+}
+
+/// `FILE_ID_INFO`(windows crate 的类常量在部分 feature 下不可见,自行声明)。
+#[repr(C)]
+#[derive(Default)]
+struct FileIdInfoRaw {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+/// 指定路径(文件或目录)的 64 位 FRN;打开失败(例如条目已被删除)返回 None。
+pub fn file_id_of(path: &str) -> Option<u64> {
+    // FileIdInfo = 18
+    const FILE_ID_INFO_CLASS: i32 = 18;
+    let wide = crate::win::to_wide(&format!(r"\\?\{path}"));
+    unsafe {
+        let handle = CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        .ok()?;
+        let mut info = FileIdInfoRaw::default();
+        let ok = GetFileInformationByHandleEx(
+            handle,
+            windows::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS(FILE_ID_INFO_CLASS),
+            &mut info as *mut FileIdInfoRaw as *mut core::ffi::c_void,
+            std::mem::size_of::<FileIdInfoRaw>() as u32,
+        );
+        crate::win::close(handle);
+        ok.ok()?;
+        Some(u64::from_le_bytes(info.file_id[..8].try_into().ok()?))
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
