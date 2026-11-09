@@ -1053,6 +1053,21 @@ fn journal_incremental_volume(
     }
 }
 
+/// 可中断的退避休眠:按 ≤100ms 切片轮询 stop,置位即提前返回。
+/// 熔断退避封顶 60s([`crate::usnwatch::UsnCircuit::BACKOFF_MAX_MS`]),
+/// 不可中断的 sleep 会把 Shutdown 卡住最坏 60s(卷线程 join 等待)。
+fn sleep_interruptible(ms: u64, stop: &AtomicBool) {
+    let mut remaining = ms;
+    while remaining > 0 {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let slice = remaining.min(100);
+        std::thread::sleep(Duration::from_millis(slice));
+        remaining -= slice;
+    }
+}
+
 /// journal 实时增量轮询(每卷独立熔断;空读必须休眠 —— 历史踩坑:忙等烧 CPU)。
 ///
 /// - `journal_id == 0`:卷上暂无活动 journal,循环内轻量 QUERY 等待;
@@ -1166,7 +1181,7 @@ fn usn_watch_loop(
                         }
                         match directive {
                             crate::usnwatch::UsnDirective::Sleep(ms) => {
-                                std::thread::sleep(Duration::from_millis(ms));
+                                sleep_interruptible(ms, stop);
                             }
                             crate::usnwatch::UsnDirective::Disable => {
                                 report_usn_state(tx, guid, cb.state, stop, &mut reported);
@@ -1204,7 +1219,7 @@ fn usn_watch_loop(
                 match cb.on_event(crate::usnwatch::UsnEvent::PollError) {
                     crate::usnwatch::UsnDirective::Sleep(ms) => {
                         report_usn_state(tx, guid, cb.state, stop, &mut reported);
-                        std::thread::sleep(Duration::from_millis(ms));
+                        sleep_interruptible(ms, stop);
                     }
                     crate::usnwatch::UsnDirective::Disable => {
                         report_usn_state(tx, guid, cb.state, stop, &mut reported);
@@ -1361,6 +1376,42 @@ fn pipe_alive(client: HANDLE) -> bool {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// 熔断退避(封顶 60s)必须可中断:stop 置位后秒级内返回,
+    /// 否则 Shutdown 会被卷线程的退避 sleep 卡住最坏 60s。
+    #[test]
+    fn backoff_sleep_is_interruptible_by_stop() {
+        // 已置位:60s 退避立即返回
+        let stop = AtomicBool::new(true);
+        let t0 = Instant::now();
+        sleep_interruptible(60_000, &stop);
+        assert!(t0.elapsed() < Duration::from_millis(500), "stop 已置位必须立即返回");
+
+        // 中途置位:切片粒度 100ms,60s 退避应在数百 ms 内返回
+        // (断言上限放宽到 2s 防测试机调度抖动;实际 ~150ms,关键是绝不接近 60s)
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let setter = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let t0 = Instant::now();
+        sleep_interruptible(60_000, &stop);
+        setter.join().unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "中途置位应在切片粒度内返回,实测 {:?}",
+            t0.elapsed()
+        );
+
+        // 未置位:完整睡满(不少睡 —— 退避节奏是熔断语义的一部分)
+        let stop = AtomicBool::new(false);
+        let t0 = Instant::now();
+        sleep_interruptible(30, &stop);
+        assert!(t0.elapsed() >= Duration::from_millis(25), "未置位不得提前返回");
+    }
 
     #[test]
     fn plan_uses_real_journal_id_without_snapshot_position() {
