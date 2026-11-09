@@ -572,28 +572,32 @@ fn scan_dir_volume(
         return;
     }
     // 与 USN 全量扫描共用串行闸门:多卷首次构建逐卷来,降低 IO/内核压力。
-    let _scan_slot = SCAN_GATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 闸门只包住枚举本身:扫描完成后本卷会进入空闲等待,若把 guard 带到
+    // 空闲循环里,下一卷会永远等不到锁(实测卡在「构建中(1/4)」)。
     let mut count: u64 = 0;
     let mut last_report = std::time::Instant::now();
-    let result = crate::dirscan::enumerate_volume(letter, stop, &mut |recs| {
-        count += recs.len() as u64;
-        let _ = send_frame(tx, Frame::Batch { guid, next_usn: 0, recs }, stop);
-        if last_report.elapsed() >= Duration::from_millis(500) {
-            last_report = std::time::Instant::now();
-            let _ = send_frame(
-                tx,
-                Frame::ScanProgress {
-                    guid,
-                    frn: 0,
-                    est: 0,
-                    count: count.min(u32::MAX as u64) as u32,
-                },
-                stop,
-            );
-        }
-    });
+    let result = {
+        let _scan_slot = SCAN_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::dirscan::enumerate_volume(letter, stop, &mut |recs| {
+            count += recs.len() as u64;
+            let _ = send_frame(tx, Frame::Batch { guid, next_usn: 0, recs }, stop);
+            if last_report.elapsed() >= Duration::from_millis(500) {
+                last_report = std::time::Instant::now();
+                let _ = send_frame(
+                    tx,
+                    Frame::ScanProgress {
+                        guid,
+                        frn: 0,
+                        est: 0,
+                        count: count.min(u32::MAX as u64) as u32,
+                    },
+                    stop,
+                );
+            }
+        })
+    };
     match result {
         Ok(total) if !stop.load(Ordering::Relaxed) => {
             if send_frame(

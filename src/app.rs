@@ -952,11 +952,17 @@ impl LstrApp {
             }
             if st.phase == lstr_index::Phase::Scanning {
                 let total: u32 = st.volumes.iter().map(|v| v.count).sum();
-                let known: Vec<f32> = st.volumes.iter().filter_map(|v| v.pct).collect();
-                let pct = if known.is_empty() {
-                    None
+                let complete = st.volumes.iter().filter(|v| v.complete).count();
+                let pcts: Vec<f32> = st.volumes.iter().filter_map(|v| v.pct).collect();
+                // 目录枚举模式没有总条数(est=0),只有「已扫条数」:
+                // 此时用「已完成卷数/总卷数」表达进度,别拿单卷 100% 平均成 99%。
+                let progress = if !pcts.is_empty() && pcts.len() == st.volumes.len() {
+                    format!(
+                        "{:.0}%",
+                        (pcts.iter().sum::<f32>() / pcts.len() as f32 * 100.0).min(99.0)
+                    )
                 } else {
-                    Some(known.iter().sum::<f32>() / known.len() as f32)
+                    format!("({}/{})", complete, st.volumes.len())
                 };
                 // Everything 未运行时不要声称「正与 Everything 合并」。
                 let suffix = if st.everything_ok {
@@ -964,19 +970,12 @@ impl LstrApp {
                 } else {
                     "（结果暂不完整）"
                 };
-                note = Some(match pct {
-                    Some(p) => format!(
-                        "正在构建索引 {:.0}% · 已收录 {} 万项{}",
-                        (p * 100.0).min(99.0),
-                        total / 10_000,
-                        suffix
-                    ),
-                    None => format!(
-                        "正在构建索引 · 已收录 {} 万项{}",
-                        total / 10_000,
-                        suffix
-                    ),
-                });
+                note = Some(format!(
+                    "正在构建索引 {} · 已收录 {} 万项{}",
+                    progress,
+                    total / 10_000,
+                    suffix
+                ));
             } else if st.phase == lstr_index::Phase::Loading {
                 // 主界面不显示任何提示时，用户会以为「卡住了」：等 UAC、等 worker
                 // 连管道都可能停在这一阶段（旧 worker 占管道时甚至永久停住）。
