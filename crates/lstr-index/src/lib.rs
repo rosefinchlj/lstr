@@ -13,6 +13,7 @@ pub mod pinyin;
 pub mod proto;
 pub mod query;
 pub mod scan;
+pub mod sidecar;
 pub mod snapshot;
 pub mod store;
 pub mod usn;

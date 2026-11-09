@@ -200,6 +200,31 @@ fn write_rec(w: &mut W, r: &Rec) {
     w.bytes(r.name.as_bytes());
 }
 
+/// 记录列表 → 线上字节(u32 数量 + 逐条 rec)。旁车增量日志复用同一编码,
+/// 保证「管道帧里的记录」与「旁车里的记录」语义/布局完全一致。
+pub(crate) fn encode_recs(recs: &[Rec]) -> Vec<u8> {
+    let mut w = W { buf: Vec::new() };
+    w.u32(recs.len() as u32);
+    for r in recs {
+        write_rec(&mut w, r);
+    }
+    w.buf
+}
+
+/// [`encode_recs`] 的逆操作;字节不完整、数量不符或有尾部残留 → None(损坏)。
+pub(crate) fn decode_recs(bytes: &[u8]) -> Option<Vec<Rec>> {
+    let mut r = R { buf: bytes };
+    let n = r.u32()? as usize;
+    let mut out = Vec::with_capacity(n.min(100_000));
+    for _ in 0..n {
+        out.push(read_rec(&mut r)?);
+    }
+    if !r.buf.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
 fn read_rec(r: &mut R) -> Option<Rec> {
     let op = match r.u8()? {
         1 => Op::Upsert,

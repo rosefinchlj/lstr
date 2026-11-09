@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::pinyin::PinyinCache;
 use crate::query::{QueryOutcome, QuerySpec, Hit};
+use crate::sidecar::{self, SidecarOp};
 use crate::snapshot::{self, SnapshotHeader};
 use crate::store::{VolumeStore, NO_PARENT, ROOT_FRN};
 use crate::usn::{Op, Rec};
@@ -70,11 +71,59 @@ pub struct VolumeState {
     /// (见 save_interval)。journal 每来一小批就整卷重写 120MB 会把查询线程
     /// 饿死(实测搜索要等几秒),必须节流。
     save_retry_at: Option<Instant>,
+    /// 旁车日志:自上次全量保存以来的增量操作(按序,回放语义与运行期 apply
+    /// 完全一致)。稳态变更先记这里,由 maintain 以 ~5s 节流原子写进旁车文件
+    /// (几 KB,毫秒级);全量保存成功后清空。见 [`crate::sidecar`]。
+    sidecar_ops: Vec<SidecarOp>,
+    /// 旁车基线:当前日志所基于的全量快照游标 (journal_id, next_usn)。
+    /// 加载/全量保存成功时更新;旁车文件基线与之不符即视为陈旧并丢弃。
+    sidecar_base: (u64, i64),
+    /// 旁车日志覆盖到的游标(= 最后一条已捕获批次的位点)。可与 next_usn
+    /// 短暂不同:日志溢出停捕期间位点继续推进,旁车文件以 sidecar_cursor
+    /// 为准 —— 游标永不超前于可回放内容,缺口由 journal 回放补齐。
+    sidecar_cursor: i64,
+    /// 内存日志与旁车文件不一致(有待写盘)。
+    sidecar_pending: bool,
+    /// 下次允许旁车写盘的时间(节流;失败按同间隔重试,写盘毫秒级,退避无必要)。
+    sidecar_retry_at: Option<Instant>,
+    /// 捕获开关:全量保存成功后武装;对账/重扫/重置窗口内关闭 —— 这些变更
+    /// 的持久化走全量快照,不进旁车(关闭期间的位点推进由 journal 回放兜底)。
+    capture_on: bool,
     /// USN 实时增量层状态(usn 后端 worker 经 UsnWatch 帧上报;默认 Off,
     /// 旧后端 worker 从不上报 → UI 不显示)。
     pub usn_watch: UsnWatchState,
     /// 游标上次推进时间(journal 批次 / VolumeReady):UI 的「游标 age」。
     cursor_at: Option<Instant>,
+}
+
+impl VolumeState {
+    /// 旁车捕获是否可用:就绪卷(非对账/非扫描)且捕获已武装。武装在每次
+    /// 全量保存成功后恢复;对账/重扫窗口内的变更走全量快照持久化。
+    fn sidecar_capture_ready(&self) -> bool {
+        self.capture_on
+            && self.complete
+            && !self.syncing
+            && self.store.as_ref().map(|s| !s.is_scanning()).unwrap_or(false)
+    }
+
+    /// 旁车日志当前的变更条数(溢出判断)。
+    fn sidecar_rec_count(&self) -> usize {
+        self.sidecar_ops.iter().map(SidecarOp::recs_len).sum()
+    }
+
+    /// 捕获一批变更:进内存日志并标记待写盘;日志已满则停捕并请求立即
+    /// 全量保存(游标停在最后一条已捕获批次,缺口由 journal 回放兜底)。
+    fn capture(&mut self, op: SidecarOp, cursor: Option<i64>) {
+        if self.sidecar_rec_count() < SIDECAR_MAX_RECS {
+            self.sidecar_ops.push(op);
+            if let Some(usn) = cursor {
+                self.sidecar_cursor = usn;
+            }
+            self.sidecar_pending = true;
+        } else {
+            self.save_retry_at = None;
+        }
+    }
 }
 
 /// 对账/首扫 Records 分批 apply 的默认块大小(条)。
@@ -84,6 +133,23 @@ pub struct VolumeState {
 /// p90=512ms;稳态 0.4ms)。按 ~512 条(约 0.2-1ms 工作量)切块,块间让宿主
 /// 线程回去服务查询,打字期间的单次等待从「一整轮」降到「一块」。
 const DEFAULT_APPLY_CHUNK: usize = 512;
+
+/// 就绪卷两次**全量**快照的最小间隔(秒)。
+///
+/// 依据(2026-11 实测):USN 稳态下就绪卷每 ~60s 全量保存一次,C 卷 117 万条
+/// 每次占引擎线程 1.6-2s,查询每分钟撞上一次 1-3 秒停顿。稳态增量改由旁车
+/// 游标承载(sidecar.rs,毫秒级写盘)后,全量快照只需做阶段归档,10 分钟一次
+/// 足以把崩溃后的 journal 回放窗口控制在分钟级;对账收尾/优雅退出仍立即全量。
+const FULL_SAVE_INTERVAL_SECS: u64 = 600;
+
+/// 旁车写盘节流:USN 轮询 500ms 一批,变更按序积压在内存日志,合并 5s 原子
+/// 写一次(几 KB)。崩溃最多丢一个节流窗口的日志 —— 游标以旁车文件里的为准,
+/// 缺口由 journal 回放补齐,不存在丢数据。
+const SIDECAR_SAVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// 旁车日志容量上限(变更条数):超出即触发立即全量保存并停捕(内存有界)。
+/// 稳态远达不到;突发批量变更(如解压/同步盘)时回落全量保存的既有路径。
+const SIDECAR_MAX_RECS: usize = 8192;
 
 /// 渐进 apply 缓冲:对账/首扫的 Records 不再一口气整条消息打完,而是按块
 /// 消化,块间让宿主线程回去服务查询。按卷分组,保证同卷记录的消费顺序与
@@ -173,6 +239,63 @@ impl Engine {
         self.volumes[i].generation = generation;
     }
 
+    /// 从快照 header 构造加载态 VolumeState(旁车基线 = 快照游标,捕获武装)。
+    fn volume_state_from_snapshot(
+        guid: u128,
+        h: &SnapshotHeader,
+        store: Option<VolumeStore>,
+        next_usn: i64,
+        sidecar_ops: Vec<SidecarOp>,
+        sidecar_base: (u64, i64),
+        sidecar_cursor: i64,
+    ) -> VolumeState {
+        VolumeState {
+            guid,
+            letter: h.letter,
+            journal_id: h.journal_id,
+            next_usn,
+            est_records: h.est_records,
+            resume_frn: h.resume_frn,
+            complete: h.complete,
+            store,
+            generation: 0,
+            dirty: false,
+            syncing: false,
+            save_backoff: 0,
+            save_retry_at: None,
+            sidecar_ops,
+            sidecar_base,
+            sidecar_cursor,
+            sidecar_pending: false,
+            sidecar_retry_at: None,
+            capture_on: true,
+            usn_watch: UsnWatchState::Off,
+            cursor_at: None,
+        }
+    }
+
+    /// 把一条旁车操作回放进 store:语义与运行期 apply 完全一致(Journal =
+    /// `apply_rec(syncing=false)` 逐条;Children = DirChildren 同款替换语义)。
+    /// 回放输入是「刚加载的快照 + 前序旁车操作」,与捕获时的 store 状态同构,
+    /// 故结果确定性一致。
+    fn replay_sidecar_op(store: &mut VolumeStore, op: &SidecarOp) {
+        match op {
+            SidecarOp::Journal { recs } => {
+                for rec in recs {
+                    Self::apply_rec(store, rec, false);
+                }
+            }
+            SidecarOp::Children { parent_frn, recs } => {
+                if *parent_frn == ROOT_FRN {
+                    store.apply_root_children(recs);
+                } else {
+                    let slot = store.find_slot(*parent_frn).unwrap_or(NO_PARENT);
+                    store.apply_children(slot, recs);
+                }
+            }
+        }
+    }
+
     fn load_snapshots(&mut self) {
         let dir = self.cfg.index_dir.clone();
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -181,9 +304,9 @@ impl Engine {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            // 上次写快照中途崩溃/被杀留下的 temp 文件(vol_<pid>.tmp):清掉,
-            // 避免长期堆积;若仍有并发写者,它会在 rename 前重建/覆盖。
-            if name.strip_prefix("vol_").is_some_and(|s| s.ends_with(".tmp")) {
+            // 上次写快照/旁车中途崩溃/被杀留下的 temp 文件(vol_*.tmp / cur_*.tmp):
+            // 清掉,避免长期堆积;若仍有并发写者,它会在 rename 前重建/覆盖。
+            if name.ends_with(".tmp") {
                 let _ = std::fs::remove_file(entry.path());
                 continue;
             }
@@ -209,25 +332,67 @@ impl Engine {
                     "loaded {guid:032x} letter={} count={} complete={}",
                     h.letter, snap.store.len(), h.complete
                 ));
-                self.volumes.push(VolumeState {
+                // 旁车:基线与快照游标完全一致才回放(回放语义与运行期 apply
+                // 一致);基线不符(陈旧)/损坏 → 删除,恢复回落「快照游标 +
+                // journal 回放」(journal 已回绕则 dirsync,语义自洽)。
+                let mut next_usn = h.next_usn;
+                let mut sidecar_ops: Vec<SidecarOp> = Vec::new();
+                let sidecar_base = (h.journal_id, h.next_usn);
+                let mut sidecar_cursor = h.next_usn;
+                let mut store = Some(snap.store);
+                match sidecar::load(&dir, guid) {
+                    Ok(Some(sc)) if sc.base == sidecar_base && sc.next_usn >= h.next_usn => {
+                        let s = store.as_mut().expect("snapshot store");
+                        for op in &sc.ops {
+                            Self::replay_sidecar_op(s, op);
+                        }
+                        snapshot::debug_log(&format!(
+                            "sidecar {guid:032x}: replayed {} ops, cursor {} → {}",
+                            sc.ops.len(),
+                            h.next_usn,
+                            sc.next_usn
+                        ));
+                        next_usn = sc.next_usn;
+                        sidecar_cursor = sc.next_usn;
+                        sidecar_ops = sc.ops;
+                    }
+                    Ok(Some(sc)) => {
+                        snapshot::debug_log(&format!(
+                            "sidecar {guid:032x}: stale base {:?} != snapshot {:?}, discarded",
+                            sc.base, sidecar_base
+                        ));
+                        sidecar::remove(&dir, guid);
+                    }
+                    Ok(None) => {}
+                    Err(()) => {
+                        snapshot::debug_log(&format!(
+                            "sidecar {guid:032x}: corrupt, discarded (recover via journal replay)"
+                        ));
+                        sidecar::remove(&dir, guid);
+                    }
+                }
+                self.volumes.push(Self::volume_state_from_snapshot(
                     guid,
-                    letter: h.letter,
-                    journal_id: h.journal_id,
-                    next_usn: h.next_usn,
-                    est_records: h.est_records,
-                    resume_frn: h.resume_frn,
-                    complete: h.complete,
-                    store: Some(snap.store),
-                    generation: 0,
-                    dirty: false,
-                    syncing: false,
-                    save_backoff: 0,
-                    save_retry_at: None,
-                    usn_watch: UsnWatchState::Off,
-                    cursor_at: None,
-                });
+                    h,
+                    store,
+                    next_usn,
+                    sidecar_ops,
+                    sidecar_base,
+                    sidecar_cursor,
+                ));
                 let i = self.volumes.len() - 1;
                 self.bump_generation(i);
+                // 回放了旁车增量的卷:这些变更不在全量快照里,须保持 dirty,
+                // 由全量保存(降频)最终归档。
+                self.volumes[i].dirty = !self.volumes[i].sidecar_ops.is_empty();
+                // 加载后不立即全量保存:游标在快照/旁车里已持久;稳态走旁车,
+                // 全量按 save_interval 降频(见常量注释)。节流从加载时刻起算。
+                let interval = if self.volumes[i].complete {
+                    Duration::from_secs(FULL_SAVE_INTERVAL_SECS)
+                } else {
+                    Duration::from_secs(20)
+                };
+                self.volumes[i].save_retry_at = Some(Instant::now() + interval);
             }
         }
         self.pinyin = self
@@ -256,6 +421,12 @@ impl Engine {
                 syncing: false,
                 save_backoff: 0,
                 save_retry_at: None,
+                sidecar_ops: Vec::new(),
+                sidecar_base: (0, 0),
+                sidecar_cursor: 0,
+                sidecar_pending: false,
+                sidecar_retry_at: None,
+                capture_on: false,
                 usn_watch: UsnWatchState::Off,
                 cursor_at: None,
             });
@@ -291,6 +462,14 @@ impl Engine {
                         if v.store.is_none() {
                             v.store = Some(VolumeStore::new(self.cfg.exclude_noise));
                         }
+                        // 重扫窗口不进旁车:store 将整卷重建,断点由 20s 全量
+                        // 快照承载。日志清零;旧旁车文件仍与旧快照自洽,留着
+                        // (基线守卫在加载时兜底)。
+                        v.capture_on = false;
+                        v.sidecar_ops = Vec::new();
+                        v.sidecar_pending = false;
+                        v.sidecar_cursor = v.next_usn;
+                        v.sidecar_base = (v.journal_id, v.next_usn);
                     }
                     // 重扫会重建/原地更新 slot,旧 Hit 必须失效(H8)
                     self.bump_generation(i);
@@ -347,6 +526,15 @@ impl Engine {
                         }
                         self.volumes[i].dirty = true;
                     }
+                    // 旁车捕获:就绪卷的稳态变更按 apply 同序记进内存日志,
+                    // 由 maintain 以 ~5s 节流原子写盘 —— 全量快照因此降频到
+                    // FULL_SAVE_INTERVAL,查询不再每分钟撞上整卷重写。
+                    if self.volumes[i].sidecar_capture_ready() {
+                        self.volumes[i].capture(
+                            SidecarOp::Journal { recs: recs.clone() },
+                            Some(next_usn),
+                        );
+                    }
                     // M2:记录批次的 journal 位点,重连握手从最新位点续传。
                     // 仅对就绪卷生效:扫描中的卷若提前写入 next_usn,
                     // 空/半 store 会被 worker 误判成可增量,丢文件。
@@ -385,7 +573,9 @@ impl Engine {
                     v.resume_frn = 0;
                     v.dirty = true;
                     v.cursor_at = Some(Instant::now());
-                    // 扫完的卷立即落一次盘(不等 60s 节流):这是最值钱的快照。
+                    // 扫完的卷立即落一次盘(不等节流):这是最值钱的快照。
+                    // 保存成功前关闭旁车捕获(重扫内容不在旧旁车基线里)。
+                    v.capture_on = false;
                     v.save_retry_at = None;
                     let mut compacted = false;
                     if let Some(store) = &mut v.store {
@@ -416,6 +606,9 @@ impl Engine {
                         self.bump_generation(i);
                     }
                     self.volumes[i].syncing = true;
+                    // 对账窗口不进旁车:patch/删除语义由 DirSyncEnd 后的全量
+                    // 保存承载(关闭捕获,保存成功后重新武装)。
+                    self.volumes[i].capture_on = false;
                     snapshot::debug_log(&format!("dirsync begin {guid:032x}"));
                 }
             }
@@ -487,6 +680,11 @@ impl Engine {
                     }
                 };
                 self.volumes[i].dirty = true;
+                // 旁车捕获:替换语义整条记录(parent_frn 存 FRN,回放时重解析)
+                if self.volumes[i].sidecar_capture_ready() {
+                    self.volumes[i]
+                        .capture(SidecarOp::Children { parent_frn, recs: recs.clone() }, None);
+                }
                 if added > 0 || removed > 0 {
                     snapshot::debug_log(&format!(
                         "watch {guid:032x} parent={parent_frn} added={added} removed={removed}"
@@ -504,12 +702,19 @@ impl Engine {
                         v.next_usn = 0;
                         v.journal_id = 0;
                         v.dirty = false;
+                        v.capture_on = false;
+                        v.sidecar_ops = Vec::new();
+                        v.sidecar_pending = false;
+                        v.sidecar_base = (0, 0);
+                        v.sidecar_cursor = 0;
                     }
                     // 索引已清空,旧 Hit 一律失效(H8)
                     self.bump_generation(i);
                     self.pinyin[i] = PinyinCache::empty();
-                    let _ = snapshot::snapshot_path(&self.cfg.index_dir, guid);
-                    let _ = std::fs::remove_file(snapshot::snapshot_path(&self.cfg.index_dir, guid));
+                    let dir = self.cfg.index_dir.clone();
+                    let _ = snapshot::snapshot_path(&dir, guid);
+                    let _ = std::fs::remove_file(snapshot::snapshot_path(&dir, guid));
+                    sidecar::remove(&dir, guid);
                 }
             }
             EngineMsg::VolumeGone { guid } => {
@@ -520,7 +725,9 @@ impl Engine {
                     // 要么越界、要么代次不符,由访问器的校验拒绝(H8)。
                     self.volumes.swap_remove(i);
                     self.pinyin.swap_remove(i);
-                    let _ = std::fs::remove_file(snapshot::snapshot_path(&self.cfg.index_dir, guid));
+                    let dir = self.cfg.index_dir.clone();
+                    let _ = std::fs::remove_file(snapshot::snapshot_path(&dir, guid));
+                    sidecar::remove(&dir, guid);
                 }
             }
             EngineMsg::VolumeAppeared { guid, letter } => {
@@ -854,7 +1061,8 @@ impl Engine {
         self.pinyin.get(hit.vol as usize)?.get(hit.slot)
     }
 
-    /// 空闲维护:需要的卷 compact + 落盘脏快照。返回是否做了事(调用方可据此让路)。
+    /// 空闲维护:需要的卷 compact + 落盘(旁车优先,全量降频)。
+    /// 返回是否做了事(调用方可据此让路)。
     pub fn maintain(&mut self) -> bool {
         let mut did = false;
         // 先归并(compact 会 remap,旧 Hit 失效),再落盘
@@ -892,10 +1100,28 @@ impl Engine {
                 did = true;
             }
         }
-        // 落盘:成功清 dirty;失败保留 dirty 并按指数退避重试(H6)。
+        let now = Instant::now();
+        // 旁车写盘:几 KB 原子写(毫秒级),不与查询抢窗口;每卷独立节流。
+        // 旁车内容 = 快照游标之后的增量,游标/变更由此持久化(见 sidecar.rs)。
+        for i in 0..self.volumes.len() {
+            let v = &mut self.volumes[i];
+            if v.syncing || !v.sidecar_pending || !v.sidecar_capture_ready() {
+                continue;
+            }
+            if let Some(at) = v.sidecar_retry_at {
+                if now < at {
+                    continue;
+                }
+            }
+            if self.write_sidecar(i) {
+                did = true;
+            }
+        }
+        // 全量保存:成功清 dirty;失败保留 dirty 并按指数退避重试(H6)。
         // 每轮最多落一个卷:一次 maintain 写 3×120MB 会把同一线程上的查询请求
         // 卡住数秒(用户可见的「搜索要好几秒,但显示只要 0.08s」)。
-        let now = Instant::now();
+        // 就绪卷在有线程内等待中的查询时推迟启动 —— 一次全量写 120MB(实测
+        // 1.6-2s),让路钩子复用:把「查询等保存」变成「保存等查询」。
         for i in 0..self.volumes.len() {
             if self.volumes[i].syncing {
                 continue; // 对账期间不落盘
@@ -908,12 +1134,55 @@ impl Engine {
                     continue;
                 }
             }
+            let ready = self.volumes[i].complete
+                && self.volumes[i]
+                    .store
+                    .as_ref()
+                    .map(|s| !s.is_scanning())
+                    .unwrap_or(false);
+            if ready && self.query_pending() {
+                continue;
+            }
             if self.save_volume(i) {
                 did = true;
                 break;
             }
         }
         did
+    }
+
+    /// 写旁车文件(内存日志 → 原子小文件)。成功清 pending 并进入节流窗口;
+    /// 失败保留 pending(内存日志是权威副本),下轮再试(写盘毫秒级,固定
+    /// 间隔重试即可,无需退避)。
+    fn write_sidecar(&mut self, i: usize) -> bool {
+        let (guid, letter, base, cursor, ops) = {
+            let v = &self.volumes[i];
+            (v.guid, v.letter, v.sidecar_base, v.sidecar_cursor, v.sidecar_ops.clone())
+        };
+        let started = Instant::now();
+        let result = sidecar::save(&self.cfg.index_dir, guid, base, cursor, &ops);
+        let ms = started.elapsed().as_millis();
+        if ms > 100 {
+            crate::snapshot::debug_log(&format!(
+                "sidecar vol {letter} took {}ms ({} ops)",
+                ms,
+                ops.len()
+            ));
+        }
+        let v = &mut self.volumes[i];
+        match result {
+            Ok(()) => {
+                v.sidecar_pending = false;
+                v.sidecar_retry_at = Some(Instant::now() + SIDECAR_SAVE_INTERVAL);
+                true
+            }
+            Err(err) => {
+                eprintln!("lstr-index: save sidecar failed: {err}");
+                crate::snapshot::debug_log(&format!("sidecar {guid:032x} failed: {err}"));
+                v.sidecar_retry_at = Some(Instant::now() + SIDECAR_SAVE_INTERVAL);
+                false
+            }
+        }
     }
 
     /// 落盘单个卷。成功返回 true 并清 dirty;失败保留 dirty、指数退避(H6)。
@@ -967,10 +1236,20 @@ impl Engine {
                     }
                 }
                 let next_at = Instant::now() + Self::save_interval(&self.volumes[i]);
+                let dir = self.cfg.index_dir.clone();
                 let v = &mut self.volumes[i];
                 v.dirty = false;
                 v.save_backoff = 0;
                 v.save_retry_at = Some(next_at);
+                // 全量快照已覆盖全部变更:清旁车日志、基线推进到本次游标、
+                // 删旁车文件(基线守卫兜底删除失败的情形,双保险)。
+                v.sidecar_base = (v.journal_id, v.next_usn);
+                v.sidecar_cursor = v.next_usn;
+                v.sidecar_ops = Vec::new();
+                v.sidecar_pending = false;
+                v.sidecar_retry_at = None;
+                v.capture_on = true;
+                sidecar::remove(&dir, v.guid);
                 true
             }
             Err(err) => {
@@ -986,27 +1265,39 @@ impl Engine {
         }
     }
 
-    /// 两次落盘的最小间隔:就绪卷只随 journal 增量变化,60s 一次足够;
-    /// 扫描中的卷保留 20s 粒度作为断点(崩溃后最多重扫 20s)。
+    /// 两次**全量**落盘的最小间隔:扫描中的卷保留 20s 粒度作为断点(崩溃后
+    /// 最多重扫 20s);就绪卷降频到 [`FULL_SAVE_INTERVAL_SECS`] —— 稳态增量由
+    /// 旁车游标承载(毫秒级写盘),全量快照只做阶段归档(见常量注释)。
     fn save_interval(v: &VolumeState) -> Duration {
         let scanning = v.store.as_ref().map(|s| s.is_scanning()).unwrap_or(false);
         if scanning {
             Duration::from_secs(20)
         } else {
-            Duration::from_secs(60)
+            Duration::from_secs(FULL_SAVE_INTERVAL_SECS)
         }
     }
 
-    /// 退出前把所有脏快照落盘(忽略节流)。失败留给下次启动的重扫/增量流程。
+    /// 退出前收尾(忽略节流)。失败留给下次启动的重扫/增量流程。
+    ///
+    /// 就绪卷的稳态变更以旁车收尾(毫秒级):游标+增量持久化语义与稳态完全
+    /// 一致,退出不必等整卷重写 —— 旧实现每卷全量保存 1.6-2s,四卷退出要
+    /// 卡 6s+;全量归档由下一会话的降频保存完成(dirty 保留,加载即恢复)。
+    /// 对账收尾/扫描断点(捕获未武装/扫描中)仍全量落盘。
     pub fn flush_all(&mut self) {
         for i in 0..self.volumes.len() {
             if self.volumes[i].syncing {
                 continue; // 对账中途退出:让下次启动重新对账,不落半态
             }
-            if self.volumes[i].dirty {
-                self.volumes[i].save_retry_at = None;
-                let _ = self.save_volume(i);
+            if !self.volumes[i].dirty {
+                continue;
             }
+            if self.volumes[i].sidecar_capture_ready() && self.volumes[i].sidecar_pending {
+                self.volumes[i].sidecar_retry_at = None;
+                self.write_sidecar(i);
+                continue;
+            }
+            self.volumes[i].save_retry_at = None;
+            let _ = self.save_volume(i);
         }
     }
 
@@ -1046,6 +1337,11 @@ mod tests {
 
     fn rec(frn: u64, parent: u64, attrs: u32, name: &str) -> Rec {
         Rec { frn, parent_frn: parent, attrs, op: Op::Upsert, name: name.to_string(), mtime: 0 }
+    }
+
+    /// attrs=0 的便捷版(旁车测试用)。
+    fn rec_file(frn: u64, parent: u64, name: &str) -> Rec {
+        rec(frn, parent, 0, name)
     }
 
     /// 走一遍 worker 的握手序列:VolumeMeta → ScanBegin → Records → VolumeReady。
@@ -1092,8 +1388,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// journal 每 500ms 一批时,不能每批都整卷重写快照(会卡查询线程);
-    /// 退出路径的 flush_all 必须无视节流。
+    /// journal 每 500ms 一批时,不能每批都整卷重写快照(会卡查询线程):
+    /// 节流窗口内的稳态变更走旁车(毫秒级),全量快照按 FULL_SAVE_INTERVAL
+    /// 降频;退出路径的 flush_all 必须无视节流。
     #[test]
     fn snapshot_saves_are_throttled_but_flushable() {
         let dir = temp_index_dir("throttle");
@@ -1102,30 +1399,275 @@ mod tests {
         feed_ready(&mut engine, guid, 'C');
 
         assert!(engine.maintain(), "first maintain should save the completed volume");
+        let snap_path = snapshot::snapshot_path(&dir, guid);
+        let before = std::fs::read(&snap_path).unwrap();
+        assert!(sidecar::load(&dir, guid).unwrap().is_none(), "全量保存后旁车应不存在");
 
-        // journal 又推来一条记录 → dirty,但节流窗口未到不应重写整卷。
+        // journal 又推来一条记录 → dirty;节流窗口未到:只写旁车,不重写整卷。
         engine.handle(EngineMsg::Records {
             guid,
-            recs: vec![rec(13, 10, 0, "gamma.txt")],
+            recs: vec![rec_file(13, 10, "gamma.txt")],
             next_usn: 200,
         });
         assert!(engine.volumes[0].dirty);
-        assert!(!engine.maintain(), "saves must be throttled while the interval is pending");
+        assert!(engine.maintain(), "旁车写盘是毫秒级动作,节流窗口内也应执行");
+        assert!(sidecar::path(&dir, guid).is_file(), "旁车应承载稳态变更");
+        assert_eq!(
+            std::fs::read(&snap_path).unwrap(),
+            before,
+            "全量快照在节流窗口内不得被重写"
+        );
 
-        // 节流窗口到期后才再次落盘。
+        // 全量节流窗口到期(模拟:清 retry_at)→ 整卷保存,旁车随成功删除。
         engine.volumes[0].save_retry_at = None;
-        assert!(engine.maintain(), "save should run once the throttle expires");
+        assert!(engine.maintain(), "full save should run once the throttle expires");
         assert!(!engine.volumes[0].dirty);
+        assert!(sidecar::load(&dir, guid).unwrap().is_none(), "全量保存成功后旁车应删除");
+        assert_ne!(std::fs::read(&snap_path).unwrap(), before, "快照应已重写");
 
-        // 退出前 flush_all 忽略节流,保证最后一次 journal 增量不丢。
+        // 退出前 flush_all:就绪卷稳态变更以旁车收尾(毫秒级,退出不等
+        // 整卷重写);最后一次 journal 增量不丢,全量归档留给下一会话。
         engine.handle(EngineMsg::Records {
             guid,
-            recs: vec![rec(14, 10, 0, "delta.txt")],
+            recs: vec![rec_file(14, 10, "delta.txt")],
             next_usn: 300,
         });
         engine.flush_all();
-        assert!(!engine.volumes[0].dirty);
+        let sc = sidecar::load(&dir, guid).unwrap().unwrap();
+        assert_eq!(sc.next_usn, 300, "最后一次增量经旁车持久");
+        assert!(engine.volumes[0].dirty, "全量归档由下一会话的降频保存完成");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旁车游标/增量日志:稳态变更只写旁车(全量快照不动),重启后
+    /// 「快照 + 旁车回放」恢复出与退出时刻一致的 store 与游标;
+    /// 旁车日志跨重启延续累积,直到下一次全量保存归档。
+    #[test]
+    fn sidecar_carries_cursor_and_delta_without_full_save() {
+        let dir = temp_index_dir("sidecar");
+        let guid = 0xa1u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain(), "首次全量保存");
+        let snap_path = snapshot::snapshot_path(&dir, guid);
+        let before = std::fs::read(&snap_path).unwrap();
+
+        // 稳态批次:捕获进旁车,全量快照不动
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec_file(13, 10, "gamma.txt")],
+            next_usn: 200,
+        });
+        assert!(engine.volumes[0].sidecar_pending);
+        assert!(engine.maintain());
+        assert!(!engine.volumes[0].sidecar_pending);
+        assert_eq!(std::fs::read(&snap_path).unwrap(), before, "全量快照不得被重写");
+        let sc = sidecar::load(&dir, guid).unwrap().expect("sidecar written");
+        assert_eq!(sc.base, (7, 100));
+        assert_eq!(sc.next_usn, 200);
+        assert_eq!(sc.ops.len(), 1);
+
+        // 重启:快照 + 旁车回放 → 游标推进、条目恢复、日志延续
+        let mut engine2 = engine_with(&dir);
+        assert_eq!(engine2.handshake_state(), vec![(guid, 7, 200, 0, true)]);
+        let store2 = engine2.volumes[0].store.as_ref().unwrap();
+        assert!(store2.find_slot(13).is_some(), "旁车增量应已回放");
+        assert_eq!(engine2.volumes[0].sidecar_ops.len(), 1, "日志须保留以延续累积");
+        assert!(engine2.volumes[0].dirty, "旁车内容不在全量快照里,须标记 dirty");
+
+        // 继续稳态:第二批次并入同一份旁车(节流窗口内每批合并写一次)
+        engine2.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec_file(14, 10, "delta.txt")],
+            next_usn: 300,
+        });
+        assert!(engine2.maintain(), "sidecar write should run");
+        let sc = sidecar::load(&dir, guid).unwrap().unwrap();
+        assert_eq!(sc.next_usn, 300);
+        assert_eq!(sc.ops.len(), 2, "重启后旁车日志延续累积");
+        assert_eq!(std::fs::read(&snap_path).unwrap(), before, "全量快照仍不得被重写");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// watcher 目录刷新(DirChildren 替换语义)同样经旁车恢复:删除的子项
+    /// 在回放时同样消失,与运行期 apply 结果一致。
+    #[test]
+    fn dir_children_changes_recover_via_sidecar() {
+        let dir = temp_index_dir("sidecar-children");
+        let guid = 0xa2u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain());
+
+        // 目录 10 的子项刷新:beta.txt 消失、child.txt 新增
+        engine.handle(EngineMsg::DirChildren {
+            guid,
+            parent_frn: 10,
+            recs: vec![rec_file(11, 10, "alpha.txt"), rec_file(15, 10, "child.txt")],
+        });
+        assert!(engine.volumes[0].dirty);
+        assert!(engine.maintain(), "sidecar write should run");
+        let sc = sidecar::load(&dir, guid).unwrap().unwrap();
+        assert_eq!(sc.ops.len(), 1, "DirChildren 应被捕获");
+
+        let engine2 = engine_with(&dir);
+        let store2 = engine2.volumes[0].store.as_ref().unwrap();
+        assert!(store2.find_slot(15).is_some(), "新增子项应恢复");
+        assert!(store2.find_slot(12).is_none(), "替换语义:未出现在刷新里的子项应标死");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 损坏旁车:加载失败即删除,回落「快照游标 + journal 回放」,绝不半态。
+    #[test]
+    fn corrupt_sidecar_falls_back_to_snapshot() {
+        let dir = temp_index_dir("sidecar-corrupt");
+        let guid = 0xa3u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain());
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec_file(13, 10, "gamma.txt")],
+            next_usn: 200,
+        });
+        assert!(engine.maintain());
+
+        std::fs::write(sidecar::path(&dir, guid), b"junk-not-a-sidecar").unwrap();
+        let engine2 = engine_with(&dir);
+        assert_eq!(engine2.handshake_state(), vec![(guid, 7, 100, 0, true)], "回落快照游标");
+        assert!(
+            engine2.volumes[0].store.as_ref().unwrap().find_slot(13).is_none(),
+            "损坏旁车不回放:增量由重启后的 journal 回放补齐"
+        );
+        assert!(!sidecar::path(&dir, guid).exists(), "损坏旁车应被删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 基线不符(陈旧)旁车:全量保存后残留的旧文件必须被识别并丢弃 ——
+    /// 它的内容已包含在更新的快照里,回放会双重施加。
+    #[test]
+    fn stale_sidecar_base_is_discarded() {
+        let dir = temp_index_dir("sidecar-stale");
+        let guid = 0xa4u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain());
+
+        // 伪造旧基线的旁车(base=(7,42) != 快照游标 (7,100))
+        sidecar::save(
+            &dir,
+            guid,
+            (7, 42),
+            500,
+            &[SidecarOp::Journal { recs: vec![rec_file(99, 10, "stale.txt")] }],
+        )
+        .unwrap();
+        let engine2 = engine_with(&dir);
+        assert_eq!(engine2.handshake_state(), vec![(guid, 7, 100, 0, true)]);
+        assert!(
+            engine2.volumes[0].store.as_ref().unwrap().find_slot(99).is_none(),
+            "陈旧旁车不得回放"
+        );
+        assert!(!sidecar::path(&dir, guid).exists(), "陈旧旁车应被删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旁车日志溢出:停捕并请求立即全量保存(内存有界,回落全量路径)。
+    #[test]
+    fn sidecar_overflow_triggers_full_save() {
+        let dir = temp_index_dir("sidecar-overflow");
+        let guid = 0xa5u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain());
+        let snap_path = snapshot::snapshot_path(&dir, guid);
+        let before = std::fs::read(&snap_path).unwrap();
+
+        // 连续灌入超过 SIDECAR_MAX_RECS 条变更
+        for k in 0..(SIDECAR_MAX_RECS / 100 + 2) {
+            let base = 1000u64 + k as u64 * 100;
+            let recs: Vec<Rec> = (0..100u64)
+                .map(|j| rec_file(base + j, 10, &format!("bulk{k:03}_{j:03}.txt")))
+                .collect();
+            engine.handle(EngineMsg::Records { guid, recs, next_usn: 200 + k as i64 });
+        }
+        assert!(
+            engine.volumes[0].sidecar_rec_count() <= SIDECAR_MAX_RECS + 100,
+            "溢出后停止捕获,内存日志有界"
+        );
+        assert_eq!(engine.volumes[0].save_retry_at, None, "溢出应请求立即全量保存");
+
+        assert!(engine.maintain(), "溢出后全量保存应立即执行");
+        assert!(!engine.volumes[0].dirty);
+        assert!(sidecar::load(&dir, guid).unwrap().is_none(), "全量保存后旁车删除");
+        assert_ne!(std::fs::read(&snap_path).unwrap(), before, "快照应已重写");
+        assert!(engine.volumes[0].sidecar_ops.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 让路钩子复用到全量保存:有线程内等待中的查询时,就绪卷的全量保存
+    /// 推迟到下一轮空闲(旁车写盘不受影响 —— 毫秒级);无等待查询时照常执行。
+    #[test]
+    fn full_save_yields_to_pending_query() {
+        let dir = temp_index_dir("save-yield");
+        let guid = 0xa6u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain());
+        let snap_path = snapshot::snapshot_path(&dir, guid);
+        let before = std::fs::read(&snap_path).unwrap();
+
+        let force = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook = force.clone();
+        engine.set_query_yield_hook(Some(Box::new(move || {
+            hook.load(std::sync::atomic::Ordering::Relaxed)
+        })));
+
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec_file(13, 10, "gamma.txt")],
+            next_usn: 200,
+        });
+        engine.volumes[0].save_retry_at = None; // 模拟全量窗口已过
+
+        // 有等待中的查询:全量保存推迟,快照不动(旁车照常,毫秒级)
+        force.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(engine.maintain(), "旁车写盘不应被让路阻塞");
+        assert_eq!(std::fs::read(&snap_path).unwrap(), before, "全量保存应让路");
+        assert!(engine.volumes[0].dirty, "dirty 保留,下一轮再全量");
+
+        // 查询服务完:全量保存执行
+        force.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(engine.maintain());
+        assert!(!engine.volumes[0].dirty);
+        assert_ne!(std::fs::read(&snap_path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 加载后不立即全量保存:快照/旁车里游标已持久,稳态首变走旁车,
+    /// 全量按 10 分钟降频(避免每次启动都撞一次整卷重写)。
+    #[test]
+    fn loaded_volume_sidecars_instead_of_full_save() {
+        let dir = temp_index_dir("sidecar-loaded");
+        let guid = 0xa7u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain());
+        let snap_path = snapshot::snapshot_path(&dir, guid);
+        let before = std::fs::read(&snap_path).unwrap();
+
+        let mut engine2 = engine_with(&dir);
+        engine2.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec_file(13, 10, "gamma.txt")],
+            next_usn: 200,
+        });
+        assert!(engine2.maintain());
+        assert_eq!(std::fs::read(&snap_path).unwrap(), before, "加载后稳态首变只写旁车");
+        assert!(sidecar::path(&dir, guid).is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1988,5 +2530,178 @@ mod tests {
             "查询最大延迟必须小于 apply 总时长(结构性)"
         );
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("lstr-bench-nonexistent"));
+    }
+
+    // ---------- timing 基准:稳态保存期间查询延迟(全量保存 vs 旁车) ----------
+    //
+    // 结构:引擎持有一卷 ~117 万条(与实测 C 卷同规模),查询线程按 300ms
+    // 节奏发查询;引擎线程每轮:注入一条稳态增量 → maintain() → 排队查询
+    // 全部服务完。延迟 = 完成时刻 - 发送时刻(含排队等待 = 用户感知)。
+    //
+    // 查询形态用稀有 token("steady",只命中注入的稳态文件):单字符查询在
+    // 117 万条上评估本身就要 ~450ms(TOTAL_CAP 内逐槽过滤),会把两种模式都
+    // 淹没在评估成本里;保存阻塞是「引擎线程被保存占住」与查询形态无关,
+    // 稀有 token 让评估降到 ~10ms,排队等待(保存阻塞)成为唯一变量。
+    //
+    // - full-save(旧行为):清 save_retry_at 模拟「每 60s 一次全量保存」,
+    //   查询排队等整卷重写(实测 1.6-2s)。
+    // - sidecar(新行为):正常 maintain —— 全量降频,稳态只写几 KB 旁车。
+    //
+    // 断言取结构性判定(避免绝对时间抖动 flaky):
+    // 1. sidecar 模式最大延迟 < full-save 模式 p50(整个分布移出保存窗口);
+    // 2. sidecar 模式 p90 < 30ms(打字无感)。
+    // 数字打印到输出(--nocapture 可见),提交信息引用。
+
+    const SAVE_BENCH_DIRS: u64 = 2000;
+    const SAVE_BENCH_FILES: u64 = 1_168_000;
+
+    fn save_bench_engine(dir: &std::path::Path) -> Engine {
+        let guid = 0xcafeu128;
+        let mut engine = Engine::new(EngineConfig {
+            index_dir: dir.to_path_buf(),
+            exclude_noise: true,
+            candidate_cap: 100,
+            volumes: Vec::new(),
+        });
+        engine.set_apply_chunk_records(0); // 构建期一次性 apply,加速
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'C',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: SAVE_BENCH_DIRS + SAVE_BENCH_FILES,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        let mut recs = Vec::with_capacity((SAVE_BENCH_DIRS + SAVE_BENCH_FILES) as usize);
+        for d in 0..SAVE_BENCH_DIRS {
+            recs.push(bench_rec(10 + d, crate::store::ROOT_FRN, format!("dir{d:05}"), 0x0010, 0));
+        }
+        for f in 0..SAVE_BENCH_FILES {
+            let prefix = ["zzz", "yyy", "mmm", "qqq", "data"][f as usize % 5];
+            recs.push(bench_rec(
+                10 + SAVE_BENCH_DIRS + f,
+                if f % 10 == 9 { 10 + (f / 10 % SAVE_BENCH_DIRS) } else { crate::store::ROOT_FRN },
+                format!("{prefix}_{f:08}.bin"),
+                0,
+                1_600_000_000 + (f % 1_000_000) as i64,
+            ));
+        }
+        for chunk in recs.chunks(50_000) {
+            engine.handle(EngineMsg::Records { guid, recs: chunk.to_vec(), next_usn: 100 });
+        }
+        engine.handle(EngineMsg::VolumeReady { guid, journal_id: 7, next_usn: 100, count: 0 });
+        engine
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-profile 基准(117 万条,真实落盘)")]
+    fn bench_save_blocks_queries_full_save_vs_sidecar() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("lstr-save-bench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let run = |full_save_each_round: bool| -> (Vec<f64>, f64) {
+            let mut engine = save_bench_engine(&dir);
+            // 预置一轮:VolumeReady 的 dirty 已由首次 maintain 消化(计时窗外)
+            engine.maintain();
+            let guid = 0xcafeu128;
+            let (q_tx, q_rx) = std::sync::mpsc::channel::<(Instant, QuerySpec)>();
+            let done = Arc::new(AtomicBool::new(false));
+            let done2 = done.clone();
+            let q_thread = std::thread::Builder::new()
+                .name("save-bench-query".to_string())
+                .spawn(move || {
+                    let spec = || QuerySpec { tokens: vec!["steady".to_string()], ..Default::default() };
+                    // 300ms 节奏(打字间距量级):评估 ~10ms/条,稳态无积压;
+                    // full-save 模式下保存期到达的查询只能排队等保存结束。
+                    while !done2.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(300));
+                        let _ = q_tx.send((Instant::now(), spec()));
+                    }
+                })
+                .unwrap();
+            let latencies = Mutex::new(Vec::new());
+            let t0 = Instant::now();
+            let deadline = t0 + Duration::from_secs(9);
+            let mut usn = 100i64;
+            let mut round = 0usize;
+            while Instant::now() < deadline {
+                let round_start = Instant::now();
+                // 空闲期:紧密服务到达的查询(对应生产循环「空闲 → recv_timeout
+                // 出队服务」;这里的轮询间隙 5ms,远小于生产 150ms,避免把空闲
+                // 排队混进保存阻塞的信号里)。
+                while round_start.elapsed() < Duration::from_millis(500) {
+                    while let Ok((sent, spec)) = q_rx.try_recv() {
+                        let _ = engine.query(&spec);
+                        latencies
+                            .lock()
+                            .unwrap()
+                            .push(sent.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                // 维护轮次(500ms 节拍,与真实 journal 轮询一致):注入稳态增量
+                // → maintain(旧模式=整卷重写,新模式=毫秒级旁车)。
+                usn += 1;
+                let recs: Vec<Rec> = (0..4)
+                    .map(|j| {
+                        bench_rec(
+                            900_000 + (round * 4 + j) as u64,
+                            10,
+                            format!("steady_{round:03}_{j}.txt"),
+                            0,
+                            0,
+                        )
+                    })
+                    .collect();
+                engine.handle(EngineMsg::Records { guid, recs, next_usn: usn });
+                if full_save_each_round {
+                    // 模拟旧节流(60s 全量)被压缩到每轮:清 retry_at 强制整卷重写
+                    engine.volumes[0].save_retry_at = None;
+                }
+                engine.maintain();
+                round += 1;
+            }
+            done.store(true, Ordering::Relaxed);
+            q_thread.join().unwrap();
+            (latencies.into_inner().unwrap(), t0.elapsed().as_secs_f64() * 1000.0)
+        };
+
+        let (lat_a, total_a) = run(true);
+        let mut lat_a = lat_a;
+        lat_a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let (lat_b, total_b) = run(false);
+        let mut lat_b = lat_b;
+        lat_b.sort_by(|x, y| x.partial_cmp(y).unwrap());
+
+        assert!(lat_a.len() >= 8 && lat_b.len() >= 8, "样本不足: {} / {}", lat_a.len(), lat_b.len());
+        let (p50_a, p90_a, max_a) = (percentile(&lat_a, 0.5), percentile(&lat_a, 0.9), *lat_a.last().unwrap());
+        let (p50_b, p90_b, max_b) = (percentile(&lat_b, 0.5), percentile(&lat_b, 0.9), *lat_b.last().unwrap());
+        println!(
+            "[bench] full-save(旧行为,每轮全量): {} queries p50={p50_a:.1}ms p90={p90_a:.1}ms max={max_a:.1}ms dur={total_a:.0}ms",
+            lat_a.len()
+        );
+        println!(
+            "[bench] sidecar (新行为,降频全量): {} queries p50={p50_b:.1}ms p90={p90_b:.1}ms max={max_b:.1}ms dur={total_b:.0}ms",
+            lat_b.len()
+        );
+        // 结构性断言(避免绝对时间抖动 flaky):
+        // - sidecar 模式 p90 至少比 full-save 模式好一倍(实测差一个数量级);
+        // - sidecar 模式 p90 上限 200ms(查询评估本身 ~60ms,余量 3 倍);
+        // - sidecar 模式最大延迟 < full-save 模式 p50(整个分布移出保存窗口)。
+        assert!(
+            p90_b < p90_a / 2.0,
+            "sidecar 模式 p90 {p90_b:.1}ms 应显著低于 full-save 模式 p90 {p90_a:.1}ms"
+        );
+        assert!(p90_b < 60.0, "sidecar 模式 p90 {p90_b:.1}ms 应落在打字无感区间");
+        assert!(
+            max_b < p50_a,
+            "sidecar 模式 max {max_b:.1}ms 应显著低于 full-save 模式 p50 {p50_a:.1}ms"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
