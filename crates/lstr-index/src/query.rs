@@ -211,6 +211,36 @@ pub(crate) fn query_volume_cancel(
         return (slots, total, false, false);
     }
 
+    // E:单字符 ASCII 查询(打字过程中的临时串)直接用名字字母位图过滤,
+    // 否则要对整卷 names_lc 做 memmem + 每个命中二分,20 万~200 万命中就是数百 ms。
+    if tokens.len() == 1 && tokens[0].len() == 1 && tokens[0][0].is_ascii_alphabetic() {
+        let bit = 1u32 << (tokens[0][0] - b'a');
+        let mut slots: Vec<u32> = Vec::with_capacity(256);
+        let mut total = 0usize;
+        let mut capped = false;
+        for slot in 0..store.name_off.len() as u32 {
+            if slot & 4095 == 0 && cancelled(cancel) {
+                return (slots, total, capped, true);
+            }
+            if store.char_mask[slot as usize] & bit == 0 {
+                continue;
+            }
+            if !passes_filters(store, slot, spec) {
+                continue;
+            }
+            total += 1;
+            if total >= TOTAL_CAP {
+                break;
+            }
+            if slots.len() < cap {
+                slots.push(slot);
+            } else {
+                capped = true;
+            }
+        }
+        return (slots, total, capped, false);
+    }
+
     // 生成 token 取最长(一般最稀有)
     let gen_idx = tokens
         .iter()
@@ -320,6 +350,18 @@ mod tests {
         let (slots, total, _) = query_volume(&s, &spec, 100);
         assert_eq!(total, 1);
         assert_eq!(s.name(slots[0]), b"new.txt");
+    }
+
+    /// E:单字符走字母位图快路径,结果应与名字里含该字母的条目一致。
+    #[test]
+    fn single_char_uses_char_mask_and_matches_names() {
+        let s = setup();
+        let spec = QuerySpec { tokens: vec!["a".into()], ..Default::default() };
+        let (slots, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 3, "alpha/Program Files/xabcxabc 含 a");
+        let names: Vec<&[u8]> = slots.iter().map(|&x| s.name(x)).collect();
+        assert!(names.contains(&&b"alpha.txt"[..]));
+        assert!(names.contains(&&b"Program Files"[..]));
     }
 
     fn setup() -> VolumeStore {

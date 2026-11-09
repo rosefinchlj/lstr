@@ -3488,7 +3488,7 @@ impl LstrApp {
 
         // —— 后端选择 ——
         Self::settings_label(painter, &theme, area.left(), y, "索引后端");
-        let backends = [("auto", "自动(内置优先)"), ("builtin", "仅内置索引"), ("everything", "仅 Everything"), ("off", "关闭内置索引")];
+        let backends = [("auto", "自动(内置优先+兜底)"), ("builtin", "仅内置索引(不碰 Everything)"), ("everything", "仅 Everything"), ("off", "关闭内置索引")];
         let current = self.cfg_index_backend();
         let mut x = area.left() + 130.0;
         for (key, label) in backends {
@@ -3521,8 +3521,8 @@ impl LstrApp {
         painter.text(
             egui::pos2(area.left(), y + 8.0),
             Align2::LEFT_CENTER,
-            "修改后需重启 lstr 生效;噪声排除变更会触发索引重建(删除快照后自动重扫)。\
-内置索引仅覆盖本机固定 NTFS 卷;其他卷(网络盘/FAT32/exFAT)的结果仍需 Everything 提供。",
+            "自动:内置索引未就绪时用 Everything 兜底合并;仅内置:完全不读取 Everything;仅 Everything:只用 Everything 后端。\
+时间筛选在内置索引(目录扫描)模式下可用;内置索引仅覆盖本机固定 NTFS 卷,其他卷(网络盘/FAT32/exFAT)需 Everything。修改后需重启 lstr 生效。",
             ui::text_font(10.5),
             theme.sub,
         );

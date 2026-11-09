@@ -56,6 +56,9 @@ pub struct VolumeStore {
     /// slot → 最后修改时间(unix 秒;0=未知)。目录枚举(首扫/watcher 刷新)写入,
     /// USN journal 路径没有时间信息(保持 0)。内置时间筛选依赖这一列。
     pub mtime: Vec<u32>,
+    /// slot → 小写名里出现的 ASCII 字母位图(bit0=a .. bit25=z)。
+    /// 单字符查询用它把 memmem 全量扫描降为按位快速筛(短串是打字延迟的主因)。
+    pub char_mask: Vec<u32>,
     /// (缓冲偏移, slot) 升序追加;memmem 命中 → slot 的映射。
     /// 就地改名后旧条目成为陈项,由 slot_at_offset 的「偏移==当前 name_off」校验过滤。
     off_index: Vec<(u32, u32)>,
@@ -75,6 +78,18 @@ pub struct VolumeStore {
     noise_anchors: std::collections::HashSet<u64>,
     /// 噪声排除开关(关=不分类、不回收)。
     pub noise_enabled: bool,
+}
+
+/// 名字里出现的 ASCII 字母位图(bit0=a .. bit25=z);非字母字节忽略。
+fn mask_of_bytes(name: &[u8]) -> u32 {
+    let mut m = 0u32;
+    for &b in name {
+        let c = b.to_ascii_lowercase();
+        if c.is_ascii_lowercase() {
+            m |= 1u32 << (c - b'a');
+        }
+    }
+    m
 }
 
 pub fn fold_ascii(bytes: &[u8]) -> Vec<u8> {
@@ -101,6 +116,7 @@ impl VolumeStore {
             parent: Vec::new(),
             attrs: Vec::new(),
             mtime: Vec::new(),
+            char_mask: Vec::new(),
             base_len: 0,
             delta: Vec::new(),
             delta_frn: HashMap::new(),
@@ -130,6 +146,10 @@ impl VolumeStore {
         let base_len = name_off.len() as u32;
         let off_index: Vec<(u32, u32)> =
             name_off.iter().enumerate().map(|(i, &o)| (o, i as u32)).collect();
+        let char_mask: Vec<u32> = name_off
+            .iter()
+            .map(|&o| mask_of_bytes(slice_at(&names_lc, o as usize)))
+            .collect();
         Self {
             names,
             names_lc,
@@ -140,6 +160,7 @@ impl VolumeStore {
             parent,
             attrs,
             mtime,
+            char_mask,
             base_len,
             delta: Vec::new(),
             delta_frn: HashMap::new(),
@@ -419,6 +440,7 @@ impl VolumeStore {
                     self.names_lc.extend_from_slice(&fold_ascii(name));
                     self.names_lc.push(0);
                     self.off_index.push((self.name_off[old as usize], old));
+                    self.char_mask[old as usize] = mask_of_bytes(name);
                 }
                 self.parent[old as usize] = new_p;
                 self.attrs[old as usize] = (self.attrs[old as usize] & ATTR_INTERNAL)
@@ -455,6 +477,7 @@ impl VolumeStore {
         }
         self.attrs.push(a);
         self.mtime.push(mtime);
+        self.char_mask.push(mask_of_bytes(name));
         self.delta.push(slot);
         // 索引策略:scan 模式只索引目录(父查找只需要目录,内存省 78%);
         // journal 模式索引全部(改名/删除要按 FRN 定位)。
@@ -652,10 +675,12 @@ impl VolumeStore {
         // 7. attrs/mtime/frn
         let mut attrs = Vec::with_capacity(by_frn.len());
         let mut mtime = Vec::with_capacity(by_frn.len());
+        let mut mask = Vec::with_capacity(by_frn.len());
         let mut frn = Vec::with_capacity(by_frn.len());
         for &(_, old) in &by_frn {
             attrs.push(self.attrs[old as usize] & !ATTR_INTERNAL);
             mtime.push(self.mtime[old as usize]);
+            mask.push(mask_of_bytes(slice_at(&self.names, self.name_off[old as usize] as usize)));
             frn.push(self.frn[old as usize]);
         }
         // 8. offs:发生过就地改名时 base 名序失效 → 整体重排;
@@ -720,6 +745,10 @@ impl VolumeStore {
         names_lc.shrink_to_fit();
         let off_index: Vec<(u32, u32)> =
             name_off.iter().enumerate().map(|(i, &o)| (o, i as u32)).collect();
+        let char_mask: Vec<u32> = name_off
+            .iter()
+            .map(|&o| mask_of_bytes(slice_at(&names_lc, o as usize)))
+            .collect();
         self.names = names;
         self.names_lc = names_lc;
         self.name_off = name_off;
@@ -729,6 +758,7 @@ impl VolumeStore {
         self.parent = parent;
         self.attrs = attrs;
         self.mtime = mtime;
+        self.char_mask = mask;
         self.delta.clear();
         self.delta.shrink_to_fit();
         self.delta_frn.clear();

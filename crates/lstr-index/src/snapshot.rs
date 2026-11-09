@@ -422,6 +422,7 @@ mod tests {
         // v4:mtime 列落盘/读回(0=未知)。
         assert_eq!(ls.mtime[slot as usize], 1_700_000_123);
         assert_eq!(ls.mtime[ls.find_slot(11).unwrap() as usize], 0);
+        assert_eq!(ls.char_mask.len(), ls.name_off.len());
         assert_eq!(ls.offs.len(), ls.name_off.len());
         // 有序性保持
         let names: Vec<&[u8]> = ls.offs.iter().map(|&x| ls.name_lc(x)).collect();
