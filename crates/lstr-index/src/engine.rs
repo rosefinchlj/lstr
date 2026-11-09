@@ -1705,4 +1705,288 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---------- timing 基准:对账期间查询延迟(分批前 vs 分批后) ----------
+    //
+    // 结构:引擎线程持续 apply dirsync 记录流(250 万条,公式化生成、零随机),
+    // 查询线程模拟打字(周期性发单字符 "a" 查询,撞 candidate_cap)。
+    // 查询延迟 = 查询完成时刻 - 发送时刻(含排队等待 = 用户感知)。
+    // 对账收尾(DirSyncEnd:remove_unseen + 拼音重建)两种模式成本相同,
+    // 在计时窗口外补发,不参与采样。
+    //
+    // - one-shot(分批前,旧行为):分批关闭;apply 以 400 条消息为一整轮,
+    //   查询只能在轮间隙被服务(复刻 0294602 之前的调度)。
+    // - chunked(分批后):512 条/块,块间让路钩子接「查询待处理」标志;
+    //   消息间隙与块间发现等待中的查询立即收手(0294602 的 apply 中段扩展)。
+    //
+    // 断言取结构性判定而非绝对时间(避免 CI/测试机抖动 flaky):
+    // 1. 分批后批间让路发生次数 > 0;
+    // 2. 分批后 p90 至少比分批前好一倍(实测差 1-2 个数量级);
+    // 3. 分批后 p50/p90 落在目标内(p50<30ms、p90<100ms,实测余量 20 倍+);
+    // 4. 分批后查询最大延迟 < apply 总时长(查询绝不等待整个 apply)。
+    // p50/p90/max 实测数字打印到输出(--nocapture 可见),提交信息引用。
+
+    /// 两卷规模:2000 目录 + 2,498,000 文件 = 250 万条。
+    const BENCH_DIRS: u64 = 2000;
+    const BENCH_FILES: u64 = 2_498_000;
+
+    fn bench_rec(frn: u64, parent: u64, name: String, attrs: u32, mtime: i64) -> Rec {
+        Rec { frn, parent_frn: parent, attrs, op: Op::Upsert, name, mtime }
+    }
+
+    /// 首扫构建流(目录先行 + 文件;名字 1/5 含 'a',单字符查询撞 cap 的痛点形态)。
+    fn bench_build_msgs(guid: u128) -> Vec<EngineMsg> {
+        let mut msgs = vec![
+            EngineMsg::VolumeMeta {
+                guid,
+                letter: 'C',
+                journal_id: 7,
+                next_usn: 100,
+                est_records: BENCH_DIRS + BENCH_FILES,
+            },
+            EngineMsg::ScanBegin { guid, resume_frn: 0 },
+        ];
+        let mut recs: Vec<Rec> = Vec::with_capacity((BENCH_DIRS + BENCH_FILES) as usize);
+        for d in 0..BENCH_DIRS {
+            recs.push(bench_rec(10 + d, crate::store::ROOT_FRN, format!("dir{d:05}"), 0x0010, 0));
+        }
+        for f in 0..BENCH_FILES {
+            let prefix = ["zzz", "yyy", "mmm", "qqq", "data"][f as usize % 5];
+            let parent = if f % 10 == 9 { 10 + (f / 10 % BENCH_DIRS) } else { crate::store::ROOT_FRN };
+            recs.push(bench_rec(
+                10 + BENCH_DIRS + f,
+                parent,
+                format!("{prefix}_{f:08}.bin"),
+                0,
+                1_600_000_000 + (f % 1_000_000) as i64,
+            ));
+        }
+        for chunk in recs.chunks(50_000) {
+            msgs.push(EngineMsg::Records { guid, recs: chunk.to_vec(), next_usn: 100 });
+        }
+        msgs.push(EngineMsg::VolumeReady { guid, journal_id: 7, next_usn: 100, count: 0 });
+        msgs
+    }
+
+    /// 对账回放流:DirSyncBegin + 同卷记录重发(98% 无变化快路径 + 1% 改名 +
+    /// 1% mtime 变化 + 1% 新增)按 dirscan 同款 4000 条/批打包。
+    /// 注意:**不含 DirSyncEnd** —— 收尾(remove_unseen/拼音重建,数百 ms 且
+    /// 与分批无关)是两种模式共同的固定成本,由调用方在计时窗口外补发,
+    /// 不参与查询延迟采样。
+    fn bench_dirsync_msgs(guid: u128) -> Vec<EngineMsg> {
+        let mut msgs = vec![EngineMsg::DirSyncBegin { guid }];
+        let base = 10 + BENCH_DIRS; // 文件起始 frn
+        let mut new_frn = base + BENCH_FILES;
+        let mut recs: Vec<Rec> = Vec::with_capacity((BENCH_FILES + BENCH_DIRS) as usize);
+        for d in 0..BENCH_DIRS {
+            recs.push(bench_rec(10 + d, crate::store::ROOT_FRN, format!("dir{d:05}"), 0x0010, 0));
+        }
+        for f in 0..BENCH_FILES {
+            let frn = base + f;
+            let parent = if f % 10 == 9 { 10 + (f / 10 % BENCH_DIRS) } else { crate::store::ROOT_FRN };
+            match f % 100 {
+                0 => recs.push(bench_rec(new_frn, parent, format!("new_{f:08}.bin"), 0, 1_700_000_000)),
+                // FRN 复用改名(new 的名字被下一轮复用的情形抽象)
+                1 => recs.push(bench_rec(frn, parent, format!("renamed_{f:08}.bin"), 0, 1_600_000_000 + (f % 1_000_000) as i64)),
+                2 => recs.push(bench_rec(frn, parent, format!("data_{f:08}.bin"), 0, 1_700_000_000)),
+                f0 => {
+                    let prefix = ["zzz", "yyy", "mmm", "qqq", "data"][f0 as usize % 5];
+                    recs.push(bench_rec(frn, parent, format!("{prefix}_{f:08}.bin"), 0, 1_600_000_000 + (f % 1_000_000) as i64));
+                }
+            }
+            if f % 100 == 0 {
+                new_frn += 1;
+            }
+        }
+        for chunk in recs.chunks(4000) {
+            msgs.push(EngineMsg::Records { guid, recs: chunk.to_vec(), next_usn: 100 });
+        }
+        msgs
+    }
+
+    fn percentile(sorted: &[f64], p: f64) -> f64 {
+        let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-profile 基准(250 万条合成记录)")]
+    fn bench_dirsync_apply_yields_to_queries() {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        const GUID: u128 = 0xbeef;
+        // 与生产一致的单字符查询形态:candidate_cap=100(engine.log 里
+        // 「单字符 a 撞 100 条结果上限」的痛点),total 会计到 TOTAL_CAP。
+        let make_engine = || {
+            Engine::new(EngineConfig {
+                // 目录不存在 → 不读也不写快照,基准零磁盘 IO
+                index_dir: std::env::temp_dir().join("lstr-bench-nonexistent"),
+                exclude_noise: true,
+                candidate_cap: 100,
+                volumes: Vec::new(),
+            })
+        };
+
+        // 两种模式共用:查询线程按 20ms 节奏发查询并打时间戳;
+        // 返回 (延迟样本 ms, apply 总时长 ms, 让路次数, 对账后 store 条数)。
+        // `tail` 在计时窗口外补发(对账收尾,不参与采样)。
+        let run = |mut engine: Engine, msgs: Vec<EngineMsg>, tail: Option<EngineMsg>, query_flag: Option<Arc<AtomicBool>>| -> (Vec<f64>, f64, u64, usize) {
+            let (q_tx, q_rx) = std::sync::mpsc::channel::<(Instant, QuerySpec)>();
+            let done = Arc::new(AtomicBool::new(false));
+            let done2 = done.clone();
+            let flag2 = query_flag.clone();
+            let spec = || QuerySpec { tokens: vec!["a".to_string()], ..Default::default() };
+            let q_thread = std::thread::Builder::new()
+                .name("bench-query".to_string())
+                .spawn(move || {
+                    // 10ms 节奏:比真实打字密,为了让延迟分布有足够样本
+                    // (Windows sleep 粒度 ~15ms,实际节奏 ≈30-70ms/条)
+                    while !done2.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(10));
+                        if let Some(f) = &flag2 {
+                            f.store(true, Ordering::Relaxed);
+                        }
+                        let _ = q_tx.send((Instant::now(), spec()));
+                    }
+                })
+                .unwrap();
+            let latencies = Mutex::new(Vec::new());
+            let t0 = Instant::now();
+            let mut queue = VecDeque::from(msgs);
+            let mut iter = 0usize;
+            // 剩最后 2 条记录消息(≈6ms)就停止注入查询:之后的收尾不采样,
+            // 也切断「服务积压期间查询线程持续注入」的雪球效应(生产里打字会停)。
+            let stop_sending = |queue: &VecDeque<EngineMsg>, engine: &Engine, done: &Arc<AtomicBool>| {
+                if queue.len() <= 2 && !engine.has_pending_apply() {
+                    done.store(true, Ordering::Relaxed);
+                }
+            };
+            loop {
+                if queue.is_empty() && !engine.has_pending_apply() {
+                    break;
+                }
+                stop_sending(&queue, &engine, &done);
+                let it_start = Instant::now();
+                // 分批缓冲:块间让路(钩子接查询标志)
+                while engine.has_pending_apply() {
+                    if engine.advance_pending_apply() == 0 {
+                        break;
+                    }
+                }
+                // 消息消化:分批后打字优先(有等待查询/缓冲未清即收手);
+                // one-shot 保持旧行为:400 条消息一整轮,期间不看查询。
+                let mut applied = 0usize;
+                while let Some(msg) = queue.pop_front() {
+                    engine.handle(msg);
+                    applied += 1;
+                    stop_sending(&queue, &engine, &done);
+                    if applied >= 400 {
+                        break;
+                    }
+                    if let Some(f) = &query_flag {
+                        if f.load(Ordering::Relaxed) || engine.has_pending_apply() {
+                            break;
+                        }
+                    }
+                }
+                // 服务查询:延迟 = 完成时刻 - 发送时刻(含排队等待)
+                let mut served = 0usize;
+                let mut served_max_lat = 0f64;
+                while let Ok((sent, s)) = q_rx.try_recv() {
+                    let _ = engine.query(&s);
+                    let lat = sent.elapsed().as_secs_f64() * 1000.0;
+                    served_max_lat = served_max_lat.max(lat);
+                    latencies.lock().unwrap().push(lat);
+                    served += 1;
+                    if let Some(f) = &query_flag {
+                        // 无论是否还有查询,都放行 apply(防让路标志滞留空等)
+                        f.store(false, Ordering::Relaxed);
+                    }
+                }
+                iter += 1;
+                if std::env::var("LSTR_BENCH_TRACE").is_ok() {
+                    println!(
+                        "[trace] iter={iter} applied={applied} served={served} dur={:.1}ms lat_max={served_max_lat:.1}ms",
+                        it_start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            }
+            done.store(true, Ordering::Relaxed);
+            q_thread.join().unwrap();
+            // 计时窗口外补发对账收尾(remove_unseen/拼音重建),与生产语义一致
+            if let Some(m) = tail {
+                engine.handle(m);
+            }
+            let total = t0.elapsed().as_secs_f64() * 1000.0;
+            let store_len = engine.volumes[0].store.as_ref().map(|s| s.len()).unwrap_or(0);
+            (latencies.into_inner().unwrap(), total, engine.apply_yield_count(), store_len)
+        };
+
+        // ---- 分批前(one-shot,旧行为)----
+        let mut engine_a = make_engine();
+        engine_a.set_apply_chunk_records(0); // 关闭分批 = 旧行为
+        for m in bench_build_msgs(GUID) {
+            engine_a.handle(m);
+        }
+        let (lat_a, total_a, _, len_a) = run(
+            engine_a,
+            bench_dirsync_msgs(GUID),
+            Some(EngineMsg::DirSyncEnd { guid: GUID, ok: true }),
+            None,
+        );
+        let mut lat_a = lat_a;
+        lat_a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+
+        // ---- 分批后(chunked + 让路钩子)----
+        let mut engine_b = make_engine();
+        engine_b.set_apply_chunk_records(512);
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_hook = flag.clone();
+        engine_b.set_query_yield_hook(Some(Box::new(move || {
+            flag_hook.load(Ordering::Relaxed)
+        })));
+        for m in bench_build_msgs(GUID) {
+            engine_b.handle(m);
+        }
+        let (lat_b, total_b, yields_b, len_b) = run(
+            engine_b,
+            bench_dirsync_msgs(GUID),
+            Some(EngineMsg::DirSyncEnd { guid: GUID, ok: true }),
+            Some(flag),
+        );
+        let mut lat_b = lat_b;
+        lat_b.sort_by(|x, y| x.partial_cmp(y).unwrap());
+
+        // 两模式最终 store 规模必须一致(对账语义未被分批改变)
+        assert_eq!(len_a, len_b, "分批前后对账结果条数必须一致");
+        assert!(lat_a.len() >= 15 && lat_b.len() >= 15, "查询样本太少,统计无意义: {} / {}", lat_a.len(), lat_b.len());
+
+        let (p50_a, p90_a, max_a) = (percentile(&lat_a, 0.5), percentile(&lat_a, 0.9), *lat_a.last().unwrap());
+        let (p50_b, p90_b, max_b) = (percentile(&lat_b, 0.5), percentile(&lat_b, 0.9), *lat_b.last().unwrap());
+        println!("[bench] one-shot(分批前): apply={total_a:.0}ms queries={} p50={p50_a:.1}ms p90={p90_a:.1}ms max={max_a:.1}ms", lat_a.len());
+        println!("[bench] chunked (分批后): apply={total_b:.0}ms queries={} p50={p50_b:.1}ms p90={p90_b:.1}ms max={max_b:.1}ms yields={yields_b}", lat_b.len());
+
+        // 结构性断言(避免绝对时间抖动 flaky):
+        // - 批间让路必须真的发生过;
+        // - 分批后 p90 至少比分批前好一倍(实测差 1-2 个数量级);
+        // - 分批后的 p50/p90 必须落在任务目标内(p50<30ms、p90<100ms,
+        //   实测留有 20 倍以上余量);
+        // - 查询最大延迟必须小于 apply 总时长(查询绝不等待整个 apply)。
+        assert!(yields_b > 0, "批间让路必须真的发生过");
+        assert!(
+            p90_b < p90_a / 2.0,
+            "分批后 p90 {p90_b:.1}ms 应明显低于分批前 p90 {p90_a:.1}ms"
+        );
+        assert!(
+            p50_b < 30.0 && p90_b < 100.0,
+            "分批后查询延迟应达标(p50<30ms、p90<100ms): p50={p50_b:.1}ms p90={p90_b:.1}ms"
+        );
+        assert!(
+            max_b < total_b,
+            "查询最大延迟必须小于 apply 总时长(结构性)"
+        );
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("lstr-bench-nonexistent"));
+    }
 }
