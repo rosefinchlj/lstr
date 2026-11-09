@@ -960,12 +960,34 @@ impl LstrApp {
                 };
                 note = Some(match pct {
                     Some(p) => format!(
-                        "正在构建索引 {:.0}% · 已收录 {} 万项",
+                        "正在构建索引 {:.0}% · 已收录 {} 万项（结果暂不完整，正与 Everything 合并）",
                         (p * 100.0).min(99.0),
                         total / 10_000
                     ),
-                    None => format!("正在构建索引 · 已收录 {} 万项", total / 10_000),
+                    None => format!(
+                        "正在构建索引 · 已收录 {} 万项（结果暂不完整，正与 Everything 合并）",
+                        total / 10_000
+                    ),
                 });
+            } else if st.phase == lstr_index::Phase::Loading {
+                // 主界面不显示任何提示时，用户会以为「卡住了」：等 UAC、等 worker
+                // 连管道都可能停在这一阶段（旧 worker 占管道时甚至永久停住）。
+                note = Some(
+                    "索引准备中：等待管理员授权 / worker 连接（当前由 Everything 出结果）"
+                        .to_string(),
+                );
+            } else if st.phase == lstr_index::Phase::Fallback {
+                // 只有配置期望用内置索引时才提示；backend=everything/off 是用户主动选择。
+                let expect_builtin = matches!(
+                    self.cfg.index.backend.as_str(),
+                    "auto" | "builtin"
+                );
+                if expect_builtin {
+                    note = Some(
+                        "内置索引不可用（未获管理员授权或 worker 未运行），当前结果来自 Everything"
+                            .to_string(),
+                    );
+                }
             }
         }
         match &note {
