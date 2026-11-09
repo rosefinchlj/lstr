@@ -432,12 +432,22 @@ fn pipe_alive(client: windows::Win32::Foundation::HANDLE) -> bool {
 /// 本机固定 NTFS 卷,新插盘也能自动纳入。
 pub fn worker_launch_args(index: &crate::config::IndexConfig, volume_mask: u32) -> String {
     let mut extra = String::new();
-    // 阶段 1 默认就是 dir(worker 端默认值),只有显式 usn 时才追加开关
-    if index.scan_mode.eq_ignore_ascii_case("usn") {
+    if index.backend == "usn" {
+        // USN 实时增量层(实验):dirscan 首扫 → journal 轮询(worker 侧带熔断/
+        // 游标校验/clean-exit 护栏)。固定 dir 首扫,与设置页文案一致;
+        // 这是唯一会下发 --index-journal 的自动路径。
+        extra.push_str(" --index-scan-mode dir --index-journal");
+        extra.push_str(&format!(" --index-poll-ms {}", index.journal_poll_ms.max(100)));
+    } else if index.scan_mode.eq_ignore_ascii_case("usn") {
+        // 旧 USN 首扫模式(蓝屏前遗留,仅手动配置可达):行为不变。
         extra.push_str(" --index-scan-mode usn");
         if index.journal_enabled {
             extra.push_str(" --index-journal");
         }
+    }
+    // 负载整形:dirscan 批次间限流(>0 才下发,0 = 不限,与旧行为一致)。
+    if index.scan_throttle_ms > 0 {
+        extra.push_str(&format!(" --index-throttle-ms {}", index.scan_throttle_ms));
     }
     if !lstr_index::volmask::is_all(volume_mask) {
         let volumes: Vec<String> = lstr_index::volmask::letters(volume_mask)
@@ -506,5 +516,54 @@ mod tests {
         let mask = lstr_index::volmask::mask_from_letters(['f', 'c']);
         let args = worker_launch_args(&cfg, mask);
         assert!(args.contains(" --index-volumes C,F"), "args={args}");
+    }
+
+    /// backend="usn" 是唯一启用 USN 增量层的取值:固定 dir 首扫 + journal 轮询
+    /// + 轮询间隔;auto/builtin 默认不加任何 USN/节流开关(行为与旧版一致)。
+    #[test]
+    fn usn_backend_enables_journal_layer_only_for_usn() {
+        // 默认配置(auto):零 USN 开关
+        let cfg = crate::config::IndexConfig::default();
+        let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
+        assert!(!args.contains("--index-journal"), "args={args}");
+        assert!(!args.contains("--index-poll-ms"), "args={args}");
+        assert!(!args.contains("--index-throttle-ms"), "args={args}");
+
+        // backend=usn:dir 首扫 + journal + poll-ms;即便 scan_mode 被旧配置
+        // 遗留成 usn,也强制 dir(与设置页「目录扫描+USN 实时增量」文案一致)。
+        let mut cfg = crate::config::IndexConfig { backend: "usn".into(), ..Default::default() };
+        let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
+        assert!(args.contains(" --index-scan-mode dir --index-journal"), "args={args}");
+        assert!(args.contains(" --index-poll-ms 500"), "args={args}");
+        assert!(!args.contains("--index-scan-mode usn"), "args={args}");
+        cfg.scan_mode = "usn".into();
+        let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
+        assert!(args.contains("--index-scan-mode dir"), "usn 后端固定 dir 首扫: {args}");
+        // poll-ms 下限在参数侧同样兜底
+        cfg.journal_poll_ms = 10;
+        let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
+        assert!(args.contains(" --index-poll-ms 100"), "args={args}");
+
+        // 旧 usn 首扫模式(手动配置):保持既有行为
+        let mut cfg = crate::config::IndexConfig::default();
+        cfg.scan_mode = "usn".into();
+        let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
+        assert!(args.contains(" --index-scan-mode usn"), "args={args}");
+        assert!(!args.contains("--index-journal"), "journal_enabled 默认关: {args}");
+        cfg.journal_enabled = true;
+        let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
+        assert!(args.contains(" --index-scan-mode usn --index-journal"), "args={args}");
+        assert!(!args.contains("--index-poll-ms"), "旧模式不接 poll-ms: {args}");
+    }
+
+    /// scan_throttle_ms > 0 时下发给 worker(任意后端);0 时不出现。
+    #[test]
+    fn scan_throttle_forwarded_when_positive() {
+        let mut cfg = crate::config::IndexConfig { scan_throttle_ms: 30, ..Default::default() };
+        let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
+        assert!(args.contains(" --index-throttle-ms 30"), "args={args}");
+        cfg.scan_throttle_ms = 0;
+        let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
+        assert!(!args.contains("--index-throttle-ms"), "args={args}");
     }
 }

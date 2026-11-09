@@ -65,11 +65,25 @@ pub struct IndexConfig {
     pub candidate_cap: usize,
     /// 首扫模式:`dir`(默认,目录枚举,零 USN FSCTL)/ `usn`(原 ENUM+journal)。
     /// 2026-11-09 本机 0x3B/Ntfs.sys 蓝屏后默认切到 `dir`。
+    /// 注:backend="usn" 实验后端固定走 dir 首扫 + journal 轮询,不读本字段。
     pub scan_mode: String,
-    /// `dir` 首扫完成后是否继续轮询 journal 做增量(阶段 2,默认关)。
+    /// `dir` 首扫完成后是否继续轮询 journal 做增量(阶段 2,默认关;
+    /// 旧 usn 首扫模式用。backend="usn" 不看此开关,自带 journal 轮询)。
     pub journal_enabled: bool,
     /// 只索引这些盘(如 `["F"]`);空 = 全部本机固定 NTFS 卷。
     pub volumes: Vec<String>,
+    /// 负载整形:dirscan 批次间隔(毫秒)。>0 时每个批次枚举后 sleep 一下,
+    /// 削峰元数据 IO(2026-11-09 BSOD 取证:真正的风险模型是高并发元数据负载
+    /// × ntfs QueryOpen × minifilter;默认 0 = 不限,行为与旧版完全一致)。
+    #[serde(default)]
+    pub scan_throttle_ms: u64,
+    /// USN journal 轮询间隔(毫秒),最小 100,默认 500。仅 backend="usn" 使用。
+    #[serde(default = "default_journal_poll_ms")]
+    pub journal_poll_ms: u64,
+}
+
+fn default_journal_poll_ms() -> u64 {
+    500
 }
 
 impl Default for IndexConfig {
@@ -81,6 +95,8 @@ impl Default for IndexConfig {
             scan_mode: "dir".into(),
             journal_enabled: false,
             volumes: Vec::new(),
+            scan_throttle_ms: 0,
+            journal_poll_ms: default_journal_poll_ms(),
         }
     }
 }
@@ -89,6 +105,15 @@ impl IndexConfig {
     /// 规范化盘符列表:大写、去重、升序。空列表仍表示「全部」。
     pub fn normalize_volumes(&mut self) {
         self.volumes = Self::normalize_letters(self.volumes.iter().filter_map(|v| v.trim().chars().next()));
+    }
+
+    /// 数值字段的归一化(Config::load 时调用):
+    /// journal_poll_ms 最小 100 —— 过于激进的轮询间隔会放大 FSCTL 频率,
+    /// 与 2026-11-09 之后的「降低 Ntfs.sys 触发面」约束冲突。
+    pub fn normalize(&mut self) {
+        if self.journal_poll_ms < 100 {
+            self.journal_poll_ms = 100;
+        }
     }
 
     fn normalize_letters<I>(letters: I) -> Vec<String>
@@ -458,6 +483,7 @@ impl Config {
                 cfg.rank.backfill_missing_noise_rules();
                 cfg.index.backend = normalize_backend(&cfg.index.backend);
                 cfg.index.normalize_volumes();
+                cfg.index.normalize();
                 cfg
             },
             Err(err) => {
@@ -481,12 +507,16 @@ impl Config {
     }
 }
 
-/// 后端名归一化:只接受 auto/builtin/everything/off,未知值一律回 auto,
+/// 后端名归一化:只接受 auto/builtin/usn/everything/off,未知值一律回 auto,
 /// 避免手写 config.toml 里的错拼被静默当成「建内置引擎」。
+///
+/// `usn` = 实验后端:目录扫描首扫 + USN journal 实时增量(带熔断/游标校验护栏)。
+/// 它是唯一会启用 USN FSCTL 路径的取值;auto/builtin 保持零 USN FSCTL 不变。
 pub fn normalize_backend(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "auto" => "auto".into(),
         "builtin" => "builtin".into(),
+        "usn" => "usn".into(),
         "everything" => "everything".into(),
         "off" => "off".into(),
         _ => "auto".into(),
@@ -563,9 +593,46 @@ mod tests {
         assert_eq!(normalize_backend("  BuIlTiN "), "builtin");
         assert_eq!(normalize_backend("everything"), "everything");
         assert_eq!(normalize_backend("off"), "off");
+        // USN 实验后端:归一化接受,大小写/空白容忍
+        assert_eq!(normalize_backend("usn"), "usn");
+        assert_eq!(normalize_backend(" USN "), "usn");
         // 手写错拼不再静默创建内置引擎,回落 auto
         assert_eq!(normalize_backend("bogus"), "auto");
         assert_eq!(normalize_backend(""), "auto");
+    }
+
+    /// 提交约束:backend 默认值(auto)与既有字段默认值不变;新增字段默认
+    /// 是「零行为差异」(不限流 + 500ms 轮询)。
+    #[test]
+    fn throttle_and_poll_defaults_are_neutral() {
+        let cfg = IndexConfig::default();
+        assert_eq!(cfg.backend, "auto");
+        assert_eq!(cfg.scan_mode, "dir");
+        assert!(!cfg.journal_enabled);
+        assert_eq!(cfg.scan_throttle_ms, 0, "默认不限流,行为与旧版一致");
+        assert_eq!(cfg.journal_poll_ms, 500);
+    }
+
+    /// 旧配置文件缺新字段 → serde default 补齐(向后兼容读取)。
+    #[test]
+    fn legacy_index_section_gets_new_field_defaults() {
+        let cfg: IndexConfig =
+            toml::from_str("backend = 'builtin'\n").expect("parse minimal index section");
+        assert_eq!(cfg.backend, "builtin");
+        assert_eq!(cfg.scan_throttle_ms, 0);
+        assert_eq!(cfg.journal_poll_ms, 500);
+    }
+
+    /// journal_poll_ms 下限 100:配置里手写更小的值在 load 归一化时被抬到 100。
+    #[test]
+    fn journal_poll_ms_clamped_to_minimum() {
+        let mut cfg = IndexConfig { journal_poll_ms: 50, ..IndexConfig::default() };
+        cfg.normalize();
+        assert_eq!(cfg.journal_poll_ms, 100);
+        // 合法值不动
+        let mut cfg = IndexConfig { journal_poll_ms: 800, ..IndexConfig::default() };
+        cfg.normalize();
+        assert_eq!(cfg.journal_poll_ms, 800);
     }
 
     #[test]
