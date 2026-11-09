@@ -251,7 +251,7 @@ impl Engine {
                     for rec in &recs {
                         match rec.op {
                             Op::Upsert => {
-                                store.insert(rec.frn, rec.parent_frn, rec.attrs, rec.name.as_bytes());
+                                store.insert_meta(rec.frn, rec.parent_frn, rec.attrs, rec.name.as_bytes(), rec.mtime);
                                 // 后台对账期间记「见过」,DirSyncEnd 据此删离线消失项。
                                 if syncing {
                                     store.mark_seen(rec.frn);
@@ -758,7 +758,7 @@ mod tests {
     }
 
     fn rec(frn: u64, parent: u64, attrs: u32, name: &str) -> Rec {
-        Rec { frn, parent_frn: parent, attrs, op: Op::Upsert, name: name.to_string() }
+        Rec { frn, parent_frn: parent, attrs, op: Op::Upsert, name: name.to_string(), mtime: 0 }
     }
 
     /// 走一遍 worker 的握手序列:VolumeMeta → ScanBegin → Records → VolumeReady。

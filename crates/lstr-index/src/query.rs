@@ -52,6 +52,10 @@ pub struct QuerySpec {
     pub group_exts: Vec<String>,
     /// 精确匹配(名字完全一致,小写比较;wfn: 语义)。设置后只返回精确名。
     pub exact: Option<String>,
+    /// 修改时间下界(unix 秒,含);None=不限。mtime=0(未知)条目在时间过滤下一律不通过。
+    pub mtime_after: Option<i64>,
+    /// 修改时间上界(unix 秒,含)。
+    pub mtime_before: Option<i64>,
 }
 
 impl QuerySpec {
@@ -83,6 +87,22 @@ pub fn passes_filters(store: &VolumeStore, slot: u32, spec: &QuerySpec) -> bool 
     let attrs = store.attrs[slot as usize];
     if attrs & ATTR_INTERNAL != 0 {
         return false;
+    }
+    if spec.mtime_after.is_some() || spec.mtime_before.is_some() {
+        let m = store.mtime[slot as usize] as i64;
+        if m == 0 {
+            return false;
+        }
+        if let Some(after) = spec.mtime_after {
+            if m < after {
+                return false;
+            }
+        }
+        if let Some(before) = spec.mtime_before {
+            if m > before {
+                return false;
+            }
+        }
     }
     let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY_U16 != 0;
     let name = store.name_lc(slot);
@@ -281,6 +301,25 @@ mod tests {
         let (_, _, _, aborted) = query_volume_cancel(&s, &spec, 2000, Some(my));
         assert!(aborted, "代次变化后旧查询应提前中止");
         CANCEL_GEN.store(my, Ordering::Relaxed);
+    }
+
+    /// B 步:mtime 过滤(内置时间筛选)必须排除 mtime=0(未知)与早于下界的条目。
+    #[test]
+    fn mtime_filter_excludes_unknown_and_old_entries() {
+        let mut s = VolumeStore::new(false);
+        s.insert_meta(5, 0, 0x10, b"root", 1_600_000_000);
+        s.insert_meta(10, 5, 0, b"new.txt", 1_800_000_000);
+        s.insert_meta(11, 5, 0, b"old.txt", 1_500_000_000);
+        s.insert(12, 5, 0, b"unknown.txt");
+        s.compact();
+        let spec = QuerySpec {
+            tokens: vec!["txt".into()],
+            mtime_after: Some(1_700_000_000),
+            ..Default::default()
+        };
+        let (slots, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 1);
+        assert_eq!(s.name(slots[0]), b"new.txt");
     }
 
     fn setup() -> VolumeStore {

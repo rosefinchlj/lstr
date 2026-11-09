@@ -88,6 +88,27 @@ impl TimeFilter {
             TimeFilter::Year => "dm:thisyear",
         }
     }
+
+    /// 内置索引用的时间过滤下界(unix 秒,含)。
+    /// Today 取本地零点;其余按固定天数回退(不用日历月,够用且不引依赖)。
+    pub fn since_unix(self) -> i64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        match self {
+            TimeFilter::Today => now - local_seconds_of_day().unwrap_or(0) as i64,
+            TimeFilter::Week => now - 7 * 86_400,
+            TimeFilter::Month => now - 30 * 86_400,
+            TimeFilter::Year => now - 365 * 86_400,
+        }
+    }
+}
+
+fn local_seconds_of_day() -> Option<u32> {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let st = unsafe { GetLocalTime() };
+    Some(st.wHour as u32 * 3600 + st.wMinute as u32 * 60 + st.wSecond as u32)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

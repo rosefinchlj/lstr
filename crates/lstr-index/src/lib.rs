@@ -28,9 +28,10 @@ pub use usn::{Op, Rec};
 /// v2:Hello 增加 16 字节能力令牌(worker 侧校验,防同用户其它进程连接固定
 /// 管道名并驱动扫描)。
 /// v3:Hello 每卷增加 resume_frn 与 complete 标记(中断续扫),布局不兼容 v2。
+/// v4:Rec 增加 mtime(目录枚举写入,内置时间筛选用)
 /// worker/client 必须同版本;升级后残留的旧提权 worker 会握手失败并退出
 /// (见 worker::run_session),新客户端重拉即可。
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 pub const PIPE_NAME: &str = r"\\.\pipe\lstr-index";
 
 /// 引擎请求(主进程 → worker 的控制指令,经管道)。

@@ -180,6 +180,7 @@ fn write_rec(w: &mut W, r: &Rec) {
     w.u32(r.attrs);
     w.u64(r.frn);
     w.u64(r.parent_frn);
+    w.u64(r.mtime as u64);
     w.bytes(r.name.as_bytes());
 }
 
@@ -192,6 +193,7 @@ fn read_rec(r: &mut R) -> Option<Rec> {
     let attrs = r.u32()?;
     let frn = r.u64()?;
     let parent_frn = r.u64()?;
+    let mtime = r.u64()? as i64;
     let name = r.bytes()?;
     Some(Rec {
         frn,
@@ -199,6 +201,7 @@ fn read_rec(r: &mut R) -> Option<Rec> {
         attrs,
         op,
         name: String::from_utf8_lossy(name).into_owned(),
+        mtime,
     })
 }
 
@@ -490,8 +493,8 @@ mod tests {
                 guid: 7,
                 next_usn: 42,
                 recs: vec![
-                    Rec { frn: 1, parent_frn: 2, attrs: 0x10, op: Op::Upsert, name: "a.txt".into() },
-                    Rec { frn: 3, parent_frn: 4, attrs: 0, op: Op::Remove, name: "删除我.txt".into() },
+                    Rec { frn: 1, parent_frn: 2, attrs: 0x10, op: Op::Upsert, name: "a.txt".into(), mtime: 0 },
+                    Rec { frn: 3, parent_frn: 4, attrs: 0, op: Op::Remove, name: "删除我.txt".into(), mtime: 0 },
                 ],
             },
             Frame::JournalReset { guid: 7 },
@@ -506,6 +509,7 @@ mod tests {
                     attrs: 0x20,
                     op: Op::Upsert,
                     name: "new.txt".into(),
+                    mtime: 0,
                 }],
             },
             Frame::VolumeGone { guid: 7 },

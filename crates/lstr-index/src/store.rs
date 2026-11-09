@@ -53,6 +53,9 @@ pub struct VolumeStore {
     /// slot → 父 slot。scan 模式下此列语义为「父 FRN」(见 parent_frn)。
     pub parent: Vec<u32>,
     pub attrs: Vec<u16>,
+    /// slot → 最后修改时间(unix 秒;0=未知)。目录枚举(首扫/watcher 刷新)写入,
+    /// USN journal 路径没有时间信息(保持 0)。内置时间筛选依赖这一列。
+    pub mtime: Vec<u32>,
     /// (缓冲偏移, slot) 升序追加;memmem 命中 → slot 的映射。
     /// 就地改名后旧条目成为陈项,由 slot_at_offset 的「偏移==当前 name_off」校验过滤。
     off_index: Vec<(u32, u32)>,
@@ -97,6 +100,7 @@ impl VolumeStore {
             frn: Vec::with_capacity(1 << 16),
             parent: Vec::new(),
             attrs: Vec::new(),
+            mtime: Vec::new(),
             base_len: 0,
             delta: Vec::new(),
             delta_frn: HashMap::new(),
@@ -117,6 +121,7 @@ impl VolumeStore {
         frn: Vec<u64>,
         parent: Vec<u32>,
         attrs: Vec<u16>,
+        mtime: Vec<u32>,
         name_off: Vec<u32>,
         unresolved: Vec<(u32, u64)>,
         noise_enabled: bool,
@@ -134,6 +139,7 @@ impl VolumeStore {
             frn,
             parent,
             attrs,
+            mtime,
             base_len,
             delta: Vec::new(),
             delta_frn: HashMap::new(),
@@ -264,7 +270,7 @@ impl VolumeStore {
         }
         let mut added = 0usize;
         for r in recs {
-            if self.insert(r.frn, r.parent_frn, r.attrs, r.name.as_bytes()) {
+            if self.insert_meta(r.frn, r.parent_frn, r.attrs, r.name.as_bytes(), r.mtime) {
                 added += 1;
             }
             if let Some(slot) = self.find_slot(r.frn) {
@@ -303,7 +309,7 @@ impl VolumeStore {
         }
         let mut added = 0usize;
         for r in recs {
-            if self.insert(r.frn, r.parent_frn, r.attrs, r.name.as_bytes()) {
+            if self.insert_meta(r.frn, r.parent_frn, r.attrs, r.name.as_bytes(), r.mtime) {
                 added += 1;
             }
             if let Some(slot) = self.find_slot(r.frn) {
@@ -351,6 +357,7 @@ impl VolumeStore {
     ///
     /// scan 模式约定(worker 保证):ENUM 流 FRN 互异、目录先行 —— 因此
     /// 父(必为目录)要么已插入(经 dir-only 索引解析),要么登记 unresolved。
+    /// 插入(不带 mtime 的便捷入口;测试/journal 旧路径用)。
     pub fn insert(
         &mut self,
         frn: u64,
@@ -358,6 +365,18 @@ impl VolumeStore {
         attrs: u32,
         name: &[u8],
     ) -> bool {
+        self.insert_meta(frn, parent_frn, attrs, name, 0)
+    }
+
+    pub fn insert_meta(
+        &mut self,
+        frn: u64,
+        parent_frn: u64,
+        attrs: u32,
+        name: &[u8],
+        mtime: i64,
+    ) -> bool {
+        let mtime = mtime.clamp(0, u32::MAX as i64) as u32;
         let scanning = self.is_scanning();
         if !scanning {
             // 命中活槽 → 就地更新;只命中死槽 → 原地复活(FRN 复用 / OLD 当删除的
@@ -385,6 +404,7 @@ impl VolumeStore {
                     self.attrs[old as usize] = (self.attrs[old as usize] & ATTR_INTERNAL)
                         | (attrs as u16 & !ATTR_INTERNAL)
                         | if parent_frn == ROOT_FRN { ATTR_ROOT_CHILD } else { 0 };
+                    self.mtime[old as usize] = mtime;
                     return false;
                 }
                 // 就地更新:slot 身份不变 —— 目录改名后子项的父指针仍然有效
@@ -404,6 +424,7 @@ impl VolumeStore {
                 self.attrs[old as usize] = (self.attrs[old as usize] & ATTR_INTERNAL)
                     | (attrs as u16 & !ATTR_INTERNAL)
                     | if parent_frn == ROOT_FRN { ATTR_ROOT_CHILD } else { 0 };
+                self.mtime[old as usize] = mtime;
                 if self.noise_enabled {
                     // 父/名变了,重新判噪(结果可能解除或加深)
                     self.attrs[old as usize] &= !ATTR_NOISE;
@@ -433,6 +454,7 @@ impl VolumeStore {
             a |= ATTR_ROOT_CHILD;
         }
         self.attrs.push(a);
+        self.mtime.push(mtime);
         self.delta.push(slot);
         // 索引策略:scan 模式只索引目录(父查找只需要目录,内存省 78%);
         // journal 模式索引全部(改名/删除要按 FRN 定位)。
@@ -627,11 +649,13 @@ impl VolumeStore {
             let p = self.parent[old as usize];
             parent.push(if p == NO_PARENT { NO_PARENT } else { remap[p as usize] });
         }
-        // 7. attrs/frn
+        // 7. attrs/mtime/frn
         let mut attrs = Vec::with_capacity(by_frn.len());
+        let mut mtime = Vec::with_capacity(by_frn.len());
         let mut frn = Vec::with_capacity(by_frn.len());
         for &(_, old) in &by_frn {
             attrs.push(self.attrs[old as usize] & !ATTR_INTERNAL);
+            mtime.push(self.mtime[old as usize]);
             frn.push(self.frn[old as usize]);
         }
         // 8. offs:发生过就地改名时 base 名序失效 → 整体重排;
@@ -704,6 +728,7 @@ impl VolumeStore {
         self.frn = frn;
         self.parent = parent;
         self.attrs = attrs;
+        self.mtime = mtime;
         self.delta.clear();
         self.delta.shrink_to_fit();
         self.delta_frn.clear();
@@ -765,8 +790,8 @@ mod tests {
         s.compact();
         assert!(s.attrs[s.find_slot(100).unwrap() as usize] & ATTR_ROOT_CHILD != 0);
         let recs = vec![
-            Rec { frn: 101, parent_frn: 5, attrs: 0, op: crate::usn::Op::Upsert, name: "keep.txt".into() },
-            Rec { frn: 102, parent_frn: 5, attrs: 0, op: crate::usn::Op::Upsert, name: "new.txt".into() },
+            Rec { frn: 101, parent_frn: 5, attrs: 0, op: crate::usn::Op::Upsert, name: "keep.txt".into(), mtime: 0 },
+            Rec { frn: 102, parent_frn: 5, attrs: 0, op: crate::usn::Op::Upsert, name: "new.txt".into(), mtime: 0 },
         ];
         let (added, removed) = s.apply_root_children(&recs);
         assert_eq!(removed, 1);

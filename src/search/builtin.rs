@@ -198,12 +198,18 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
         path_prefix: query.path_filter.as_deref().map(str::to_lowercase),
         group_exts: Vec::new(),
         exact: None,
+        mtime_after: None,
+        mtime_before: None,
     };
     if let Some(location) = &filters.location {
         let p = location.path().display().to_string().to_lowercase();
         if spec.path_prefix.is_none() {
             spec.path_prefix = Some(p);
         }
+    }
+    // 时间筛选:B 步起目录扫描把 mtime 写进索引,内置模式也能按时间过滤。
+    if let Some(t) = filters.time {
+        spec.mtime_after = Some(t.since_unix());
     }
     if spec.ext.is_none() {
         if let Some(group) = &filters.group {

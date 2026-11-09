@@ -131,6 +131,24 @@ fn u64_at(buf: &[u8], off: usize) -> Option<u64> {
         .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
 }
 
+fn i64_at(buf: &[u8], off: usize) -> Option<i64> {
+    buf.get(off..off + 8)
+        .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+}
+
+/// FILETIME(1601 起的 100ns 计数)→ unix 秒;越界/0 返回 0(未知)。
+fn unix_from_filetime(ticks: i64) -> i64 {
+    if ticks <= 0 {
+        return 0;
+    }
+    let secs = ticks / 10_000_000 - 11_644_473_600;
+    if secs > 0 && secs <= i64::from(u32::MAX) {
+        secs
+    } else {
+        0
+    }
+}
+
 /// `FILE_ID_BOTH_DIR_INFORMATION` 的固定头长度:`FileName` 从这里开始。
 const ENTRY_HEAD: usize = 104;
 
@@ -204,12 +222,14 @@ pub fn enumerate_dir(
                     if !is_meta {
                         let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
                         let is_reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+                        let mtime = unix_from_filetime(i64_at(&buf, off + 24).unwrap_or(0));
                         pending.push(Rec {
                             frn: file_id,
                             parent_frn: dir_frn,
                             attrs,
                             op: Op::Upsert,
                             name: name.clone(),
+                            mtime,
                         });
                         total += 1;
                         if pending.len() >= BATCH_RECS {
@@ -299,12 +319,14 @@ pub fn enumerate_children(
                 let mfrn = file_id & 0x0000_FFFF_FFFF_FFFF;
                 let is_meta = mfrn < 0x100 && name.starts_with('$');
                 if !is_meta {
+                    let mtime = unix_from_filetime(i64_at(&buf, off + 24).unwrap_or(0));
                     out.push(Rec {
                         frn: file_id,
                         parent_frn: dir_frn,
                         attrs,
                         op: Op::Upsert,
                         name,
+                        mtime,
                     });
                 }
             }
@@ -415,6 +437,8 @@ mod tests {
         // 顶层文件 parent 是根 FRN
         let a = recs.iter().find(|r| r.name == "a.txt").unwrap();
         assert_eq!(a.parent_frn, ROOT_FRN);
+        // B 步:mtime 来自 FILE_ID_BOTH_DIR_INFORMATION(刚创建的文件必须非 0)。
+        assert!(a.mtime > 0, "mtime 应为最近时间,实际 {}", a.mtime);
     }
 
     #[test]

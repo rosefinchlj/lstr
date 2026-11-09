@@ -285,6 +285,9 @@ fn run_worker(
     // 显式选择「仅内置索引」:此时无论引擎是否就绪,都不再回落 Everything,
     // 否则与设置页文案矛盾(旧实现在 Fallback 时仍把查询发给 Everything)。
     let force_builtin = config.index.backend == "builtin";
+    // 目录扫描(dir)会把 mtime 写进快照,所以内置索引自己能做时间筛选;
+    // USN 模式没有 mtime,时间筛选仍需 Everything(或直接报错)。
+    let builtin_time_ok = config.index.scan_mode == "dir";
     // 严格模式:用户选了「仅内置索引」就完全不碰 Everything —— 连 IPC 探测
     // 都不做(既避免 IPC 超时拖慢首次查询,也保证观察不到一切 Everything 结果)。
     let mut everything = if force_builtin {
@@ -566,7 +569,7 @@ fn run_worker(
                     let folder_fetch = (fetch / 5).clamp(40, 120);
                     let file_fetch = fetch.saturating_sub(folder_fetch).max(60);
                     let mut truncation = 0usize;
-                    if use_builtin && !time_forced {
+                    if use_builtin && (!time_forced || builtin_time_ok) {
                         // 内置索引:本地引擎,双路语义在 kind 过滤层保持
                         if let Some(b) = &builtin {
                             // H4:内置双路都用同一 spec 时,旧实现把同一个 All-kind
@@ -721,7 +724,8 @@ fn run_worker(
                         .map(|b| b.engine.status().phase)
                         .unwrap_or(lstr_index::Phase::Fallback);
                     let time_forced = request.filters.time.is_some();
-                    let used_builtin = (force_builtin || phase != lstr_index::Phase::Fallback) && !time_forced;
+                    let used_builtin = (force_builtin || phase != lstr_index::Phase::Fallback)
+                        && (!time_forced || builtin_time_ok);
                     if let Some(b) = &builtin {
                         if used_builtin {
                             let fetch = fetch_count(&request.query, request.limit);
