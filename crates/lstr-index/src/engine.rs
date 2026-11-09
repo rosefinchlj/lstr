@@ -88,6 +88,10 @@ pub struct EngineConfig {
     pub index_dir: PathBuf,
     pub exclude_noise: bool,
     pub candidate_cap: usize,
+    /// 勾选要索引的盘符(大写单字母,如 `'C'`);空 vec = 全部卷。
+    /// 只影响启动时加载哪些 `vol_*.bin` 快照:未选中卷的旧快照留在磁盘上,
+    /// 重新勾选后下次启动可直接复用,无需重扫。
+    pub volumes: Vec<char>,
 }
 
 pub struct Engine {
@@ -145,6 +149,15 @@ impl Engine {
             let Ok(guid) = u128::from_str_radix(hex, 16) else { continue };
             if let Some(snap) = snapshot::load(&dir, guid, self.cfg.exclude_noise) {
                 let h = &snap.header;
+                // 配置勾选了盘符时只加载选中的卷:不 push VolumeState、不建
+                // PinyinCache;快照文件保留,重新勾选后可直接复用(不重扫)。
+                if !self.cfg.volumes.is_empty() && !self.cfg.volumes.contains(&h.letter) {
+                    snapshot::debug_log(&format!(
+                        "skip {guid:032x} letter={} not selected",
+                        h.letter
+                    ));
+                    continue;
+                }
                 snapshot::debug_log(&format!(
                     "loaded {guid:032x} letter={} count={} complete={}",
                     h.letter, snap.store.len(), h.complete
@@ -437,7 +450,7 @@ impl Engine {
     }
 
     pub fn status(&self) -> IndexStatus {
-        let volumes = self
+        let mut volumes: Vec<VolumeProgress> = self
             .volumes
             .iter()
             .map(|v| {
@@ -452,6 +465,9 @@ impl Engine {
                 VolumeProgress { letter: v.letter, complete: v.complete, pct, count }
             })
             .collect();
+        // 内部顺序来自 read_dir / swap_remove(会乱),UI 要按盘符 C D E F
+        // 升序显示,所以在出口做一次确定性排序。
+        volumes.sort_by_key(|v| v.letter);
         IndexStatus { phase: self.phase, volumes, since: self.phase_since }
     }
 
@@ -781,10 +797,16 @@ mod tests {
     }
 
     fn engine_with(dir: &std::path::Path) -> Engine {
+        engine_with_volumes(dir, Vec::new())
+    }
+
+    /// 指定勾选盘符(空 = 全部)构造引擎,用于验证快照加载过滤。
+    fn engine_with_volumes(dir: &std::path::Path, volumes: Vec<char>) -> Engine {
         Engine::new(EngineConfig {
             index_dir: dir.to_path_buf(),
             exclude_noise: true,
             candidate_cap: 1000,
+            volumes,
         })
     }
 
@@ -1121,6 +1143,54 @@ mod tests {
         let store2 = engine2.volumes[0].store.as_ref().unwrap();
         assert_eq!(store2.len(), 3);
         assert!(store2.find_slot(12).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 状态输出的卷顺序必须是盘符升序(C D E F),不能依赖内部
+    /// read_dir / swap_remove 的偶然顺序。
+    #[test]
+    fn status_volumes_sorted_by_letter() {
+        let dir = temp_index_dir("status-order");
+        let mut engine = engine_with(&dir);
+        // 刻意先喂 F 再喂 C:内部 push 顺序与期望显示顺序相反。
+        feed_ready(&mut engine, 0x61u128, 'F');
+        feed_ready(&mut engine, 0x62u128, 'C');
+
+        let letters: Vec<char> = engine.status().volumes.iter().map(|v| v.letter).collect();
+        assert_eq!(letters, vec!['C', 'F']);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// index.volumes 非空时,未选中卷的快照不加载(文件保留);
+    /// 空 vec = 全部加载。
+    #[test]
+    fn load_snapshots_skips_unselected_volumes() {
+        let dir = temp_index_dir("vol-filter");
+        let guid_c = 0x71u128;
+        let guid_f = 0x72u128;
+        let mut engine = engine_with_volumes(&dir, Vec::new());
+        feed_ready(&mut engine, guid_c, 'C');
+        feed_ready(&mut engine, guid_f, 'F');
+        engine.flush_all();
+        assert!(snapshot::snapshot_path(&dir, guid_c).is_file());
+        assert!(snapshot::snapshot_path(&dir, guid_f).is_file());
+
+        // 只勾选 C:F 的 VolumeState / PinyinCache 不建,但快照文件必须保留。
+        let only_c = engine_with_volumes(&dir, vec!['C']);
+        let letters: Vec<char> = only_c.volumes.iter().map(|v| v.letter).collect();
+        assert_eq!(letters, vec!['C']);
+        assert_eq!(only_c.pinyin.len(), 1, "skip 卷不应建 PinyinCache");
+        assert!(
+            snapshot::snapshot_path(&dir, guid_f).is_file(),
+            "未选中卷的快照文件必须保留"
+        );
+
+        // 空 = 全部:两卷都加载。
+        let all = engine_with_volumes(&dir, Vec::new());
+        let mut letters: Vec<char> = all.volumes.iter().map(|v| v.letter).collect();
+        letters.sort();
+        assert_eq!(letters, vec!['C', 'F']);
+        assert_eq!(all.pinyin.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

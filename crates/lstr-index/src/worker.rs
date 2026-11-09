@@ -19,7 +19,7 @@
 //!   属信任边界内的噪音级 DoS,不针对数据。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -89,8 +89,40 @@ fn opts() -> &'static WorkerOpts {
     OPTS.get_or_init(WorkerOpts::default)
 }
 
-/// 按 `--index-volumes` 过滤卷列表(阶段 1 先在单盘验收)。
+/// 运行期卷掩码(设置页勾选 → C→W `Frame::SetVolumes`)。
+/// 0 = 未设置,此时沿用启动参数 `--index-volumes`(见 [`filter_volumes`])。
+/// bit i = 盘符 `'A' + i`,位运算语义统一由 [`crate::volmask`] 定义。
+///
+/// 语义是**会话级**的:每个新会话开始时复位为 0(见 [`reset_session_volume_mask`]),
+/// 客户端连上后再用 `SetVolumes` 覆盖;不跨会话继承上一个主进程的勾选。
+static RUNTIME_VOLUME_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// 会话级掩码复位:新会话先回到启动参数 `--index-volumes` 的行为,
+/// 避免上一个会话残留的掩码让「本次启动参数里本来不索引的卷」先起
+/// volume_loop 扫一段、再收 `VolumeGone`(无谓 churn,engine 还会删快照)。
+fn reset_session_volume_mask() {
+    RUNTIME_VOLUME_MASK.store(0, Ordering::Relaxed);
+}
+
+/// 纯函数:按运行期掩码过滤固定 NTFS 卷列表。
+/// mask==0 表示「未设置」,原样返回(是否回落到 `--index-volumes` 由
+/// [`filter_volumes`] 决定);不读全局状态,便于单测且不会污染 `opts()`。
+fn apply_volume_mask(list: Vec<(char, String)>, mask: u32) -> Vec<(char, String)> {
+    if mask == 0 {
+        return list;
+    }
+    list.into_iter()
+        .filter(|(letter, _)| crate::volmask::has_letter(mask, *letter))
+        .collect()
+}
+
+/// 按运行期掩码过滤;掩码未设置(0)时保持 `--index-volumes` 启动参数行为
+/// 不变(阶段 1 先在单盘验收)。设置页切换后下一轮 500ms 差异逻辑即生效。
 fn filter_volumes(list: Vec<(char, String)>) -> Vec<(char, String)> {
+    let mask = RUNTIME_VOLUME_MASK.load(Ordering::Relaxed);
+    if mask != 0 {
+        return apply_volume_mask(list, mask);
+    }
     match &opts().volumes {
         Some(allowed) => list
             .into_iter()
@@ -328,6 +360,11 @@ fn run_session(client: HANDLE) {
     });
 
     // 卷线程表
+    //
+    // 掩码是会话级的:每次会话回到启动参数 `--index-volumes`,随后由客户端
+    // 的 `Frame::SetVolumes` 覆盖。必须放在起初始 volume_loop 之前——否则如果
+    // 复用上一个会话残留的掩码,已取消的卷会先起线程扫几百毫秒再收 VolumeGone。
+    reset_session_volume_mask();
     let mut threads: HashMap<u128, VolumeThread> = HashMap::new();
     let volumes = filter_volumes(win::fixed_ntfs_volumes());
     for (letter, guid_path) in &volumes {
@@ -373,6 +410,16 @@ fn run_session(client: HANDLE) {
                             .ok();
                         threads.insert(guid, VolumeThread { stop, handle });
                     }
+                }
+                Frame::SetVolumes { mask } => {
+                    // 只更新掩码,不在这里起/停线程:下面的 500ms 热插拔差异
+                    // 逻辑读 filter_volumes(),同一轮就会按新掩码补发
+                    // VolumeAppeared/VolumeGone 并起/停对应 volume_loop。
+                    RUNTIME_VOLUME_MASK.store(mask, Ordering::Relaxed);
+                    crate::snapshot::debug_log(&format!(
+                        "worker: runtime volume mask -> {} (0x{mask:08x})",
+                        crate::volmask::describe(mask)
+                    ));
                 }
                 Frame::Shutdown => {
                     EXIT_AFTER_SESSION.store(true, Ordering::Relaxed);
@@ -948,6 +995,56 @@ mod tests {
             plan_volume_session(Some((7, 500, 0, false)), Some((7, 100, 800))),
             ScanPlan::Full { journal_id: 7, high_usn: 800 }
         );
+    }
+
+    /// 运行期掩码过滤(纯函数,不碰全局 `opts()`/`RUNTIME_VOLUME_MASK`)。
+    /// mask 只留 C 时 D 被过滤;mask==0 原样返回 = 回落到 `--index-volumes`
+    /// 的既有行为(默认未设置时即不过滤)。
+    #[test]
+    fn apply_volume_mask_filters_unselected_letters() {
+        let list = vec![
+            ('C', r"\\?\Volume{cccc}\".to_string()),
+            ('D', r"\\?\Volume{dddd}\".to_string()),
+        ];
+        // 只选 C:D 被过滤
+        assert_eq!(
+            apply_volume_mask(list.clone(), crate::volmask::mask_from_letters(['C'])),
+            vec![list[0].clone()]
+        );
+        // 只选 D:反向验证不是「按序号保留」
+        assert_eq!(
+            apply_volume_mask(list.clone(), crate::volmask::mask_from_letters(['d'])),
+            vec![list[1].clone()]
+        );
+        // 全选:都保留
+        assert_eq!(
+            apply_volume_mask(list.clone(), crate::volmask::MASK_ALL),
+            list
+        );
+        // 0 = 未设置:原样返回,由 filter_volumes 回落到 opts().volumes
+        assert_eq!(apply_volume_mask(list.clone(), 0), list);
+        // 掩码里的不存在的盘符不影响已有卷(空结果也是合法过滤结果)
+        let only_z = crate::volmask::mask_from_letters(['Z']);
+        assert!(apply_volume_mask(list, only_z).is_empty());
+    }
+
+    /// 会话级复位:先锁定掩码(只剩 C),复位后 `filter_volumes` 回到启动参数路径。
+    /// 本测试进程从不调用 `worker_main`,故 `opts().volumes` 固定为默认 `None`
+    /// (不过滤),断言「复位后 D 回到列表」即可证明掩码已不再是过滤依据;
+    /// 测试只动 `RUNTIME_VOLUME_MASK` 这一个静态,不写 `OPTS`(OnceLock 不可逆)。
+    #[test]
+    fn session_reset_restores_startup_volume_behavior() {
+        let list = vec![
+            ('C', r"\\?\Volume{cccc}\".to_string()),
+            ('D', r"\\?\Volume{dddd}\".to_string()),
+        ];
+        // 模拟上个会话中途勾掉 D:掩码只剩 C,D 被过滤
+        RUNTIME_VOLUME_MASK.store(crate::volmask::mask_from_letters(['C']), Ordering::Relaxed);
+        assert_eq!(filter_volumes(list.clone()), vec![list[0].clone()]);
+        // 新会话入口复位 → 掩码未设置,回落到启动参数(= 本次 opts().volumes)
+        reset_session_volume_mask();
+        assert_eq!(RUNTIME_VOLUME_MASK.load(Ordering::Relaxed), 0);
+        assert_eq!(filter_volumes(list.clone()), list);
     }
 
     #[test]

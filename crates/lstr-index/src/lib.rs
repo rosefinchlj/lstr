@@ -16,6 +16,7 @@ pub mod scan;
 pub mod snapshot;
 pub mod store;
 pub mod usn;
+pub mod volmask;
 pub mod watch;
 pub mod win;
 pub mod worker;
@@ -29,9 +30,10 @@ pub use usn::{Op, Rec};
 /// 管道名并驱动扫描)。
 /// v3:Hello 每卷增加 resume_frn 与 complete 标记(中断续扫),布局不兼容 v2。
 /// v4:Rec 增加 mtime(目录枚举写入,内置时间筛选用)
+/// v5:新增 SetVolumes 控制帧(运行期切换索引卷,不重启 worker/不重弹 UAC)
 /// worker/client 必须同版本;升级后残留的旧提权 worker 会握手失败并退出
 /// (见 worker::run_session),新客户端重拉即可。
-pub const PROTO_VERSION: u32 = 4;
+pub const PROTO_VERSION: u32 = 5;
 pub const PIPE_NAME: &str = r"\\.\pipe\lstr-index";
 
 /// 引擎请求(主进程 → worker 的控制指令,经管道)。
@@ -40,4 +42,8 @@ pub enum ClientCommand {
     /// 请求重建指定卷(设置页「重建」按钮)。
     Rescan(u128),
     Shutdown,
+    /// 运行期切换参与索引的卷:bit i 对应盘符 `'A' + i`,取
+    /// [`volmask`] 的掩码(0 = 未设置,worker 回落到 `--index-volumes`)。
+    /// worker 存下掩码后由既有 500ms 热插拔差异逻辑起/停卷线程,不重启进程。
+    SetVolumes(u32),
 }

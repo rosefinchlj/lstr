@@ -1,6 +1,6 @@
 //! 管道帧协议:u32 长度前缀 | u8 类型 | 载荷(全部小端)。
 //!
-//! C→W:Hello(握手,带每卷续传位点)/ Rescan / Shutdown
+//! C→W:Hello(握手,带每卷续传位点)/ Rescan / Shutdown / SetVolumes
 //! W→C:Welcome / VolumeMeta / ScanBegin / ScanProgress / Batch / VolumeReady
 //!      / JournalReset / VolumeGone / VolumeAppeared / WorkerExit
 
@@ -19,6 +19,9 @@ pub mod frame_type {
     pub const DIR_SYNC_END: u8 = 15;
     /// watcher 目录刷新:该父目录的最新子项集合。
     pub const DIR_CHILDREN: u8 = 16;
+    /// 运行期切换索引卷:载荷 u32 位掩码(bit i = 盘符 `'A' + i`,0 = 未设置)。
+    /// worker 只更新内存掩码,卷线程起停交给会话循环既有的 500ms 热插拔差异。
+    pub const SET_VOLUMES: u8 = 17;
     // W→C
     pub const WELCOME: u8 = 2;
     pub const VOLUME_META: u8 = 3;
@@ -136,6 +139,10 @@ pub enum Frame {
     },
     Rescan {
         guid: u128,
+    },
+    /// 运行期切换索引卷的掩码(bit i = 盘符 `'A' + i`,0 = 未设置)。
+    SetVolumes {
+        mask: u32,
     },
     Shutdown,
 }
@@ -371,6 +378,11 @@ impl Frame {
                 w.u128(*guid);
                 w
             }
+            Frame::SetVolumes { mask } => {
+                let mut w = W::new(frame_type::SET_VOLUMES);
+                w.u32(*mask);
+                w
+            }
             Frame::Shutdown => W::new(frame_type::SHUTDOWN),
         };
         // 前置长度(含类型字节)
@@ -455,6 +467,7 @@ impl Frame {
             },
             frame_type::WORKER_EXIT => Frame::WorkerExit { reason: r.u32()? },
             frame_type::RESCAN => Frame::Rescan { guid: r.u128()? },
+            frame_type::SET_VOLUMES => Frame::SetVolumes { mask: r.u32()? },
             frame_type::SHUTDOWN => Frame::Shutdown,
             _ => return None,
         })
@@ -516,6 +529,8 @@ mod tests {
             Frame::VolumeAppeared { guid: 7, letter: 'E' },
             Frame::WorkerExit { reason: 0 },
             Frame::Rescan { guid: 7 },
+            Frame::SetVolumes { mask: (1 << 2) | (1 << 3) },
+            Frame::SetVolumes { mask: u32::MAX },
             Frame::Shutdown,
         ];
         for f in frames {

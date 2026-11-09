@@ -85,6 +85,71 @@ impl Default for IndexConfig {
     }
 }
 
+impl IndexConfig {
+    /// 规范化盘符列表:大写、去重、升序。空列表仍表示「全部」。
+    pub fn normalize_volumes(&mut self) {
+        self.volumes = Self::normalize_letters(self.volumes.iter().filter_map(|v| v.trim().chars().next()));
+    }
+
+    fn normalize_letters<I>(letters: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = char>,
+    {
+        let mut out: Vec<char> = letters
+            .into_iter()
+            .filter_map(|c| {
+                let up = c.to_ascii_uppercase();
+                up.is_ascii_uppercase().then_some(up)
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out.into_iter().map(|c| c.to_string()).collect()
+    }
+
+    /// 显式配置的卷字母(升序);空 = 未指定 = 全部固定 NTFS 卷。
+    pub fn volume_letters(&self) -> Vec<char> {
+        let mut out: Vec<char> = self
+            .volumes
+            .iter()
+            .filter_map(|v| v.trim().chars().next())
+            .map(|c| c.to_ascii_uppercase())
+            .filter(|c| c.is_ascii_uppercase())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// 运行时掩码:bit i = `'A' + i`;空配置 = 全部(`u32::MAX`)。
+    /// worker 的卷过滤与 `SetVolumes` 控制帧都用这一份语义(见 `lstr_index::volmask`)。
+    pub fn volume_mask(&self) -> u32 {
+        lstr_index::volmask::mask_from_letters(self.volume_letters())
+    }
+
+    /// 该盘是否参与索引。空配置(全部)时任何盘都返回 true。
+    pub fn volume_enabled(&self, letter: char) -> bool {
+        lstr_index::volmask::has_letter(self.volume_mask(), letter)
+    }
+
+    /// 写入设置页的勾选结果。`selected` = 勾选中的盘,`known` = 设置页可见的全部盘。
+    ///
+    /// - 全选 → 清空 `volumes`(语义「全部」:以后新插的盘自动纳入,不用再改配置);
+    /// - 部分选 → 写显式升序列表;
+    /// - 全不选 → 拒绝并返回 `false`(至少保留一个盘,否则配置语义会退回「全部」)。
+    pub fn set_selected_volumes(&mut self, selected: &[char], known: &[char]) -> bool {
+        let want = Self::normalize_letters(selected.iter().copied());
+        if want.is_empty() {
+            return false;
+        }
+        let all = Self::normalize_letters(known.iter().copied());
+        // 全集比较:勾满可见的全部盘 = 「全部」,落盘为空列表。
+        let covers_all = !all.is_empty() && all.iter().all(|v| want.contains(v));
+        self.volumes = if covers_all { Vec::new() } else { want };
+        true
+    }
+}
+
 /// 排序权重：设置面板里可以直接拖滑块调整，实时生效。
 /// 数值越大越优先；同档内的位置/词首等微调仍是内置固定值。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -392,6 +457,7 @@ impl Config {
             Ok(mut cfg) => {
                 cfg.rank.backfill_missing_noise_rules();
                 cfg.index.backend = normalize_backend(&cfg.index.backend);
+                cfg.index.normalize_volumes();
                 cfg
             },
             Err(err) => {
@@ -441,6 +507,55 @@ pub fn parse_hex(input: &str) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    // —— 索引卷选择(index.volumes)——
+
+    #[test]
+    fn empty_volumes_means_all_drives() {
+        let cfg = IndexConfig::default();
+        assert!(cfg.volume_letters().is_empty());
+        assert_eq!(cfg.volume_mask(), u32::MAX);
+        assert!(cfg.volume_enabled('C'));
+        assert!(cfg.volume_enabled('Z'));
+    }
+
+    #[test]
+    fn volumes_are_normalized_to_upper_sorted_unique() {
+        let mut cfg = IndexConfig { volumes: vec!["f".into(), " C ".into(), "c".into(), "1".into()], ..IndexConfig::default() };
+        cfg.normalize_volumes();
+        assert_eq!(cfg.volumes, vec!["C".to_string(), "F".to_string()]);
+        assert_eq!(cfg.volume_letters(), vec!['C', 'F']);
+        let mask = cfg.volume_mask();
+        assert!(lstr_index::volmask::has_letter(mask, 'C'));
+        assert!(!lstr_index::volmask::has_letter(mask, 'D'));
+    }
+
+    #[test]
+    fn selecting_every_visible_drive_collapses_to_all() {
+        let mut cfg = IndexConfig { volumes: vec!["C".into(), "F".into()], ..IndexConfig::default() };
+        // 勾满 C/D/E/F → 落盘为空列表(全部),新插盘自动纳入
+        assert!(cfg.set_selected_volumes(&['c', 'D', 'e', 'F'], &['C', 'D', 'E', 'F']));
+        assert!(cfg.volumes.is_empty());
+        assert_eq!(cfg.volume_mask(), u32::MAX);
+    }
+
+    #[test]
+    fn unchecking_a_drive_writes_explicit_sorted_list() {
+        let mut cfg = IndexConfig::default();
+        // 从「全部」取消 F:其余 C/D/E 写成显式列表
+        assert!(cfg.set_selected_volumes(&['D', 'C', 'E'], &['C', 'D', 'E', 'F']));
+        assert_eq!(cfg.volumes, vec!["C".to_string(), "D".to_string(), "E".to_string()]);
+        assert!(!cfg.volume_enabled('F'));
+        assert!(cfg.volume_enabled('C'));
+    }
+
+    #[test]
+    fn unchecking_the_last_drive_is_rejected() {
+        let mut cfg = IndexConfig { volumes: vec!["F".into()], ..IndexConfig::default() };
+        assert!(!cfg.set_selected_volumes(&[], &['C', 'D', 'E', 'F']));
+        assert_eq!(cfg.volumes, vec!["F".to_string()]);
+    }
 
     #[test]
     fn backend_names_are_normalized() {

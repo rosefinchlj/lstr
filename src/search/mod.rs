@@ -11,12 +11,12 @@ pub mod uwp;
 
 use crate::config::{Config, KeywordConfig, RankConfig};
 use crate::history::History;
-use lstr_index::EngineMsg;
+use lstr_index::{ClientCommand, EngineMsg};
 use crate::model::{Entry, Kind, Query, Scope};
 use crate::search::filters::SearchFilters;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use eframe::egui;
@@ -88,6 +88,11 @@ pub struct SearchService {
     apps_dirty: Arc<AtomicBool>,
     /// 自研索引状态(设置页/状态行用);worker 线程随时刷新。
     pub index_status: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
+    /// 「参与索引的卷」掩码(lstr_index::volmask 位掩码,bit i='A'+i),
+    /// 设置页勾选/取消盘时更新;worker 线程在每次拉起与每帧指令里读取。
+    volume_mask: Arc<AtomicU32>,
+    /// 发给索引 worker 的控制指令(运行期切卷/重建),由 client 线程非阻塞写帧。
+    index_cmd: mpsc::Sender<ClientCommand>,
 }
 
 impl SearchService {
@@ -100,6 +105,11 @@ impl SearchService {
         let worker_apps_dirty = Arc::clone(&apps_dirty);
         let status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>> = Arc::new(Mutex::new(None));
         let worker_status = Arc::clone(&status_slot);
+        // 卷选择:启动时从配置取快照(空列表 = 全部盘),之后设置页改掩码即可
+        // 在运行期切卷,不需要重启 lstr。
+        let volume_mask = Arc::new(AtomicU32::new(config.index.volume_mask()));
+        let worker_volume_mask = Arc::clone(&volume_mask);
+        let (index_cmd_tx, index_cmd_rx) = mpsc::channel::<ClientCommand>();
         std::thread::Builder::new()
             .name("lstr-search".to_string())
             .spawn(move || {
@@ -111,6 +121,8 @@ impl SearchService {
                     ctx,
                     worker_apps_dirty,
                     worker_status,
+                    index_cmd_rx,
+                    worker_volume_mask,
                 )
             })
             .expect("spawn search worker");
@@ -124,7 +136,23 @@ impl SearchService {
             favorites: config.favorites,
             apps_dirty,
             index_status: status_slot,
+            volume_mask,
+            index_cmd: index_cmd_tx,
         }
+    }
+
+    /// 设置页勾选/取消盘后调用:更新掩码并通知 worker 线程切卷。
+    /// worker 没在跑(后端 off / Everything / UAC 被拒)时指令会静默失败,
+    /// 下次拉起 worker 会按最新掩码生成启动参数,所以不会丢。
+    pub fn set_index_volumes(&self, mask: u32) {
+        self.volume_mask.store(mask, Ordering::Relaxed);
+        if self.index_cmd.send(ClientCommand::SetVolumes(mask)).is_err() {
+            return;
+        }
+        lstr_index::snapshot::debug_log(&format!(
+            "main: set volumes mask=0x{mask:08x} ({})",
+            lstr_index::volmask::describe(mask)
+        ));
     }
 
     pub fn search(
@@ -557,6 +585,8 @@ fn run_worker(
     ctx: egui::Context,
     apps_dirty: Arc<AtomicBool>,
     status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
+    index_cmd_rx: Receiver<ClientCommand>,
+    volume_mask: Arc<AtomicU32>,
 ) {
     // 显式选择「仅内置索引」:此时无论引擎是否就绪,都不再回落 Everything,
     // 否则与设置页文案矛盾(旧实现在 Fallback 时仍把查询发给 Everything)。
@@ -589,8 +619,10 @@ fn run_worker(
     let handshake_slot: Arc<Mutex<Vec<(u128, u64, i64, u64, bool)>>> =
         Arc::new(Mutex::new(Vec::new()));
     match config.index.backend.as_str() {
-        "off" => {}
-        "everything" => {}
+        // 这两个后端不拉 worker:控制通道直接丢弃(发送端失败即忽略)。
+        "off" | "everything" => {
+            drop(index_cmd_rx);
+        }
         _ => {
             let engine = builtin::make_engine(&config.index);
             *handshake_slot.lock().unwrap() = engine.handshake_state();
@@ -600,6 +632,8 @@ fn run_worker(
                 Arc::clone(&shutdown_client),
                 false,
                 config.index.clone(),
+                index_cmd_rx,
+                volume_mask,
             );
             builtin = Some(builtin::BuiltinProvider::new(engine));
         }

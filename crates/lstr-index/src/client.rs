@@ -110,6 +110,16 @@ pub fn write_frame(client: HANDLE, frame: &Frame) -> bool {
     crate::worker::write_frame_pub(client, frame)
 }
 
+/// 控制指令 → 线上帧。主进程发指令的**唯一**映射点:新增指令只改这里,
+/// 避免各处手搓 `Frame` 与协议枚举漂移。
+pub fn command_frame(cmd: &crate::ClientCommand) -> Frame {
+    match cmd {
+        crate::ClientCommand::Rescan(guid) => Frame::Rescan { guid: *guid },
+        crate::ClientCommand::Shutdown => Frame::Shutdown,
+        crate::ClientCommand::SetVolumes(mask) => Frame::SetVolumes { mask: *mask },
+    }
+}
+
 /// 管道是否仍然连通(peek 探测)。
 pub fn pipe_alive(client: HANDLE) -> bool {
     use windows::Win32::System::Pipes::PeekNamedPipe;
@@ -124,6 +134,24 @@ pub fn pipe_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_frame_maps_every_command() {
+        assert_eq!(
+            command_frame(&crate::ClientCommand::Rescan(0xabc)),
+            Frame::Rescan { guid: 0xabc }
+        );
+        assert_eq!(command_frame(&crate::ClientCommand::Shutdown), Frame::Shutdown);
+        // 掩码原样透传,不做语义解释(0 也照样传,worker 侧再决定回落)
+        assert_eq!(
+            command_frame(&crate::ClientCommand::SetVolumes(0b100)),
+            Frame::SetVolumes { mask: 0b100 }
+        );
+        assert_eq!(
+            command_frame(&crate::ClientCommand::SetVolumes(0)),
+            Frame::SetVolumes { mask: 0 }
+        );
+    }
 
     #[test]
     fn session_token_is_stable_and_roundtrips_hex() {

@@ -358,3 +358,40 @@ store（插入/改名/删除/前缀/子串/精确/父链路径）、USN 解析�
 1. 免 UAC 是「默认引导安装计划任务」还是「v1 先 runas,v2 再引导」。
 2. v3 是否要为时间筛选/日期排序上裸 MFT（+1~2k LOC,风险高）。
 3. 是否提供「索引根目录白名单」（只索引指定目录可再省内存,但偏离 Everything 语义）。
+
+
+## 10. 卷选择:多盘纳入 / 单盘取消（2026-11-09 落地）
+
+**背景**:首版 `--index-volumes` 只是启动参数的 allowlist,验收时用 `volumes=["F"]`
+跑完没还原,导致「只索引了 F 盘」。用户诉求:(1) 盘符按 C D E F 排序显示;
+(2) 能选中/取消某个盘。
+
+**配置**:`[index] volumes = []`(字符串数组,大写盘符)。语义保持向后兼容:
+- 空数组 = **全部本机固定 NTFS 卷**(新插盘自动纳入,UI 显示「全部」);
+- 非空 = 显式 allowlist,升序落盘。`Config::load` 会 `normalize_volumes()`
+  (大写 / 去重 / 升序)。
+
+**位掩码**:`lstr-index::volmask`(bit i = 盘符 `'A' + i`,`MASK_ALL = u32::MAX`)
+是所有层之间的唯一表示:配置 ↔ 引擎 ↔ worker ↔ UI。空配置折算成 `MASK_ALL`。
+
+**四层落点**:
+
+| 层 | 行为 |
+|---|---|
+| 配置 → 主进程 | `IndexConfig::{volume_letters,volume_mask,volume_enabled,set_selected_volumes}`;`SearchService::set_index_volumes(mask)` 更新共享 `Arc<AtomicU32>` 并投递 `ClientCommand::SetVolumes` |
+| 主进程 → worker | 协议 v5 新增 C→W `Frame::SetVolumes{mask}`(帧号 17)。worker 存进 `RUNTIME_VOLUME_MASK`,**不自己起停线程**,交给既有的 500ms 卷热插拔差异逻辑按新过滤结果补发 `VolumeAppeared`/`VolumeGone` |
+| worker 拉起参数 | `--index-volumes C,D` 按**当前掩码**现算(掩码=全部时不传,让 worker 自己枚举);worker 重启也跟随最新选择 |
+| 引擎 | `EngineConfig.volumes`:启动加载 `vol_*.bin` 时跳过未选中的卷(快照文件保留,重新勾选后下次启动直接复用);`status()` 出口按 letter 升序(C D E F)输出 |
+
+**运行期语义**:取消某盘 → 一个 500ms 周期内 worker 停掉该卷线程并发
+`VolumeGone`;引擎删掉该卷内存态与快照(不占内存)。重新勾选 → `VolumeAppeared`
++ 全量 dir 扫描(该盘无快照,从头建)。**不需要重启 lstr,也不会重弹 UAC**。
+索引后端 / 噪声目录开关仍需重启。
+
+**UI**:设置 → 搜索 → 索引卷,一行 chips(`C:` `D:` `E:` `F:`,升序,选中 amber)。
+候选盘 = 本机固定 NTFS 盘 ∪ 配置里显式列出的盘 ∪ 当前引擎状态里的盘。
+最后一个盘不允许取消(至少保留一个);勾满所有已知盘会折叠回「全部」(空数组)。
+
+**测试**:`volmask` 位运算、`IndexConfig` 归一化/折叠/拒绝全取消、`worker_launch_args`
+掩码→参数、proto `SetVolumes` roundtrip、worker `apply_volume_mask` 纯函数、
+引擎「未选中快照不加载」与「状态按盘符排序」。

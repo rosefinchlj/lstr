@@ -2,12 +2,14 @@
 //! 查询面(search / search_split / search_exact),产出 Entry 走既有
 //! finalize/rank 管线;client 线程负责 worker 连接与帧→EngineMsg 转换。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::time::Duration;
 
 use lstr_index::{
-    client as idx_client, win as idx_win, Engine, EngineConfig, EngineMsg, KindFilter, QuerySpec,
+    client as idx_client, win as idx_win, ClientCommand, Engine, EngineConfig, EngineMsg,
+    KindFilter, QuerySpec,
 };
 
 use crate::model::{Entry, Kind, Query, Scope};
@@ -247,8 +249,9 @@ pub fn spawn_client_thread(
     shutdown: std::sync::Arc<AtomicBool>,
     launched_worker: bool,
     index_cfg: crate::config::IndexConfig,
+    index_cmd_rx: Receiver<ClientCommand>,
+    volume_mask: Arc<AtomicU32>,
 ) {
-    let extra_args = worker_launch_args(&index_cfg);
     std::thread::Builder::new()
         .name("lstr-idx-client".to_string())
         .spawn(move || {
@@ -263,10 +266,14 @@ pub fn spawn_client_thread(
                 // 用户拒绝过 UAC 就不再弹(防骚扰),保持 Fallback 走 Everything。
                 // 守卫还要求距上次拉起 >1s:worker 启动后要一点时间建管道,
                 // 否则 HandShake 失败与「管道不存在」会在循环里空转重拉。
+                // 参数按「当前」掩码现算:设置页可能改过卷选择,worker 重启后
+                // 必须跟着新卷集合走,不能沿用启动时的旧参数。
                 if !launch_declined
                     && !pipe_exists()
                     && last_launch.elapsed() > Duration::from_secs(1)
                 {
+                    let extra_args =
+                        worker_launch_args(&index_cfg, volume_mask.load(Ordering::Relaxed));
                     last_launch = std::time::Instant::now();
                     if !launch_worker(&extra_args) {
                         launch_declined = true;
@@ -279,7 +286,7 @@ pub fn spawn_client_thread(
                 first_connect = false;
                 match idx_client::connect_and_handshake(snapshot, timeout) {
                     Ok(client) => {
-                                frame_loop(client, &tx, &shutdown);
+                        frame_loop(client, &tx, &shutdown, &index_cmd_rx, &volume_mask);
                         let _ = tx.send(EngineMsg::WorkerLost);
                     }
                     Err(_err) => {
@@ -295,6 +302,8 @@ pub fn spawn_client_thread(
                     && !pipe_exists()
                     && last_launch.elapsed() > Duration::from_secs(1)
                 {
+                    let extra_args =
+                        worker_launch_args(&index_cfg, volume_mask.load(Ordering::Relaxed));
                     last_launch = std::time::Instant::now();
                     if !launch_worker(&extra_args) {
                         launch_declined = true;
@@ -311,7 +320,19 @@ pub fn spawn_client_thread(
         .expect("spawn idx client");
 }
 
-fn frame_loop(client: windows::Win32::Foundation::HANDLE, tx: &std::sync::mpsc::SyncSender<EngineMsg>, shutdown: &AtomicBool) {
+fn frame_loop(
+    client: windows::Win32::Foundation::HANDLE,
+    tx: &std::sync::mpsc::SyncSender<EngineMsg>,
+    shutdown: &AtomicBool,
+    index_cmd_rx: &Receiver<ClientCommand>,
+    volume_mask: &AtomicU32,
+) {
+    // 连上先把当前卷选择同步给 worker:worker 是常驻提权进程,可能带着上一次
+    // 会话/启动参数进来;这一帧保证会话内的卷掩码与主进程一致。
+    let _ = idx_client::write_frame(
+        client,
+        &lstr_index::proto::Frame::SetVolumes { mask: volume_mask.load(Ordering::Relaxed) },
+    );
     'frames: loop {
         if shutdown.load(Ordering::Relaxed) {
             // M4:主进程要退出时显式发 Shutdown,worker 收到后不再重建管道
@@ -319,12 +340,33 @@ fn frame_loop(client: windows::Win32::Foundation::HANDLE, tx: &std::sync::mpsc::
             let _ = idx_client::write_frame(client, &lstr_index::proto::Frame::Shutdown);
             break 'frames;
         }
-        match idx_client::read_frame(client, Duration::from_secs(2)) {
+        // 设置页指令(切卷/重建卷):非阻塞写帧,不打断下面的读循环。
+        loop {
+            match index_cmd_rx.try_recv() {
+                Ok(cmd) => {
+                    let frame = idx_client::command_frame(&cmd);
+                    if !idx_client::write_frame(client, &frame) {
+                        break 'frames;
+                    }
+                    if matches!(cmd, ClientCommand::Shutdown) {
+                        break 'frames;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // 服务被 drop:继续读,主进程退出时由 shutdown 收尾。
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        // 读超时取 300ms(而不是 2s):设置页切卷的指令要靠这个间隙尽快写出去。
+        match idx_client::read_frame(client, Duration::from_millis(300)) {
             Some(frame) => {
                 if let Some(msg) = to_engine_msg(frame) {
                     if tx.send(msg).is_err() {
                         // 引擎线程已经收工(服务被 drop):顺手通知 worker 退出。
-                        let _ = idx_client::write_frame(client, &lstr_index::proto::Frame::Shutdown);
+                        let _ = idx_client::write_frame(
+                            client,
+                            &lstr_index::proto::Frame::Shutdown,
+                        );
                         break 'frames;
                     }
                 }
@@ -366,6 +408,8 @@ fn to_engine_msg(frame: lstr_index::proto::Frame) -> Option<EngineMsg> {
         F::VolumeAppeared { guid, letter } => EngineMsg::VolumeAppeared { guid, letter },
         F::WorkerExit { .. } | F::Shutdown => return None,
         F::Hello { .. } | F::Welcome { .. } | F::Rescan { .. } => return None,
+        // C→W 控制帧(设置页切卷):worker 不会回给主进程,遇到即忽略。
+        F::SetVolumes { .. } => return None,
     })
 }
 
@@ -382,7 +426,11 @@ fn pipe_alive(client: windows::Win32::Foundation::HANDLE) -> bool {
 
 /// 组装 worker 启动参数:`--index-worker --index-token <hex>` 之后追加首扫模式、
 /// journal 开关与卷过滤(阶段 1 默认 `dir` = 零 USN FSCTL)。
-pub fn worker_launch_args(index: &crate::config::IndexConfig) -> String {
+///
+/// 卷过滤以 `volume_mask` 为准(设置页运行期可改,worker 每次重启都按当前
+/// 掩码重新生成参数)。掩码=全部时不加 `--index-volumes`:让 worker 自己枚举
+/// 本机固定 NTFS 卷,新插盘也能自动纳入。
+pub fn worker_launch_args(index: &crate::config::IndexConfig, volume_mask: u32) -> String {
     let mut extra = String::new();
     // 阶段 1 默认就是 dir(worker 端默认值),只有显式 usn 时才追加开关
     if index.scan_mode.eq_ignore_ascii_case("usn") {
@@ -391,14 +439,14 @@ pub fn worker_launch_args(index: &crate::config::IndexConfig) -> String {
             extra.push_str(" --index-journal");
         }
     }
-    let volumes: Vec<String> = index
-        .volumes
-        .iter()
-        .filter_map(|v| v.trim().chars().next())
-        .map(|c| c.to_ascii_uppercase().to_string())
-        .collect();
-    if !volumes.is_empty() {
-        extra.push_str(&format!(" --index-volumes {}", volumes.join(",")));
+    if !lstr_index::volmask::is_all(volume_mask) {
+        let volumes: Vec<String> = lstr_index::volmask::letters(volume_mask)
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        if !volumes.is_empty() {
+            extra.push_str(&format!(" --index-volumes {}", volumes.join(",")));
+        }
     }
     extra
 }
@@ -427,6 +475,8 @@ pub fn make_engine(cfg: &crate::config::IndexConfig) -> Engine {
         index_dir: crate::config::attach_dir().join("index"),
         exclude_noise: cfg.exclude_noise,
         candidate_cap: cfg.candidate_cap,
+        // 只加载选中盘的快照;未选中的快照留在磁盘,重新勾选即可秒开。
+        volumes: cfg.volume_letters(),
     })
 }
 
@@ -443,5 +493,18 @@ mod tests {
         assert_eq!(spec.ext.as_deref(), Some("rs"));
         let spec = build_spec(&parse("ext:.arj", Scope::All), &filters);
         assert_eq!(spec.ext.as_deref(), Some("arj"));
+    }
+
+    #[test]
+    fn launch_args_follow_volume_mask() {
+        let cfg = crate::config::IndexConfig::default();
+        // 全部选中:不加 --index-volumes,交给 worker 自己枚举固定 NTFS 卷
+        // (新插盘也能自动纳入)。
+        let all = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
+        assert!(!all.contains("--index-volumes"), "全部盘时不应限制卷: {all}");
+        // 部分选中:只传掩码里的盘,且按盘符升序。
+        let mask = lstr_index::volmask::mask_from_letters(['f', 'c']);
+        let args = worker_launch_args(&cfg, mask);
+        assert!(args.contains(" --index-volumes C,F"), "args={args}");
     }
 }

@@ -148,6 +148,9 @@ pub struct LstrApp {
     index_note: Option<String>,
     /// 状态行首次出现时间(>300ms 才显示,避免闪烁)。
     index_note_since: Option<std::time::Instant>,
+    /// 设置页「索引卷」候选盘缓存:(枚举时刻, 升序盘符)。
+    /// 枚举一次固定卷要跑 26 组 GetDriveType/GetVolumeInformation,不能每帧调。
+    index_drives: Option<(Instant, Vec<char>)>,
     pending_gen: u64,
     /// 诊断用：请求发出时刻（定位「显示 70ms、实际等 2s」的排队来源）。
     search_sent_at: Option<Instant>,
@@ -281,6 +284,7 @@ impl LstrApp {
             error: None,
             index_note: None,
             index_note_since: None,
+            index_drives: None,
             pending_gen,
             search_sent_at: None,
             waiting: true,
@@ -3855,7 +3859,7 @@ impl LstrApp {
     fn paint_settings_search(
         &mut self,
         ui: &mut egui::Ui,
-        _ctx: &egui::Context,
+        ctx: &egui::Context,
         painter: &egui::Painter,
         area: Rect,
     ) {
@@ -3924,6 +3928,94 @@ impl LstrApp {
         }
         y += ROW;
 
+        // —— 索引卷勾选 ——
+        // 只有勾选的盘进内置索引;盘符升序(C D E F),点击立即生效(worker 起停扫描)。
+        // 候选盘 = 固定 NTFS 盘 ∪ 配置里已有的盘 ∪ worker 上报的盘,
+        // 这样「已选但当前枚举不到」的盘也能取消勾选,否则用户没法撤销。
+        Self::settings_label(painter, &theme, area.left(), y, "索引卷");
+        let known = self.index_drive_letters();
+        let selected: Vec<char> = known
+            .iter()
+            .copied()
+            .filter(|letter| self.cfg.index.volume_enabled(*letter))
+            .collect();
+        const CHIP_W: f32 = 44.0;
+        const CHIP_H: f32 = 26.0;
+        const CHIP_GAP: f32 = 6.0;
+        let mut chip_x = area.left() + 130.0;
+        let mut row_top = y;
+        let mut toggled: Option<char> = None;
+        for letter in known.iter().copied() {
+            // 盘多时自动换行,不横向溢出(最小窗口宽度 780 也放得下 4 个盘)。
+            if chip_x + CHIP_W > area.right() {
+                chip_x = area.left() + 130.0;
+                row_top += CHIP_H + 4.0;
+            }
+            let rect =
+                Rect::from_min_size(egui::pos2(chip_x, row_top), egui::vec2(CHIP_W, CHIP_H));
+            let on = self.cfg.index.volume_enabled(letter);
+            let response = ui.interact(rect, Id::new(("lstr-idx-volume", letter)), Sense::click());
+            if response.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            painter.rect_filled(
+                rect,
+                CornerRadius::same(6),
+                if on { theme.amber_soft } else { theme.hover },
+            );
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(6),
+                Stroke::new(1.0, if on { theme.amber } else { theme.hair }),
+                StrokeKind::Inside,
+            );
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                format!("{letter}:"),
+                ui::text_font(11.0),
+                if on { theme.amber } else { theme.text },
+            );
+            if response.clicked() {
+                toggled = Some(letter);
+            }
+            chip_x += CHIP_W + CHIP_GAP;
+        }
+        // 只剩一个卷时给提示:再点它会被拒绝(配置里空列表表示「全部」,不能真全不选)。
+        let mut hint_h = 0.0;
+        if selected.len() <= 1 {
+            painter.text(
+                egui::pos2(area.left() + 130.0, row_top + CHIP_H + 11.0),
+                Align2::LEFT_CENTER,
+                "至少保留一个卷",
+                ui::text_font(10.0),
+                theme.dim,
+            );
+            hint_h = 19.0;
+        }
+        y = row_top + ROW + hint_h;
+        if let Some(letter) = toggled {
+            let mut next = selected.clone();
+            if next.contains(&letter) {
+                next.retain(|c| *c != letter);
+            } else {
+                next.push(letter);
+            }
+            if self.cfg.index.set_selected_volumes(&next, &known) {
+                let _ = self.cfg.save();
+                let mask = self.cfg.index.volume_mask();
+                self.service.set_index_volumes(mask);
+                self.toast(
+                    ctx,
+                    format!("索引卷:{} · 立即生效", lstr_index::volmask::describe(mask)),
+                );
+            } else {
+                // 设置页打开时 footer 不绘制,toast 只作为关闭设置后的兜底;
+                // 页面内的可见提示是上面那行「至少保留一个卷」。
+                self.toast(ctx, "至少保留一个盘".to_string());
+            }
+        }
+
         // —— 后端选择 ——
         Self::settings_label(painter, &theme, area.left(), y, "索引后端");
         let backends = [("auto", "自动(内置优先+兜底)"), ("builtin", "仅内置索引(不碰 Everything)"), ("everything", "仅 Everything"), ("off", "关闭内置索引")];
@@ -3956,14 +4048,20 @@ impl LstrApp {
         }
         y += ROW;
 
-        painter.text(
-            egui::pos2(area.left(), y + 8.0),
-            Align2::LEFT_CENTER,
-            "自动:内置索引未就绪时用 Everything 兜底合并;仅内置:完全不读取 Everything;仅 Everything:只用 Everything 后端。\
-时间筛选在内置索引(目录扫描)模式下可用;内置索引仅覆盖本机固定 NTFS 卷,其他卷(网络盘/FAT32/exFAT)需 Everything。修改后需重启 lstr 生效。",
+        // 帮助:按实际生效时机分开写——切卷立即生效,后端/噪声要重启。
+        // 这里用 layout+wrap 按 area 宽度自动折行:文案再长也不会跑出右边界
+        // (painter.text 是 no-wrap,旧版单行长段落其实早就被窗口右侧裁掉了)。
+        let help = "自动:内置索引未就绪时用 Everything 兜底合并;仅内置:完全不读取 Everything;仅 Everything:只用 Everything 后端。\n\
+索引卷勾选立即生效(worker 自动起停该盘扫描);索引后端与噪声目录仍需重启 lstr 生效。\n\
+时间筛选在内置索引(目录扫描)模式下可用。\n\
+内置索引只覆盖本机固定 NTFS 卷;网络盘/FAT32/exFAT 等需 Everything。";
+        let galley = painter.layout(
+            help.to_string(),
             ui::text_font(10.5),
             theme.sub,
+            area.width(),
         );
+        painter.galley(egui::pos2(area.left(), y + 8.0), galley, theme.sub);
     }
 
     fn cfg_index_backend(&self) -> &'static str {
@@ -4006,6 +4104,38 @@ impl LstrApp {
             }
         }
         let _ = self.cfg.save();
+    }
+
+    /// 设置页「索引卷」的候选盘:固定 NTFS 盘 ∪ 配置已选盘 ∪ worker 上报盘,
+    /// 升序去重(visual 上必须 C D E F 这样排,便于和资源管理器对照)。
+    ///
+    /// `fixed_ntfs_volumes()` 一次要跑 26 组 GetDriveType/GetVolumeInformation,
+    /// 不能每帧调用:结果缓存在 [`Self::index_drives`],5 秒过期
+    /// (热插拔后最多 5 秒就能在设置页看到新盘)。
+    fn index_drive_letters(&mut self) -> Vec<char> {
+        const TTL: Duration = Duration::from_secs(5);
+        if let Some((at, letters)) = &self.index_drives {
+            if at.elapsed() < TTL {
+                return letters.clone();
+            }
+        }
+        let mut letters: Vec<char> = lstr_index::win::fixed_ntfs_volumes()
+            .into_iter()
+            .map(|(letter, _)| letter)
+            .collect();
+        // 配置里已选、但此刻枚举不到的盘(比如移动硬盘没插)也要显示,否则没法取消勾选。
+        letters.extend(self.cfg.index.volume_letters());
+        if let Some(st) = self.service.index_status.lock().unwrap().as_ref() {
+            letters.extend(st.volumes.iter().map(|v| v.letter));
+        }
+        letters.sort_unstable();
+        letters.dedup();
+        // 枚举异常(权限等)时至少给一个 C:,否则这一行是空的、用户没法操作。
+        if letters.is_empty() {
+            letters.push('C');
+        }
+        self.index_drives = Some((Instant::now(), letters.clone()));
+        letters
     }
 
     fn paint_settings_maintenance(
