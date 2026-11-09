@@ -257,6 +257,11 @@ pub fn spawn_client_thread(
         .spawn(move || {
             let mut first_connect = !launched_worker;
             let mut launch_declined = false;
+            // 测试进程里不拉起提权 worker:UAC 弹窗会卡住无人值守的测试。
+            // 生产构建(cfg!(test) == false)行为不变。
+            if cfg!(test) {
+                launch_declined = true;
+            }
             let mut last_launch = std::time::Instant::now() - Duration::from_secs(60);
             loop {
                 if shutdown.load(Ordering::Relaxed) {
