@@ -201,8 +201,6 @@ pub struct LstrApp {
     last_width: f32,
     center_frames: u8,
     suppress_hide_until: Instant,
-    /// 按住 Esc 关闭窗口：记录按下起始时刻，超过阈值即隐藏。
-    esc_hold_since: Option<Instant>,
     icons: IconStore,
 }
 
@@ -305,7 +303,6 @@ impl LstrApp {
             last_width: 0.0,
             center_frames: 0,
             suppress_hide_until: Instant::now(),
-            esc_hold_since: None,
             icons: IconStore::new(),
         }
     }
@@ -614,19 +611,21 @@ impl LstrApp {
             return;
         }
 
-        // 按住 Esc 关闭窗口（约 450ms）：短按仍走原有逻辑（清空输入、收起菜单、
-        // 退出设置页等），长按直接隐藏。窗口不再因为失焦自动关闭。
-        const ESC_HOLD_HIDE: Duration = Duration::from_millis(450);
-        if ctx.input(|i| i.key_down(Key::Escape)) {
-            let since = *self.esc_hold_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= ESC_HOLD_HIDE {
-                self.esc_hold_since = None;
+        // Esc 直接关闭窗口（不再需要按住）：菜单/筛选/设置一并收起。
+        // 窗口不会因为失焦自动关闭。
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.menu_open = false;
+            self.filter_menu = None;
+            self.settings_open = false;
+            if let Some(dialog) = self.dialog.take() {
+                // 交还焦点：抑制这个对话框的自动唤出。
+                self.suppressed_dialog = Some(dialog.hwnd);
                 self.hide(ctx);
-                return;
+                dialog::restore_focus(&dialog);
+            } else {
+                self.hide(ctx);
             }
-            ctx.request_repaint_after(Duration::from_millis(25));
-        } else {
-            self.esc_hold_since = None;
+            return;
         }
 
         if self.settings_open {
