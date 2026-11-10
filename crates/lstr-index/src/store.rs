@@ -489,6 +489,23 @@ impl VolumeStore {
         self.name_off.len()
     }
 
+    /// compact 后已归并的 slot 数。快照按「base(FRN 序)+ delta(FRN 排序后归并)」
+    /// 流式重建列,保存期间不 compact(见 snapshot 的分段保存)。
+    pub fn base_len(&self) -> u32 {
+        self.base_len
+    }
+
+    /// 自上次 compact 以来就地改名过的 base slot(reindex 里小于 base_len 的项)。
+    /// 这些 slot 在 `offs` 里的位置已失效,快照视图需把它们移出 base 序列,
+    /// 与 delta/复活槽一起按当前名重排后归并。
+    pub fn renamed_base_slots(&self) -> Vec<u32> {
+        self.reindex
+            .iter()
+            .copied()
+            .filter(|&s| s < self.base_len)
+            .collect()
+    }
+
     /// 各列堆字节数(诊断/内存预算断言用)。不含未收缩的 Vec 容量余量。
     pub fn heap_bytes(&self) -> usize {
         let v = |x: &Vec<u8>| x.len();

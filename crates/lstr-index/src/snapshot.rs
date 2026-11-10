@@ -13,12 +13,15 @@
 //! mtime  : u64 len + u32×  (unix 秒;0=未知,USN 路径为 0)
 //! unres  : u64 len + (u32 slot, u64 parent_frn)×
 //! ```
-//! 只在 compact 后落盘(列处于一致有序态)。写盘走 tmp+rename 原子替换。
+//! 列必须一致有序。就绪卷由 [`SaveTask`] 构造只读快照视图(不 compact store,
+//! 分段写);scan 模式/外部调用走 [`save_report`](先 compact 再整写)。两条
+//! 路径都沿 tmp+fsync+rename 原子替换。
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use crate::store::{VolumeStore, NO_PARENT};
+use crate::store::{VolumeStore, ATTR_INTERNAL, ATTR_SEEN, NO_PARENT};
 
 pub const MAGIC: &[u8; 4] = b"LIDX";
 /// v3:未消解父链接 (slot, parent_frn) 也落盘(v2 没有,重启后这些条目永久退化)。
@@ -204,6 +207,697 @@ fn write_col_u64<W: Write>(w: &mut W, col: &[u64]) -> std::io::Result<()> {
 }
 fn write_col_u16<W: Write>(w: &mut W, col: &[u16]) -> std::io::Result<()> {
     write_col(w, col)
+}
+
+// ---------------------------------------------------------------------------
+// 分段快照保存(可中断状态机)
+// ---------------------------------------------------------------------------
+//
+// 背景:整卷 compact + 一次写完 50-120MB 会把引擎线程独占 1-3 秒(实测
+// `save vol C took 2397ms`),查询只能排队。这里把「为快照准备一致列 + 写盘」
+// 拆成可恢复的步骤:
+//
+// - 保存期间**不 compact store**,而是按「base(已按 FRN 有序)+ delta」构造
+//   只读快照视图:活 slot 按 FRN 归并、父指针重映射、名字区重建(就地改名的
+//   幽灵字节不落盘)、offs 按当前名归并。store 一个字节都不改,查询可继续
+//   (引擎把修改类消息延迟到保存完成,见 Engine::handle)。
+// - 每步只做一小块(64K 元素 / 256KB 输出),步间检查查询让路钩子;状态
+//   (阶段 + 游标)保存在 SaveTask 里,下一轮 maintain 续写。
+// - 沿用 tmp + fsync + rename 纪律:只有全部列写完并 fsync 后才 rename;
+//   中途崩溃留下的 `.tmp` 由 load_snapshots 启动清理。
+//
+// 一次性保存(save_view_sync)与分段保存跑同一个状态机,只是预算不同,
+// 因此两条路径的最终字节天然一致(测试对拍)。
+
+/// 单个保存步的元素/输出上限(约 1-4ms 工作量)。
+const SAVE_CHUNK_ELEMS: usize = 64 * 1024;
+/// 输出缓冲上限;超过即写盘,避免一次 write 过大。
+const SAVE_WRITE_BUF: usize = 256 * 1024;
+/// 引擎空闲轮里单个 maintain 的保存预算(超过就让出,查询优先)。
+pub const SAVE_STEP_BUDGET: Duration = Duration::from_millis(4);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SavePhase {
+    Start,
+    ScanBase,
+    ScanDelta,
+    SortDelta,
+    Merge,
+    NamesLen,
+    Header,
+    Names,
+    OffsPrepare,
+    OffsBase,
+    OffsExtras,
+    OffsSort,
+    OffsHeader,
+    Offs,
+    Frn,
+    Parent,
+    Attrs,
+    Mtime,
+    UnresolvedWrite,
+    Finish,
+    SyncWait,
+}
+
+pub(crate) enum SaveStep {
+    Pending,
+    Done(SaveReport),
+    Failed(std::io::Error),
+}
+
+/// 可中断的整卷快照写入器。一次只服务一个卷(engine 持有 `Option<SaveTask>`)。
+pub(crate) struct SaveTask {
+    guid: u128,
+    header: SnapshotHeader,
+    dir: PathBuf,
+    tmp_path: PathBuf,
+    final_path: PathBuf,
+    file: Option<std::fs::File>,
+    phase: SavePhase,
+    started: Instant,
+    /// base 已归并 slot 数 / 当前 store 总 slot 数。
+    base_len: u32,
+    slot_count: u32,
+    /// 最终 slot 序(旧 slot id,按 FRN 升序)与 old→new 映射。
+    order: Vec<u32>,
+    delta: Vec<u32>,
+    merged: Vec<u32>,
+    remap: Vec<u32>,
+    merge_b: usize,
+    merge_d: usize,
+    /// 当前阶段的元素游标。
+    cursor: usize,
+    /// 名字区总字节数(头里先写,再流式追加名字)。
+    names_len: u64,
+    /// 写缓冲。
+    out: Vec<u8>,
+    /// offs 视图:base 中仍有效的部分(新 id,按名有序)+ 其余活槽(新 id)。
+    renamed: std::collections::HashSet<u32>,
+    covered: Vec<bool>,
+    base_kept: Vec<u32>,
+    extras: Vec<u32>,
+    bi: usize,
+    ei: usize,
+    offs_written: usize,
+    /// 落盘的未消解父链接(新 slot id)。
+    unresolved: Vec<(u32, u64)>,
+    /// 保存视图里可解析的未消解父链:(新 slot id, 新父 slot)。
+    /// 旧 compact 会顺手解析;视图不改 store,但可以在父列写正确链接。
+    parent_override: Vec<(u32, u32)>,
+    /// fsync 放到独立线程:慢盘上 sync_all 可能数百 ms,不能占着引擎线程
+    /// (查询还在等)。等待期间引擎继续服务查询,收尾只做 rename。
+    sync_thread: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    finished: bool,
+}
+
+impl SaveTask {
+    pub(crate) fn new(dir: &Path, header: &SnapshotHeader) -> Self {
+        let guid = header.guid;
+        Self {
+            guid,
+            header: header.clone(),
+            dir: dir.to_path_buf(),
+            tmp_path: dir.join(format!("vol_{:032x}.tmp", std::process::id())),
+            final_path: snapshot_path(dir, guid),
+            file: None,
+            phase: SavePhase::Start,
+            started: Instant::now(),
+            base_len: 0,
+            slot_count: 0,
+            order: Vec::new(),
+            delta: Vec::new(),
+            merged: Vec::new(),
+            remap: Vec::new(),
+            merge_b: 0,
+            merge_d: 0,
+            cursor: 0,
+            names_len: 0,
+            out: Vec::with_capacity(SAVE_WRITE_BUF),
+            renamed: std::collections::HashSet::new(),
+            covered: Vec::new(),
+            base_kept: Vec::new(),
+            extras: Vec::new(),
+            bi: 0,
+            ei: 0,
+            offs_written: 0,
+            unresolved: Vec::new(),
+            parent_override: Vec::new(),
+            sync_thread: None,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn guid(&self) -> u128 {
+        self.guid
+    }
+
+    /// 从开始(含可能的让路等待)到当前的总耗时。
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn file_mut(&mut self) -> std::io::Result<&mut std::fs::File> {
+        self.file.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "snapshot save: file not opened")
+        })
+    }
+
+    fn flush_out(&mut self) -> std::io::Result<()> {
+        if !self.out.is_empty() {
+            let out = std::mem::take(&mut self.out);
+            self.file_mut()?.write_all(&out)?;
+            self.out = out;
+            self.out.clear();
+        }
+        Ok(())
+    }
+
+    fn pause(
+        &mut self,
+        started: Instant,
+        budget: Duration,
+        yield_now: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        yield_now() || started.elapsed() >= budget
+    }
+
+    pub(crate) fn advance(
+        &mut self,
+        store: &VolumeStore,
+        budget: Duration,
+        yield_now: &mut dyn FnMut() -> bool,
+    ) -> SaveStep {
+        match self.advance_inner(store, budget, yield_now) {
+            Ok(Some(report)) => SaveStep::Done(report),
+            Ok(None) => SaveStep::Pending,
+            Err(err) => SaveStep::Failed(err),
+        }
+    }
+
+    fn advance_inner(
+        &mut self,
+        store: &VolumeStore,
+        budget: Duration,
+        yield_now: &mut dyn FnMut() -> bool,
+    ) -> std::io::Result<Option<SaveReport>> {
+        if self.finished {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "snapshot save: advanced after finish",
+            ));
+        }
+        let step_started = Instant::now();
+        loop {
+            if yield_now() {
+                return Ok(None);
+            }
+            match self.phase {
+                SavePhase::Start => {
+                    std::fs::create_dir_all(&self.dir)?;
+                    self.file = Some(std::fs::File::create(&self.tmp_path)?);
+                    self.base_len = store.base_len();
+                    self.slot_count = store.len() as u32;
+                    self.remap = vec![u32::MAX; self.slot_count as usize];
+                    self.order = Vec::with_capacity(self.slot_count as usize);
+                    self.phase = SavePhase::ScanBase;
+                    self.cursor = 0;
+                }
+                SavePhase::ScanBase => {
+                    let end = (self.cursor + SAVE_CHUNK_ELEMS).min(self.base_len as usize);
+                    for s in self.cursor..end {
+                        if store.visible(s as u32) {
+                            self.order.push(s as u32);
+                        }
+                    }
+                    self.cursor = end;
+                    if self.cursor >= self.base_len as usize {
+                        self.phase = SavePhase::ScanDelta;
+                        self.cursor = self.base_len as usize;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::ScanDelta => {
+                    let end =
+                        (self.cursor + SAVE_CHUNK_ELEMS).min(self.slot_count as usize);
+                    for s in self.cursor..end {
+                        if store.visible(s as u32) {
+                            self.delta.push(s as u32);
+                        }
+                    }
+                    self.cursor = end;
+                    if self.cursor >= self.slot_count as usize {
+                        self.phase = SavePhase::SortDelta;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::SortDelta => {
+                    self.delta
+                        .sort_unstable_by_key(|&s| store.frn[s as usize]);
+                    self.merged = Vec::with_capacity(self.order.len() + self.delta.len());
+                    self.merge_b = 0;
+                    self.merge_d = 0;
+                    self.phase = SavePhase::Merge;
+                }
+                SavePhase::Merge => {
+                    // 两段都已按 FRN 升序:稳定地取较小者(base 先,FRN 唯一)。
+                    let mut n = 0usize;
+                    while self.merge_b < self.order.len() || self.merge_d < self.delta.len() {
+                        let take_base = if self.merge_d >= self.delta.len() {
+                            true
+                        } else if self.merge_b >= self.order.len() {
+                            false
+                        } else {
+                            store.frn[self.order[self.merge_b] as usize]
+                                <= store.frn[self.delta[self.merge_d] as usize]
+                        };
+                        let old = if take_base {
+                            let old = self.order[self.merge_b];
+                            self.merge_b += 1;
+                            old
+                        } else {
+                            let old = self.delta[self.merge_d];
+                            self.merge_d += 1;
+                            old
+                        };
+                        let new_id = self.merged.len() as u32;
+                        self.merged.push(old);
+                        self.remap[old as usize] = new_id;
+                        n += 1;
+                        if n >= SAVE_CHUNK_ELEMS {
+                            break;
+                        }
+                    }
+                    if self.merge_b >= self.order.len() && self.merge_d >= self.delta.len() {
+                        self.order = std::mem::take(&mut self.merged);
+                        self.delta.clear();
+                        self.unresolved.clear();
+                        self.parent_override.clear();
+                        for (old, frn) in store.unresolved_pairs() {
+                            let new_id = *self.remap.get(old as usize).unwrap_or(&u32::MAX);
+                            if new_id == u32::MAX {
+                                continue;
+                            }
+                            // 父项已在 store 里(只是子项先到):视图直接写父链接,
+                            // 不必等下次 compact;父被排除时写 NO_PARENT。
+                            if let Some(p) = store.find_slot(frn) {
+                                let np =
+                                    *self.remap.get(p as usize).unwrap_or(&NO_PARENT);
+                                self.parent_override.push((new_id, np));
+                            } else {
+                                self.unresolved.push((new_id, frn));
+                            }
+                        }
+                        self.parent_override.sort_unstable_by_key(|&(id, _)| id);
+                        self.phase = SavePhase::NamesLen;
+                        self.cursor = 0;
+                        self.names_len = 0;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::NamesLen => {
+                    let end = (self.cursor + SAVE_CHUNK_ELEMS).min(self.order.len());
+                    for k in self.cursor..end {
+                        let name = store.name(self.order[k]);
+                        self.names_len += name.len() as u64 + 1;
+                    }
+                    self.cursor = end;
+                    if self.cursor >= self.order.len() {
+                        self.phase = SavePhase::Header;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::Header => {
+                    let mut out = Vec::with_capacity(64);
+                    out.extend_from_slice(MAGIC);
+                    out.extend_from_slice(&VERSION.to_le_bytes());
+                    out.extend_from_slice(&self.header.guid.to_le_bytes());
+                    out.push(self.header.letter as u32 as u8);
+                    out.push(flags_of(
+                        self.header.complete,
+                        self.header.exclude_noise,
+                    ));
+                    out.extend_from_slice(&self.header.journal_id.to_le_bytes());
+                    out.extend_from_slice(&self.header.next_usn.to_le_bytes());
+                    out.extend_from_slice(&self.header.resume_frn.to_le_bytes());
+                    out.extend_from_slice(&self.header.est_records.to_le_bytes());
+                    out.extend_from_slice(&(self.order.len() as u64).to_le_bytes());
+                    out.extend_from_slice(&self.names_len.to_le_bytes());
+                    self.file_mut()?.write_all(&out)?;
+                    self.phase = SavePhase::Names;
+                    self.cursor = 0;
+                }
+                SavePhase::Names => {
+                    let mut n = 0usize;
+                    while self.cursor < self.order.len() && n < SAVE_CHUNK_ELEMS {
+                        let name = store.name(self.order[self.cursor]);
+                        self.out.extend_from_slice(name);
+                        self.out.push(0);
+                        self.cursor += 1;
+                        n += 1;
+                        if self.out.len() >= SAVE_WRITE_BUF {
+                            self.flush_out()?;
+                        }
+                    }
+                    if self.cursor >= self.order.len() {
+                        self.flush_out()?;
+                        self.phase = SavePhase::OffsPrepare;
+                        self.cursor = 0;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::OffsPrepare => {
+                    self.renamed = store.renamed_base_slots().into_iter().collect();
+                    self.covered = vec![false; self.order.len()];
+                    self.base_kept.clear();
+                    self.base_kept.reserve(store.offs.len());
+                    self.phase = SavePhase::OffsBase;
+                    self.cursor = 0;
+                }
+                SavePhase::OffsBase => {
+                    let end = (self.cursor + SAVE_CHUNK_ELEMS).min(store.offs.len());
+                    for k in self.cursor..end {
+                        let old = store.offs[k];
+                        let new_id = *self.remap.get(old as usize).unwrap_or(&u32::MAX);
+                        if new_id != u32::MAX && !self.renamed.contains(&old) {
+                            self.covered[new_id as usize] = true;
+                            self.base_kept.push(new_id);
+                        }
+                    }
+                    self.cursor = end;
+                    if self.cursor >= store.offs.len() {
+                        self.phase = SavePhase::OffsExtras;
+                        self.cursor = 0;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::OffsExtras => {
+                    let end = (self.cursor + SAVE_CHUNK_ELEMS).min(self.order.len());
+                    for k in self.cursor..end {
+                        if !self.covered[k] {
+                            self.extras.push(k as u32);
+                        }
+                    }
+                    self.cursor = end;
+                    if self.cursor >= self.order.len() {
+                        self.phase = SavePhase::OffsSort;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::OffsSort => {
+                    let order = &self.order;
+                    self.extras.sort_unstable_by(|&a, &b| {
+                        store
+                            .name_lc(order[a as usize])
+                            .cmp(store.name_lc(order[b as usize]))
+                    });
+                    self.phase = SavePhase::OffsHeader;
+                    self.bi = 0;
+                    self.ei = 0;
+                    self.offs_written = 0;
+                }
+                SavePhase::OffsHeader => {
+                    let n = self.order.len() as u64 * 4;
+                    self.file_mut()?.write_all(&n.to_le_bytes())?;
+                    self.phase = SavePhase::Offs;
+                }
+                SavePhase::Offs => {
+                    self.out.clear();
+                    let before = self.offs_written;
+                    let mut n = 0usize;
+                    while (self.bi < self.base_kept.len() || self.ei < self.extras.len())
+                        && n < SAVE_CHUNK_ELEMS
+                    {
+                        let take_base = if self.ei >= self.extras.len() {
+                            true
+                        } else if self.bi >= self.base_kept.len() {
+                            false
+                        } else {
+                            let a = self.order[self.base_kept[self.bi] as usize];
+                            let b = self.order[self.extras[self.ei] as usize];
+                            store.name_lc(a) <= store.name_lc(b)
+                        };
+                        let id = if take_base {
+                            let id = self.base_kept[self.bi];
+                            self.bi += 1;
+                            id
+                        } else {
+                            let id = self.extras[self.ei];
+                            self.ei += 1;
+                            id
+                        };
+                        self.out.extend_from_slice(&id.to_le_bytes());
+                        self.offs_written += 1;
+                        n += 1;
+                    }
+                    self.flush_out()?;
+                    if self.offs_written >= self.order.len() {
+                        self.phase = SavePhase::Frn;
+                        self.cursor = 0;
+                    } else if self.offs_written == before {
+                        // 防御:base_kept ∪ extras 必须恰好覆盖全部活槽。
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "snapshot offs incomplete: {}/{}",
+                                self.offs_written,
+                                self.order.len()
+                            ),
+                        ));
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::Frn => {
+                    let end = (self.cursor + SAVE_CHUNK_ELEMS).min(self.order.len());
+                    if self.cursor == 0 {
+                        let n = self.order.len() as u64 * 8;
+                        self.file_mut()?.write_all(&n.to_le_bytes())?;
+                    }
+                    self.out.clear();
+                    for k in self.cursor..end {
+                        let old = self.order[k];
+                        self.out.extend_from_slice(&store.frn[old as usize].to_le_bytes());
+                    }
+                    self.flush_out()?;
+                    self.cursor = end;
+                    if self.cursor >= self.order.len() {
+                        self.phase = SavePhase::Parent;
+                        self.cursor = 0;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::Parent => {
+                    let end = (self.cursor + SAVE_CHUNK_ELEMS).min(self.order.len());
+                    if self.cursor == 0 {
+                        let n = self.order.len() as u64 * 4;
+                        self.file_mut()?.write_all(&n.to_le_bytes())?;
+                    }
+                    self.out.clear();
+                    for k in self.cursor..end {
+                        let old = self.order[k];
+                        let p = store.parent[old as usize];
+                        let mut new_p = if p == NO_PARENT {
+                            NO_PARENT
+                        } else {
+                            *self.remap.get(p as usize).unwrap_or(&NO_PARENT)
+                        };
+                        if let Ok(j) = self
+                            .parent_override
+                            .binary_search_by_key(&(k as u32), |&(id, _)| id)
+                        {
+                            new_p = self.parent_override[j].1;
+                        }
+                        self.out.extend_from_slice(&new_p.to_le_bytes());
+                    }
+                    self.flush_out()?;
+                    self.cursor = end;
+                    if self.cursor >= self.order.len() {
+                        self.phase = SavePhase::Attrs;
+                        self.cursor = 0;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::Attrs => {
+                    let end = (self.cursor + SAVE_CHUNK_ELEMS).min(self.order.len());
+                    if self.cursor == 0 {
+                        let n = self.order.len() as u64 * 2;
+                        self.file_mut()?.write_all(&n.to_le_bytes())?;
+                    }
+                    self.out.clear();
+                    for k in self.cursor..end {
+                        let old = self.order[k];
+                        // DEAD/NOISE/SEEN 都是内存态:可见 slot 本就不带 DEAD/NOISE,
+                        // SEEN 只在对账窗口存在(保存被禁止),这里统一剥掉兜底。
+                        let a = store.attrs[old as usize] & !(ATTR_INTERNAL | ATTR_SEEN);
+                        self.out.extend_from_slice(&a.to_le_bytes());
+                    }
+                    self.flush_out()?;
+                    self.cursor = end;
+                    if self.cursor >= self.order.len() {
+                        self.phase = SavePhase::Mtime;
+                        self.cursor = 0;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::Mtime => {
+                    let end = (self.cursor + SAVE_CHUNK_ELEMS).min(self.order.len());
+                    if self.cursor == 0 {
+                        let n = self.order.len() as u64 * 4;
+                        self.file_mut()?.write_all(&n.to_le_bytes())?;
+                    }
+                    self.out.clear();
+                    for k in self.cursor..end {
+                        let old = self.order[k];
+                        self.out
+                            .extend_from_slice(&store.mtime[old as usize].to_le_bytes());
+                    }
+                    self.flush_out()?;
+                    self.cursor = end;
+                    if self.cursor >= self.order.len() {
+                        self.phase = SavePhase::UnresolvedWrite;
+                        self.cursor = 0;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::UnresolvedWrite => {
+                    if self.cursor == 0 {
+                        let n = self.unresolved.len() as u64;
+                        self.file_mut()?.write_all(&n.to_le_bytes())?;
+                    }
+                    let end =
+                        (self.cursor + SAVE_CHUNK_ELEMS).min(self.unresolved.len());
+                    self.out.clear();
+                    for k in self.cursor..end {
+                        let (slot, parent_frn) = self.unresolved[k];
+                        self.out.extend_from_slice(&slot.to_le_bytes());
+                        self.out.extend_from_slice(&parent_frn.to_le_bytes());
+                    }
+                    self.flush_out()?;
+                    self.cursor = end;
+                    if self.cursor >= self.unresolved.len() {
+                        self.phase = SavePhase::Finish;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::Finish => {
+                    self.flush_out()?;
+                    let f = self.file.take().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "snapshot save: missing file at finish",
+                        )
+                    })?;
+                    // 慢盘 fsync 可能数百 ms:移到独立线程,引擎继续服务查询。
+                    self.sync_thread = Some(
+                        std::thread::Builder::new()
+                            .name("lstr-snapshot-fsync".to_string())
+                            .spawn(move || f.sync_all())
+                            .map_err(|e| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("spawn fsync thread: {e}"),
+                                )
+                            })?,
+                    );
+                    self.phase = SavePhase::SyncWait;
+                }
+                SavePhase::SyncWait => {
+                    let Some(handle) = self.sync_thread.as_ref() else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "snapshot save: missing fsync thread",
+                        ));
+                    };
+                    if !handle.is_finished() {
+                        // 不忙等:1ms 粒度让出,宿主每轮回来检查;查询优先。
+                        std::thread::sleep(Duration::from_millis(1));
+                        return Ok(None);
+                    }
+                    let handle = self.sync_thread.take().expect("fsync thread");
+                    match handle.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => return Err(err),
+                        Err(_) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "snapshot fsync thread panicked",
+                            ))
+                        }
+                    }
+                    std::fs::rename(&self.tmp_path, &self.final_path)?;
+                    if let Some(parent) = self.final_path.parent() {
+                        if !crate::win::flush_dir(parent) {
+                            debug_log(&format!(
+                                "snapshot: flush_dir {} failed, dir entry may be non-durable",
+                                parent.display()
+                            ));
+                        }
+                    }
+                    self.finished = true;
+                    let bytes = std::fs::metadata(&self.final_path)?.len();
+                    return Ok(Some(SaveReport { bytes, compacted: false }));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for SaveTask {
+    fn drop(&mut self) {
+        // 未完成(失败/被控制消息中止/进程正常退出):删掉半成品 tmp。
+        // 进程被杀不会走到这里,由 load_snapshots 的 `.tmp` 清理兜底。
+        if !self.finished {
+            self.file.take();
+            if let Some(handle) = self.sync_thread.take() {
+                let _ = handle.join();
+            }
+            let _ = std::fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
+/// 一次性(同步)跑完分段保存状态机:同一套列视图/写盘代码,不做步间让路。
+/// 用于 flush_all 与测试对拍(分段 vs 一次性的字节必须一致)。
+pub(crate) fn save_view_sync(
+    dir: &Path,
+    header: &SnapshotHeader,
+    store: &VolumeStore,
+) -> std::io::Result<SaveReport> {
+    let mut task = SaveTask::new(dir, header);
+    loop {
+        match task.advance(store, Duration::MAX, &mut || false) {
+            SaveStep::Pending => continue,
+            SaveStep::Done(report) => return Ok(report),
+            SaveStep::Failed(err) => return Err(err),
+        }
+    }
 }
 
 pub struct LoadedSnapshot {
@@ -737,6 +1431,272 @@ mod tests {
         let p = snapshot_path(&dir, guid);
         std::fs::write(&p, b"garbage-data-here").unwrap();
         assert!(load(&dir, guid, false).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 分段保存的列视图测试数据:base compact 后叠加 delta、就地改名、
+    /// 删除、未消解父链接 —— 覆盖保存视图需要重建的全部状态。
+    fn view_store() -> VolumeStore {
+        let mut s = VolumeStore::new(true);
+        s.insert(5, 0, 0x10, b"root");
+        s.insert(10, 5, 0x10, b"docs");
+        s.insert(11, 10, 0, b"alpha.txt");
+        s.insert(12, 10, 0, b"beta.txt");
+        s.insert(13, 5, 0x10, b"media");
+        s.compact();
+        // 就地改名(base slot,offs 里的旧位置失效)
+        s.insert(11, 10, 0, b"alpha-renamed.txt");
+        // 删除(base slot → DEAD,不得进快照)
+        s.remove(12);
+        // delta 新 slot
+        s.insert(100, 10, 0, b"gamma.txt");
+        s.insert(101, 13, 0, b"movie.mkv");
+        // 父项尚未到达 → unresolved 必须原样落盘
+        s.insert(200, 999, 0, b"orphan.txt");
+        // 子项先到、父项随后到达:仍是 unresolved 记录,但保存视图可在父列
+        // 直接写正确链接(与 compact 的解析结果一致)。
+        s.insert(301, 300, 0, b"late-child.txt");
+        s.insert(300, 5, 0x10, b"late-parent");
+        s
+    }
+
+    fn view_header(guid: u128) -> SnapshotHeader {
+        SnapshotHeader {
+            guid,
+            letter: 'V',
+            complete: true,
+            exclude_noise: true,
+            journal_id: 0xabc,
+            next_usn: 12345,
+            resume_frn: 0,
+            est_records: 7,
+        }
+    }
+
+    /// 分段保存与一次性保存必须逐字节一致(同一 store、同一列视图)。
+    #[test]
+    fn segmented_save_is_byte_identical_to_one_shot() {
+        let store = view_store();
+        let h = view_header(0x5e6);
+        let dir_one = tmpdir("seg-one");
+        let dir_seg = tmpdir("seg-chunked");
+        let _ = std::fs::remove_dir_all(&dir_one);
+        let _ = std::fs::remove_dir_all(&dir_seg);
+        save_view_sync(&dir_one, &h, &store).unwrap();
+        let one = std::fs::read(snapshot_path(&dir_one, h.guid)).unwrap();
+
+        let mut task = SaveTask::new(&dir_seg, &h);
+        let mut calls = 0usize;
+        loop {
+            // 每 3 次检查让路一次(模拟查询到达),步间恢复续写。
+            let mut yield_now = || {
+                calls += 1;
+                calls % 3 == 0
+            };
+            match task.advance(&store, Duration::from_micros(50), &mut yield_now) {
+                SaveStep::Pending => continue,
+                SaveStep::Done(_) => break,
+                SaveStep::Failed(err) => panic!("segmented save failed: {err}"),
+            }
+        }
+        let seg = std::fs::read(snapshot_path(&dir_seg, h.guid)).unwrap();
+        assert_eq!(one, seg, "分段保存文件必须与一次性保存字节级一致");
+        assert!(!task.tmp_path.exists(), "完成后 tmp 必须已 rename");
+
+        // 视图语义:改名生效、删除项不落盘、delta/unresolved 可恢复。
+        let loaded = load(&dir_one, h.guid, true).unwrap();
+        let ls = &loaded.store;
+        assert_eq!(ls.len(), 9, "9 个活项(删除项不落盘)");
+        assert_eq!(ls.find_slot(11).map(|s| ls.name(s).to_vec()), Some(b"alpha-renamed.txt".to_vec()));
+        assert!(ls.find_slot(12).is_none(), "DEAD 条目不得进快照");
+        assert!(ls.find_slot(100).is_some());
+        let child = ls.find_slot(301).unwrap();
+        let parent = ls.find_slot(300).unwrap();
+        assert_eq!(ls.parent[child as usize], parent, "已到达的父项应在视图里解析");
+        assert_eq!(ls.unresolved_pairs().len(), 1, "仍未消解的父链接必须落盘");
+        let names: Vec<&[u8]> = ls.offs.iter().map(|&s| ls.name_lc(s)).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "offs 必须按小写名有序");
+        let _ = std::fs::remove_dir_all(&dir_one);
+        let _ = std::fs::remove_dir_all(&dir_seg);
+    }
+
+    /// 噪声排除:NOISE slot 不得进快照;compact 后迟到的噪声子树子项
+    /// (靠锚点立即判噪)同样必须被视图过滤。
+    #[test]
+    fn save_view_respects_noise_bits() {
+        let mut s = VolumeStore::new(true);
+        s.insert(5, 0, 0x10, b"root");
+        s.insert(10, 5, 0x10, b"node_modules");
+        s.insert(11, 10, 0, b"dep.js");
+        s.insert(12, 5, 0, b"keep.txt");
+        s.compact();
+        // compact 已剔除噪声子树,锚点保留;迟到子项立即判噪。
+        s.insert(13, 10, 0, b"late.js");
+        assert!(!s.visible(s.find_slot(13).unwrap()), "迟到子项应判噪");
+        let h = view_header(0x0e5);
+        let dir = tmpdir("seg-noise");
+        let _ = std::fs::remove_dir_all(&dir);
+        save_view_sync(&dir, &h, &s).unwrap();
+        let loaded = load(&dir, h.guid, true).expect("view snapshot loads");
+        assert_eq!(loaded.store.find_slot(12).map(|x| loaded.store.name(x).to_vec()), Some(b"keep.txt".to_vec()));
+        assert!(loaded.store.find_slot(10).is_none(), "噪声目录不得进快照");
+        assert!(loaded.store.find_slot(11).is_none());
+        assert!(loaded.store.find_slot(13).is_none(), "迟到的噪声子项不得进快照");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 随机状态(新增/改名/删除/未消解父链/中途 compact)下,保存视图与
+    /// compact 后的整存语义一致:可见集合、FRN→名字、offs 有序、父列边界。
+    #[test]
+    fn save_view_matches_compacted_state_on_random_ops() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() >> 33) as usize % n
+            }
+        }
+        let mut rng = Lcg(0x5eed_1234_abcd);
+        let mut store = VolumeStore::new(false);
+        store.insert(5, 0, 0x10, b"root");
+        let mut frns: Vec<u64> = vec![5];
+        let mut next_frn = 10u64;
+        let mut next_parent = 90_000u64; // 只用于制造未消解父链
+        for step in 0..3000usize {
+            match rng.below(10) {
+                0 => {
+                    let frn = next_frn;
+                    next_frn += 1;
+                    let parent = if rng.below(8) == 0 {
+                        next_parent += 1;
+                        next_parent
+                    } else {
+                        frns[rng.below(frns.len())]
+                    };
+                    let name = if rng.below(20) == 0 {
+                        format!("文件{step}.txt")
+                    } else {
+                        format!("file{step}.bin")
+                    };
+                    store.insert(frn, parent, 0, name.as_bytes());
+                    frns.push(frn);
+                }
+                1 => {
+                    // 改名/更新已有条目
+                    let frn = frns[rng.below(frns.len())];
+                    store.insert(frn, frns[rng.below(frns.len())], 0, format!("renamed{step}.txt").as_bytes());
+                }
+                2 => {
+                    let frn = frns[rng.below(frns.len())];
+                    store.remove(frn);
+                }
+                3 => {
+                    let frn = next_frn;
+                    next_frn += 1;
+                    store.insert(frn, 5, 0x10, format!("dir{step}").as_bytes());
+                    frns.push(frn);
+                }
+                _ => {
+                    // 高频短串名,制造就地改名与名字区幽灵
+                    let frn = frns[rng.below(frns.len())];
+                    store.insert(frn, 5, 0, format!("a{}", step % 37).as_bytes());
+                }
+            }
+            if step % 250 == 249 {
+                store.compact();
+            }
+        }
+        // 末尾至少留 delta/改名的视图态
+        store.insert(next_frn, 5, 0, b"tail-delta.txt");
+        let mut h = view_header(0x7a7);
+        h.exclude_noise = false;
+        let dir = tmpdir("seg-random");
+        let _ = std::fs::remove_dir_all(&dir);
+        save_view_sync(&dir, &h, &store).unwrap();
+        let loaded = load(&dir, h.guid, false).expect("view snapshot loads");
+        let ls = &loaded.store;
+        let live: Vec<u64> = (0..store.len() as u32)
+            .filter(|&s| store.visible(s))
+            .map(|s| store.frn[s as usize])
+            .collect();
+        assert_eq!(ls.len(), live.len(), "可见集合条数一致");
+        for frn in &live {
+            let a = store.find_slot(*frn).unwrap();
+            let b = ls.find_slot(*frn).expect("visible FRN must load");
+            assert_eq!(ls.name(b), store.name(a), "FRN={frn} 名字一致");
+        }
+        let names: Vec<&[u8]> = ls.offs.iter().map(|&s| ls.name_lc(s)).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "offs 必须按小写名有序");
+        assert!(ls
+            .parent
+            .iter()
+            .all(|&p| p == NO_PARENT || (p as usize) < ls.len()));
+        assert!(ls.offs.iter().all(|&s| (s as usize) < ls.len()));
+
+        // 再把同一状态 compact 后整存:可见集合/名字必须与视图完全一致。
+        store.compact();
+        let dir2 = tmpdir("seg-random-compact");
+        let _ = std::fs::remove_dir_all(&dir2);
+        save_view_sync(&dir2, &h, &store).unwrap();
+        let old = load(&dir2, h.guid, false).expect("compacted snapshot loads");
+        assert_eq!(old.store.len(), live.len());
+        for frn in &live {
+            let a = store.find_slot(*frn).unwrap();
+            let b = old.store.find_slot(*frn).expect("visible FRN must load");
+            assert_eq!(old.store.name(b), store.name(a));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// 写完若干块后中断(只留半成品 tmp):最终文件不得出现;残留 tmp 由
+    /// 下一次完整保存覆盖,快照可正常 load。
+    #[test]
+    fn segmented_save_interrupted_then_resumed() {
+        let store = view_store();
+        let h = view_header(0x9a9);
+        let dir = tmpdir("seg-interrupt");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut task = SaveTask::new(&dir, &h);
+        let tmp = task.tmp_path.clone();
+        let mut steps = 0usize;
+        loop {
+            match task.advance(&store, Duration::from_micros(20), &mut || false) {
+                SaveStep::Pending => {
+                    steps += 1;
+                    if steps >= 5 {
+                        break;
+                    }
+                }
+                SaveStep::Done(_) => panic!("save should not finish in 5 tiny steps"),
+                SaveStep::Failed(err) => panic!("save failed: {err}"),
+            }
+        }
+        assert!(tmp.exists(), "中断时必须留下半成品 tmp");
+        let partial = std::fs::read(&tmp).unwrap();
+        assert!(!partial.is_empty());
+        assert!(!snapshot_path(&dir, h.guid).exists(), "中断不得生成正式快照");
+        // 模拟进程被杀:不经过 Drop 清理,半成品 tmp 留在盘上。
+        std::mem::forget(task);
+        assert!(tmp.exists());
+
+        // 恢复:新任务从零重写,覆盖残留 tmp,完成后可 load。
+        let report = save_view_sync(&dir, &h, &store).unwrap();
+        assert!(report.bytes > 0);
+        assert!(!tmp.exists(), "完成后残留 tmp 必须消失");
+        let loaded = load(&dir, h.guid, true).expect("resumed snapshot must load");
+        assert_eq!(loaded.store.len(), 9);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
