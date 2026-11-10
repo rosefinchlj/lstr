@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::history::History;
+use crate::hotkey::{display_hotkey, TapKey, WakeHotkey, DOUBLE_TAP_WINDOW};
 use crate::model::{Entry, Kind, Scope};
 use crate::search::filters::{FileGroup, LocationFilter, SearchFilters, TimeFilter};
 use crate::search::{self, SearchService};
@@ -216,6 +217,8 @@ pub struct LstrApp {
     typing_folder: Option<std::path::PathBuf>,
     /// 目录上下文里临时切到全局搜索（Ctrl+Shift+G）。
     typing_global: bool,
+    /// 设置页「唤起热键」录制状态（None = 未在录制）。
+    hotkey_recording: Option<HotkeyRecording>,
 }
 
 impl LstrApp {
@@ -242,7 +245,7 @@ impl LstrApp {
         let preview_open = cfg.preview;
         let mut service = SearchService::new(cfg.clone(), Arc::clone(&history), cc.egui_ctx.clone());
         let pending_gen = service.search("", Scope::All, false, &SearchFilters::default(), &cfg.rank, cfg.show_history);
-        let hotkey = match HotkeyService::start(cc.egui_ctx.clone()) {
+        let hotkey = match HotkeyService::start(cc.egui_ctx.clone(), &cfg.hotkey) {
             Ok(service) => Some(service),
             Err(err) => {
                 eprintln!("lstr: hotkey 启动失败: {err}");
@@ -336,6 +339,7 @@ impl LstrApp {
             assets_ui: crate::assets_ui::AssetUiState::default(),
             typing_folder: None,
             typing_global: false,
+            hotkey_recording: None,
         }
     }
 
@@ -351,6 +355,36 @@ impl LstrApp {
             }
         }
         let _ = self.cfg.save();
+    }
+
+    /// 应用新的唤起热键（设置页录制完成）：丢弃旧 HotkeyService 重新启动，
+    /// 双击修饰键 / 组合键两条注册路径一起热生效，不必重启应用。
+    ///
+    /// 启动失败（组合键被系统/其他程序占用、钩子装不上）时用旧热键原样拉回，
+    /// 返回 `Err` 让 UI 显示失败提示；配置只在成功后落盘，保证「失败保留旧值」。
+    fn apply_hotkey(&mut self, ctx: &egui::Context, new_hotkey: String) -> Result<(), String> {
+        let old = self.cfg.hotkey.clone();
+        // Drop：unhook + unregister + join，干净卸载后再装新的。
+        self.hotkey = None;
+        match HotkeyService::start(ctx.clone(), &new_hotkey) {
+            Ok(service) => {
+                self.hotkey = Some(service);
+                self.cfg.hotkey = new_hotkey;
+                let _ = self.cfg.save();
+                Ok(())
+            }
+            Err(err) => {
+                // 旧热键刚被释放，重新注册大概率成功；再失败只能置空并留日志。
+                self.hotkey = match HotkeyService::start(ctx.clone(), &old) {
+                    Ok(service) => Some(service),
+                    Err(restore_err) => {
+                        eprintln!("lstr: 热键服务恢复失败({old}): {restore_err}");
+                        None
+                    }
+                };
+                Err(err)
+            }
+        }
     }
 
     /// P0-2：Explorer 里敲下的第一个字符唤出启动器并写入输入框。
@@ -387,6 +421,11 @@ impl LstrApp {
                 events.push(event);
             }
         }
+        // 设置页录制唤起热键时忽略全局热键触发：否则录 double-ctrl 的瞬间
+        // 现役热键会先把窗口收起，录制被打断（事件照常取走，只是不执行）。
+        if self.hotkey_recording.is_some() {
+            return;
+        }
         for event in events {
             match event {
                 HotkeyEvent::Toggle => {
@@ -415,6 +454,134 @@ impl LstrApp {
                 },
                 HotkeyEvent::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
+        }
+    }
+
+    /// 设置页「唤起热键」录制中：消费本帧按键，产出新的热键配置。
+    ///
+    /// 两类输入（见 [`crate::hotkey`]）：
+    /// - 双击修饰键：egui 不派发裸修饰键的 Key 事件，只能逐帧比较
+    ///   `modifiers` 检测按下沿；同一修饰键两次按下沿间隔 ≤400ms 即完成
+    ///   （录制期间 16ms 高频重绘保证沿不丢）；
+    /// - 组合键：`Event::Key` 自带按下时的修饰键快照，修饰键 + 普通键直接编码。
+    ///
+    /// Esc 随时取消；完成/取消后回到普通按键处理。
+    fn poll_hotkey_recording(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let (key_events, mods) = ctx.input(|i| {
+            let events: Vec<(egui::Key, egui::Modifiers)> = i
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::Key { key, modifiers, pressed, repeat, .. }
+                        if *pressed && !*repeat =>
+                    {
+                        Some((*key, *modifiers))
+                    }
+                    _ => None,
+                })
+                .collect();
+            (events, i.modifiers)
+        });
+
+        // take()：录制状态拿走处理，方法中途要调 &mut self（toast/apply）。
+        let Some(mut recording) = self.hotkey_recording.take() else {
+            return;
+        };
+
+        // 1) Esc 取消（无论带不带修饰键）。
+        if key_events.iter().any(|(key, _)| *key == egui::Key::Escape) {
+            self.toast(ctx, "已取消录制，唤起热键未改动".to_string());
+            return; // hotkey_recording 已被 take，保持 None。
+        }
+
+        // 2) 普通键按下 → 组合键路径；同时打断双击修饰键序列。
+        for (key, modifiers) in &key_events {
+            let Some(primary) = primary_key_from_egui(*key) else {
+                // 不可录制的键（方向键/标点等）：打断双击修饰键序列（与运行时
+                // 检测器「中间杂键重置」语义一致），提示后继续等。
+                recording.first_mod = None;
+                self.hotkey_recording = Some(recording);
+                self.toast(
+                    ctx,
+                    "该键不支持：请录字母 / 数字 / F1-F12 / 空格，或双击 Ctrl / Alt / Shift"
+                        .to_string(),
+                );
+                return;
+            };
+            recording.first_mod = None;
+            let wake = WakeHotkey::Combo {
+                mods: crate::hotkey::Mods {
+                    ctrl: modifiers.ctrl,
+                    alt: modifiers.alt,
+                    shift: modifiers.shift,
+                },
+                key: primary,
+            };
+            let encoded = wake.encode();
+            match crate::hotkey::parse_hotkey(&encoded) {
+                // 裸字母/数字/Shift 单修饰会被 parse 拒绝：全局注册会吞掉正常打字。
+                Some(valid) => self.finish_hotkey_recording(ctx, valid),
+                None => {
+                    // 非法组合：留在录制态，提示后继续等下一个键。
+                    self.hotkey_recording = Some(recording);
+                    self.toast(
+                        ctx,
+                        "需要至少一个 Ctrl / Alt 修饰键（Shift 单独修饰会吞掉正常打字）".to_string(),
+                    );
+                }
+            }
+            return;
+        }
+
+        // 3) 修饰键按下沿 → 双击修饰键检测。
+        let current = [mods.ctrl, mods.alt, mods.shift];
+        let edges = [
+            current[0].then_some(TapKey::Ctrl),
+            current[1].then_some(TapKey::Alt),
+            current[2].then_some(TapKey::Shift),
+        ];
+        for (idx, edge) in edges.into_iter().enumerate() {
+            let Some(tap) = edge else {
+                continue;
+            };
+            if !recording.prev_mods[idx] {
+                match recording.first_mod {
+                    Some((same, first_at))
+                        if same == tap
+                            && now.saturating_duration_since(first_at) <= DOUBLE_TAP_WINDOW =>
+                    {
+                        self.finish_hotkey_recording(ctx, WakeHotkey::DoubleTap(tap));
+                        return;
+                    }
+                    _ => recording.first_mod = Some((tap, now)),
+                }
+            }
+        }
+        recording.prev_mods = current;
+
+        // 未完成：放回录制状态，继续等。
+        self.hotkey_recording = Some(recording);
+        // 录制期间高频重绘：修饰键按下沿靠帧间比较，丢帧会漏掉双击。
+        ctx.request_repaint_after(Duration::from_millis(16));
+    }
+
+    /// 录制完成：应用新热键（热生效），失败保留旧值并提示。
+    fn finish_hotkey_recording(&mut self, ctx: &egui::Context, wake: WakeHotkey) {
+        self.hotkey_recording = None;
+        let encoded = wake.encode();
+        match self.apply_hotkey(ctx, encoded.clone()) {
+            Ok(()) => self.toast(
+                ctx,
+                format!("唤起热键已改为 {}，立即生效", display_hotkey(&encoded)),
+            ),
+            Err(err) => self.toast(
+                ctx,
+                format!(
+                    "注册失败（可能被其他程序占用）：{err}；已保留原热键 {}",
+                    display_hotkey(&self.cfg.hotkey)
+                ),
+            ),
         }
     }
 
@@ -737,6 +904,13 @@ impl LstrApp {
         });
         self.ime_composing = preedit;
         if ime_active {
+            return;
+        }
+
+        // 设置页「唤起热键」录制中：本帧按键全部进录制器（Esc 取消），
+        // 不落入下方任何常规快捷键处理，否则 Esc 会顺手关掉整个设置面板。
+        if self.hotkey_recording.is_some() {
+            self.poll_hotkey_recording(ctx);
             return;
         }
 
@@ -3219,6 +3393,8 @@ impl LstrApp {
         );
         if close.clicked() {
             self.settings_open = false;
+            // 关掉设置面板时退出热键录制态，避免录制提示残留到下次打开。
+            self.hotkey_recording = None;
         }
 
         painter.text(
@@ -3471,11 +3647,87 @@ impl LstrApp {
         area: Rect,
     ) {
         let theme = self.theme;
-        Self::settings_heading(painter, &theme, area, "行为", "结果数量、对话框联动与开机启动");
+        Self::settings_heading(painter, &theme, area, "行为", "唤起热键、结果数量、对话框联动与开机启动");
         let mut y = area.top() + 62.0;
         const ROW: f32 = 36.0;
         let ctrl_x = area.left() + 130.0;
         let ctrl_w = (area.width() - 140.0).min(240.0);
+
+        // —— 唤起热键：显示当前值 + 录制（双击修饰键 / 组合键），完成后热生效 ——
+        Self::settings_label(painter, &theme, area.left(), y, "唤起热键");
+        let recording = self.hotkey_recording.is_some();
+        let hotkey_label = if recording {
+            match self.hotkey_recording.as_ref().and_then(|state| state.first_mod) {
+                // 双击修饰键进行中：提示第二落。
+                Some((tap, _)) => {
+                    format!("已按下 {}：再按一下完成双击，或加普通键（Esc 取消）", tap.display_name())
+                }
+                None => "按下一个键…（Esc 取消）".to_string(),
+            }
+        } else {
+            display_hotkey(&self.cfg.hotkey)
+        };
+        painter.text(
+            egui::pos2(ctrl_x, y + 14.0),
+            Align2::LEFT_CENTER,
+            &hotkey_label,
+            ui::text_font(12.0),
+            if recording { theme.amber } else { theme.text },
+        );
+        let button = Rect::from_min_size(
+            egui::pos2(ctrl_x + 186.0, y + 2.0),
+            egui::vec2(60.0, 24.0),
+        );
+        let record = ui.interact(button, Id::new("lstr-hotkey-record"), Sense::click());
+        if record.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        painter.rect_filled(
+            button,
+            CornerRadius::same(6),
+            if recording { theme.amber_soft } else { theme.hover },
+        );
+        let button_stroke_w: f32 = 1.0;
+        painter.rect_stroke(
+            button,
+            CornerRadius::same(6),
+            Stroke::new(
+                button_stroke_w,
+                if recording {
+                    theme.amber
+                } else if record.hovered() {
+                    theme.sub
+                } else {
+                    theme.hair2
+                },
+            ),
+            StrokeKind::Inside,
+        );
+        painter.text(
+            button.center(),
+            Align2::CENTER_CENTER,
+            if recording { "取消" } else { "录制" },
+            ui::text_font(11.5),
+            if recording { theme.text } else { theme.sub },
+        );
+        if record.clicked() {
+            // 再点一次（或 Esc）退出录制；这里只切换状态，按键消费在 handle_keys。
+            self.hotkey_recording = if recording {
+                None
+            } else {
+                Some(HotkeyRecording::default())
+            };
+        }
+        if !recording {
+            painter.text(
+                egui::pos2(button.right() + 10.0, y + 14.0),
+                Align2::LEFT_CENTER,
+                "双击修饰键或组合键",
+                ui::mono_font(10.5),
+                theme.dim,
+            );
+        }
+        y += ROW;
 
         Self::settings_label(painter, &theme, area.left(), y, "最大结果数");
         let mut max_results = self.cfg.max_results as f32;
@@ -4466,6 +4718,74 @@ enum SettingsTab {
     Noise = 4,
     Maintenance = 5,
     Assets = 6,
+}
+
+/// 设置页「唤起热键」录制状态。
+#[derive(Debug, Default)]
+struct HotkeyRecording {
+    /// 双击修饰键：第一个修饰键的按下沿（键 + 时刻）；None = 尚未按下。
+    first_mod: Option<(TapKey, Instant)>,
+    /// 上一帧的修饰键状态 [ctrl, alt, shift]，用于检测按下沿。
+    prev_mods: [bool; 3],
+}
+
+/// egui 按键 → 组合键主键。只收录可安全全局注册的键：
+/// 字母 / 数字 / F1-F12 / 空格；方向键、标点等一律不支持录制。
+fn primary_key_from_egui(key: egui::Key) -> Option<crate::hotkey::PrimaryKey> {
+    use crate::hotkey::PrimaryKey as P;
+    use egui::Key as K;
+    Some(match key {
+        K::A => P::Letter('a'),
+        K::B => P::Letter('b'),
+        K::C => P::Letter('c'),
+        K::D => P::Letter('d'),
+        K::E => P::Letter('e'),
+        K::F => P::Letter('f'),
+        K::G => P::Letter('g'),
+        K::H => P::Letter('h'),
+        K::I => P::Letter('i'),
+        K::J => P::Letter('j'),
+        K::K => P::Letter('k'),
+        K::L => P::Letter('l'),
+        K::M => P::Letter('m'),
+        K::N => P::Letter('n'),
+        K::O => P::Letter('o'),
+        K::P => P::Letter('p'),
+        K::Q => P::Letter('q'),
+        K::R => P::Letter('r'),
+        K::S => P::Letter('s'),
+        K::T => P::Letter('t'),
+        K::U => P::Letter('u'),
+        K::V => P::Letter('v'),
+        K::W => P::Letter('w'),
+        K::X => P::Letter('x'),
+        K::Y => P::Letter('y'),
+        K::Z => P::Letter('z'),
+        K::Num0 => P::Digit(0),
+        K::Num1 => P::Digit(1),
+        K::Num2 => P::Digit(2),
+        K::Num3 => P::Digit(3),
+        K::Num4 => P::Digit(4),
+        K::Num5 => P::Digit(5),
+        K::Num6 => P::Digit(6),
+        K::Num7 => P::Digit(7),
+        K::Num8 => P::Digit(8),
+        K::Num9 => P::Digit(9),
+        K::F1 => P::Function(1),
+        K::F2 => P::Function(2),
+        K::F3 => P::Function(3),
+        K::F4 => P::Function(4),
+        K::F5 => P::Function(5),
+        K::F6 => P::Function(6),
+        K::F7 => P::Function(7),
+        K::F8 => P::Function(8),
+        K::F9 => P::Function(9),
+        K::F10 => P::Function(10),
+        K::F11 => P::Function(11),
+        K::F12 => P::Function(12),
+        K::Space => P::Space,
+        _ => return None,
+    })
 }
 
 /// 筛选条上的三个按钮。
