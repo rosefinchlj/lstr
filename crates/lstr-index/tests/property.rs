@@ -211,7 +211,8 @@ fn store_path_of(store: &VolumeStore, slot: u32) -> String {
     parts.join("\\")
 }
 
-/// 查询对拍:模型线性扫 vs store 查询,路径集合与 total 一致。
+/// 查询对拍:模型线性扫 vs store 查询,路径集合与 total 一致;
+/// 另外断言输出保持 memmem 偏移序(= name_off 升序,n-gram 快路径的序契约)。
 fn verify_query(model: &Model, store: &VolumeStore, needle: &str) {
     let spec = QuerySpec {
         tokens: vec![needle.into()],
@@ -235,6 +236,22 @@ fn verify_query(model: &Model, store: &VolumeStore, needle: &str) {
     store_hits.sort();
     assert_eq!(store_hits, model_hits, "query hits mismatch needle={needle}");
     assert_eq!(total, model_hits.len(), "query total mismatch needle={needle}");
+    // 序契约(仅 ngram 快路径 ≥2 字符):候选序 = name_off 升序(memmem
+    // 全量扫描的枚举序)。单字符走字母位图路径(slot 序),改名后与偏移序
+    // 本就不同,属既有语义,不在此断言。
+    let nb = needle.as_bytes();
+    if nb.len() >= 2 {
+        let mut expected: Vec<u32> = (0..store.name_off.len() as u32)
+            .filter(|&s| {
+                store.visible(s) && {
+                    let n = store.name_lc(s);
+                    nb.len() <= n.len() && n.windows(nb.len()).any(|w| w == nb)
+                }
+            })
+            .collect();
+        expected.sort_by_key(|&s| store.name_off[s as usize]);
+        assert_eq!(slots, expected, "query order must be name_off order needle={needle}");
+    }
 }
 
 #[test]
@@ -249,7 +266,7 @@ fn random_op_stream_matches_model() {
     }
     store.compact();
 
-    let needles = ["a", "e", "0", "1", "ab", "zz"];
+    let needles = ["a", "e", "0", "1", "ab", "zz", "e1", "0a", "9_"];
     for step in 0..3000usize {
         apply_random_op(&mut rng, &mut model, &mut store, true);
         if step % 300 == 299 {
