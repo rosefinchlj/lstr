@@ -103,9 +103,22 @@ impl AppIndex {
                     // 散字母伪匹配如 rust → Blend for Visual Studio 直接拒绝）。
                     4
                 } else {
-                    // 拼音容错（wxin → weixin）：对「首字母串」「全拼串」逐段
-                    // 密度匹配。不做跨段拼接，也拒绝纯散布命中——sz 散布在
-                    // windowsanquanzhongxin / jtyjxzs+… 里都是噪声。
+                    // 拼音容错（wxin → weixin）：中文名的「首字母串」「全拼串」
+                    // 逐段密度匹配。纯 ASCII 名的 pinyin key 只是名字小写无空格
+                    // 副本：只保留「首字符命中开头」的散字母模式（ps → Photoshop），
+                    // 从中间散拼的伪匹配拒绝（rust → blendforvisualstudio：
+                    // b≠r，曾在此漏过逐字符闸门）。
+                    if entry.name.is_ascii() {
+                        let head_ok = py
+                            .chars()
+                            .next()
+                            .zip(needle.chars().next())
+                            .map(|(a, b)| a == b)
+                            .unwrap_or(false);
+                        if !head_ok {
+                            return None;
+                        }
+                    }
                     let ok = py
                         .split(' ')
                         .any(|token| fuzzy::score_dense(token, &needle).is_some());
@@ -454,6 +467,19 @@ mod tests {
         assert_eq!(index.search("vsc", 10)[0].name, "Visual Studio Code");
         // 乱序/漏字母：拼音容错。
         assert_eq!(index.search("wxin", 10)[0].name, "微信");
+    }
+
+    #[test]
+    fn scattered_letters_do_not_match_english_names() {
+        // rust 散布在 "Blend for Visual Studio"（r 在 for、u 在 Visual 中间）：
+        // 名字模糊闸门与拼音回退都必须拒绝，不能因为 s/t 的连击加分过线。
+        let index = AppIndex {
+            apps: vec![app("Blend for Visual Studio"), app("RustDesk")],
+        };
+        let hits: Vec<String> = index.search("rust", 10).into_iter().map(|e| e.name).collect();
+        assert_eq!(hits, vec!["RustDesk".to_string()], "只应命中真名匹配: {hits:?}");
+        // 词首 + 连续模式仍然可用
+        assert_eq!(index.search("blend", 10)[0].name, "Blend for Visual Studio");
     }
 
     #[test]
