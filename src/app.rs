@@ -2634,7 +2634,9 @@ impl LstrApp {
             } else {
                 String::new()
             };
-            let size_text = if selected && self.cfg.show_meta {
+            // 大小/类型常显（受「显示元数据」开关控制）：用户要横向对比体积
+            // 再决定打开哪个，不能只在选中行才给。文件夹显示「文件夹」。
+            let size_text = if self.cfg.show_meta {
                 match entry.kind {
                     Kind::Folder => "文件夹".to_string(),
                     Kind::Command => String::new(),
