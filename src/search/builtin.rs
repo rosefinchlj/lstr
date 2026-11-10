@@ -2,6 +2,7 @@
 //! 查询面(search / search_split / search_exact),产出 Entry 走既有
 //! finalize/rank 管线;client 线程负责 worker 连接与帧→EngineMsg 转换。
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -41,6 +42,80 @@ pub struct BuiltinProvider {
     pub engine: Engine,
 }
 
+/// 「全部」双路一次查询的结果:两条前缀 + 两个精确计数 + 精确同名补齐。
+/// `exact` 只在「有截断且未按时间筛选」时填充,与旧 `search_exact` 的第二趟
+/// 结果逐条一致;`exact_ms` 供 stage 日志把 exact 与 split 分项计时。
+#[derive(Clone, Debug, Default)]
+pub struct SplitOnceResult {
+    pub folders: Vec<Entry>,
+    pub files: Vec<Entry>,
+    pub folder_total: usize,
+    pub all_total: usize,
+    pub exact: Vec<Entry>,
+    pub exact_ms: f32,
+}
+
+/// 元数据填充的统计(剖析用):逐条回退次数 / 一次成功枚举的目录数 /
+/// 直接从目录枚举命中的候选数。
+#[derive(Clone, Copy, Debug, Default)]
+struct FillStats {
+    per_file_calls: usize,
+    dir_enums: usize,
+    batch_hits: usize,
+}
+
+impl FillStats {
+    fn add(&mut self, other: Self) {
+        self.per_file_calls += other.per_file_calls;
+        self.dir_enums += other.dir_enums;
+        self.batch_hits += other.batch_hits;
+    }
+}
+
+/// 一次查询内的父目录元数据缓存。目录只枚举一次,命中按名字填充;枚举失败/
+/// 名字歧义/名字不在目录内一律回退旧 `find_meta`。缓存生命周期 = 一次查询,
+/// 不跨查询复用,因此不会引入「元数据可能陈旧」的语义漂移。
+struct MetaBatch {
+    dirs: HashMap<String, Option<idx_win::DirMeta>>,
+}
+
+impl MetaBatch {
+    fn new() -> Self {
+        Self { dirs: HashMap::new() }
+    }
+
+    /// 预取父目录。None = 之前已经枚举过(命中缓存);Some(true) = 本次枚举成功;
+    /// Some(false) = 本次枚举失败(后续该目录的候选逐条回退)。
+    fn prefetch(&mut self, parent: &str) -> Option<bool> {
+        if self.dirs.contains_key(parent) {
+            return None;
+        }
+        let meta = idx_win::list_dir_meta(parent);
+        let ok = meta.is_some();
+        self.dirs.insert(parent.to_string(), meta);
+        Some(ok)
+    }
+
+    /// 查一条候选的元数据。第二个返回值 = 是否来自目录枚举(否则逐条回退)。
+    fn lookup(&mut self, path: &str, name: &str) -> (Option<(u64, i64, bool)>, bool) {
+        if let Some(parent) = parent_dir(path) {
+            if let Some(Some(map)) = self.dirs.get(parent) {
+                if let Some(meta) = map.get(name) {
+                    return (Some((meta.size, meta.mtime, meta.is_dir)), true);
+                }
+            }
+        }
+        (idx_win::find_meta(path), false)
+    }
+}
+
+/// 路径的父目录(`C:\foo` → `C:`)。无分隔符返回 None(逐条回退)。
+fn parent_dir(path: &str) -> Option<&str> {
+    path.rfind('\\')
+        .map(|i| &path[..i])
+        .filter(|parent| !parent.is_empty())
+}
+
 impl BuiltinProvider {
     /// 包一层 panic 隔离:查询路径上的任何 bug 都只能让这一次查询返回空,
     /// 不能把 run_worker 线程打死(否则 UI 会永远停在「搜索中…」)。
@@ -55,9 +130,15 @@ impl BuiltinProvider {
         }
     }
 
-    /// 单次 All-kind 查询的双路结果,panic 隔离与 query_spec 相同。
-    fn query_split_spec(&self, spec: &QuerySpec) -> lstr_index::SplitOutcome {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.engine.query_split(spec))) {
+    /// 双路 + 精确同名候选(与旧 search_exact 的候选逐条一致),同一趟产出。
+    fn query_split_exact_spec(
+        &self,
+        spec: &QuerySpec,
+        exact: Option<&str>,
+    ) -> lstr_index::SplitOutcome {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.engine.query_split_with_exact(spec, exact)
+        })) {
             Ok(outcome) => outcome,
             Err(_) => {
                 lstr_index::snapshot::debug_log("search: engine.query_split panicked, returning empty");
@@ -120,61 +201,148 @@ impl BuiltinProvider {
         })
     }
 
-    /// 「全部」双路合并版:一次 All-kind 引擎查询拿到文件夹前缀、文件前缀与
-    /// 两个精确计数,再按各自预算产出 Entry。返回
-    /// `(folders, files, folder_total, all_total)`;旧 files 路总数 =
-    /// `all_total - folder_total`。结果与旧双路逐条一致(对拍测试锁死)。
+    /// 旧元数据路径(逐条 find_meta)的双路 oracle:只用于 release 基准对照
+    /// 批量填充的收益,生产/对拍均已走 [`Self::search_split_once`]。
+    #[cfg(test)]
+    fn search_split_per_entry(
+        &self,
+        query: &Query,
+        filters: &SearchFilters,
+        limit: usize,
+        folders: bool,
+    ) -> (Vec<Entry>, usize) {
+        let mut spec = build_spec(query, filters);
+        spec.kind = if folders { KindFilter::Folders } else { KindFilter::All };
+        let outcome = self.query_spec(&spec);
+        let mut entries = Vec::with_capacity(outcome.hits.len().min(limit));
+        self.fill_entries_per_entry(
+            &outcome.hits,
+            query,
+            limit,
+            |kind| {
+                if folders {
+                    kind == Kind::Folder
+                } else {
+                    kind != Kind::Folder
+                }
+            },
+            &mut entries,
+        );
+        (entries, outcome.total)
+    }
+
+    /// 「全部」双路合并版:一次 All-kind 引擎查询拿到文件夹前缀、文件前缀、
+    /// 两个精确计数,并顺带收集精确同名候选(旧 `search_exact` 第二趟)。
+    /// 旧 files 路总数 = `all_total - folder_total`。前缀结果与旧双路逐条一致
+    /// (对拍测试锁死);`exact` 与旧 `search_exact` 逐条一致,仅在有截断且
+    /// 未按时间筛选时填充。
     pub fn search_split_once(
         &self,
         query: &Query,
         filters: &SearchFilters,
         folder_limit: usize,
         file_limit: usize,
-    ) -> Result<(Vec<Entry>, Vec<Entry>, usize, usize), String> {
+    ) -> Result<SplitOnceResult, String> {
         let mut spec = build_spec(query, filters);
         spec.kind = KindFilter::All;
+        // 时间筛选时 mod.rs 不会补 exact(Everything 分支才支持),这里不做无用功。
+        let exact_needle = filters.time.is_none().then(|| query.text.to_lowercase());
         // 一次性分项剖析:引擎候选(eval)与收尾(path_of/find_meta/Entry)分开计时。
         // 旧双路里 files 路 15.8ms vs folders 8.4ms 的根因就在这里 —— 引擎两部分
         // 几乎相等,差的是 files 路要为 4 倍的候选逐条 FindFirstFileW。
         let t_engine = std::time::Instant::now();
-        let outcome = self.query_split_spec(&spec);
+        let outcome = self.query_split_exact_spec(&spec, exact_needle.as_deref());
         let engine_ms = t_engine.elapsed().as_secs_f32() * 1000.0;
         let mut folders = Vec::with_capacity(outcome.folder_hits.len().min(folder_limit));
         let mut files = Vec::with_capacity(outcome.file_hits.len().min(file_limit));
+        let mut batch = MetaBatch::new();
         let t_folders = std::time::Instant::now();
-        let folder_meta = self.fill_entries(
+        let folder_stats = self.fill_entries(
             &outcome.folder_hits,
             query,
             folder_limit,
             |kind| kind == Kind::Folder,
             &mut folders,
+            &mut batch,
         );
         let folder_fill_ms = t_folders.elapsed().as_secs_f32() * 1000.0;
         let t_files = std::time::Instant::now();
-        let file_meta = self.fill_entries(
+        let file_stats = self.fill_entries(
             &outcome.file_hits,
             query,
             file_limit,
             |kind| kind != Kind::Folder,
             &mut files,
+            &mut batch,
         );
         let file_fill_ms = t_files.elapsed().as_secs_f32() * 1000.0;
+        // 与 mod.rs 的 truncation 口径一致:总数减去已取回条数。
+        let file_total = outcome.total_all.saturating_sub(outcome.total_folders);
+        let truncation = outcome
+            .total_folders
+            .saturating_sub(folders.len())
+            + file_total.saturating_sub(files.len());
+        let mut exact = Vec::new();
+        let mut exact_ms = 0.0f32;
+        let exact_stats = if truncation > 0 && exact_needle.is_some() {
+            let t_exact = std::time::Instant::now();
+            let stats = self.fill_exact_entries(
+                &outcome.exact_hits,
+                query,
+                50,
+                &mut exact,
+                &mut batch,
+            );
+            exact_ms = t_exact.elapsed().as_secs_f32() * 1000.0;
+            stats
+        } else {
+            FillStats::default()
+        };
+        // 三个阶段的批量命中汇总(跨阶段共享目录缓存,dirs 只算首次枚举)。
+        let mut all_stats = folder_stats;
+        all_stats.add(file_stats);
+        all_stats.add(exact_stats);
+        // 分项计时/统计只在非测试构建的慢查询日志里使用;测试构建不落盘。
+        #[cfg(test)]
+        let _ = (
+            engine_ms,
+            folder_fill_ms,
+            file_fill_ms,
+            all_stats,
+        );
         // 测试里不写 APPDATA 日志(只用 release 基准/真实部署观测)。
         #[cfg(not(test))]
-        if engine_ms + folder_fill_ms + file_fill_ms > 15.0 || super::profile_queries() {
+        if engine_ms + folder_fill_ms + file_fill_ms + exact_ms > 15.0
+            || super::profile_queries()
+        {
             lstr_index::snapshot::debug_log(&format!(
-                "search: split engine={engine_ms:.1}ms folder_fill={folder_fill_ms:.1}ms(folder_meta={folder_meta}) file_fill={file_fill_ms:.1}ms(file_meta={file_meta}) hits={}+{} text={:?}",
+                "search: split engine={engine_ms:.1}ms folder_fill={folder_fill_ms:.1}ms(meta={}/dirs={}/batch={}) file_fill={file_fill_ms:.1}ms(meta={}/dirs={}/batch={}) exact_fill={exact_ms:.1}ms(meta={}/dirs={}/batch={},hits={}) batch_total(dirs={},hit={},fallback={}) hits={}+{} text={:?}",
+                folder_stats.per_file_calls,
+                folder_stats.dir_enums,
+                folder_stats.batch_hits,
+                file_stats.per_file_calls,
+                file_stats.dir_enums,
+                file_stats.batch_hits,
+                exact_stats.per_file_calls,
+                exact_stats.dir_enums,
+                exact_stats.batch_hits,
+                exact.len(),
+                all_stats.dir_enums,
+                all_stats.batch_hits,
+                all_stats.per_file_calls,
                 outcome.folder_hits.len(),
                 outcome.file_hits.len(),
                 query.text
             ));
         }
-        Ok((
+        Ok(SplitOnceResult {
             folders,
             files,
-            outcome.total_folders,
-            outcome.total_all,
-        ))
+            folder_total: outcome.total_folders,
+            all_total: outcome.total_all,
+            exact,
+            exact_ms,
+        })
     }
 
     /// 完全同名:索引内 offs 二分,毫秒级(替代 wfn: 二次 IPC)。
@@ -226,14 +394,14 @@ impl BuiltinProvider {
         spec.kind = kind_filter;
         let outcome = self.query_spec(&spec);
         let mut entries = Vec::with_capacity(outcome.hits.len().min(limit));
-        let _ = self.fill_entries(&outcome.hits, query, limit, keep, &mut entries);
+        let mut batch = MetaBatch::new();
+        let _ = self.fill_entries(&outcome.hits, query, limit, keep, &mut entries, &mut batch);
         Ok((entries, outcome.total))
     }
 
     /// Hit → Entry 的统一收尾:limit 预算、名字/kind 过滤、路径拼接、懒填元数据、
     /// 类型漂移校正。旧 `run` 与新的合并双路共用这一份逻辑,保证两条路径的
     /// Entry 字段与顺序逐条一致。
-    /// 返回实际发起的 `FindFirstFileW` 次数(剖析用:files 路慢在元数据条数)。
     fn fill_entries(
         &self,
         hits: &[lstr_index::Hit],
@@ -241,17 +409,34 @@ impl BuiltinProvider {
         limit: usize,
         keep: impl Fn(Kind) -> bool,
         entries: &mut Vec<Entry>,
-    ) -> usize {
+        batch: &mut MetaBatch,
+    ) -> FillStats {
+        self.fill_hits(hits, query, limit, entries, batch, |name, is_dir| {
+            // 索引里的空名(异常记录)与旧 fill_entries 一样直接丢弃;
+            // exact 路径保留旧 search_exact 行为(不按空名过滤)。
+            if name.is_empty() {
+                return None;
+            }
+            let kind = kind_of(name, is_dir);
+            keep(kind).then_some(kind)
+        }, true)
+    }
+
+    /// 旧逐条 `find_meta` 的 Entry 收尾(无损对拍 oracle,仅测试用)。
+    #[cfg(test)]
+    fn fill_entries_per_entry(
+        &self,
+        hits: &[lstr_index::Hit],
+        query: &Query,
+        limit: usize,
+        keep: impl Fn(Kind) -> bool,
+        entries: &mut Vec<Entry>,
+    ) {
         let want_pinyin = query.text.is_ascii();
-        let mut meta_calls = 0usize;
         for hit in hits {
-            // H3:limit 契约 —— 调用方预算(40-120/60-500)必须生效,
-            // 不能对最多 2000×卷 的全部候选逐条 find_meta 后才返回。
             if entries.len() >= limit {
                 break;
             }
-            // 先做零成本的名字/kind 过滤,再拼路径:旧实现先 path_of(沿父链
-            // 逐级分配 String),被 kind 丢弃的文件夹候选也白付了整条路径成本。
             let name = self.engine.entry_name(hit);
             if name.is_empty() {
                 continue;
@@ -264,13 +449,10 @@ impl BuiltinProvider {
             let Some(path) = self.engine.path_of(hit) else {
                 continue;
             };
-            // 懒填元数据:FindFirstFileW(约 100 条 × ~20µs);不存在=USN 延迟,丢弃
-            meta_calls += 1;
             let Some((size, modified, fs_dir)) = idx_win::find_meta(&path) else {
                 continue;
             };
             if fs_dir != is_dir {
-                // 类型漂移(罕见):以文件系统为准
                 kind = kind_of(&name, fs_dir);
                 if !keep(kind) {
                     continue;
@@ -289,7 +471,161 @@ impl BuiltinProvider {
                 pinyin,
             });
         }
-        meta_calls
+    }
+
+    /// 旧 `search_exact` 的 Entry 收尾(无损对拍 oracle,仅测试用)。
+    #[cfg(test)]
+    fn fill_exact_entries_per_entry(
+        &self,
+        hits: &[lstr_index::Hit],
+        query: &Query,
+        limit: usize,
+        entries: &mut Vec<Entry>,
+    ) {
+        let want_pinyin = query.text.is_ascii();
+        for hit in hits {
+            let Some(path) = self.engine.path_of(hit) else { continue };
+            let name = self.engine.entry_name(hit);
+            let is_dir = self.engine.is_dir(hit);
+            let kind = kind_of(&name, is_dir);
+            let Some((size, modified, fs_dir)) = idx_win::find_meta(&path) else { continue };
+            let pinyin = (want_pinyin && pinyin::has_cjk(&name)).then(|| pinyin::keys(&name));
+            entries.push(Entry {
+                tone: tone_for(&path),
+                initial: initial_of(&name),
+                id: path.clone(),
+                kind,
+                name,
+                path: Some(std::path::PathBuf::from(path)),
+                size: (!fs_dir && size > 0).then_some(size),
+                modified: (modified > 0).then_some(modified),
+                pinyin,
+            });
+            if entries.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    /// 精确同名候选的 Entry 收尾(语义与旧 `search_exact` 循环一致,元数据改走
+    /// 批量枚举;不做类型漂移校正 —— 旧路径也不做)。
+    fn fill_exact_entries(
+        &self,
+        hits: &[lstr_index::Hit],
+        query: &Query,
+        limit: usize,
+        entries: &mut Vec<Entry>,
+        batch: &mut MetaBatch,
+    ) -> FillStats {
+        self.fill_hits(hits, query, limit, entries, batch, |name, is_dir| {
+            Some(kind_of(name, is_dir))
+        }, false)
+    }
+
+    /// 分块批量填充内核:先按 `classify` 过滤候选(零成本),按父目录分组,
+    /// 组内 ≥2 条候选才做一次 `FindFirstFileExW` 目录枚举(单条候选逐条查更便宜,
+    /// 也避免为一个候选枚举超大目录);随后按原始候选顺序回填 Entry。
+    /// 分块大小 = 当前还缺的 Entry 数,保证 limit 契约与「元数据缺失时继续
+    /// 向后找」的旧行为完全一致,额外工作最多一个块。
+    fn fill_hits(
+        &self,
+        hits: &[lstr_index::Hit],
+        query: &Query,
+        limit: usize,
+        entries: &mut Vec<Entry>,
+        batch: &mut MetaBatch,
+        classify: impl Fn(&str, bool) -> Option<Kind>,
+        correct_kind: bool,
+    ) -> FillStats {
+        struct Candidate {
+            name: String,
+            is_dir: bool,
+            kind: Kind,
+            path: String,
+        }
+
+        let want_pinyin = query.text.is_ascii();
+        let mut stats = FillStats::default();
+        let mut cursor = 0usize;
+        while entries.len() < limit && cursor < hits.len() {
+            // H3:limit 契约 —— 调用方预算(40-120/60-500)必须生效,
+            // 不能对最多 2000×卷 的全部候选逐条 find_meta 后才返回。
+            let need = limit - entries.len();
+            let mut candidates: Vec<Candidate> =
+                Vec::with_capacity(need.min(hits.len().saturating_sub(cursor)));
+            while candidates.len() < need && cursor < hits.len() {
+                let hit = &hits[cursor];
+                cursor += 1;
+                // 先做零成本的名字/kind 过滤,再拼路径:旧实现先 path_of(沿父链
+                // 逐级分配 String),被 kind 丢弃的文件夹候选也白付了整条路径成本。
+                let name = self.engine.entry_name(hit);
+                let is_dir = self.engine.is_dir(hit);
+                let Some(kind) = classify(&name, is_dir) else {
+                    continue;
+                };
+                let Some(path) = self.engine.path_of(hit) else {
+                    continue;
+                };
+                candidates.push(Candidate { name, is_dir, kind, path });
+            }
+            if candidates.is_empty() {
+                continue;
+            }
+
+            // 按唯一父目录分组,只对 ≥2 条候选的目录预取一次。
+            let mut groups: HashMap<&str, usize> = HashMap::new();
+            for candidate in &candidates {
+                if let Some(parent) = parent_dir(&candidate.path) {
+                    *groups.entry(parent).or_insert(0) += 1;
+                }
+            }
+            for (&parent, &count) in &groups {
+                if count >= 2 {
+                    match batch.prefetch(parent) {
+                        Some(true) => stats.dir_enums += 1,
+                        Some(false) | None => {}
+                    }
+                }
+            }
+            drop(groups);
+
+            for candidate in candidates {
+                let (meta, batched) = batch.lookup(&candidate.path, &candidate.name);
+                if batched {
+                    stats.batch_hits += 1;
+                } else {
+                    stats.per_file_calls += 1;
+                }
+                let Some((size, modified, fs_dir)) = meta else {
+                    continue;
+                };
+                let mut kind = candidate.kind;
+                if correct_kind && fs_dir != candidate.is_dir {
+                    // 类型漂移(罕见):以文件系统为准
+                    let Some(new_kind) = classify(&candidate.name, fs_dir) else {
+                        continue;
+                    };
+                    kind = new_kind;
+                }
+                let pinyin = (want_pinyin && pinyin::has_cjk(&candidate.name))
+                    .then(|| pinyin::keys(&candidate.name));
+                entries.push(Entry {
+                    tone: tone_for(&candidate.path),
+                    initial: initial_of(&candidate.name),
+                    id: candidate.path.clone(),
+                    kind,
+                    name: candidate.name,
+                    path: Some(std::path::PathBuf::from(candidate.path)),
+                    size: (!fs_dir && size > 0).then_some(size),
+                    modified: (modified > 0).then_some(modified),
+                    pinyin,
+                });
+                if entries.len() >= limit {
+                    break;
+                }
+            }
+        }
+        stats
     }
 }
 
@@ -676,20 +1012,49 @@ mod tests {
         let test_dir = base.join("target-opt").join(&tag);
         let _ = std::fs::remove_dir_all(&test_dir);
         std::fs::create_dir_all(&test_dir).unwrap();
-        let mut names = Vec::new();
-        for i in 0..files {
-            let name = format!("ai_file_{i:04}.txt");
-            std::fs::write(test_dir.join(&name), b"x").unwrap();
-            names.push((name, false));
-        }
+        let mut dir_names: Vec<String> = Vec::new();
         for i in 0..dirs {
             let name = format!("ai_dir_{i:04}");
             std::fs::create_dir_all(test_dir.join(&name)).unwrap();
-            names.push((name, true));
+            dir_names.push(name);
         }
+        // 文件分散到各 ai_dir 子目录(每条父目录 2-4 个候选),模拟真实查询
+        // 候选来自几十个父目录的形态;第三个元素 = 父目录在 dir_names 的序号。
+        let mut names: Vec<(String, bool, Option<usize>)> = Vec::new();
+        for (i, name) in dir_names.iter().enumerate() {
+            names.push((name.clone(), true, None));
+        }
+        for i in 0..files {
+            let name = format!("ai_file_{i:04}.txt");
+            let parent_idx = (dirs > 0).then_some(i % dirs);
+            let parent = parent_idx
+                .map(|p| test_dir.join(&dir_names[p]))
+                .unwrap_or_else(|| test_dir.clone());
+            std::fs::write(parent.join(&name), b"x").unwrap();
+            names.push((name, false, parent_idx));
+        }
+        // 每个子目录再放一个无扩展名文件 "ai":精确同名候选 > 50,专门
+        // 验证 exact 补齐的 50 条预算与 offs 顺序,而不只是测到 4 条。
+        for (i, dir_name) in dir_names.iter().enumerate() {
+            std::fs::write(test_dir.join(dir_name).join("ai"), b"x").unwrap();
+            names.push(("ai".to_string(), false, Some(i)));
+        }
+        // 文件夹就叫 "ai":正文里排在全部 ai_dir_* 之后,通常落在 fetch 窗口
+        // 之外,专门用来验证 exact 补齐会把它捞回来并置顶。
+        std::fs::create_dir_all(test_dir.join("ai")).unwrap();
+        names.push(("ai".to_string(), true, None));
         for name in ["ai_tool.exe", "报告_ai.txt", "AI_CAPS.TXT"] {
             std::fs::write(test_dir.join(name), b"x").unwrap();
-            names.push((name.to_string(), false));
+            names.push((name.to_string(), false, None));
+        }
+        // 索引名与磁盘实际大小写不同(Windows 路径大小写不敏感):逐条
+        // FindFirstFileW 能命中,批量枚举必须按 ASCII 折叠名同样命中。
+        for (disk, index_name) in [
+            ("AI_CASE_MISMATCH.TXT", "ai_case_mismatch.txt"),
+            ("报告_AI_CASE.TXT", "报告_ai_case.txt"),
+        ] {
+            std::fs::write(test_dir.join(disk), b"x").unwrap();
+            names.push((index_name.to_string(), false, None));
         }
         let missing = "ai_missing.txt"; // 索引有、磁盘无:两条路径都必须丢弃
 
@@ -736,10 +1101,13 @@ mod tests {
             name: tag.clone(),
             mtime: 0,
         });
-        for (i, (name, is_dir)) in names.iter().enumerate() {
+        for (i, (name, is_dir, parent_idx)) in names.iter().enumerate() {
+            let parent_frn = parent_idx
+                .map(|p| 1000 + p as u64)
+                .unwrap_or(test_dir_frn);
             recs.push(Rec {
                 frn: 1000 + i as u64,
-                parent_frn: test_dir_frn,
+                parent_frn,
                 attrs: if *is_dir { 0x10 } else { 0 },
                 op: Op::Upsert,
                 name: name.clone(),
@@ -747,7 +1115,7 @@ mod tests {
             });
         }
         recs.push(Rec {
-            frn: 2000,
+            frn: 5000,
             parent_frn: test_dir_frn,
             attrs: 0,
             op: Op::Upsert,
@@ -786,20 +1154,133 @@ mod tests {
             ("ai", 80usize, 320usize),
             ("a", 80, 320),
             ("ai ext:txt", 80, 320),
+            ("AI_CASE_MISMATCH.TXT", 40, 60),
         ] {
             let query = parse(text, Scope::All);
             let filters = SearchFilters::default();
             let legacy_folders = fx.provider.search_split(&query, &filters, folder_limit, true).unwrap();
             let legacy_files = fx.provider.search_split(&query, &filters, file_limit, false).unwrap();
-            let (folders, files, folder_total, all_total) = fx
+            let result = fx
                 .provider
                 .search_split_once(&query, &filters, folder_limit, file_limit)
                 .unwrap();
-            assert_eq!(folders, legacy_folders.0, "folders 顺序/字段不一致: {text}");
-            assert_eq!(files, legacy_files.0, "files 顺序/字段不一致: {text}");
-            assert_eq!(folder_total, legacy_folders.1, "folder_total 不一致: {text}");
-            assert_eq!(all_total, legacy_files.1, "all_total 不一致: {text}");
+            assert_eq!(result.folders, legacy_folders.0, "folders 顺序/字段不一致: {text}");
+            assert_eq!(result.files, legacy_files.0, "files 顺序/字段不一致: {text}");
+            assert_eq!(result.folder_total, legacy_folders.1, "folder_total 不一致: {text}");
+            assert_eq!(result.all_total, legacy_files.1, "all_total 不一致: {text}");
         }
+    }
+
+    /// 任务 1 的元数据对拍:批量目录枚举填充 vs 旧逐条 FindFirstFileW 填充,
+    /// 同一批真实 Hit 上 Entry 逐字段相等(含大小写不同名/子目录/磁盘缺失项)。
+    #[test]
+    fn batch_meta_fill_matches_per_entry_on_real_files() {
+        let Some(fx) = real_index(400, 100, "meta-parity") else { return };
+        let query = parse("ai", Scope::All);
+        let filters = SearchFilters::default();
+        let mut spec = build_spec(&query, &filters);
+        spec.kind = KindFilter::All;
+        let outcome = fx
+            .provider
+            .engine
+            .query_split_with_exact(&spec, Some("ai"));
+        assert!(!outcome.aborted);
+
+        for (hits, keep_folder, limit) in [
+            (&outcome.folder_hits, true, 100usize),
+            (&outcome.file_hits, false, 400usize),
+            (&outcome.folder_hits, true, 7usize),
+            (&outcome.file_hits, false, 33usize),
+        ] {
+            let keep = |kind: Kind| {
+                if keep_folder {
+                    kind == Kind::Folder
+                } else {
+                    kind != Kind::Folder
+                }
+            };
+            let mut batch = MetaBatch::new();
+            let mut batched = Vec::new();
+            fx.provider.fill_entries(hits, &query, limit, keep, &mut batched, &mut batch);
+            let mut per_entry = Vec::new();
+            fx.provider.fill_entries_per_entry(hits, &query, limit, keep, &mut per_entry);
+            assert_eq!(
+                batched, per_entry,
+                "批量填充与逐条填充不一致(folder={keep_folder}, limit={limit})"
+            );
+        }
+
+        // 精确同名补齐同样对拍(旧 search_exact 逐条 vs 新批量)。
+        let mut batch = MetaBatch::new();
+        let mut batched = Vec::new();
+        fx.provider.fill_exact_entries(&outcome.exact_hits, &query, 50, &mut batched, &mut batch);
+        let mut per_entry = Vec::new();
+        fx.provider.fill_exact_entries_per_entry(
+            &outcome.exact_hits,
+            &query,
+            50,
+            &mut per_entry,
+        );
+        assert_eq!(batched, per_entry, "exact 批量填充与逐条填充不一致");
+    }
+
+    /// 任务 2 的端到端对拍:split 并趟带回的 exact Entry 与旧 `search_exact`
+    /// 第二趟逐条一致(字段/顺序/50 条预算)。
+    #[test]
+    fn split_once_exact_matches_search_exact_with_real_files() {
+        let Some(fx) = real_index(400, 100, "exact-parity") else { return };
+        let filters = SearchFilters::default();
+        for (text, folder_limit, file_limit) in [
+            ("ai", 30usize, 60usize),
+            ("a", 20, 40),
+            ("ai ext:txt", 20, 40),
+            // 纯过滤器查询(text 为空、tokens 为空):旧 exact 走全量列举,
+            // 并趟必须产出同一批候选。
+            ("ext:txt", 20, 40),
+        ] {
+            let query = parse(text, Scope::All);
+            let result = fx
+                .provider
+                .search_split_once(&query, &filters, folder_limit, file_limit)
+                .unwrap();
+            let expected = fx.provider.search_exact(&query, &filters, 50).unwrap().0;
+            assert_eq!(result.exact, expected, "exact 补齐不一致: {text}");
+        }
+    }
+
+    /// 目录枚举失败(整棵测试目录被删)时,批量填充必须回退逐条 find_meta,
+    /// 结果与旧路径一致(全部丢弃,而不是 panic 或返回陈旧元数据)。
+    #[test]
+    fn batch_meta_fallbacks_when_directory_disappears() {
+        let Some(fx) = real_index(160, 40, "meta-fallback") else { return };
+        let query = parse("ai", Scope::All);
+        let filters = SearchFilters::default();
+        let mut spec = build_spec(&query, &filters);
+        spec.kind = KindFilter::All;
+        let outcome = fx.provider.engine.query_split(&spec);
+
+        // 删掉测试目录:父目录枚举失败,所有候选的路径都不存在。
+        let _ = std::fs::remove_dir_all(&fx.test_dir);
+        let mut batch = MetaBatch::new();
+        let mut batched = Vec::new();
+        fx.provider.fill_entries(
+            &outcome.file_hits,
+            &query,
+            usize::MAX,
+            |kind| kind != Kind::Folder,
+            &mut batched,
+            &mut batch,
+        );
+        let mut per_entry = Vec::new();
+        fx.provider.fill_entries_per_entry(
+            &outcome.file_hits,
+            &query,
+            usize::MAX,
+            |kind| kind != Kind::Folder,
+            &mut per_entry,
+        );
+        assert_eq!(batched, per_entry, "目录消失后的回退结果不一致");
+        assert!(batched.is_empty(), "磁盘不存在的条目必须丢弃");
     }
 
     /// 任务 2 基准(手动运行):真实文件系统上旧双路 vs 合并单次的耗时,
@@ -825,14 +1306,16 @@ mod tests {
         };
         let (old_fold_p50, _) = samples(
             Box::new(|| {
-                fx.provider.search_split(&query, &filters, 80, true).unwrap();
+                fx.provider
+                    .search_split_per_entry(&query, &filters, 80, true);
             }),
             1,
             5,
         );
         let (old_file_p50, _) = samples(
             Box::new(|| {
-                fx.provider.search_split(&query, &filters, 320, false).unwrap();
+                fx.provider
+                    .search_split_per_entry(&query, &filters, 320, false);
             }),
             1,
             5,
@@ -846,10 +1329,127 @@ mod tests {
         );
         let mut spec = build_spec(&query, &filters);
         spec.kind = KindFilter::All;
-        let (engine_p50, _) = samples(Box::new(|| { fx.provider.engine.query_split(&spec); }), 2, 7);
+        let outcome = fx
+            .provider
+            .engine
+            .query_split_with_exact(&spec, Some("ai"));
+        let (engine_p50, _) = samples(
+            Box::new(|| {
+                fx.provider.engine.query_split_with_exact(&spec, Some("ai"));
+            }),
+            2,
+            7,
+        );
+        let mut exact_spec = spec.clone();
+        exact_spec.exact = Some("ai".to_string());
+        let (old_exact_query_p50, _) = samples(
+            Box::new(|| {
+                fx.provider.engine.query(&exact_spec);
+            }),
+            2,
+            7,
+        );
+        let (fold_per_entry, _) = samples(
+            Box::new(|| {
+                let mut entries = Vec::new();
+                fx.provider.fill_entries_per_entry(
+                    &outcome.folder_hits,
+                    &query,
+                    80,
+                    |kind: Kind| kind == Kind::Folder,
+                    &mut entries,
+                );
+            }),
+            1,
+            7,
+        );
+        let (fold_batched, _) = samples(
+            Box::new(|| {
+                let mut batch = MetaBatch::new();
+                let mut entries = Vec::new();
+                fx.provider.fill_entries(
+                    &outcome.folder_hits,
+                    &query,
+                    80,
+                    |kind: Kind| kind == Kind::Folder,
+                    &mut entries,
+                    &mut batch,
+                );
+            }),
+            1,
+            7,
+        );
+        let (file_per_entry, _) = samples(
+            Box::new(|| {
+                let mut entries = Vec::new();
+                fx.provider.fill_entries_per_entry(
+                    &outcome.file_hits,
+                    &query,
+                    320,
+                    |kind: Kind| kind != Kind::Folder,
+                    &mut entries,
+                );
+            }),
+            1,
+            7,
+        );
+        let (file_batched, _) = samples(
+            Box::new(|| {
+                let mut batch = MetaBatch::new();
+                let mut entries = Vec::new();
+                fx.provider.fill_entries(
+                    &outcome.file_hits,
+                    &query,
+                    320,
+                    |kind: Kind| kind != Kind::Folder,
+                    &mut entries,
+                    &mut batch,
+                );
+            }),
+            1,
+            7,
+        );
+        let (exact_per_entry, _) = samples(
+            Box::new(|| {
+                let mut entries = Vec::new();
+                fx.provider.fill_exact_entries_per_entry(
+                    &outcome.exact_hits,
+                    &query,
+                    50,
+                    &mut entries,
+                );
+            }),
+            1,
+            7,
+        );
+        let (exact_batched, _) = samples(
+            Box::new(|| {
+                let mut batch = MetaBatch::new();
+                let mut entries = Vec::new();
+                fx.provider.fill_exact_entries(
+                    &outcome.exact_hits,
+                    &query,
+                    50,
+                    &mut entries,
+                    &mut batch,
+                );
+            }),
+            1,
+            7,
+        );
+        let one = fx
+            .provider
+            .search_split_once(&query, &filters, 80, 320)
+            .unwrap();
+        let old_total =
+            old_fold_p50 + old_file_p50 + old_exact_query_p50 + exact_per_entry;
         println!(
-            "[bench-split] real files(500): 旧 folders={old_fold_p50:.2}ms + files={old_file_p50:.2}ms = {:.2}ms | 新 once p50={new_p50:.2}ms max={new_max:.2}ms | 其中引擎 query_split={engine_p50:.2}ms",
-            old_fold_p50 + old_file_p50
+            "[bench-split] real 505 files/101 dirs: 旧 double-pass+exact = folders {old_fold_p50:.2} + files {old_file_p50:.2} + exact_query {old_exact_query_p50:.2} + exact_fill {exact_per_entry:.2} = {old_total:.2}ms | 新 once p50={new_p50:.2}ms max={new_max:.2}ms (其中 exact_fill={:.2}ms/hits={}) | 引擎 query_split+exact={engine_p50:.2}ms",
+            one.exact_ms,
+            one.exact.len()
+        );
+        println!(
+            "[bench-meta] 逐条 find_meta → 批量目录枚举: folder {fold_per_entry:.2}→{fold_batched:.2}ms, file {file_per_entry:.2}→{file_batched:.2}ms, exact(独立缓存) {exact_per_entry:.2}→{exact_batched:.2}ms"
         );
     }
 

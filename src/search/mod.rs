@@ -1231,6 +1231,9 @@ fn run_worker(
                     let folder_fetch = (fetch / 5).clamp(40, 120);
                     let file_fetch = fetch.saturating_sub(folder_fetch).max(60);
                     let mut truncation = 0usize;
+                    // split 并趟产出的精确同名补齐(旧 search_exact 第二趟)。
+                    let mut split_exact: Option<Vec<Entry>> = None;
+                    let mut split_exact_ms = 0f32;
                     if use_builtin && (!time_forced || builtin_time_ok) {
                         // 内置索引:本地引擎,双路语义在 kind 过滤层保持
                         if let Some(b) = &builtin {
@@ -1248,19 +1251,30 @@ fn run_worker(
                                 folder_fetch,
                                 file_fetch,
                             );
-                            diag_split = t_split.elapsed().as_secs_f32() * 1000.0;
                             match r_split {
-                                Ok((mut folders, mut files, folder_total, all_total)) => {
-                                    truncation += folder_total.saturating_sub(folders.len());
-                                    let file_total = all_total.saturating_sub(folder_total);
-                                    truncation += file_total.saturating_sub(files.len());
-                                    total += folder_total + file_total;
+                                Ok(mut result) => {
+                                    split_exact_ms = result.exact_ms;
+                                    diag_split = (t_split.elapsed().as_secs_f32() * 1000.0
+                                        - split_exact_ms)
+                                        .max(0.0);
+                                    truncation += result
+                                        .folder_total
+                                        .saturating_sub(result.folders.len());
+                                    let file_total = result
+                                        .all_total
+                                        .saturating_sub(result.folder_total);
+                                    truncation += file_total.saturating_sub(result.files.len());
+                                    total += result.folder_total + file_total;
                                     // 旧实现先 folders 后 files,保持同一 Entry 顺序。
-                                    entries.append(&mut folders);
-                                    entries.append(&mut files);
+                                    entries.append(&mut result.folders);
+                                    entries.append(&mut result.files);
+                                    split_exact = Some(result.exact);
                                     needs_exact = truncation > 0;
                                 }
-                                Err(err) => error = Some(err),
+                                Err(err) => {
+                                    diag_split = t_split.elapsed().as_secs_f32() * 1000.0;
+                                    error = Some(err)
+                                }
                             }
                         }
                     } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
@@ -1349,13 +1363,20 @@ fn run_worker(
                             if (force_builtin || phase != lstr_index::Phase::Fallback)
                                 && request.filters.time.is_none()
                             {
-                                let t_exact = Instant::now();
-                                let r_exact =
-                                    b.search_exact(&request.query, &request.filters, 50);
-                                diag_exact = t_exact.elapsed().as_secs_f32() * 1000.0;
-                                if let Ok((mut exact, _)) = r_exact
-                                {
+                                // split 并趟已带回精确同名候选(与旧 search_exact
+                                // 逐条一致),直接 append;仅在拿不到(如 split 出错)
+                                // 时才回退第二趟查询。
+                                if let Some(mut exact) = split_exact.take() {
                                     entries.append(&mut exact);
+                                    diag_exact = split_exact_ms;
+                                } else {
+                                    let t_exact = Instant::now();
+                                    let r_exact =
+                                        b.search_exact(&request.query, &request.filters, 50);
+                                    diag_exact = t_exact.elapsed().as_secs_f32() * 1000.0;
+                                    if let Ok((mut exact, _)) = r_exact {
+                                        entries.append(&mut exact);
+                                    }
                                 }
                             } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
                                 if let Ok((mut exact, _)) =
