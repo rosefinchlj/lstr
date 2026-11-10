@@ -1004,10 +1004,14 @@ impl Engine {
             }
             out.total += total;
             out.capped |= capped;
-            let mut hits: Vec<Hit> = slots
-                .into_iter()
-                .map(|slot| Hit { vol: i as u32, slot, generation })
-                .collect();
+            // 命中一律带上索引 mtime(0=未知),候选排序零 FS。
+            let hit = |slot: u32| Hit {
+                vol: i as u32,
+                slot,
+                generation,
+                mtime: store.mtime[slot as usize] as i64,
+            };
+            let mut hits: Vec<Hit> = slots.into_iter().map(|slot| hit(slot)).collect();
             // 拼音候选(仅 ASCII 查询;名字里不含查询词时靠拼音命中)
             if !spec.tokens.is_empty() && spec.tokens.iter().all(|t| t.is_ascii()) {
                 let tokens: Vec<Vec<u8>> = spec
@@ -1020,7 +1024,7 @@ impl Engine {
                         && crate::query::passes_filters(store, slot, spec)
                     {
                         out.total += 1;
-                        hits.push(Hit { vol: i as u32, slot, generation });
+                        hits.push(hit(slot));
                     }
                 }
             }
@@ -1099,14 +1103,16 @@ impl Engine {
             }
             out.total_all += total_all;
             out.total_folders += total_folders;
-            let mut all_hits: Vec<Hit> = all_slots
-                .into_iter()
-                .map(|slot| Hit { vol: i as u32, slot, generation })
-                .collect();
-            let mut folder_hits: Vec<Hit> = folder_slots
-                .into_iter()
-                .map(|slot| Hit { vol: i as u32, slot, generation })
-                .collect();
+            // 命中一律带上索引 mtime(0=未知),候选排序零 FS。
+            let hit = |slot: u32| Hit {
+                vol: i as u32,
+                slot,
+                generation,
+                mtime: store.mtime[slot as usize] as i64,
+            };
+            let mut all_hits: Vec<Hit> = all_slots.into_iter().map(|slot| hit(slot)).collect();
+            let mut folder_hits: Vec<Hit> =
+                folder_slots.into_iter().map(|slot| hit(slot)).collect();
             // 精确同名候选:旧 search_exact 的第二趟,这里并进同一次遍历。
             // 同名槽位由 offs 二分直接拿(成本 ~µs),不需要扫候选。
             let mut exact_hits: Vec<Hit> = Vec::new();
@@ -1119,10 +1125,7 @@ impl Engine {
                     exact_set = exact_hits.iter().map(|h| h.slot).collect();
                 } else {
                     let slots = crate::query::exact_slots(store, spec, needle.as_bytes());
-                    exact_hits = slots
-                        .into_iter()
-                        .map(|slot| Hit { vol: i as u32, slot, generation })
-                        .collect();
+                    exact_hits = slots.into_iter().map(|slot| hit(slot)).collect();
                     exact_set = exact_hits.iter().map(|h| h.slot).collect();
                 }
             }
@@ -1146,15 +1149,15 @@ impl Engine {
                     }
                     if all_set.insert(slot) {
                         out.total_all += 1;
-                        all_hits.push(Hit { vol: i as u32, slot, generation });
+                        all_hits.push(hit(slot));
                     }
                     if store.is_dir(slot) && folder_set.insert(slot) {
                         out.total_folders += 1;
-                        folder_hits.push(Hit { vol: i as u32, slot, generation });
+                        folder_hits.push(hit(slot));
                     }
                     // 旧 exact 的拼音补集与同名槽位去重后按同一序列追加。
                     if exact.is_some() && exact_set.insert(slot) {
-                        exact_hits.push(Hit { vol: i as u32, slot, generation });
+                        exact_hits.push(hit(slot));
                     }
                 }
             }
@@ -2222,7 +2225,12 @@ mod tests {
         assert!(engine.path_of(&hit).is_none());
 
         // 伪造/过期代次同样拒绝
-        let stale = Hit { vol: 0, slot: 0, generation: hit.generation.wrapping_add(1) };
+        let stale = Hit {
+            vol: 0,
+            slot: 0,
+            generation: hit.generation.wrapping_add(1),
+            mtime: 0,
+        };
         assert!(engine.path_of(&stale).is_none());
         assert!(engine.pinyin_of(&stale).is_none());
         let _ = std::fs::remove_dir_all(&dir);

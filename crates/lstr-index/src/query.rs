@@ -77,6 +77,9 @@ pub struct Hit {
     pub slot: u32,
     /// 卷索引代次:compact/重扫/重置/卷移除后校验,拒绝过期命中(H8)。
     pub generation: u32,
+    /// 索引里的 mtime(unix 秒,0 = 未知)。候选排序(最近修改加权)直接
+    /// 复用该值,零 FS 调用;展示条目的 mtime 仍由 finalize 从 FS 重新取。
+    pub mtime: i64,
 }
 
 #[derive(Clone, Debug, Default)]
