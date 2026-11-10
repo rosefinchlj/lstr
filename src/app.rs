@@ -2618,11 +2618,24 @@ impl LstrApp {
             // 「已打开」(对话框 Quick Switch 的近期目录)与「拼音」是两种
             // 不同来源提示:同时满足时保留两者,读作「已打开 · 拼音 · …」,
             // 先交代条目已在打开列表里,再说明本次为何命中。
+            // 拼音标注带出具体拼音串（weixin → 微信资料 时显示「拼音 weixin ziliao」），
+            // 过长截断避免挤压路径。
+            let pinyin_text = if pinyin_path_hit {
+                let mut t = crate::search::pinyin::spaced(&entry.name);
+                const MAX_PINYIN_CHARS: usize = 40;
+                if t.chars().count() > MAX_PINYIN_CHARS {
+                    t = t.chars().take(MAX_PINYIN_CHARS).collect::<String>();
+                    t.push('…');
+                }
+                t
+            } else {
+                String::new()
+            };
             let lead = match (entry.id.starts_with("qs:"), pinyin_path_hit) {
-                (true, true) => "已打开 · 拼音 · ",
-                (true, false) => "已打开 · ",
-                (false, true) => "拼音 · ",
-                (false, false) => "",
+                (true, true) => format!("已打开 · 拼音 {pinyin_text} · "),
+                (true, false) => "已打开 · ".to_string(),
+                (false, true) => format!("拼音 {pinyin_text} · "),
+                (false, false) => String::new(),
             };
             let time_text = if is_path_row {
                 entry

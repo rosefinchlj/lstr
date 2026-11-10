@@ -28,6 +28,23 @@ pub fn full(name: &str) -> String {
     out
 }
 
+/// 展示用：拼音串（微信资料 → weixinziliao；LstrAcc-微信资料 → lstracc weixinziliao）。
+/// 逐音节按原文顺序拼接、仅在分隔符处留空格（不按字切分，避免 "wei xin zi liao" 的碎读）；
+/// 供结果行「拼音 xxx」标注，与 keys()（匹配用、含首字母备选）区分。
+pub fn spaced(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if let Some(py) = ch.to_pinyin() {
+            out.push_str(py.plain());
+        } else if !out.is_empty() && !out.ends_with(' ') {
+            out.push(' ');
+        }
+    }
+    out.trim_end().to_string()
+}
+
 /// 是否包含中日韩统一表意文字（用于决定是否值得生成拼音）。
 pub fn has_cjk(text: &str) -> bool {
     text.chars()
@@ -36,8 +53,7 @@ pub fn has_cjk(text: &str) -> bool {
 
 /// 匹配用的拼音串：空格分隔的备选写法，例如 "wx weixin"。
 /// 评分时按 token 分别判断前缀/子串，因此首字母和全拼都能拿到前缀分。
-pub fn keys(name: &str) -> String {
-    let initials = initials(name);
+pub fn keys(name: &str) -> String {    let initials = initials(name);
     let full = full(name);
     if full.is_empty() || full == initials {
         initials
@@ -78,6 +94,14 @@ mod tests {
     fn keys_contains_initials_and_full_pinyin() {
         assert_eq!(super::keys("微信"), "wx weixin");
         assert_eq!(super::keys("Visual Studio Code"), "visualstudiocode");
+    }
+
+    #[test]
+    fn spaced_splits_syllables_for_display() {
+        assert_eq!(super::spaced("微信资料"), "weixinziliao");
+        assert_eq!(super::spaced("LstrAcc-微信资料"), "lstracc weixinziliao");
+        assert_eq!(super::spaced("report.docx"), "report docx");
+        assert_eq!(super::spaced(""), "");
     }
 
     #[test]
