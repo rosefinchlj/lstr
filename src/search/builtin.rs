@@ -13,7 +13,7 @@ use lstr_index::{
 };
 
 use crate::model::{Entry, Kind, Query, Scope};
-use crate::search::everything::{initial_of, kind_of, tone_for};
+use crate::search::everything::{initial_of, kept_in_scope, kind_of, tone_for};
 use crate::search::filters::SearchFilters;
 use crate::search::pinyin;
 
@@ -78,7 +78,14 @@ impl BuiltinProvider {
         filters: &SearchFilters,
         limit: usize,
     ) -> Result<(Vec<Entry>, usize), String> {
-        self.run(query, filters, limit, KindFilter::All, |_| true)
+        // 单分类作用域(文件夹/程序/文件)必须在这里按 kind 过滤:引擎侧过滤
+        // 负责候选,keep 再兜底类型漂移。8e2e208 把 kind 抽成 run 的参数后,
+        // 这里一度误传 KindFilter::All + 全放行,导致三个分类 tab 都返回
+        // 全部类型(2026-11-09 用户报「选了程序还出文件夹」)。
+        let scope = query.scope;
+        self.run(query, filters, limit, scope_kind_filter(scope), move |kind| {
+            kept_in_scope(scope, kind)
+        })
     }
 
     /// 「全部」双路:kind 过滤在引擎侧完成,语义与 Everything 的
@@ -197,6 +204,16 @@ impl BuiltinProvider {
     }
 }
 
+/// 单分类作用域 → 引擎侧 KindFilter(索引只收集对应 kind 的候选)。
+fn scope_kind_filter(scope: Scope) -> KindFilter {
+    match scope {
+        Scope::Folder => KindFilter::Folders,
+        Scope::Program => KindFilter::Programs,
+        Scope::File => KindFilter::Files,
+        _ => KindFilter::All,
+    }
+}
+
 /// Query + SearchFilters → 引擎查询规格。
 pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
     let mut spec = QuerySpec {
@@ -274,6 +291,11 @@ pub fn spawn_client_thread(
             let _done_guard = ClientDoneGuard(client_done);
             let mut first_connect = !launched_worker;
             let mut launch_declined = false;
+            // 测试进程里不拉起提权 worker:UAC 弹窗会卡住无人值守的测试。
+            // 生产构建(cfg!(test) == false)行为不变。
+            if cfg!(test) {
+                launch_declined = true;
+            }
             let mut last_launch = std::time::Instant::now() - Duration::from_secs(60);
             loop {
                 if shutdown.load(Ordering::Relaxed) {
@@ -542,6 +564,23 @@ mod tests {
         assert_eq!(spec.ext.as_deref(), Some("rs"));
         let spec = build_spec(&parse("ext:.arj", Scope::All), &filters);
         assert_eq!(spec.ext.as_deref(), Some("arj"));
+    }
+
+    #[test]
+    fn scope_kind_filter_follows_single_scope_tabs() {
+        // 8e2e208 曾把这里退化成 KindFilter::All + 全放行,分类 tab 才混进
+        // 其它类型;映射与 keep 兜底都要守住。
+        assert_eq!(scope_kind_filter(Scope::Folder), KindFilter::Folders);
+        assert_eq!(scope_kind_filter(Scope::Program), KindFilter::Programs);
+        assert_eq!(scope_kind_filter(Scope::File), KindFilter::Files);
+        assert_eq!(scope_kind_filter(Scope::All), KindFilter::All);
+        assert!(kept_in_scope(Scope::Folder, Kind::Folder));
+        assert!(!kept_in_scope(Scope::Folder, Kind::Program));
+        assert!(kept_in_scope(Scope::Program, Kind::Program));
+        assert!(!kept_in_scope(Scope::Program, Kind::Folder));
+        assert!(!kept_in_scope(Scope::Program, Kind::File));
+        assert!(kept_in_scope(Scope::File, Kind::File));
+        assert!(!kept_in_scope(Scope::File, Kind::Program));
     }
 
     #[test]

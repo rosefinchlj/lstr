@@ -1147,24 +1147,12 @@ fn run_worker(
                     // M7:合并进来的 Everything 结果与应用/命令命中也要计入总数,
                     // 否则会出现「显示 0 个结果但列表里有内容」。
                     total = total.max(entries.len());
-                    // 两阶段返回：先发不含精确补齐的结果（约 200ms 可见），
-                    // 再补 wfn 精确项；最终结果与一次性返回等价。
+                    // 精确同名补齐必须在唯一一次返回之前完成。旧实现把补齐放在
+                    // 「先发一版」之后:先发的那版里精确同名可能根本不在候选窗口里
+                    // (如搜 "ai" 时文件夹 ai 排在第 246 个候选,而文件夹预算只有
+                    // 100),UI 会停在这一版上,用户就看不到 ai。现在只发一次,
+                    // 每次返回都经过 pin 置顶,不存在“中间错列表”的窗口。
                     if needs_exact {
-                        let first = finalize_entries(
-                            entries.clone(),
-                            &request,
-                            &history,
-                            &config,
-                            keyword_rows.clone(),
-                        );
-                        send_response(&tx, &request, Response {
-                            generation: request.generation,
-                            entries: first,
-                            total,
-                            elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
-                            error: error.clone(),
-                        });
-                        ctx.request_repaint();
                         let phase = builtin
                             .as_ref()
                             .map(|b| b.engine.status().phase)
@@ -1192,6 +1180,7 @@ fn run_worker(
                                 entries.append(&mut exact);
                             }
                         }
+                        total = total.max(entries.len());
                     }
                 }
                 _ => {
@@ -1258,24 +1247,11 @@ fn run_worker(
                             }
                         }
                     }
-                    // M7:合并的 Everything 结果与两阶段补齐都要计入总数。
+                    // M7:合并的 Everything 结果与精确补齐都要计入总数。
                     total = total.max(entries.len());
+                    // 同 All 分支:精确补齐在唯一一次返回之前完成,避免 UI 停在
+                    // 未置顶的中间版本上。
                     if needs_exact {
-                        let first = finalize_entries(
-                            entries.clone(),
-                            &request,
-                            &history,
-                            &config,
-                            Vec::new(),
-                        );
-                        send_response(&tx, &request, Response {
-                            generation: request.generation,
-                            entries: first,
-                            total,
-                            elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
-                            error: error.clone(),
-                        });
-                        ctx.request_repaint();
                         let phase = builtin
                             .as_ref()
                             .map(|b| b.engine.status().phase)
@@ -1303,6 +1279,7 @@ fn run_worker(
                                 entries.append(&mut exact);
                             }
                         }
+                        total = total.max(entries.len());
                     }
                 }
             }
@@ -1842,6 +1819,118 @@ mod tests {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
+        }
+    }
+
+    /// 回归(2026-11-09 截图):搜 "ai" 时精确同名文件夹必须出现在**唯一一次**
+    /// 返回里并置顶。旧实现在精确补齐之前先发了一版未置顶的结果,而且那一版
+    /// 里根本没有 E:\use\ai(文件夹候选预算 100,它在第 246 个),UI 一旦停在那
+    /// 版上用户就看不到 ai。
+    ///
+    /// 依赖本机内置索引快照与 E:\use\ai;换机器时该测试自跳过。
+    #[test]
+    #[ignore = "requires the machine's builtin index snapshot (E:\\use\\ai)"]
+    fn ai_folder_is_pinned_in_the_single_response() {
+        if !std::path::Path::new(r"E:\use\ai").exists() {
+            return;
+        }
+        let mut config = crate::config::Config::default();
+        // 强制纯内置索引:不依赖 Everything,也不会有双后端合并干扰。
+        config.index.backend = "builtin".to_string();
+        config.max_results = 10;
+        let history = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::history::History::in_memory(),
+        ));
+        let ctx = eframe::egui::Context::default();
+        let mut service = SearchService::new(config, history, ctx);
+        let filters = SearchFilters {
+            location: Some(crate::search::filters::LocationFilter::Drive('E')),
+            ..SearchFilters::default()
+        };
+        let generation = service.search(
+            "ai",
+            crate::model::Scope::All,
+            false,
+            &filters,
+            &Default::default(),
+            false,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let first = loop {
+            if let Some(response) = service.poll() {
+                if response.generation == generation {
+                    break response;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "等待搜索结果超时");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let top = first.entries.first().expect("结果不能为空");
+        assert_eq!(
+            top.kind,
+            Kind::Folder,
+            "首行应是文件夹 ai,实际: {:?}",
+            top.name
+        );
+        assert_eq!(
+            top.name.to_lowercase(),
+            "ai",
+            "首行应是精确同名 ai,实际: {:?}",
+            top.name
+        );
+        assert!(
+            top.full_path().eq_ignore_ascii_case(r"E:\use\ai"),
+            "首行应是 E:\\use\\ai,实际: {:?}",
+            top.full_path()
+        );
+        // 旧两阶段实现会再发一版;现在必须只有一版,UI 不存在“停在未置顶中间结果”的窗口。
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(service.poll().is_none(), "不应再有第二版结果(两阶段遗留)");
+    }
+
+    /// 真实快照端到端:程序 tab 不得混入文件夹/普通文件(2026-11-09 回归)。
+    /// 依赖本机内置索引快照;换机器或快照为空时该测试自跳过。
+    #[test]
+    #[ignore = "requires the machine's builtin index snapshot"]
+    fn program_scope_only_returns_programs() {
+        let mut config = crate::config::Config::default();
+        // 强制纯内置索引:Everything 合并会掩盖分类过滤的回归。
+        config.index.backend = "builtin".to_string();
+        config.max_results = 20;
+        let history = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::history::History::in_memory(),
+        ));
+        let ctx = eframe::egui::Context::default();
+        let mut service = SearchService::new(config, history, ctx);
+        let generation = service.search(
+            "remote",
+            crate::model::Scope::Program,
+            false,
+            &SearchFilters::default(),
+            &Default::default(),
+            false,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let first = loop {
+            if let Some(response) = service.poll() {
+                if response.generation == generation {
+                    break response;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "等待搜索结果超时");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        if first.entries.is_empty() {
+            return; // 快照里没有 remote 程序:换机器时自跳过
+        }
+        for entry in &first.entries {
+            assert_eq!(
+                entry.kind,
+                Kind::Program,
+                "程序 tab 混入了非程序条目: {:?} ({:?})",
+                entry.name,
+                entry.full_path()
+            );
         }
     }
 }

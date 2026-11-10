@@ -4048,25 +4048,44 @@ impl LstrApp {
         }
 
         // —— 后端选择 ——
+        // 两列等宽网格:旧版写死 118px 宽/124px 步进,「仅内置索引(不碰 Everything)」
+        // 文字溢出按钮、第 4 个按钮又被窗口右边裁掉;这里按可见宽度均分。
         Self::settings_label(painter, &theme, area.left(), y, "索引后端");
         // usn = 实验后端:目录扫描首扫 + USN journal 实时增量(带熔断/对账护栏);
         // 文案风格与其余四项一致(短句括注)。
         let backends = [("auto", "自动(内置优先+兜底)"), ("builtin", "仅内置索引(不碰 Everything)"), ("usn", "实验:目录扫描+USN 实时增量"), ("everything", "仅 Everything"), ("off", "关闭内置索引")];
         let current = self.cfg_index_backend();
-        let mut x = area.left() + 130.0;
-        for (key, label) in backends {
-            let rect = Rect::from_min_size(egui::pos2(x, y), egui::vec2(118.0, 26.0));
-            let accent = key == current;
-            let response = ui.interact(rect, Id::new(("lstr-idx-backend", key)), Sense::click());
+        const BACKEND_CHIP_H: f32 = 26.0;
+        const BACKEND_CHIP_GAP: f32 = 8.0;
+        const BACKEND_COLS: usize = 2;
+        let font = ui::text_font(10.5);
+        let start_x = area.left() + 130.0;
+        let avail = (area.right() - start_x).max(160.0);
+        let chip_w = ((avail - BACKEND_CHIP_GAP * (BACKEND_COLS - 1) as f32) / BACKEND_COLS as f32).floor();
+        for (i, (key, label)) in backends.iter().enumerate() {
+            let col = i % BACKEND_COLS;
+            let row = i / BACKEND_COLS;
+            let rect = Rect::from_min_size(
+                egui::pos2(
+                    start_x + col as f32 * (chip_w + BACKEND_CHIP_GAP),
+                    y + row as f32 * (BACKEND_CHIP_H + BACKEND_CHIP_GAP),
+                ),
+                egui::vec2(chip_w, BACKEND_CHIP_H),
+            );
+            let accent = *key == current;
+            let response = ui.interact(rect, Id::new(("lstr-idx-backend", *key)), Sense::click());
+            if response.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
             painter.rect_filled(rect, CornerRadius::same(6), if accent { theme.amber_soft } else { theme.hover });
             painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, if accent { theme.amber } else { theme.hair }), StrokeKind::Inside);
-            painter.text(rect.center(), Align2::CENTER_CENTER, label, ui::text_font(10.5), if accent { theme.amber } else { theme.text });
+            painter.text(rect.center(), Align2::CENTER_CENTER, *label, font.clone(), if accent { theme.amber } else { theme.text });
             if response.clicked() {
                 self.set_cfg_index_backend(key);
             }
-            x += 124.0;
         }
-        y += ROW;
+        let rows = (backends.len() + BACKEND_COLS - 1) / BACKEND_COLS;
+        y += rows as f32 * BACKEND_CHIP_H + (rows.saturating_sub(1)) as f32 * BACKEND_CHIP_GAP + 12.0;
 
         // —— 噪声排除开关 ——
         Self::settings_label(painter, &theme, area.left(), y, "噪声目录");
