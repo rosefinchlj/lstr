@@ -23,7 +23,7 @@ pub mod watch;
 pub mod win;
 pub mod worker;
 
-pub use engine::{Engine, EngineConfig, EngineMsg, IndexStatus, Phase, VolumeProgress};
+pub use engine::{Engine, EngineConfig, EngineMsg, IndexStatus, Phase, SplitOutcome, VolumeProgress};
 pub use query::{Hit, KindFilter, QueryOutcome, QuerySpec};
 pub use usn::{Op, Rec};
 

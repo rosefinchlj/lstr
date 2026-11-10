@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::pinyin::PinyinCache;
-use crate::query::{QueryOutcome, QuerySpec, Hit};
+use crate::query::{Hit, KindFilter, QueryOutcome, QuerySpec};
 use crate::sidecar::{self, SidecarOp};
 use crate::snapshot::{self, SnapshotHeader};
 use crate::store::{VolumeStore, NO_PARENT, ROOT_FRN};
@@ -191,6 +191,23 @@ pub struct EngineConfig {
     /// 只影响启动时加载哪些 `vol_*.bin` 快照:未选中卷的旧快照留在磁盘上,
     /// 重新勾选后下次启动可直接复用,无需重扫。
     pub volumes: Vec<char>,
+}
+
+/// 一次遍历同时产出的「文件夹路 + 文件路」结果(取代旧的双路两次全引擎查询)。
+///
+/// 语义与两次独立查询逐字节对齐:
+/// - `folder_hits` = 旧 `search_split(folders=true)` 的引擎候选(Folders 前缀);
+/// - `file_hits` = 旧 `search_split(folders=false)` 的 All 前缀里的非文件夹项;
+/// - `total_folders` = 旧文件夹路的精确计数(TOTAL_CAP 封顶);
+/// - `total_all` = 旧 All 路的精确计数(TOTAL_CAP 封顶);
+///   旧 files 路的总数 = total_all - total_folders。
+#[derive(Clone, Debug, Default)]
+pub struct SplitOutcome {
+    pub file_hits: Vec<Hit>,
+    pub folder_hits: Vec<Hit>,
+    pub total_all: usize,
+    pub total_folders: usize,
+    pub aborted: bool,
 }
 
 pub struct Engine {
@@ -1017,6 +1034,115 @@ impl Engine {
         out
     }
 
+    /// 「全部」双路一次查询:单次候选遍历同时产出文件夹前缀、文件前缀与两个
+    /// 精确计数。旧实现 folders/files 各跑一次全引擎(两次 n-gram/memmem 扫描
+    /// + 两次拼音扫描),这里合并成一次;结果语义(顺序/total/去重)与旧双路
+    /// 完全一致,由 `query_split_matches_two_pass` 对拍锁死。
+    ///
+    /// 调用方须传 `spec.kind = KindFilter::All`(分清 kind 由本函数完成)。
+    pub fn query_split(&self, spec: &QuerySpec) -> SplitOutcome {
+        // 传入非 All 的 kind 会让「文件前缀」失去语义;调用方只说「查全部」。
+        debug_assert_eq!(spec.kind, KindFilter::All, "query_split 只接受 All-kind 查询");
+        let mut out = SplitOutcome::default();
+        let cancel_my = crate::query::CANCEL_GEN.load(std::sync::atomic::Ordering::Relaxed);
+        // 与 Engine::query 相同的收集上限:仅过滤器查询(无 name token)放大 8 倍,
+        // 否则 candidate_cap。两条前缀各用这个上限(旧双路各自也是这个上限)。
+        let cap = if spec.tokens.is_empty() {
+            self.cfg.candidate_cap.saturating_mul(8)
+        } else {
+            self.cfg.candidate_cap
+        };
+        for (i, v) in self.volumes.iter().enumerate() {
+            if crate::query::CANCEL_GEN.load(std::sync::atomic::Ordering::Relaxed) != cancel_my {
+                out.aborted = true;
+                break;
+            }
+            // 路径前缀带盘符 → 只查对应卷(与 Engine::query 一致)
+            if let Some(prefix) = &spec.path_prefix {
+                if prefix.len() >= 2 && prefix.as_bytes()[1] == b':' {
+                    let want = prefix.as_bytes()[0].to_ascii_lowercase();
+                    if want != v.letter.to_ascii_lowercase() as u8 {
+                        continue;
+                    }
+                }
+            }
+            let Some(store) = &v.store else { continue };
+            let generation = v.generation;
+            let (all_slots, folder_slots, total_all, total_folders, aborted) =
+                crate::query::query_volume_split_cancel(
+                    store,
+                    spec,
+                    cap,
+                    cap,
+                    Some(cancel_my),
+                );
+            if aborted {
+                out.aborted = true;
+                break;
+            }
+            out.total_all += total_all;
+            out.total_folders += total_folders;
+            let mut all_hits: Vec<Hit> = all_slots
+                .into_iter()
+                .map(|slot| Hit { vol: i as u32, slot, generation })
+                .collect();
+            let mut folder_hits: Vec<Hit> = folder_slots
+                .into_iter()
+                .map(|slot| Hit { vol: i as u32, slot, generation })
+                .collect();
+            // 拼音候选(仅 ASCII 查询;名字里不含查询词时靠拼音命中)。
+            // 旧双路各自调一次 pinyin.search(同一序列),这里只扫一次,再按
+            // 「是否已在各自 hits 里」独立补进两条前缀并各自计数 —— 与旧实现
+            // 的两个 total 口径完全一致。
+            if !spec.tokens.is_empty() && spec.tokens.iter().all(|t| t.is_ascii()) {
+                let tokens: Vec<Vec<u8>> = spec
+                    .tokens
+                    .iter()
+                    .map(|t| crate::store::fold_ascii(t.as_bytes()))
+                    .collect();
+                let mut all_set: std::collections::HashSet<u32> =
+                    all_hits.iter().map(|h| h.slot).collect();
+                let mut folder_set: std::collections::HashSet<u32> =
+                    folder_hits.iter().map(|h| h.slot).collect();
+                for slot in self.pinyin[i].search(store, &tokens, self.cfg.candidate_cap) {
+                    if !crate::query::passes_filters(store, slot, spec) {
+                        continue;
+                    }
+                    if all_set.insert(slot) {
+                        out.total_all += 1;
+                        all_hits.push(Hit { vol: i as u32, slot, generation });
+                    }
+                    if store.is_dir(slot) && folder_set.insert(slot) {
+                        out.total_folders += 1;
+                        folder_hits.push(Hit { vol: i as u32, slot, generation });
+                    }
+                }
+            }
+            // 深路径前缀后置过滤(total 为近似值,与旧实现一致)
+            if let Some(prefix) = &spec.path_prefix {
+                all_hits.retain(|h| {
+                    self.path_of(h)
+                        .map(|p| p.to_lowercase().starts_with(prefix))
+                        .unwrap_or(false)
+                });
+                folder_hits.retain(|h| {
+                    self.path_of(h)
+                        .map(|p| p.to_lowercase().starts_with(prefix))
+                        .unwrap_or(false)
+                });
+            }
+            // 文件前缀 = All 前缀里的非文件夹项(旧 files 路在应用层用 kind_of
+            // 丢文件夹;这里等价地按 attrs 目录位提前剔除,少了无用路径拼接)。
+            out.file_hits.extend(
+                all_hits
+                    .into_iter()
+                    .filter(|h| !self.is_dir(h)),
+            );
+            out.folder_hits.append(&mut folder_hits);
+        }
+        out
+    }
+
     /// 校验 Hit 仍指向有效卷/有效 slot(H8:裸索引在 compact/卷移除后必须拒绝)。
     fn store_for_hit(&self, hit: &Hit) -> Option<&VolumeStore> {
         let v = self.volumes.get(hit.vol as usize)?;
@@ -1345,6 +1471,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::KindFilter;
 
     fn temp_index_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1401,6 +1528,106 @@ mod tests {
             next_usn: 100,
         });
         engine.handle(EngineMsg::VolumeReady { guid, journal_id: 7, next_usn: 100, count: 3 });
+    }
+
+    /// 任务 1 的引擎级对拍:一次 `query_split` ≡ 旧 folders/files 两次 query。
+    /// 覆盖两卷、CJK 拼音候选、路径前缀、ext 过滤、单字符位图与 n-gram 路径。
+    #[test]
+    fn split_query_matches_two_pass_engine() {
+        fn feed_volume(engine: &mut Engine, guid: u128, letter: char, recs: Vec<Rec>) {
+            let count = recs.len() as u32;
+            engine.handle(EngineMsg::VolumeMeta {
+                guid,
+                letter,
+                journal_id: 7,
+                next_usn: 100,
+                est_records: count as u64,
+            });
+            engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+            engine.handle(EngineMsg::Records { guid, recs, next_usn: 100 });
+            engine.handle(EngineMsg::VolumeReady { guid, journal_id: 7, next_usn: 100, count });
+        }
+        let dir = temp_index_dir("split-parity");
+        let mut engine = engine_with(&dir);
+        feed_volume(
+            &mut engine,
+            0xA11u128,
+            'C',
+            vec![
+                rec(5, 0, 0x10, "docs"),
+                rec(10, 5, 0x10, "ai_dir"),
+                rec(11, 5, 0, "ai_report.txt"),
+                rec(12, 5, 0, "ai_tool.exe"),
+                rec(13, 5, 0, "报告_ai.docx"),
+                rec(14, 5, 0x10, "报告目录"),
+            ],
+        );
+        feed_volume(
+            &mut engine,
+            0xB22u128,
+            'E',
+            vec![
+                rec(20, 0, 0x10, "workspace"),
+                rec(21, 20, 0x10, "ai_notes"),
+                rec(22, 20, 0, "notes_ai.txt"),
+                rec(23, 20, 0, "文件_ai.log"),
+                rec(24, 20, 0, "alphafile.rs"),
+            ],
+        );
+        assert_eq!(engine.phase, Phase::Ready);
+
+        let check = |spec_all: &QuerySpec| {
+            let split = engine.query_split(spec_all);
+            let mut spec_folders = spec_all.clone();
+            spec_folders.kind = KindFilter::Folders;
+            let all = engine.query(spec_all);
+            let folders = engine.query(&spec_folders);
+            assert!(!split.aborted);
+            assert_eq!(split.total_all, all.total, "total_all: {:?}", spec_all.tokens);
+            assert_eq!(
+                split.total_folders, folders.total,
+                "total_folders: {:?}",
+                spec_all.tokens
+            );
+            assert_eq!(
+                split.folder_hits, folders.hits,
+                "文件夹前缀: {:?}",
+                spec_all.tokens
+            );
+            let expected_files: Vec<Hit> = all
+                .hits
+                .iter()
+                .filter(|h| !engine.is_dir(h))
+                .copied()
+                .collect();
+            assert_eq!(
+                split.file_hits, expected_files,
+                "文件前缀: {:?}",
+                spec_all.tokens
+            );
+        };
+
+        for spec in [
+            QuerySpec { tokens: vec!["ai".into()], kind: KindFilter::All, ..Default::default() },
+            QuerySpec { tokens: vec!["a".into()], kind: KindFilter::All, ..Default::default() },
+            QuerySpec { tokens: vec!["bg".into()], kind: KindFilter::All, ..Default::default() },
+            QuerySpec {
+                tokens: vec!["ai".into()],
+                kind: KindFilter::All,
+                path_prefix: Some("c:\\docs".into()),
+                ..Default::default()
+            },
+            QuerySpec {
+                tokens: vec!["ai".into()],
+                kind: KindFilter::All,
+                ext: Some("txt".into()),
+                ..Default::default()
+            },
+            QuerySpec { tokens: Vec::new(), kind: KindFilter::All, ext: Some("rs".into()), ..Default::default() },
+        ] {
+            check(&spec);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// MAJOR 回归(端到端):空卷(新 U 盘/全删卷)首扫完成 → VolumeReady
@@ -3244,6 +3471,27 @@ mod tests {
         let (s_con, con_total) = profile_ms(|| crate::query::query_volume(&store, &con, 100).1, 2, 15);
         let (s_narrow, narrow_total) = profile_ms(|| crate::query::query_volume(&store, &narrow, 100).1, 2, 15);
         let (s_empty, empty_total) = profile_ms(|| crate::query::query_volume(&store, &empty, 800).1, 2, 10);
+        // 任务 1 合成对照:production cap(2000)下,旧双路(All + Folders 各跑
+        // query_volume)vs 一次 split 遍历。只算引擎候选评估(不含拼音/应用层
+        // 元数据),用于证明「三趟→一趟」省的是同一批候选的第二遍扫描。
+        let mut folders_spec = ai.clone();
+        folders_spec.kind = KindFilter::Folders;
+        let (s_all_2k, all_2k) = profile_ms(|| crate::query::query_volume(&store, &ai, 2000).1, 2, 15);
+        let (s_fold_2k, fold_2k) = profile_ms(|| crate::query::query_volume(&store, &folders_spec, 2000).1, 2, 15);
+        let (s_split_2k, split_totals) = profile_ms(
+            || {
+                let (a, f, ta, tf, _) =
+                    crate::query::query_volume_split_cancel(&store, &ai, 2000, 2000, None);
+                assert!(a.len() >= f.len());
+                ta + tf
+            },
+            2,
+            15,
+        );
+        // 拼音候选:旧双路各扫一次同一序列,合并后只扫一次(引擎层 query_split
+        // 已把这一份省掉)。cap=2000 的实测用于折算完整旧/新引擎耗时。
+        let (s_py_2k, py_hits_2k) =
+            profile_ms(|| pinyin.search(&store, &ai_tokens, 2000).count(), 2, 15);
         // 拼音缓存重建耗时(快照「加载时重建」方案的成本依据)
         let (s_rebuild, py_entries) = profile_ms(|| PinyinCache::rebuild(&store).slots.len(), 1, 3);
         // n-gram 倒排:内存占用 + 重建耗时(compact/加载时重建的成本依据)。
@@ -3268,6 +3516,19 @@ mod tests {
             "[profile] pinyin entries={} rebuild p50={:.1}ms | 'ai' pinyin p50={:.2}ms hits={py_hits}",
             py_entries, p(&s_rebuild).0, p(&s4).0,
         );
+        let two_pass = p(&s_all_2k).0 + p(&s_fold_2k).0 + 2.0 * p(&s_py_2k).0;
+        let one_pass = p(&s_split_2k).0 + p(&s_py_2k).0;
+        println!(
+            "[bench-merge] 'ai' cap=2000: 旧双路 All p50={:.2}ms + Folders p50={:.2}ms + 2×拼音 p50={:.2}ms = {two_pass:.2}ms → split 一遍{:.2}ms + 1×拼音 = {one_pass:.2}ms (saved {:.2}ms, totals={}/{}, pinyin_hits={py_hits_2k})",
+            p(&s_all_2k).0,
+            p(&s_fold_2k).0,
+            p(&s_py_2k).0,
+            p(&s_split_2k).0,
+            two_pass - one_pass,
+            all_2k,
+            fold_2k,
+        );
+        assert_eq!(split_totals, all_2k + fold_2k, "split 的两个 total 必须等于双路 total 之和");
         println!(
             "[profile] con  total={con_total} p50={:.2}ms p90={:.2}ms",
             p(&s_con).0, p(&s_con).1,
