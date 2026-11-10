@@ -2495,9 +2495,18 @@ impl LstrApp {
             let is_path_row = matches!(entry.kind, Kind::File | Kind::Folder | Kind::Program);
             let full_path = entry.full_path();
             let lead = if entry.id.starts_with("qs:") { "已打开 · " } else { "" };
-            // meta（文件夹/大小）只在选中且开启时绘制；未选中行不预留 76px，
-            // 否则本可一行的长路径会被无谓地挤成两行。
-            let meta = if selected && self.cfg.show_meta {
+            // meta（修改时间；选中且开启时并列大小）：
+            // 时间对路径行**始终显示**（相对时间：刚刚/N 分钟前/N 天前/日期），
+            // 让列表页可直接判断新旧；大小仍是选中行才画，避免每行挤压路径。
+            let time_text = if is_path_row {
+                entry
+                    .modified
+                    .map(ui::format_relative_time)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let size_text = if selected && self.cfg.show_meta {
                 match entry.kind {
                     Kind::Folder => "文件夹".to_string(),
                     Kind::Command => String::new(),
@@ -2506,7 +2515,19 @@ impl LstrApp {
             } else {
                 String::new()
             };
-            let meta_w = if meta.is_empty() { 0.0 } else { 76.0 };
+            let meta = match (size_text.is_empty(), time_text.is_empty()) {
+                (true, true) => String::new(),
+                (false, true) => size_text,
+                (true, false) => time_text,
+                (false, false) => format!("{size_text} · {time_text}"),
+            };
+            let meta_w = if meta.is_empty() {
+                0.0
+            } else if meta.chars().count() > 12 {
+                122.0
+            } else {
+                76.0
+            };
             // 是否折两行按「实际渲染宽度」判断而不是字符数：中文字符宽约为
             // ASCII 的两倍，按字符数判断会让视觉上已超宽的路径仍被单行省略。
             let mono = ui::mono_font(11.5);
