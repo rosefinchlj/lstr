@@ -89,13 +89,48 @@ pub fn foreground_explorer_folder() -> Option<PathBuf> {
     None
 }
 
+/// 从 Explorer 窗口标题解析「活动标签名」。
+///
+/// Win11 标签页窗口的 caption 不是裸目录名，实测（26H2 中文）：
+/// - 多标签：`4.2.0.13 和 2 个其他选项卡 - 文件资源管理器`
+/// - 单标签：`<名> - 文件资源管理器`
+/// - 无后缀（控制面板）：`程序和功能`
+/// 旧的「整标题 == 目录名」比对永远失败，只能退回枚举第一个（= 非活动标签）。
+fn active_tab_name(title: &str) -> String {
+    let t = title.trim();
+    // 中文多标签：`<名> 和 N 个其他选项卡 ...`——必须校验后缀形态，
+    // 否则目录名本身含「 和 」的窗口（A 和 B）会被截错。
+    if let Some(idx) = t.find(" 和 ") {
+        let rest = &t[idx + " 和 ".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() && rest.contains("个其他选项卡") {
+            return t[..idx].trim().to_string();
+        }
+    }
+    // 英文多标签：`<name> and N other tabs - File Explorer`
+    if let Some(idx) = t.find(" and ") {
+        let rest = &t[idx + " and ".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() && rest.to_ascii_lowercase().contains("other tab") {
+            return t[..idx].trim().to_string();
+        }
+    }
+    // 单标签：去掉 ` - 文件资源管理器` / ` - File Explorer` 后缀。
+    if let Some((head, tail)) = t.rsplit_once(" - ") {
+        if tail.contains("文件资源管理器") || tail.to_ascii_lowercase().contains("file explorer") {
+            return head.trim().to_string();
+        }
+    }
+    t.to_string()
+}
+
 /// 一次 ShellWindows 枚举里先试 HWND 精确匹配，再试标题近似匹配。
 /// 返回匹配到的 Shell 窗口 HWND（标题兜底时可能不是原前台窗口，但至少是真实窗口）。
 ///
 /// Win11 标签页资源管理器：同一窗口的多个标签是多个 IWebBrowser2，但共享
 /// 同一个顶层 HWND。只按 HWND 取第一个会选到**非活动标签**（实测：活动标签
-/// 在 C:\...\4.2.0.13，却解析成另一个标签"文档"）。同 HWND 多候选时用
-/// 窗口标题（= 活动标签名）与目录名精确匹配来消歧。
+/// 在 C:\...\4.2.0.13，却解析成另一个标签"文档"）。同 HWND 多候选时解析
+/// 标题里的活动标签名，与目录名精确匹配来消歧。
 unsafe fn resolve_foreground(hwnd: isize, title: &str) -> Option<(isize, PathBuf)> {
     let list = enumerate_with_hwnd();
     let mut exact: Vec<(isize, PathBuf)> = list
@@ -103,26 +138,27 @@ unsafe fn resolve_foreground(hwnd: isize, title: &str) -> Option<(isize, PathBuf
         .filter(|(candidate, _)| *candidate == hwnd)
         .cloned()
         .collect();
-    if exact.len() > 1 && !title.is_empty() {
+    let active = active_tab_name(title);
+    if exact.len() > 1 && !active.is_empty() {
         if let Some(hit) = exact.iter().find(|(_, path)| {
             path.file_name()
-                .map(|name| name.to_string_lossy().eq_ignore_ascii_case(title))
+                .map(|name| name.to_string_lossy().eq_ignore_ascii_case(&active))
                 .unwrap_or(false)
         }) {
             return Some(hit.clone());
         }
     }
     if !exact.is_empty() {
-        // 标题对不上（重命名中/虚拟视图）：保持旧行为取第一个。
+        // 活动标签名对不上（本地化显示名如「文档」vs Documents）：保持旧行为取第一个。
         return Some(exact.remove(0));
     }
-    if title.is_empty() {
+    if active.is_empty() {
         return None;
     }
     list.iter()
         .find(|(_, path)| {
             path.file_name()
-                .map(|name| name.to_string_lossy().eq_ignore_ascii_case(title))
+                .map(|name| name.to_string_lossy().eq_ignore_ascii_case(&active))
                 .unwrap_or(false)
         })
         .cloned()
@@ -451,5 +487,30 @@ mod tests {
             path_to_file_url("\\\\server\\share\\dir"),
             "file://server/share/dir"
         );
+    }
+
+    #[test]
+    fn parses_active_tab_from_window_caption() {
+        // 中文 Win11 多标签（实测 26H2）
+        assert_eq!(
+            active_tab_name("4.2.0.13 和 2 个其他选项卡 - 文件资源管理器"),
+            "4.2.0.13"
+        );
+        assert_eq!(
+            active_tab_name("金太阳教育软件客户端 和 3 个其他选项卡 - 文件资源管理器"),
+            "金太阳教育软件客户端"
+        );
+        // 英文多标签
+        assert_eq!(
+            active_tab_name("4.2.0.13 and 2 other tabs - File Explorer"),
+            "4.2.0.13"
+        );
+        // 单标签
+        assert_eq!(active_tab_name("文档 - 文件资源管理器"), "文档");
+        assert_eq!(active_tab_name("Downloads - File Explorer"), "Downloads");
+        // 无后缀（控制面板）
+        assert_eq!(active_tab_name("程序和功能"), "程序和功能");
+        // 目录名本身含「 和 」但非多标签格式：原样保留
+        assert_eq!(active_tab_name("A 和 B"), "A 和 B");
     }
 }
