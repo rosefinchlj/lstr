@@ -71,6 +71,10 @@ pub struct VolumeState {
     /// (见 save_interval)。journal 每来一小批就整卷重写 120MB 会把查询线程
     /// 饿死(实测搜索要等几秒),必须节流。
     save_retry_at: Option<Instant>,
+    /// 旁车日志是否已溢出停捕。溢出本身有界(停捕后不再进日志),此处只做
+    /// 一次性「安排尽快全量保存」的闩:否则每个后续批次都会把 save_retry_at
+    /// 清成「立即」,高频变更卷会连续整卷重写(实测 E 卷 1 分钟内连发多次)。
+    sidecar_overflowed: bool,
     /// 旁车日志:自上次全量保存以来的增量操作(按序,回放语义与运行期 apply
     /// 完全一致)。稳态变更先记这里,由 maintain 以 ~5s 节流原子写进旁车文件
     /// (几 KB,毫秒级);全量保存成功后清空。见 [`crate::sidecar`]。
@@ -111,8 +115,14 @@ impl VolumeState {
         self.sidecar_ops.iter().map(SidecarOp::recs_len).sum()
     }
 
-    /// 捕获一批变更:进内存日志并标记待写盘;日志已满则停捕并请求立即
+    /// 捕获一批变更:进内存日志并标记待写盘;日志已满则停捕并**只安排一次**
     /// 全量保存(游标停在最后一条已捕获批次,缺口由 journal 回放兜底)。
+    ///
+    /// 溢出闩必须只触发一次:旧实现每个后续批次都写 `save_retry_at = None`,
+    /// 把 600s 的全量节流反复抵消;高频变更卷(实测 E 卷,构建/同步盘)
+    /// 在日志清空后几秒又溢出,于是 1 分钟内连发多次 200-350ms 的整卷保存。
+    /// 这里改为:首次溢出把保存排到 [`SIDECAR_OVERFLOW_SAVE_DELAY`] 之后
+    /// (若原本就已到期则保持立即),之后若再次溢出不再改写截止时间。
     fn capture(&mut self, op: SidecarOp, cursor: Option<i64>) {
         if self.sidecar_rec_count() < SIDECAR_MAX_RECS {
             self.sidecar_ops.push(op);
@@ -120,8 +130,18 @@ impl VolumeState {
                 self.sidecar_cursor = usn;
             }
             self.sidecar_pending = true;
-        } else {
-            self.save_retry_at = None;
+        } else if !self.sidecar_overflowed {
+            self.sidecar_overflowed = true;
+            let due = Instant::now() + SIDECAR_OVERFLOW_SAVE_DELAY;
+            if self.save_retry_at.map_or(true, |at| at > due) {
+                self.save_retry_at = Some(due);
+            }
+            snapshot::debug_log(&format!(
+                "sidecar {:032x}: overflow (>{} recs), full save scheduled in {}s",
+                self.guid,
+                SIDECAR_MAX_RECS,
+                SIDECAR_OVERFLOW_SAVE_DELAY.as_secs()
+            ));
         }
     }
 }
@@ -150,6 +170,11 @@ const SIDECAR_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 /// 旁车日志容量上限(变更条数):超出即触发立即全量保存并停捕(内存有界)。
 /// 稳态远达不到;突发批量变更(如解压/同步盘)时回落全量保存的既有路径。
 const SIDECAR_MAX_RECS: usize = 8192;
+
+/// 旁车日志溢出后,全量保存的最小延迟:溢出本身有界(停捕),无需秒级抢救;
+/// 60s 上限避免高频变更卷把「溢出→整卷保存→几秒后再溢出」打成连环保存。
+/// 期间的位点缺口由 journal 回放兜底(crash 安全语义不变)。
+const SIDECAR_OVERFLOW_SAVE_DELAY: Duration = Duration::from_secs(60);
 
 /// 渐进 apply 缓冲:对账/首扫的 Records 不再一口气整条消息打完,而是按块
 /// 消化,块间让宿主线程回去服务查询。按卷分组,保证同卷记录的消费顺序与
@@ -231,6 +256,11 @@ pub struct Engine {
     query_yield: Option<Box<dyn Fn() -> bool + Send>>,
     /// 让路发生次数(诊断/基准断言:批间让路必须真的发生过)。
     apply_yields: u64,
+    /// 正在进行的可中断全量保存(一次一个卷)。保存期间 store 冻结:
+    /// 修改类 EngineMsg 进 deferred,查询继续按冻结视图服务。
+    save_task: Option<snapshot::SaveTask>,
+    /// 保存期间到达的修改/控制消息(FIFO),保存收尾后按原序重放。
+    deferred_msgs: std::collections::VecDeque<EngineMsg>,
 }
 
 impl Engine {
@@ -246,6 +276,8 @@ impl Engine {
             apply_chunk_records: DEFAULT_APPLY_CHUNK,
             query_yield: None,
             apply_yields: 0,
+            save_task: None,
+            deferred_msgs: std::collections::VecDeque::new(),
         };
         engine.load_snapshots();
         engine.recompute_phase();
@@ -283,6 +315,7 @@ impl Engine {
             syncing: false,
             save_backoff: 0,
             save_retry_at: None,
+            sidecar_overflowed: false,
             sidecar_ops,
             sidecar_base,
             sidecar_cursor,
@@ -441,6 +474,7 @@ impl Engine {
                 syncing: false,
                 save_backoff: 0,
                 save_retry_at: None,
+                sidecar_overflowed: false,
                 sidecar_ops: Vec::new(),
                 sidecar_base: (0, 0),
                 sidecar_cursor: 0,
@@ -459,6 +493,28 @@ impl Engine {
     }
 
     pub fn handle(&mut self, msg: EngineMsg) {
+        // 保存期间 store 必须冻结(快照按启动时的冻结视图写列);修改类消息
+        // 按到达顺序排队,保存收尾后原序重放。查询不走 EngineMsg,不受影响。
+        if let Some(saved_guid) = self.save_guid() {
+            match &msg {
+                // 纯状态帧:不碰 store,立即生效(UI 的 USN 状态不因保存停滞)。
+                EngineMsg::UsnWatch { .. } | EngineMsg::WorkerLost => {}
+                // 会重建/清空 store 的控制帧:中止本次保存,先按序重放已排队
+                // 消息,再处理它自己(否则旧视图会被写进已被取代的卷)。
+                EngineMsg::ScanBegin { guid, .. }
+                | EngineMsg::JournalReset { guid }
+                | EngineMsg::VolumeGone { guid }
+                    if *guid == saved_guid =>
+                {
+                    self.abort_save("control message superseded frozen store");
+                    self.flush_deferred();
+                }
+                _ => {
+                    self.deferred_msgs.push_back(msg);
+                    return;
+                }
+            }
+        }
         match msg {
             EngineMsg::WorkerLost => {
                 self.phase = Phase::Fallback;
@@ -494,6 +550,7 @@ impl Engine {
                         v.capture_on = false;
                         v.sidecar_ops = Vec::new();
                         v.sidecar_pending = false;
+                        v.sidecar_overflowed = false;
                         v.sidecar_cursor = v.next_usn;
                         v.sidecar_base = (v.journal_id, v.next_usn);
                     }
@@ -729,6 +786,7 @@ impl Engine {
                         v.capture_on = false;
                         v.sidecar_ops = Vec::new();
                         v.sidecar_pending = false;
+                        v.sidecar_overflowed = false;
                         v.sidecar_base = (0, 0);
                         v.sidecar_cursor = 0;
                         // 状态显示字段一并重置:旧断点/旧游标时间对已清空的
@@ -762,6 +820,50 @@ impl Engine {
             }
         }
         self.recompute_phase();
+    }
+
+    /// 是否有正在进行的可中断保存(宿主据此不阻塞等待请求,持续给保存推进)。
+    pub fn save_in_progress(&self) -> bool {
+        self.save_task.is_some()
+    }
+
+    /// 是否有保存期间积压、待重放的消息。
+    pub fn has_deferred_msgs(&self) -> bool {
+        !self.deferred_msgs.is_empty()
+    }
+
+    fn save_guid(&self) -> Option<u128> {
+        self.save_task.as_ref().map(|t| t.guid())
+    }
+
+    /// 中止当前保存(丢弃 tmp)。store 未被修改,无需回滚。
+    fn abort_save(&mut self, reason: &str) {
+        if let Some(task) = self.save_task.take() {
+            crate::snapshot::debug_log(&format!(
+                "save vol {} aborted after {}ms: {reason}",
+                self.volume_letter(task.guid()),
+                task.elapsed().as_millis()
+            ));
+        }
+    }
+
+    fn volume_letter(&self, guid: u128) -> char {
+        self.volumes
+            .iter()
+            .find(|v| v.guid == guid)
+            .map(|v| v.letter)
+            .unwrap_or('?')
+    }
+
+    /// 按原序重放保存期间积压的消息。保存已结束(成功/失败/中止)后调用;
+    /// 重放引入的变更照常进入旁车/dirty,不会丢。
+    fn flush_deferred(&mut self) {
+        while self.save_task.is_none() {
+            let Some(msg) = self.deferred_msgs.pop_front() else {
+                return;
+            };
+            self.handle(msg);
+        }
     }
 
     /// 注入查询让路钩子(见 [`Engine::query_yield`])。宿主(search worker)
@@ -860,6 +962,11 @@ impl Engine {
     /// 返回 0,剩余由宿主稍后继续(宿主服务完查询再调本方法续传)。
     /// 返回本块实际 apply 的条数;0 = 无待消化内容或本次让路。
     pub fn advance_pending_apply(&mut self) -> usize {
+        // 保存期间 store 冻结:未消化的首扫/对账缓冲也必须停手(否则会改
+        // store,破坏快照视图)。消息在 handle 层已排队,这里只是防御。
+        if self.save_task.is_some() {
+            return 0;
+        }
         if !self.has_pending_apply() {
             return 0;
         }
@@ -1270,6 +1377,16 @@ impl Engine {
     /// 空闲维护:需要的卷 compact + 落盘(旁车优先,全量降频)。
     /// 返回是否做了事(调用方可据此让路)。
     pub fn maintain(&mut self) -> bool {
+        // 有分段保存在进行:本轮只推进保存(小步 + 让路),不再做 compact/旁车
+        // —— store 冻结,且磁盘争用越小,保存期间的查询延迟越稳。保存收尾后
+        // 重放积压的修改消息。
+        if self.save_task.is_some() {
+            self.advance_save();
+            if self.save_task.is_none() {
+                self.flush_deferred();
+            }
+            return true;
+        }
         let mut did = false;
         // 先归并(compact 会 remap,旧 Hit 失效),再落盘
         for i in 0..self.volumes.len() {
@@ -1349,12 +1466,189 @@ impl Engine {
             if ready && self.query_pending() {
                 continue;
             }
+            // 就绪/已归并卷走可中断分段保存:保存期间查询仍按冻结 store 服务,
+            // 不再一次占住引擎线程 1-3 秒。仍处于首扫(scan 模式)的卷列布局
+            // 未定型(offs 为空、delta=全部),整列视图需要一次性全量排序,
+            // 保留原来的同步 compact+写盘(冷路径,20s 断点保存)。
+            let view_ready = self.volumes[i]
+                .store
+                .as_ref()
+                .map(|s| !s.is_scanning())
+                .unwrap_or(false);
+            if view_ready {
+                if self.start_save(i) {
+                    // 小卷(单测/小盘)一次 maintain 跑完,保持「maintain 返回即
+                    // 已落盘」的既有语义;大卷只在 4ms 预算内推进一块,由宿主
+                    // 循环继续(查询始终优先)。
+                    let small = self.volumes[i]
+                        .store
+                        .as_ref()
+                        .map(|s| s.len() < 50_000)
+                        .unwrap_or(false);
+                    if small {
+                        while self.save_task.is_some() && !self.query_pending() {
+                            self.advance_save();
+                        }
+                        if self.save_task.is_none() {
+                            self.flush_deferred();
+                        }
+                    } else {
+                        self.advance_save();
+                    }
+                    did = true;
+                    break;
+                }
+                continue;
+            }
             if self.save_volume(i) {
                 did = true;
                 break;
             }
         }
         did
+    }
+
+    /// 启动分段保存(不写盘,只建状态机)。前置条件与 [`Engine::save_volume`]
+    /// 相同:B-1 缓冲必须已清空、非对账窗口。
+    fn start_save(&mut self, i: usize) -> bool {
+        if self.save_task.is_some() {
+            return false;
+        }
+        if self.has_pending_apply_for(self.volumes[i].guid) {
+            return false;
+        }
+        let header = {
+            let v = &self.volumes[i];
+            if v.syncing {
+                return false;
+            }
+            let Some(store) = &v.store else { return false };
+            if store.is_scanning() && v.resume_frn == 0 {
+                return false;
+            }
+            SnapshotHeader {
+                guid: v.guid,
+                letter: v.letter,
+                complete: v.complete,
+                exclude_noise: self.cfg.exclude_noise,
+                journal_id: v.journal_id,
+                next_usn: v.next_usn,
+                resume_frn: v.resume_frn,
+                est_records: v.est_records,
+            }
+        };
+        self.save_task = Some(snapshot::SaveTask::new(&self.cfg.index_dir, &header));
+        true
+    }
+
+    /// 推进当前分段保存一步(受 SAVE_STEP_BUDGET 限制)。有等待查询时本轮
+    /// 不推进,宿主会先出队服务查询,下轮再续。
+    fn advance_save(&mut self) {
+        let Some(guid) = self.save_guid() else { return };
+        if self.query_pending() {
+            return;
+        }
+        let Some(i) = self.volumes.iter().position(|v| v.guid == guid) else {
+            self.abort_save("volume gone");
+            return;
+        };
+        let Some(store) = self.volumes[i].store.as_ref() else {
+            self.abort_save("store gone");
+            return;
+        };
+        let step = {
+            // 把让路钩子临时借给状态机:块间(每 64K 元素)发现等待中的查询
+            // 立即收手,而不是等服务满一个 4ms 预算。take/归还避免同时借用
+            // self 与 self.save_task。
+            let hook = self.query_yield.take();
+            let step = {
+                let task = self.save_task.as_mut().expect("save task");
+                let mut yield_now = || hook.as_ref().map(|f| f()).unwrap_or(false);
+                task.advance(store, snapshot::SAVE_STEP_BUDGET, &mut yield_now)
+            };
+            self.query_yield = hook;
+            step
+        };
+        match step {
+            snapshot::SaveStep::Pending => {}
+            snapshot::SaveStep::Failed(err) => {
+                let task = self.save_task.take().expect("save task");
+                let elapsed = task.elapsed().as_millis();
+                drop(task);
+                crate::snapshot::debug_log(&format!(
+                    "save vol {} failed after {}ms: {err}",
+                    self.volumes[i].letter, elapsed
+                ));
+                self.apply_save_failure(i, err);
+            }
+            snapshot::SaveStep::Done(report) => {
+                let task = self.save_task.take().expect("save task");
+                let elapsed = task.elapsed().as_millis();
+                drop(task);
+                if elapsed > 100 {
+                    crate::snapshot::debug_log(&format!(
+                        "save vol {} took {}ms (segmented)",
+                        self.volumes[i].letter, elapsed
+                    ));
+                }
+                self.apply_save_success(i, report);
+            }
+        }
+    }
+
+    /// 保存成功后的状态收尾:清 dirty/旁车、恢复捕获、推进游标与节流。
+    fn apply_save_success(&mut self, i: usize, report: snapshot::SaveReport) {
+        if report.compacted {
+            // 旧路径(scan 模式)可能在保存中 compact:slot 重排,拼音缓存
+            // 与旧 Hit 必须失效。分段视图不改 store,compacted 恒 false。
+            self.bump_generation(i);
+            if let Some(store) = &self.volumes[i].store {
+                self.pinyin[i] = PinyinCache::rebuild(store);
+            }
+        }
+        if !report.compacted {
+            // 分段保存不 compact:把上次 compact 以来的新增/改名 slot 局部
+            // 刷进拼音缓存(缓存只含非 ASCII,量 <1%),不重建 250 万条。
+            let v = &self.volumes[i];
+            if let Some(store) = &v.store {
+                let mut slots: Vec<u32> =
+                    (store.base_len()..store.len() as u32).collect();
+                slots.extend(store.renamed_base_slots());
+                if !slots.is_empty() {
+                    self.pinyin[i].refresh_slots(store, &slots);
+                }
+            }
+        }
+        let next_at = Instant::now() + Self::save_interval(&self.volumes[i]);
+        let dir = self.cfg.index_dir.clone();
+        let v = &mut self.volumes[i];
+        v.dirty = false;
+        v.save_backoff = 0;
+        v.save_retry_at = Some(next_at);
+        // 全量快照已覆盖全部变更:清旁车日志、基线推进到本次游标、
+        // 删旁车文件(基线守卫兜底删除失败的情形,双保险)。
+        v.sidecar_base = (v.journal_id, v.next_usn);
+        v.sidecar_cursor = v.next_usn;
+        v.sidecar_ops = Vec::new();
+        v.sidecar_pending = false;
+        v.sidecar_retry_at = None;
+        v.sidecar_overflowed = false;
+        v.capture_on = true;
+        sidecar::remove(&dir, v.guid);
+    }
+
+    /// 保存失败:保留 dirty,指数退避(H6)。tmp 由 SaveTask::drop 清掉。
+    fn apply_save_failure(&mut self, i: usize, err: std::io::Error) {
+        eprintln!("lstr-index: save snapshot failed: {err}");
+        crate::snapshot::debug_log(&format!(
+            "save {:032x} failed: {err}",
+            self.volumes[i].guid
+        ));
+        let v = &mut self.volumes[i];
+        v.save_backoff = v.save_backoff.saturating_add(1);
+        // 1s, 2s, 4s … 上限 60s;dirty 保留,下一轮 maintain 再试
+        let secs = (1u64 << v.save_backoff.min(6)).min(60);
+        v.save_retry_at = Some(Instant::now() + Duration::from_secs(secs));
     }
 
     /// 写旁车文件(内存日志 → 原子小文件)。成功清 pending 并进入节流窗口;
@@ -1422,57 +1716,37 @@ impl Engine {
                 resume_frn: v.resume_frn,
                 est_records: v.est_records,
             };
+            let view = !store.is_scanning();
             let started = Instant::now();
-            let result = snapshot::save_report(
-                &self.cfg.index_dir,
-                &header,
-                &mut self.volumes[i].store.as_mut().unwrap(),
-            );
+            // 非 scan 模式:走与分段保存完全相同的列视图/写盘状态机(一次跑完),
+            // 不 compact store —— 退出/回落路径与分段路径字节一致。
+            let result = if view {
+                snapshot::save_view_sync(&self.cfg.index_dir, &header, store)
+            } else {
+                snapshot::save_report(
+                    &self.cfg.index_dir,
+                    &header,
+                    self.volumes[i].store.as_mut().unwrap(),
+                )
+            };
             let ms = started.elapsed().as_millis();
             if ms > 100 {
                 crate::snapshot::debug_log(&format!(
-                    "save vol {} took {}ms",
-                    self.volumes[i].letter, ms
+                    "save vol {} took {}ms{}",
+                    self.volumes[i].letter,
+                    ms,
+                    if view { " (view)" } else { "" }
                 ));
             }
             result
         };
         match save_result {
             Ok(report) => {
-                if report.compacted {
-                    // save 内部可能 compact(未归并 delta/扫描中/待处理改名)→ slot 重排。
-                    // 拼音缓存以 slot 为键,必须同步重建,并把旧 Hit 代次作废,
-                    // 否则下一次查询会拿旧 slot 越界 panic(m04259)。
-                    self.bump_generation(i);
-                    if let Some(store) = &self.volumes[i].store {
-                        self.pinyin[i] = PinyinCache::rebuild(store);
-                    }
-                }
-                let next_at = Instant::now() + Self::save_interval(&self.volumes[i]);
-                let dir = self.cfg.index_dir.clone();
-                let v = &mut self.volumes[i];
-                v.dirty = false;
-                v.save_backoff = 0;
-                v.save_retry_at = Some(next_at);
-                // 全量快照已覆盖全部变更:清旁车日志、基线推进到本次游标、
-                // 删旁车文件(基线守卫兜底删除失败的情形,双保险)。
-                v.sidecar_base = (v.journal_id, v.next_usn);
-                v.sidecar_cursor = v.next_usn;
-                v.sidecar_ops = Vec::new();
-                v.sidecar_pending = false;
-                v.sidecar_retry_at = None;
-                v.capture_on = true;
-                sidecar::remove(&dir, v.guid);
+                self.apply_save_success(i, report);
                 true
             }
             Err(err) => {
-                eprintln!("lstr-index: save snapshot failed: {err}");
-                crate::snapshot::debug_log(&format!("save {} failed: {err}", self.volumes[i].guid));
-                let v = &mut self.volumes[i];
-                v.save_backoff = v.save_backoff.saturating_add(1);
-                // 1s, 2s, 4s … 上限 60s;dirty 保留,下一轮 maintain 再试
-                let secs = (1u64 << v.save_backoff.min(6)).min(60);
-                v.save_retry_at = Some(Instant::now() + Duration::from_secs(secs));
+                self.apply_save_failure(i, err);
                 false
             }
         }
@@ -1499,6 +1773,16 @@ impl Engine {
     /// 回落全量保存,退出前变更必须以任一自洽形式落盘。
     /// 对账收尾/扫描断点(捕获未武装/扫描中)仍全量落盘。
     pub fn flush_all(&mut self) {
+        // 退出路径没有查询压力:把进行中的分段保存一次跑完(复用同一状态机),
+        // 再处理积压消息,避免把半成品 tmp 留在盘上等下次启动清理。
+        if self.save_task.is_some() {
+            let hook = self.query_yield.take();
+            while self.save_task.is_some() {
+                self.advance_save();
+            }
+            self.query_yield = hook;
+            self.flush_deferred();
+        }
         for i in 0..self.volumes.len() {
             if self.volumes[i].syncing {
                 continue; // 对账中途退出:让下次启动重新对账,不落半态
@@ -1974,13 +2258,51 @@ mod tests {
             engine.volumes[0].sidecar_rec_count() <= SIDECAR_MAX_RECS + 100,
             "溢出后停止捕获,内存日志有界"
         );
-        assert_eq!(engine.volumes[0].save_retry_at, None, "溢出应请求立即全量保存");
+        let scheduled = engine.volumes[0]
+            .save_retry_at
+            .expect("溢出应安排全量保存");
+        assert!(
+            scheduled <= Instant::now() + SIDECAR_OVERFLOW_SAVE_DELAY,
+            "溢出保存应落在延迟窗口内"
+        );
+        assert!(engine.volumes[0].sidecar_overflowed, "溢出闩应置位");
+        // 再溢出不得反复改写截止时间(旧实现每个批次都清成 None → E 卷连发)。
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec_file(90_000, 10, "after-overflow.txt")],
+            next_usn: 300,
+        });
+        assert_eq!(
+            engine.volumes[0].save_retry_at,
+            Some(scheduled),
+            "溢出闩只触发一次,后续批次不得再改截止时间"
+        );
 
-        assert!(engine.maintain(), "溢出后全量保存应立即执行");
+        // 模拟溢出延迟已到:全量保存执行
+        engine.volumes[0].save_retry_at = None;
+        assert!(engine.maintain(), "溢出后全量保存应执行");
         assert!(!engine.volumes[0].dirty);
+        assert!(!engine.volumes[0].sidecar_overflowed, "保存成功清溢出闩");
         assert!(sidecar::load(&dir, guid).unwrap().is_none(), "全量保存后旁车删除");
         assert_ne!(std::fs::read(&snap_path).unwrap(), before, "快照应已重写");
         assert!(engine.volumes[0].sidecar_ops.is_empty());
+
+        // 再次高变更:新溢出只能按延迟窗口排一次保存,不得立刻连发整卷重写。
+        let now = Instant::now();
+        for k in 0..(SIDECAR_MAX_RECS / 100 + 2) {
+            let base = 200_000u64 + k as u64 * 100;
+            let recs: Vec<Rec> = (0..100u64)
+                .map(|j| rec_file(base + j, 10, &format!("again{k:03}_{j:03}.txt")))
+                .collect();
+            engine.handle(EngineMsg::Records { guid, recs, next_usn: 400 + k as i64 });
+        }
+        let again = engine.volumes[0]
+            .save_retry_at
+            .expect("溢出应安排全量保存");
+        assert!(
+            again > now + SIDECAR_OVERFLOW_SAVE_DELAY - Duration::from_secs(5),
+            "溢出触发的全量保存必须受延迟窗口约束(避免 E 卷式连发)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2047,12 +2369,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// m04259: save 内部 compact(未归并 delta / 改名 / 扫描中)会重排 slot,
-    /// engine 的拼音缓存必须随之重建,否则下一次查询按旧 slot 索引 → 越界 panic。
+    /// 分段保存不 compact store(slot 身份不变),因此拼音缓存不会因保存而
+    /// 越界;但快照视图必须仍把 DEAD 条目排除在外(与 compact 后的字节语义
+    /// 一致)。旧实现 save 内部 compact,这里改为「保存视图 + 延迟 compact」。
     #[test]
-    fn pinyin_cache_is_rebuilt_after_save_time_compact() {
+    fn save_view_keeps_slots_and_drops_dead_entries() {
         const DIR: u32 = 0x0010;
-        let dir = temp_index_dir("pinyin-save-compact");
+        let dir = temp_index_dir("pinyin-save-view");
         let guid = 0x4444u128;
         let mut engine = engine_with(&dir);
         feed_ready(&mut engine, guid, 'C');
@@ -2060,7 +2383,7 @@ mod tests {
         // VolumeReady 已 compact 过,这次落盘不会 compact。
         assert!(engine.maintain());
 
-        // 删掉一条(dead→compact 时丢弃)+ 就地改名(renames>0,触发 save 内部 compact)。
+        // 删掉一条 + 就地改名:保存视图必须排除 DEAD、按新名重建名字区。
         engine.handle(EngineMsg::Records {
             guid,
             recs: vec![Rec {
@@ -2086,16 +2409,27 @@ mod tests {
 
         // 跳过落盘节流窗口(第一次 maintain 刚保存过)。
         engine.volumes[0].save_retry_at = None;
-        assert!(engine.maintain(), "save-time compact should still write the snapshot");
+        assert!(engine.maintain(), "分段保存应写入快照");
 
         let store = engine.volumes[0].store.as_ref().unwrap();
-        assert_eq!(store.len(), 2, "dead entry dropped by save-time compact");
+        assert_eq!(store.len(), 3, "保存视图不改 store:DEAD slot 留在内存,等 compact");
         assert!(
             engine.pinyin[0]
                 .slots
                 .iter()
                 .all(|&slot| (slot as usize) < store.len()),
-            "pinyin cache must be rebuilt after save-time compact"
+            "保存不 remap slot,拼音缓存天然不越界"
+        );
+        // 快照本身必须是 compact 后语义:DEAD 条目被排除,改名生效。
+        let loaded = snapshot::load(&dir, guid, true).expect("snapshot loads");
+        assert_eq!(loaded.store.len(), 2, "快照视图必须排除 DEAD 条目");
+        assert!(loaded.store.find_slot(12).is_none());
+        assert_eq!(
+            loaded
+                .store
+                .find_slot(11)
+                .map(|s| loaded.store.name(s).to_vec()),
+            Some(b"alpaca.txt".to_vec())
         );
 
         // 查询(ASCII token 会走拼音候选)不得 panic,total 仍能找到改名后的条目。
@@ -3329,8 +3663,12 @@ mod tests {
 
         let run = |full_save_each_round: bool| -> (Vec<f64>, f64) {
             let mut engine = save_bench_engine(&dir);
-            // 预置一轮:VolumeReady 的 dirty 已由首次 maintain 消化(计时窗外)
+            // 预置一轮:VolumeReady 的 dirty 已由首次 maintain 消化(计时窗外;
+            // 大卷走分段保存,需驱动到完成)
             engine.maintain();
+            while engine.save_in_progress() {
+                engine.maintain();
+            }
             let guid = 0xcafeu128;
             let (q_tx, q_rx) = std::sync::mpsc::channel::<(Instant, QuerySpec)>();
             let done = Arc::new(AtomicBool::new(false));
@@ -3383,10 +3721,28 @@ mod tests {
                     .collect();
                 engine.handle(EngineMsg::Records { guid, recs, next_usn: usn });
                 if full_save_each_round {
-                    // 模拟旧节流(60s 全量)被压缩到每轮:清 retry_at 强制整卷重写
+                    // 旧行为:引擎线程里一次 compact+写完整卷(阻塞查询)。
+                    // 直接调用 snapshot::save_report,不再经过新的分段状态机。
+                    let header = SnapshotHeader {
+                        guid,
+                        letter: 'C',
+                        complete: true,
+                        exclude_noise: true,
+                        journal_id: 7,
+                        next_usn: usn,
+                        resume_frn: 0,
+                        est_records: 0,
+                    };
+                    snapshot::save_report(
+                        &dir,
+                        &header,
+                        engine.volumes[0].store.as_mut().unwrap(),
+                    )
+                    .unwrap();
                     engine.volumes[0].save_retry_at = None;
+                } else {
+                    engine.maintain();
                 }
-                engine.maintain();
                 round += 1;
             }
             done.store(true, Ordering::Relaxed);
@@ -3422,10 +3778,199 @@ mod tests {
         );
         assert!(p90_b < 60.0, "sidecar 模式 p90 {p90_b:.1}ms 应落在打字无感区间");
         assert!(
-            max_b < p50_a,
-            "sidecar 模式 max {max_b:.1}ms 应显著低于 full-save 模式 p50 {p50_a:.1}ms"
+            max_b < max_a / 2.0,
+            "sidecar 模式 max {max_b:.1}ms 应显著低于 full-save 模式 max {max_a:.1}ms"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- 基准:分段保存 vs 一次性整存(保存期间查询延迟,250 万条) ----------
+    //
+    // 旧行为 = 引擎线程里直接 snapshot::save_report(内部 compact + 写 50MB),
+    // 保存期间查询只能排队;新行为 = maintain 每次推进 4ms 的分段保存,查询
+    // 在步间被服务。查询用稀有 token("steady",只命中每轮注入的 4 条),评估
+    // 成本 ~20ms,让「保存阻塞」成为延迟分布的主体。
+    //
+    // 断言取结构性判定:
+    // 1. 分段保存 p90 < 50ms(任务目标);
+    // 2. 分段保存 p90 明显低于旧整存;
+    // 3. 保存墙钟(分段路径含步间服务查询)不劣于旧路径 1.2 倍。
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-profile 基准(250 万条,真实落盘)")]
+    fn bench_segmented_save_query_latency() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        const GUID: u128 = 0x5a7e_u128;
+        let dir_a = std::env::temp_dir().join(format!("lstr-seg-bench-a-{}", std::process::id()));
+        let dir_b = std::env::temp_dir().join(format!("lstr-seg-bench-b-{}", std::process::id()));
+        for dir in [&dir_a, &dir_b] {
+            let _ = std::fs::remove_dir_all(dir);
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let make_engine = |dir: &std::path::Path| {
+            let mut e = Engine::new(EngineConfig {
+                index_dir: dir.to_path_buf(),
+                exclude_noise: true,
+                candidate_cap: 100,
+                volumes: Vec::new(),
+            });
+            e.set_apply_chunk_records(0);
+            for m in bench_build_msgs(GUID) {
+                e.handle(m);
+            }
+            e
+        };
+        // 把初始 VolumeReady 的 dirty 落盘(不计时),大卷要驱动多次。
+        let settle = |e: &mut Engine| {
+            e.maintain();
+            while e.save_in_progress() {
+                e.maintain();
+            }
+        };
+
+        let (q_tx, q_rx) = std::sync::mpsc::channel::<(Instant, QuerySpec)>();
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+        let q_thread = std::thread::Builder::new()
+            .name("seg-save-bench-query".to_string())
+            .spawn(move || {
+                let spec = || QuerySpec {
+                    tokens: vec!["steady".to_string()],
+                    ..Default::default()
+                };
+                // 30ms 节奏:比真实打字密,给保存窗口足够样本。
+                while !done2.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(30));
+                    let _ = q_tx.send((Instant::now(), spec()));
+                }
+            })
+            .unwrap();
+        let service = |engine: &mut Engine, lat: &Mutex<Vec<f64>>, q_rx: &std::sync::mpsc::Receiver<(Instant, QuerySpec)>| {
+            while let Ok((sent, spec)) = q_rx.try_recv() {
+                let _ = engine.query(&spec);
+                lat.lock()
+                    .unwrap()
+                    .push(sent.elapsed().as_secs_f64() * 1000.0);
+            }
+        };
+        // 丢弃计时窗口外(建库/settle)积压的样本,只统计保存窗口内的查询。
+        let discard = |q_rx: &std::sync::mpsc::Receiver<(Instant, QuerySpec)>| {
+            while q_rx.try_recv().is_ok() {}
+        };
+        let inject = |e: &mut Engine, round: usize| {
+            let usn = 1_000 + round as i64;
+            let recs: Vec<Rec> = (0..4)
+                .map(|j| {
+                    bench_rec(
+                        5_000_000 + (round * 4 + j) as u64,
+                        10,
+                        format!("steady_{round:03}_{j}.txt"),
+                        0,
+                        0,
+                    )
+                })
+                .collect();
+            e.handle(EngineMsg::Records { guid: GUID, recs, next_usn: usn });
+        };
+
+        // ---- 旧行为:一次整存(compact + 写),保存期间不服务查询 ----
+        let mut engine_a = make_engine(&dir_a);
+        settle(&mut engine_a);
+        let lat_a = Mutex::new(Vec::new());
+        let mut busy_a = Duration::ZERO;
+        for round in 0..3usize {
+            inject(&mut engine_a, round);
+            engine_a.volumes[0].save_retry_at = None;
+            discard(&q_rx); // 只统计保存窗口内的查询
+            let started = Instant::now();
+            let header = SnapshotHeader {
+                guid: GUID,
+                letter: 'C',
+                complete: true,
+                exclude_noise: true,
+                journal_id: 7,
+                next_usn: 1_000 + round as i64,
+                resume_frn: 0,
+                est_records: 0,
+            };
+            snapshot::save_report(
+                &dir_a,
+                &header,
+                engine_a.volumes[0].store.as_mut().unwrap(),
+            )
+            .unwrap();
+            busy_a += started.elapsed();
+            service(&mut engine_a, &lat_a, &q_rx);
+        }
+
+        // ---- 新行为:分段保存,步间服务查询 ----
+        let mut engine_b = make_engine(&dir_b);
+        settle(&mut engine_b);
+        let lat_b = Mutex::new(Vec::new());
+        let mut busy_b = Duration::ZERO;
+        for round in 0..3usize {
+            inject(&mut engine_b, round);
+            engine_b.volumes[0].save_retry_at = None;
+            discard(&q_rx);
+            let started = Instant::now();
+            loop {
+                engine_b.maintain();
+                service(&mut engine_b, &lat_b, &q_rx);
+                if !engine_b.save_in_progress() && !engine_b.has_deferred_msgs() {
+                    break;
+                }
+            }
+            busy_b += started.elapsed();
+            service(&mut engine_b, &lat_b, &q_rx);
+        }
+        done.store(true, Ordering::Relaxed);
+        q_thread.join().unwrap();
+
+        let mut lat_a = lat_a.into_inner().unwrap();
+        let mut lat_b = lat_b.into_inner().unwrap();
+        lat_a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        lat_b.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        assert!(
+            lat_a.len() >= 15 && lat_b.len() >= 15,
+            "样本不足: old={} new={}",
+            lat_a.len(),
+            lat_b.len()
+        );
+        let (p50_a, p90_a, max_a) = (
+            percentile(&lat_a, 0.5),
+            percentile(&lat_a, 0.9),
+            *lat_a.last().unwrap(),
+        );
+        let (p50_b, p90_b, max_b) = (
+            percentile(&lat_b, 0.5),
+            percentile(&lat_b, 0.9),
+            *lat_b.last().unwrap(),
+        );
+        let save_a = busy_a.as_secs_f64() * 1000.0 / 3.0;
+        let save_b = busy_b.as_secs_f64() * 1000.0 / 3.0;
+        println!(
+            "[bench] save-oneshot (旧,250万条): {} queries p50={p50_a:.1}ms p90={p90_a:.1}ms max={max_a:.1}ms | save={save_a:.0}ms/次",
+            lat_a.len()
+        );
+        println!(
+            "[bench] save-segmented(新,250万条): {} queries p50={p50_b:.1}ms p90={p90_b:.1}ms max={max_b:.1}ms | save={save_b:.0}ms/次",
+            lat_b.len()
+        );
+        assert!(p90_b < 50.0, "分段保存期间 p90 应 <50ms: {p90_b:.1}ms");
+        assert!(
+            p90_b < p90_a / 2.0,
+            "分段保存 p90 {p90_b:.1}ms 应显著低于整存 p90 {p90_a:.1}ms"
+        );
+        assert!(
+            save_b <= save_a * 1.2,
+            "分段保存墙钟 {save_b:.0}ms 不应比整存 {save_a:.0}ms 慢 20% 以上"
+        );
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     // ---------- 基准:宽查询分项剖析("ai" 类,250 万条) ----------
@@ -3697,5 +4242,163 @@ mod tests {
             p(&s_con_post).0,
             p(&s_con_post).1,
         );
+    }
+
+    /// 分段保存期间:store 冻结(修改类消息排队),查询按冻结视图服务;
+    /// 保存完成后积压消息按序应用,快照只包含保存开始时的状态,新增量
+    /// 由旁车承载(崩溃恢复语义不变)。
+    #[test]
+    fn segmented_save_freezes_store_and_buffers_mutations() {
+        let dir = temp_index_dir("seg-engine-freeze");
+        let guid = 0x5e6u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain());
+
+        // 保存前变更(应进快照)
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(13, 10, 0, "pre.txt")],
+            next_usn: 150,
+        });
+        engine.volumes[0].save_retry_at = None;
+        assert!(engine.start_save(0));
+        assert!(engine.save_in_progress());
+
+        // 压住让路钩子:保存暂停在起始阶段
+        let force = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook = force.clone();
+        engine.set_query_yield_hook(Some(Box::new(move || {
+            hook.load(std::sync::atomic::Ordering::Relaxed)
+        })));
+        assert!(engine.maintain());
+        assert!(engine.save_in_progress(), "有查询时保存必须让路而不是整存");
+
+        // 保存期间到达的修改:排队,不得改 store
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(14, 10, 0, "post.txt")],
+            next_usn: 160,
+        });
+        assert!(engine.has_deferred_msgs());
+        assert!(
+            engine.volumes[0]
+                .store
+                .as_ref()
+                .unwrap()
+                .find_slot(14)
+                .is_none(),
+            "保存期间 store 必须冻结"
+        );
+        // 冻结视图下查询照常:pre 可见,post 尚不可见。
+        let find = |e: &Engine, token: &str| {
+            e.query(&QuerySpec {
+                tokens: vec![token.to_string()],
+                ..Default::default()
+            })
+            .total
+        };
+        assert_eq!(find(&engine, "pre"), 1);
+        assert_eq!(find(&engine, "post"), 0);
+
+        // 放行:保存收尾 → 积压消息重放
+        force.store(false, std::sync::atomic::Ordering::Relaxed);
+        while engine.save_in_progress() {
+            engine.maintain();
+        }
+        assert!(!engine.has_deferred_msgs(), "积压消息必须重放完");
+        assert_eq!(find(&engine, "post"), 1, "保存后新增量必须应用");
+
+        // 快照只含保存开始时的状态;post 由旁车承载。
+        let loaded = snapshot::load(&dir, guid, true).expect("snapshot loads");
+        assert!(loaded.store.find_slot(13).is_some(), "pre 必须进快照");
+        assert!(loaded.store.find_slot(14).is_none(), "post 不得进本次快照");
+        engine.maintain(); // 旁车节流写盘(几 KB)
+        let sc = sidecar::load(&dir, guid).unwrap().expect("sidecar persisted");
+        assert!(!sc.ops.is_empty(), "保存后新增量必须进旁车");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// flush_all(退出路径)必须把进行中的分段保存一次跑完:快照落盘、
+    /// tmp 不残留、保存态清空。
+    #[test]
+    fn flush_all_finishes_active_segmented_save() {
+        let dir = temp_index_dir("seg-engine-flush");
+        let guid = 0x5e9u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain());
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(13, 10, 0, "flush.txt")],
+            next_usn: 150,
+        });
+        engine.volumes[0].save_retry_at = None;
+        assert!(engine.start_save(0));
+
+        // 压住让路钩子,让保存停在半途(模拟退出时保存正被查询打断)。
+        let force = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook = force.clone();
+        engine.set_query_yield_hook(Some(Box::new(move || {
+            hook.load(std::sync::atomic::Ordering::Relaxed)
+        })));
+        assert!(engine.maintain());
+        assert!(engine.save_in_progress());
+
+        engine.flush_all();
+        assert!(!engine.save_in_progress(), "退出收尾必须完成分段保存");
+        assert!(!engine.has_deferred_msgs());
+        assert!(snapshot::snapshot_path(&dir, guid).is_file());
+        let loaded = snapshot::load(&dir, guid, true).expect("snapshot loads");
+        assert!(loaded.store.find_slot(13).is_some());
+        let tmp = dir.join(format!("vol_{:032x}.tmp", std::process::id()));
+        assert!(!tmp.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 控制帧(JournalReset)会取代冻结 store:中止保存、清理 tmp,
+    /// 先重放已排队消息再处理控制帧(顺序语义不丢)。
+    #[test]
+    fn segmented_save_aborts_on_journal_reset() {
+        let dir = temp_index_dir("seg-engine-abort");
+        let guid = 0x5e7u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain());
+        assert!(engine.start_save(0));
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(13, 10, 0, "queued.txt")],
+            next_usn: 150,
+        });
+        assert!(engine.has_deferred_msgs());
+
+        engine.handle(EngineMsg::JournalReset { guid });
+        assert!(!engine.save_in_progress(), "控制帧必须中止保存");
+        assert!(!engine.has_deferred_msgs());
+        assert!(
+            engine.volumes[0].store.is_none(),
+            "JournalReset 按原序生效(先重放,后清空)"
+        );
+        assert!(!snapshot::snapshot_path(&dir, guid).is_file());
+        let tmp = dir.join(format!("vol_{:032x}.tmp", std::process::id()));
+        assert!(!tmp.exists(), "中止后不得残留 tmp");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启动清理:上次保存中途被杀留下的 vol_*.tmp 必须被删除。
+    #[test]
+    fn orphan_save_tmp_is_removed_on_startup() {
+        let dir = temp_index_dir("seg-tmp-orphan");
+        let guid = 0x5e8u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain());
+        let tmp = dir.join(format!("vol_{:032x}.tmp", std::process::id()));
+        std::fs::write(&tmp, b"partial snapshot").unwrap();
+        assert!(tmp.exists());
+        let _ = engine_with(&dir); // 新会话:load_snapshots 清孤儿 tmp
+        assert!(!tmp.exists(), "启动必须清理孤儿 tmp");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

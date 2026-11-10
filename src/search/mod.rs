@@ -1097,33 +1097,47 @@ fn run_worker(
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => break,
         };
+        let mut maintenance_busy = false;
         if pending.is_none() {
             let idle_start = Instant::now();
             // 1. 应用自研索引的增量 + 维护(仅空闲路径)
             if let Some(b) = &mut builtin {
-                // 对账/首扫的分批记录:先消化引擎缓冲。advance 在块间查让路
-                // 钩子,有等待查询时返回 0 → 收手,让下面优先出队服务。
-                while b.engine.has_pending_apply() {
-                    if b.engine.advance_pending_apply() == 0 {
-                        break;
+                // 分段保存进行中:store 冻结,不再向外拉消息(client 线程在
+                // 有界通道上背压即可),只推进保存一小步;查询仍在主循环优先
+                // 出队。修改类消息由 Engine::handle 排队兜底。
+                if b.engine.save_in_progress() {
+                    b.engine.maintain();
+                    *handshake_slot.lock().unwrap() = b.engine.handshake_state();
+                    maintenance_busy = true;
+                } else {
+                    // 对账/首扫的分批记录:先消化引擎缓冲。advance 在块间查让路
+                    // 钩子,有等待查询时返回 0 → 收手,让下面优先出队服务。
+                    while b.engine.has_pending_apply() {
+                        if b.engine.advance_pending_apply() == 0 {
+                            break;
+                        }
                     }
+                    let mut applied = 0usize;
+                    while let Ok(msg) = engine_rx.try_recv() {
+                        b.engine.handle(msg);
+                        applied += 1;
+                        if applied >= 400 {
+                            break;
+                        }
+                        // 打字优先(0294602 的 apply 中段扩展):消息间隙发现等待中
+                        // 的查询、或分批记录还没消化完 → 立即收手回到主循环出队;
+                        // 空闲时仍整轮消化,对账吞吐不受损。
+                        if QUERY_INFLIGHT.load(Ordering::Relaxed) > 0
+                            || b.engine.has_pending_apply()
+                        {
+                            break;
+                        }
+                    }
+                    b.engine.maintain();
+                    *handshake_slot.lock().unwrap() = b.engine.handshake_state();
+                    maintenance_busy =
+                        b.engine.save_in_progress() || b.engine.has_deferred_msgs();
                 }
-                let mut applied = 0usize;
-                while let Ok(msg) = engine_rx.try_recv() {
-                    b.engine.handle(msg);
-                    applied += 1;
-                    if applied >= 400 {
-                        break;
-                    }
-                    // 打字优先(0294602 的 apply 中段扩展):消息间隙发现等待中
-                    // 的查询、或分批记录还没消化完 → 立即收手回到主循环出队;
-                    // 空闲时仍整轮消化,对账吞吐不受损。
-                    if QUERY_INFLIGHT.load(Ordering::Relaxed) > 0 || b.engine.has_pending_apply() {
-                        break;
-                    }
-                }
-                b.engine.maintain();
-                *handshake_slot.lock().unwrap() = b.engine.handshake_state();
             }
             let idle_ms = idle_start.elapsed().as_millis();
             if idle_ms > 100 {
@@ -1146,14 +1160,21 @@ fn run_worker(
         // 2. 取请求(有 pending 直接用;否则 150ms 超时 → 回到维护)
         let mut request = match pending {
             Some(r) => r,
-            None => match rx.recv_timeout(Duration::from_millis(150)) {
-                Ok(r) => {
-                    query_inflight_dec();
-                    r
+            None => {
+                // 保存/积压消息待推进:不阻塞等请求,立即回主循环继续维护
+                // (顶部 try_recv 仍会最优先服务刚到的查询)。
+                if maintenance_busy {
+                    continue;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            },
+                match rx.recv_timeout(Duration::from_millis(150)) {
+                    Ok(r) => {
+                        query_inflight_dec();
+                        r
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
         };
         // 用户可能刚点了提示条启动 Everything；每次查询前尝试重连，
         // 而不是启动时连不上就永久报错。
