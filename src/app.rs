@@ -2510,12 +2510,18 @@ impl LstrApp {
                 (true, false) => time_text,
                 (false, false) => format!("{size_text} · {time_text}"),
             };
+            // 按**实际渲染宽度**预留 meta 区：全局 TEXT_SCALE=1.18 会放大字体，
+            // 固定像素估算（76/122）会算窄，右对齐的日期从预留区左缘溢出、
+            // 盖住路径尾巴。这里用与绘制完全相同的字体测量，再留右缘 10px +
+            // 与路径的 4px 间隔。
             let meta_w = if meta.is_empty() {
                 0.0
-            } else if meta.chars().count() > 12 {
-                122.0
             } else {
-                76.0
+                painter
+                    .layout_no_wrap(meta.clone(), ui::mono_font(11.0), theme.dim)
+                    .size()
+                    .x
+                    + 14.0
             };
             let mut title_job = match &fuzzy_hit {
                 Some(positions) => ui::text_job_positions(
