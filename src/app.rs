@@ -2618,23 +2618,12 @@ impl LstrApp {
             // 「已打开」(对话框 Quick Switch 的近期目录)与「拼音」是两种
             // 不同来源提示:同时满足时保留两者,读作「已打开 · 拼音 · …」,
             // 先交代条目已在打开列表里,再说明本次为何命中。
-            // 拼音标注带出具体拼音串（weixin → 微信资料 时显示「拼音 weixin ziliao」），
-            // 过长截断避免挤压路径。
-            let pinyin_text = if pinyin_path_hit {
-                let mut t = crate::search::pinyin::spaced(&entry.name);
-                const MAX_PINYIN_CHARS: usize = 40;
-                if t.chars().count() > MAX_PINYIN_CHARS {
-                    t = t.chars().take(MAX_PINYIN_CHARS).collect::<String>();
-                    t.push('…');
-                }
-                t
-            } else {
-                String::new()
-            };
+            // 拼音标注只显示本次查询词（与应用行「应用 · 拼音 weixin」一致）：
+            // 目的只是标明「这条是拼音命中」，不列名字的完整拼音。
             let lead = match (entry.id.starts_with("qs:"), pinyin_path_hit) {
-                (true, true) => format!("已打开 · 拼音 {pinyin_text} · "),
+                (true, true) => format!("已打开 · 拼音 {} · ", query.text),
                 (true, false) => "已打开 · ".to_string(),
-                (false, true) => format!("拼音 {pinyin_text} · "),
+                (false, true) => format!("拼音 {} · ", query.text),
                 (false, false) => String::new(),
             };
             let time_text = if is_path_row {
@@ -2699,8 +2688,14 @@ impl LstrApp {
             let title_galley = painter.layout_job(title_job);
             let title_width = title_galley.size().x;
             let title_height = title_galley.size().y;
+            // 两行内容的垂直布局：标题 + 6px 行距 + 副标题(路径)，整块在行内
+            // 垂直居中（row_height 可配置 36-52，写死 5/25 在 44 时两行只隔 3px）。
+            const SUB_LINE_H: f32 = 16.0; // mono 11.5 × TEXT_SCALE 的近似行高
+            let content_h = title_height + 6.0 + SUB_LINE_H;
+            let y_title = row_rect.top() + ((theme.row_h - content_h) / 2.0).max(2.0);
+            let y_sub = y_title + title_height + 6.0;
             painter.galley(
-                egui::pos2(row_rect.left() + 54.0, row_rect.top() + 5.0),
+                egui::pos2(row_rect.left() + 54.0, y_title),
                 title_galley,
                 theme.text,
             );
@@ -2745,7 +2740,7 @@ impl LstrApp {
                     head_job.wrap.max_rows = 1;
                     head_job.wrap.break_anywhere = true;
                     let head_galley = painter.layout_job(head_job);
-                    let y = row_rect.top() + 5.0 + (title_height - head_galley.size().y).max(0.0);
+                    let y = y_title + (title_height - head_galley.size().y).max(0.0);
                     painter.galley(
                         egui::pos2(row_rect.left() + 54.0 + title_width + gap, y),
                         head_galley,
@@ -2760,7 +2755,7 @@ impl LstrApp {
                     // 极端超长路径的兜底：正常窗口宽度两行足够，不会走到省略。
                     tail_job.wrap.overflow_character = Some('…');
                     painter.galley(
-                        egui::pos2(row_rect.left() + 54.0, row_rect.top() + 25.0),
+                        egui::pos2(row_rect.left() + 54.0, y_sub),
                         painter.layout_job(tail_job),
                         theme.sub,
                     );
@@ -2813,7 +2808,7 @@ impl LstrApp {
                 sub_job.wrap.overflow_character = Some('…');
                 sub_job.wrap.break_anywhere = true;
                 painter.galley(
-                    egui::pos2(row_rect.left() + 54.0, row_rect.top() + 25.0),
+                    egui::pos2(row_rect.left() + 54.0, y_sub),
                     painter.layout_job(sub_job),
                     theme.sub,
                 );
