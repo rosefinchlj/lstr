@@ -3203,6 +3203,16 @@ mod tests {
         let (s_empty, empty_total) = profile_ms(|| crate::query::query_volume(&store, &empty, 800).1, 2, 10);
         // 拼音缓存重建耗时(快照「加载时重建」方案的成本依据)
         let (s_rebuild, py_entries) = profile_ms(|| PinyinCache::rebuild(&store).slots.len(), 1, 3);
+        // n-gram 倒排:内存占用 + 重建耗时(compact/加载时重建的成本依据)。
+        // 放在全部计时测量之后,不影响上面的采样;此后不再查询。
+        let ng_mb = mb(store.ngram_heap_bytes());
+        let mut store = store;
+        let t = Instant::now();
+        store.rebuild_ngram();
+        println!(
+            "[profile] ngram heap={ng_mb:.1}MB rebuild(2.5M)={:.0}ms",
+            t.elapsed().as_millis()
+        );
 
         let p = |samples: &[f64]| (percentile(samples, 0.5), percentile(samples, 0.9));
         let (ai_p50, ai_p90) = p(&s3);
