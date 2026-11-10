@@ -1403,6 +1403,43 @@ mod tests {
         engine.handle(EngineMsg::VolumeReady { guid, journal_id: 7, next_usn: 100, count: 3 });
     }
 
+    /// MAJOR 回归(端到端):空卷(新 U 盘/全删卷)首扫完成 → VolumeReady
+    /// compact 后必须进入 ready 形态;journal 新建文件的 ≥2 字符查询必须命中。
+    /// 旧实现空卷 compact 后 is_scanning 恒真:insert 不进 overlay、
+    /// maintain/save 对 scanning 卷跳过,查询又被空倒排静默归零。
+    #[test]
+    fn empty_volume_ready_then_new_file_is_searchable() {
+        let dir = temp_index_dir("empty-ready");
+        let guid = 0xe0e0u128;
+        let mut engine = engine_with(&dir);
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'E',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: 0,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        engine.handle(EngineMsg::VolumeReady { guid, journal_id: 7, next_usn: 100, count: 0 });
+        {
+            let store = engine.volumes[0].store.as_ref().unwrap();
+            assert!(!store.is_scanning(), "空卷首扫完成(compact)后必须退出 scan 模式");
+            assert!(store.is_empty());
+        }
+        // 卷已就绪:新建文件走 journal 增量(而不是重新扫描)
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec_file(10, 0, "alpha.txt")],
+            next_usn: 101,
+        });
+        let spec = QuerySpec { tokens: vec!["alpha".into()], ..Default::default() };
+        let outcome = engine.query(&spec);
+        assert_eq!(outcome.total, 1, "空卷 compact 后新建的文件必须可查");
+        assert_eq!(outcome.hits.len(), 1);
+        assert_eq!(engine.entry_name(&outcome.hits[0]), "alpha.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn h6_dirty_cleared_after_successful_save() {
         let dir = temp_index_dir("h6");
@@ -3178,14 +3215,20 @@ mod tests {
             2,
             15,
         );
-        // ② 命中→slot 解析(含陈项过滤,无 token AND/无过滤/无收集)
+        // ② 命中→slot 解析(含陈项过滤与同条目去重,无 token AND/无过滤/无收集)
+        // 去重口径与 query 的 total 一致(同一名字内多次出现只算一条),
+        // 否则 "hits_resolved" 按原始出现计数,和 total 的语义错位。
         let (s2, hits_resolved) = profile_ms(
             || {
                 let finder = memchr::memmem::Finder::new("ai");
                 let mut n = 0usize;
+                let mut last: Option<u32> = None;
                 for off in finder.find_iter(&store.names_lc) {
-                    if store.slot_at_offset(off).is_some() {
-                        n += 1;
+                    if let Some(slot) = store.slot_at_offset(off) {
+                        if last != Some(slot) {
+                            last = Some(slot);
+                            n += 1;
+                        }
                     }
                 }
                 n
@@ -3243,5 +3286,73 @@ mod tests {
         assert!(con_total > 80_000, "con 中频量级, got {con_total}");
         assert!(narrow_total >= 40 && narrow_total <= 60, "窄 token ~50, got {narrow_total}");
         assert!(py_entries > 4_000, "CJK 拼音候选 ~0.2%, got {py_entries}");
+
+        // ---------- MINOR-2 基准:改名风暴下 reindex overlay 满态 ----------
+        // compact 后先做 5 万条就地改名(只进 overlay、不进 delta,旧实现
+        // needs_compact 看不到它);再注入 32768 条追加(delta 同为阈值量级),
+        // 复现 overlay 8.3 万的最坏查询态。断言 needs_compact 捕获该状态,
+        // 并测 "ai"/"con" 满态延迟与 compact 恢复后的延迟。
+        let renames = 50_000usize;
+        for slot in 0..renames {
+            let frn = store.frn[slot];
+            let attrs = store.attrs[slot] as u32;
+            store.insert(
+                frn,
+                crate::store::ROOT_FRN,
+                attrs,
+                format!("ai_con_{slot:06}.txt").as_bytes(),
+            );
+        }
+        assert!(store.delta_is_empty(), "就地改名不进 delta");
+        assert!(
+            store.needs_compact(),
+            "改名风暴的 overlay 必须纳入 needs_compact(旧实现此处为 false)"
+        );
+        for i in 0..crate::store::COMPACT_DELTA as u64 {
+            let frn = 10 + PROFILE_DIRS + PROFILE_FILES + i;
+            store.insert(
+                frn,
+                crate::store::ROOT_FRN,
+                0,
+                profile_name(PROFILE_FILES + i).as_bytes(),
+            );
+        }
+        let overlay = store.reindex_slots().len();
+        assert_eq!(overlay, renames + crate::store::COMPACT_DELTA);
+        assert!(store.needs_compact());
+
+        // 满态正确性:快路径 total 必须与强制 memmem 路径一致
+        let mem_ai = crate::query::query_volume_memmem_scan(&store, &ai, &ai_tokens, 0, b"ai", 100, None).1;
+        let (s_ai_ov, ai_ov_total) = profile_ms(|| crate::query::query_volume(&store, &ai, 100).1, 2, 15);
+        assert_eq!(ai_ov_total, mem_ai, "overlay 满态下 ai 快路径 total 必须与 memmem 一致");
+        let con_tokens = vec![b"con".to_vec()];
+        let mem_con =
+            crate::query::query_volume_memmem_scan(&store, &con, &con_tokens, 0, b"con", 100, None).1;
+        let (s_con_ov, con_ov_total) = profile_ms(|| crate::query::query_volume(&store, &con, 100).1, 2, 15);
+        assert_eq!(con_ov_total, mem_con, "overlay 满态下 con 快路径 total 必须与 memmem 一致");
+
+        // compact 恢复(重建倒排、清空 overlay)后,同一批查询应回到常数成本
+        let t_compact = Instant::now();
+        store.compact();
+        let compact_ms = t_compact.elapsed().as_millis();
+        let (s_ai_post, ai_post_total) = profile_ms(|| crate::query::query_volume(&store, &ai, 100).1, 2, 15);
+        let (s_con_post, con_post_total) = profile_ms(|| crate::query::query_volume(&store, &con, 100).1, 2, 15);
+        assert_eq!(ai_post_total, ai_ov_total, "compact 不改变 ai 查询结果");
+        assert_eq!(con_post_total, con_ov_total, "compact 不改变 con 查询结果");
+        println!(
+            "[bench-overlay] renames={renames} appends={} overlay={overlay} needs_compact=caught | ai total={ai_ov_total} 满态 p50={:.2}ms p90={:.2}ms → compact后 p50={:.2}ms p90={:.2}ms",
+            crate::store::COMPACT_DELTA,
+            p(&s_ai_ov).0,
+            p(&s_ai_ov).1,
+            p(&s_ai_post).0,
+            p(&s_ai_post).1,
+        );
+        println!(
+            "[bench-overlay] con total={con_ov_total} 满态 p50={:.2}ms p90={:.2}ms → compact后 p50={:.2}ms p90={:.2}ms | compact(2.5M+改名)={compact_ms}ms",
+            p(&s_con_ov).0,
+            p(&s_con_ov).1,
+            p(&s_con_post).0,
+            p(&s_con_post).1,
+        );
     }
 }
