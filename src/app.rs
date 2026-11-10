@@ -888,7 +888,13 @@ impl LstrApp {
             // 窗口高度按「最大结果数」定：worker 会多送候选（可滚动），
             // 窗口只长到设置的行数，不会因为候选多就撑满屏幕。
             let rows = self.entries.len().min(self.cfg.max_results);
-            let list_h = if rows == 0 { 120.0 } else { rows as f32 * self.theme.row_h };
+            let mut list_h = if rows == 0 { 120.0 } else { rows as f32 * self.theme.row_h };
+            // 空态技巧面板（分类两列约 280px）：仅空输入+空结果时撑高窗口，
+            // 一旦有结果或开始输入即恢复按行数计算。
+            let tips_active = rows == 0 && self.input.trim().is_empty() && !self.settings_open;
+            if tips_active {
+                list_h = list_h.max(300.0);
+            }
             let banner_h = if self.error.is_some() || self.index_note.is_some() { 30.0 } else { 0.0 };
             let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
             let computed_h = (SEARCH_H
@@ -2298,46 +2304,106 @@ impl LstrApp {
     ) {
         let theme = self.theme;
         if entries.is_empty() {
-            // 空查询（还没开始搜索）：显示搜索技巧引导面板。
+            // 空查询（还没开始搜索）：分类两列的搜索技巧面板。
             if query.is_empty() {
                 self.needle_target = 0.0;
                 self.scrollable = false;
-                // 两列：左键名（sub 色）+ 右说明（dim 色），行距 24。
-                let tips: [(&str, &str); 6] = [
-                    ("c:  d:", "只在这些盘符搜 · -c: 排除某盘"),
-                    ("ext:rs", "按扩展名 · path:D:\\目录 限定目录"),
-                    ("a 微信", "搜应用 · f 文件 · > 命令"),
-                    ("拼音", "全拼或首字母，如 wx → 微信"),
-                    ("Tab", "切换范围 · Alt+← 返回 · Esc 收起"),
-                    ("Ctrl+G", "对打开/保存对话框搜索并填入"),
+                // 左列「搜索语法」：位置 / 筛选 / 范围；右列「输入与快捷键」。
+                // 分类标题（sub 色）+ 键名（mono sub）+ 说明（mono dim），
+                // 窗口窄时退化为单列顺排。
+                let syntax: [(&str, &[(&str, &str)]); 3] = [
+                    (
+                        "位置",
+                        &[
+                            ("c:  d:", "只搜这些盘，可多个"),
+                            ("-c:", "排除某盘，如 ap -c:"),
+                            ("path:D:\\目录", "限定到某目录"),
+                        ],
+                    ),
+                    (
+                        "筛选",
+                        &[("ext:rs", "按扩展名"), ("时间 · 类型", "用下方筛选条切换")],
+                    ),
+                    (
+                        "范围",
+                        &[("a 微信", "搜应用"), ("f 文件", "只搜文件"), ("> 命令", "命令页")],
+                    ),
                 ];
-                let key_x = rect.left() + 28.0;
-                let desc_x = rect.left() + 108.0;
-                let mut y = list_top + 18.0;
+                let misc: [(&str, &[(&str, &str)]); 2] = [
+                    (
+                        "输入",
+                        &[
+                            ("拼音", "全拼或首字母，wx → 微信"),
+                            ("Tab", "切换范围"),
+                            ("Alt+←", "返回上级范围"),
+                        ],
+                    ),
+                    (
+                        "快捷键",
+                        &[
+                            ("Esc", "收起（再唤出保留输入）"),
+                            ("Ctrl+G", "对话框搜索并填入"),
+                            ("双击 Ctrl", "唤出"),
+                        ],
+                    ),
+                ];
+                let x0 = rect.left() + 26.0;
+                let two_col = rect.width() >= 560.0;
+                let col_w = if two_col {
+                    (rect.width() - 64.0) / 2.0
+                } else {
+                    rect.width() - 52.0
+                };
+                let key_w = 96.0;
+                let draw_group = |painter: &egui::Painter, x: f32, y: &mut f32, (title, rows): (&str, &[(&str, &str)])| {
+                    painter.text(
+                        egui::pos2(x, *y),
+                        Align2::LEFT_TOP,
+                        title,
+                        ui::text_font(11.5),
+                        theme.sub,
+                    );
+                    *y += 21.0;
+                    for (key, desc) in rows {
+                        painter.text(
+                            egui::pos2(x + 6.0, *y),
+                            Align2::LEFT_TOP,
+                            *key,
+                            ui::mono_font(11.0),
+                            theme.sub,
+                        );
+                        painter.text(
+                            egui::pos2(x + 6.0 + key_w, *y),
+                            Align2::LEFT_TOP,
+                            *desc,
+                            ui::mono_font(11.0),
+                            theme.dim,
+                        );
+                        *y += 19.0;
+                    }
+                    *y += 8.0;
+                };
+                let mut y = list_top + 14.0;
                 painter.text(
-                    egui::pos2(key_x, y),
+                    egui::pos2(x0, y),
                     Align2::LEFT_TOP,
                     "搜索技巧",
                     ui::text_font(12.0),
                     theme.sub,
                 );
-                y += 26.0;
-                for (key, desc) in tips {
-                    painter.text(
-                        egui::pos2(key_x, y),
-                        Align2::LEFT_TOP,
-                        key,
-                        ui::mono_font(11.5),
-                        theme.sub,
-                    );
-                    painter.text(
-                        egui::pos2(desc_x, y),
-                        Align2::LEFT_TOP,
-                        desc,
-                        ui::mono_font(11.5),
-                        theme.dim,
-                    );
-                    y += 24.0;
+                y += 24.0;
+                for group in syntax {
+                    draw_group(painter, x0, &mut y, group);
+                }
+                if two_col {
+                    let mut ry = list_top + 14.0 + 24.0;
+                    for group in misc {
+                        draw_group(painter, x0 + col_w + 12.0, &mut ry, group);
+                    }
+                } else {
+                    for group in misc {
+                        draw_group(painter, x0, &mut y, group);
+                    }
                 }
                 return;
             }
