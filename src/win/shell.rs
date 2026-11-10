@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::model::{Entry, Kind};
+use std::os::windows::process::CommandExt; // raw_arg：按原样拼命令行
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use windows::core::PCWSTR;
