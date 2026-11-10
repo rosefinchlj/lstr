@@ -176,6 +176,9 @@ pub struct LstrApp {
     quit_armed_at: Option<Instant>,
     /// 退出原因（写 engine.log 用）：window/tray/cmd:quit/hotkey。
     exit_reason: &'static str,
+    /// 下次唤出是否保留输入框内容与结果：Esc/热键收起置真（继续上次搜索），
+    /// 执行结果后收起（启动文件/应用）置假（下次唤出从空开始）。
+    resume_input: bool,
     last_height: f32,
     needle_y: f32,
     needle_target: f32,
@@ -314,6 +317,7 @@ impl LstrApp {
             clear_armed_at: None,
             quit_armed_at: None,
             exit_reason: "window",
+            resume_input: false,
             last_height: 0.0,
             needle_y: 0.0,
             needle_target: 0.0,
@@ -738,7 +742,7 @@ impl LstrApp {
         if self.hidden {
             self.show(ctx);
         } else {
-            self.hide(ctx);
+            self.hide_keep(ctx);
         }
     }
 
@@ -752,6 +756,9 @@ impl LstrApp {
     }
 
     fn show(&mut self, ctx: &egui::Context) {
+        // Esc/热键收起后再次唤出：保留输入框内容、选中项与筛选，继续上次搜索；
+        // 执行结果后收起则照旧从空开始。
+        let keep = std::mem::take(&mut self.resume_input);
         self.dialog = None;
         self.settings_open = false;
         self.menu_open = false;
@@ -764,12 +771,14 @@ impl LstrApp {
         self.focus_requested = true;
         self.mouse_moved = false;
         self.needle_ready = false;
-        self.input.clear();
+        if !keep {
+            self.input.clear();
+            self.selected = 0;
+            self.scroll_y = 0.0;
+            self.scroll_to_selection = false;
+            self.filters = SearchFilters::default();
+        }
         Self::reset_input_cursor(ctx);
-        self.selected = 0;
-        self.scroll_y = 0.0;
-        self.scroll_to_selection = false;
-        self.filters = SearchFilters::default();
         self.filter_menu = None;
         // 普通唤出（双击 Space / 托盘）不携带 Explorer 目录上下文。
         self.typing_folder = None;
@@ -833,7 +842,19 @@ impl LstrApp {
         ctx.request_repaint();
     }
 
-    fn hide(&mut self, _ctx: &egui::Context) {
+    fn hide(&mut self, ctx: &egui::Context) {
+        // 执行结果后收起：下次唤出从空开始。
+        self.resume_input = false;
+        self.hide_inner(ctx);
+    }
+
+    /// Esc / 热键收起：下次唤出保留输入框内容与结果，继续上次搜索。
+    fn hide_keep(&mut self, ctx: &egui::Context) {
+        self.resume_input = true;
+        self.hide_inner(ctx);
+    }
+
+    fn hide_inner(&mut self, _ctx: &egui::Context) {
         if let Some(hwnd) = self.hwnd {
             window::hide(hwnd);
         }
@@ -932,10 +953,10 @@ impl LstrApp {
             if let Some(dialog) = self.dialog.take() {
                 // 交还焦点：抑制这个对话框的自动唤出。
                 self.suppressed_dialog = Some(dialog.hwnd);
-                self.hide(ctx);
+                self.hide_keep(ctx);
                 dialog::restore_focus(&dialog);
             } else {
-                self.hide(ctx);
+                self.hide_keep(ctx);
             }
             return;
         }
