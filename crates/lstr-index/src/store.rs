@@ -6,10 +6,11 @@
 //! - 名字以 `\0` 结尾打包:子串匹配天然不会跨条目(needle 不含 \0)。
 //! - slot 即列下标,append-only;改名/删除=旧 slot 置 DEAD 位+新 slot,
 //!   因此 name_off 恒升序,「命中偏移→slot」可二分。
-//! - scan 模式(base_len==0):parent 列暂存父 FRN(u64),一切查询走打包
+//! - scan 模式(scan_mode=true):parent 列暂存父 FRN(u64),一切查询走打包
 //!   buffer 扫描;volume 完成后 compact():解析父 slot、噪声分类、列重建。
-//! - journal 模式(base_len>0):frn 有序数组二分 + delta HashMap 定位;
+//! - journal 模式(scan_mode=false):frn 有序数组二分 + delta HashMap 定位;
 //!   delta 攒批,超阈值或空闲时 compact 归并(保留既有排序,只做 O(n) 归并)。
+//!   scan_mode 与 base_len 解耦:空卷 compact 后 base_len 仍为 0,但已 ready。
 
 use std::collections::HashMap;
 
@@ -37,8 +38,8 @@ pub const NO_PARENT: u32 = u32::MAX;
 /// compact 250 万条,CPU 单核打满、查询被饿死。根目录必须当作 NO_PARENT。
 pub const ROOT_FRN: u64 = 5;
 
-/// compact 触发阈值:delta 新 slot 数。
-const COMPACT_DELTA: usize = 32_768;
+/// compact 触发阈值:delta 新 slot 数(同样用作 reindex overlay 阈值)。
+pub(crate) const COMPACT_DELTA: usize = 32_768;
 /// compact 触发阈值:死 slot 占比(分子)。
 const COMPACT_DEAD: u32 = 4096;
 
@@ -262,8 +263,8 @@ impl NgramIndex {
     pub fn heap_bytes(&self) -> usize {
         self.postings_b.len()
             + self.postings_t.len()
-            + self.bigram.len() * 8
-            + self.trigram.len() * 8
+            + self.bigram.len() * std::mem::size_of::<NgList>()
+            + self.trigram.len() * std::mem::size_of::<NgList>()
     }
 }
 
@@ -344,6 +345,10 @@ pub struct VolumeStore {
     off_index: Vec<(u32, u32)>,
     /// compact 后的 slot 数(= offs.len());之后的新 slot 全在 delta。
     base_len: u32,
+    /// 是否仍在 scan 模式(未完成首次 compact)。与 `base_len` 解耦:空卷
+    /// compact 后 `base_len` 仍为 0,但 scan 模式必须结束(否则空卷上新建
+    /// 的文件永不进 reindex overlay,≥2 字符查询被空倒排静默归零)。
+    scan_mode: bool,
     /// 自上次 compact 以来的就地改名次数(>0 时 base offs 名序失效,需整体重排)。
     renames: u32,
     /// compact 后新增的 slot(base_len..)。
@@ -407,6 +412,7 @@ impl VolumeStore {
             mtime: Vec::new(),
             char_mask: Vec::new(),
             base_len: 0,
+            scan_mode: true,
             delta: Vec::new(),
             delta_frn: HashMap::new(),
             dead_count: 0,
@@ -455,6 +461,7 @@ impl VolumeStore {
             mtime,
             char_mask,
             base_len,
+            scan_mode: false,
             delta: Vec::new(),
             delta_frn: HashMap::new(),
             dead_count: 0,
@@ -507,11 +514,20 @@ impl VolumeStore {
 
     /// 重建倒排(compact/from_parts 尾部调用;列处于一致有序态)。
     /// pub(crate):bench 测构建耗时用。
+    ///
+    /// 空名字区不建索引(保持 None):空卷 compact 后新建的文件没有 base
+    /// 倒排可用,查询必须回落 memmem;若给空 store 造 `Some(空倒排)`,
+    /// 2/3 字符链命中集恒空且永不走兜底,查询会静默归零。
+    /// 先释放旧索引再构建,避免新旧两份 postings 同时驻留(峰值内存翻倍)。
     pub(crate) fn rebuild_ngram(&mut self) {
         self.ngram_base_len = self.name_off.len() as u32;
         self.reindex.clear();
         self.reindex_mark.clear();
         self.reindex_mark.resize((self.name_off.len() + 63) / 64, 0);
+        self.ngram = None;
+        if self.name_off.is_empty() {
+            return;
+        }
         self.ngram = Some(NgramIndex::build(&self.names_lc, &self.name_off));
     }
 
@@ -531,12 +547,19 @@ impl VolumeStore {
 
     /// n-gram 快路径候选:gen(已小写折叠)全部字节在字母表内且有索引时,
     /// 返回升序候选 slot(链内 slot 序 ≡ name_off 序 ≡ memmem 命中序)。
-    /// None = 无索引(scan 模式)/token 不可索引 → 调用方走 memmem 兜底。
+    /// None = 无可用倒排(scan 模式/空 store/倒排未建)/token 不可索引
+    /// → 调用方走 memmem 兜底。
     ///
     /// - 2/3 字符:单链即精确命中集(子串出现 ⇔ n-gram 在链上);
     /// - ≥4 字符:全部连续 trigram 链求交(最短链起步)= 超集,调用方逐个
     ///   memmem 验证。
     pub(crate) fn ngram_candidates(&self, gen: &[u8]) -> Option<Vec<u32>> {
+        // 三层防御:空 store / scan 模式 / 倒排缺失任一都不得走倒排路径 ——
+        // 空倒排的 2/3 字符链返回 `Some(vec![])`,会让查询静默归零且永不
+        // 回落 memmem(空卷首扫完成后的新建文件因此查不到)。
+        if self.name_off.is_empty() || self.is_scanning() || self.ngram.is_none() {
+            return None;
+        }
         let idx = self.ngram.as_ref()?;
         if gen.len() < 2 || gen.iter().any(|&b| ng_alpha(b).is_none()) {
             return None;
@@ -582,8 +605,10 @@ impl VolumeStore {
     }
 
     /// 是否仍在 scan 模式(未完成首次 compact)。
+    /// 读显式 `scan_mode`,不看 `base_len`:空卷 compact 后 base_len 仍为 0,
+    /// 若以 `base_len == 0` 判定,空卷会永远停留在 scanning。
     pub fn is_scanning(&self) -> bool {
-        self.base_len == 0
+        self.scan_mode
     }
 
     pub fn name(&self, slot: u32) -> &[u8] {
@@ -882,8 +907,9 @@ impl VolumeStore {
         self.char_mask.push(mask_of_bytes(name));
         self.delta.push(slot);
         // 倒排 overlay:索引构建后的新增槽不进倒排(重建留给 compact),
-        // 查询时逐个 memmem 验证;scan 模式无索引,首次 compact 全量建。
-        if !scanning {
+        // 查询时逐个 memmem 验证;scan 模式或倒排未建(空 store)时无可用
+        // 倒排,查询整体走 memmem 兜底,登记 overlay 没有意义。
+        if !scanning && self.ngram.is_some() {
             self.reindex.push(slot);
         }
         // 索引策略:scan 模式只索引目录(父查找只需要目录,内存省 78%);
@@ -979,8 +1005,15 @@ impl VolumeStore {
     ///
     /// unresolved 不计入触发条件:未解析父链只有在 delta 带来新记录时才可能被
     /// 修好,单凭 unresolved 会让「每轮 maintain 全量 compact」变成活锁。
+    ///
+    /// reindex overlay 同样计入:就地改名只进 overlay、不进 delta/死计数,
+    /// 批量改名(daemon 同步/解压/构建产物)能把 overlay 顶到 250 万级,
+    /// 使逐击键的 overlay 排序 + memmem 随改名数线性劣化。达到 delta 同量级
+    /// 就 compact 重建倒排(overlay 随之清空),把查询成本拉回常数。
     pub fn needs_compact(&self) -> bool {
-        self.delta.len() >= COMPACT_DELTA || self.dead_count >= COMPACT_DEAD
+        self.delta.len() >= COMPACT_DELTA
+            || self.dead_count >= COMPACT_DEAD
+            || self.reindex.len() >= COMPACT_DELTA
     }
 
     pub fn pending_work(&self) -> usize {
@@ -1178,8 +1211,10 @@ impl VolumeStore {
         self.base_len = self.name_off.len() as u32;
         self.dead_count = 0;
         self.renames = 0;
-        // 10. 列已一致有序:重建倒排,清空 overlay
+        // 10. 列已一致有序:重建倒排,清空 overlay;scan 模式结束 —— 空卷
+        //     (live 为空)同样结束,否则空卷会永远停留在 scanning。
         self.rebuild_ngram();
+        self.scan_mode = false;
     }
 }
 
@@ -1210,6 +1245,53 @@ mod tests {
         assert!(s.unresolved_pairs().is_empty());
         // 反复 compact 不应再有任何工作(旧实现在这里会永远重建)
         s.compact();
+        assert!(!s.needs_compact());
+    }
+
+    /// 空卷首扫完成:compact 后即使 live 为空也必须退出 scan 模式,且不建
+    /// 空倒排。旧实现两者都错:`is_scanning()==base_len==0` 恒真,插入不进
+    /// overlay,`Some(空倒排)` 让 2/3 字符查询静默返回 0。
+    #[test]
+    fn empty_compact_exits_scan_mode_and_skips_empty_ngram() {
+        let mut s = VolumeStore::new(false);
+        assert!(s.is_scanning());
+        s.compact();
+        assert!(!s.is_scanning(), "空卷 compact 后 scan 模式必须结束");
+        assert!(s.is_empty());
+        assert!(s.ngram.is_none(), "空名字区不得构建倒排");
+        assert!(s.ngram_candidates(b"ab").is_none(), "无倒排时必须回落 memmem");
+        // 空 store 生长期:插入可用,但不进 overlay(没有可维护的倒排)
+        assert!(s.insert(10, 0, 0, b"alpha.txt"));
+        assert!(s.reindex_slots().is_empty());
+        assert!(s.ngram_candidates(b"alp").is_none());
+        s.compact();
+        assert!(!s.is_scanning());
+        assert!(!s.needs_compact());
+    }
+
+    /// MINOR-2:就地改名不进 delta/死计数,只堆 reindex overlay。批量改名
+    /// 达到 COMPACT_DELTA 时必须触发 compact,否则 overlay 无界增长会把每次
+    /// 查询拖成 O(改名数) 的排序 + memmem。
+    #[test]
+    fn rename_storm_overlay_triggers_compact() {
+        let mut s = VolumeStore::new(false);
+        for i in 0..COMPACT_DELTA as u64 {
+            s.insert(1000 + i, 0, 0, format!("f{i}.txt").as_bytes());
+        }
+        s.compact();
+        assert!(!s.needs_compact());
+        for slot in 0..COMPACT_DELTA as u64 {
+            let frn = s.frn[slot as usize];
+            s.insert(frn, 0, 0, format!("g{slot}_con.txt").as_bytes());
+        }
+        assert!(s.delta_is_empty(), "就地改名不进 delta");
+        assert_eq!(s.dead_count, 0);
+        assert!(s.has_pending_rename());
+        assert_eq!(s.reindex_slots().len(), COMPACT_DELTA);
+        assert!(s.needs_compact(), "overlay 达到 COMPACT_DELTA 必须触发 compact");
+        s.compact();
+        assert!(!s.has_pending_rename());
+        assert!(s.reindex_slots().is_empty());
         assert!(!s.needs_compact());
     }
 
