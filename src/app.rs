@@ -759,6 +759,12 @@ impl LstrApp {
         // Esc/热键收起后再次唤出：保留输入框内容、选中项与筛选，继续上次搜索；
         // 执行结果后收起则照旧从空开始。
         let keep = std::mem::take(&mut self.resume_input);
+        // 诊断：输入保留链路的每一次 show/hide 都落一条（排查「唤出后输入丢失」）。
+        lstr_index::snapshot::debug_log(&format!(
+            "ui: show keep={keep} input_len={} entries={}",
+            self.input.chars().count(),
+            self.entries.len()
+        ));
         self.dialog = None;
         self.settings_open = false;
         self.menu_open = false;
@@ -844,12 +850,20 @@ impl LstrApp {
 
     fn hide(&mut self, ctx: &egui::Context) {
         // 执行结果后收起：下次唤出从空开始。
+        lstr_index::snapshot::debug_log(&format!(
+            "ui: hide (fresh) input_len={}",
+            self.input.chars().count()
+        ));
         self.resume_input = false;
         self.hide_inner(ctx);
     }
 
     /// Esc / 热键收起：下次唤出保留输入框内容与结果，继续上次搜索。
     fn hide_keep(&mut self, ctx: &egui::Context) {
+        lstr_index::snapshot::debug_log(&format!(
+            "ui: hide_keep input_len={}",
+            self.input.chars().count()
+        ));
         self.resume_input = true;
         self.hide_inner(ctx);
     }
@@ -950,9 +964,22 @@ impl LstrApp {
             return;
         }
 
-        // Esc 直接关闭窗口（不再需要按住）：菜单/筛选/设置一并收起。
+        // Esc 关闭窗口（不再需要按住），但按层级优先：菜单 → 筛选菜单 →
+        // 设置面板 先各自收起，全部收完后再按一次才隐藏窗口。
         // 窗口不会因为失焦自动关闭。
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            if self.menu_open {
+                self.menu_open = false;
+                return;
+            }
+            if self.filter_menu.is_some() {
+                self.filter_menu = None;
+                return;
+            }
+            if self.settings_open {
+                self.settings_open = false;
+                return;
+            }
             self.menu_open = false;
             self.filter_menu = None;
             self.settings_open = false;
@@ -1145,6 +1172,7 @@ impl LstrApp {
 
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             if !self.input.is_empty() {
+                lstr_index::snapshot::debug_log("ui: esc_clear_input");
                 self.input.clear();
                 self.trigger(ctx);
             } else if let Some(dialog) = self.dialog.take() {
@@ -1770,6 +1798,7 @@ impl LstrApp {
                         if clear.hovered() { theme.text } else { theme.dim },
                     );
                     if clear.clicked() {
+                        lstr_index::snapshot::debug_log("ui: clear_button");
                         self.input.clear();
                         self.selected = 0;
                         self.menu_open = false;
@@ -2919,7 +2948,11 @@ impl LstrApp {
         }
 
         if let Some(index) = hovered {
-            self.selected = index;
+            // 菜单打开时冻结选中行：菜单锚定在选中行下方，鼠标移向菜单途中
+            // 经过别的行会改选中 → 菜单每帧跟着跳走，永远追不上。
+            if !self.menu_open {
+                self.selected = index;
+            }
         }
         if let Some(index) = clicked {
             self.activate_index(ui.ctx(), index);
