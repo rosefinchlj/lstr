@@ -200,13 +200,16 @@ pub struct EngineConfig {
 /// - `file_hits` = 旧 `search_split(folders=false)` 的 All 前缀里的非文件夹项;
 /// - `total_folders` = 旧文件夹路的精确计数(TOTAL_CAP 封顶);
 /// - `total_all` = 旧 All 路的精确计数(TOTAL_CAP 封顶);
-///   旧 files 路的总数 = total_all - total_folders。
+///   旧 files 路的总数 = total_all - total_folders;
+/// - `exact_hits` = 旧 `Engine::query(exact spec)` 的候选(仅
+///   `query_split_with_exact` 填):同名 offs 二分结果 + 拼音补集,顺序一致。
 #[derive(Clone, Debug, Default)]
 pub struct SplitOutcome {
     pub file_hits: Vec<Hit>,
     pub folder_hits: Vec<Hit>,
     pub total_all: usize,
     pub total_folders: usize,
+    pub exact_hits: Vec<Hit>,
     pub aborted: bool,
 }
 
@@ -1041,6 +1044,20 @@ impl Engine {
     ///
     /// 调用方须传 `spec.kind = KindFilter::All`(分清 kind 由本函数完成)。
     pub fn query_split(&self, spec: &QuerySpec) -> SplitOutcome {
+        self.query_split_with_exact(spec, None)
+    }
+
+    /// 双路查询 + 精确同名候选并趟。`exact` = 旧 `search_exact` 用的
+    /// `query.text.to_lowercase()`(None = 不收集)。候选顺序与旧
+    /// `Engine::query(exact spec)` 逐条一致:
+    /// - 有名字 token:offs 二分的同名槽位在前,拼音补集在后;
+    /// - 无名字 token(纯 ext:/path: 查询):旧 exact 走「过滤器全量列举」,
+    ///   等价于本卷 all 前缀(逐条相同),不是同名匹配。
+    pub fn query_split_with_exact(
+        &self,
+        spec: &QuerySpec,
+        exact: Option<&str>,
+    ) -> SplitOutcome {
         // 传入非 All 的 kind 会让「文件前缀」失去语义;调用方只说「查全部」。
         debug_assert_eq!(spec.kind, KindFilter::All, "query_split 只接受 All-kind 查询");
         let mut out = SplitOutcome::default();
@@ -1090,6 +1107,25 @@ impl Engine {
                 .into_iter()
                 .map(|slot| Hit { vol: i as u32, slot, generation })
                 .collect();
+            // 精确同名候选:旧 search_exact 的第二趟,这里并进同一次遍历。
+            // 同名槽位由 offs 二分直接拿(成本 ~µs),不需要扫候选。
+            let mut exact_hits: Vec<Hit> = Vec::new();
+            let mut exact_set: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            if let Some(needle) = exact {
+                if spec.tokens.is_empty() {
+                    // 旧 exact 在无 token 时走过滤器全量列举(= 本卷 all 前缀),
+                    // 排序/条数与 all_hits 相同;放在此处分叉以保持逐条一致。
+                    exact_hits = all_hits.clone();
+                    exact_set = exact_hits.iter().map(|h| h.slot).collect();
+                } else {
+                    let slots = crate::query::exact_slots(store, spec, needle.as_bytes());
+                    exact_hits = slots
+                        .into_iter()
+                        .map(|slot| Hit { vol: i as u32, slot, generation })
+                        .collect();
+                    exact_set = exact_hits.iter().map(|h| h.slot).collect();
+                }
+            }
             // 拼音候选(仅 ASCII 查询;名字里不含查询词时靠拼音命中)。
             // 旧双路各自调一次 pinyin.search(同一序列),这里只扫一次,再按
             // 「是否已在各自 hits 里」独立补进两条前缀并各自计数 —— 与旧实现
@@ -1116,6 +1152,10 @@ impl Engine {
                         out.total_folders += 1;
                         folder_hits.push(Hit { vol: i as u32, slot, generation });
                     }
+                    // 旧 exact 的拼音补集与同名槽位去重后按同一序列追加。
+                    if exact.is_some() && exact_set.insert(slot) {
+                        exact_hits.push(Hit { vol: i as u32, slot, generation });
+                    }
                 }
             }
             // 拼音扫描/排序段不可中断(缓存 ~0.2% 条目、candidate_cap 封顶);
@@ -1136,6 +1176,11 @@ impl Engine {
                         .map(|p| p.to_lowercase().starts_with(prefix))
                         .unwrap_or(false)
                 });
+                exact_hits.retain(|h| {
+                    self.path_of(h)
+                        .map(|p| p.to_lowercase().starts_with(prefix))
+                        .unwrap_or(false)
+                });
             }
             // 文件前缀 = All 前缀里的非文件夹项(旧 files 路在应用层用 kind_of
             // 丢文件夹;这里等价地按 attrs 目录位提前剔除,少了无用路径拼接)。
@@ -1145,6 +1190,7 @@ impl Engine {
                     .filter(|h| !self.is_dir(h)),
             );
             out.folder_hits.append(&mut folder_hits);
+            out.exact_hits.append(&mut exact_hits);
         }
         out
     }
@@ -1177,10 +1223,14 @@ impl Engine {
     }
 
     /// 沿父链拼全路径(盘符 + 路径)。Hit 失效/卷已移除时返回 None。
+    ///
+    /// 只在最后做一次 `String` 分配:父链名字保留为 `&[u8]`(旧实现每层
+    /// `from_utf8_lossy().into_owned()` 都会分配一个 String,500 条候选 ×
+    /// 路径深度 5 ≈ 2500 次短分配)。
     pub fn path_of(&self, hit: &Hit) -> Option<String> {
         let store = self.store_for_hit(hit)?;
         let v = &self.volumes[hit.vol as usize];
-        let mut parts: Vec<String> = Vec::new();
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(8);
         let mut cur = hit.slot;
         let mut hops = 0;
         while cur != crate::store::NO_PARENT && hops < 64 {
@@ -1188,8 +1238,7 @@ impl Engine {
             if store.attrs[cur as usize] & crate::store::ATTR_DEAD != 0 {
                 return None;
             }
-            let s = store.name(cur);
-            parts.push(String::from_utf8_lossy(s).into_owned());
+            parts.push(store.name(cur));
             cur = store.parent[cur as usize];
             hops += 1;
         }
@@ -1197,7 +1246,16 @@ impl Engine {
             return None;
         }
         parts.reverse();
-        Some(format!("{}:\\{}", v.letter, parts.join("\\")))
+        let mut out = String::with_capacity(2 + parts.iter().map(|p| p.len() + 1).sum::<usize>());
+        out.push(v.letter);
+        out.push_str(":\\");
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                out.push('\\');
+            }
+            out.push_str(&String::from_utf8_lossy(part));
+        }
+        Some(out)
     }
 
     /// 拼音 (initials, full),无缓存/Hit 失效则 None。
@@ -1583,11 +1641,15 @@ mod tests {
         assert_eq!(engine.phase, Phase::Ready);
 
         let check = |spec_all: &QuerySpec| {
-            let split = engine.query_split(spec_all);
+            let needle = spec_all.tokens.join(" ").to_lowercase();
+            let split = engine.query_split_with_exact(spec_all, Some(&needle));
             let mut spec_folders = spec_all.clone();
             spec_folders.kind = KindFilter::Folders;
             let all = engine.query(spec_all);
             let folders = engine.query(&spec_folders);
+            let mut spec_exact = spec_all.clone();
+            spec_exact.exact = Some(needle.clone());
+            let exact = engine.query(&spec_exact);
             assert!(!split.aborted);
             assert_eq!(split.total_all, all.total, "total_all: {:?}", spec_all.tokens);
             assert_eq!(
@@ -1609,6 +1671,11 @@ mod tests {
             assert_eq!(
                 split.file_hits, expected_files,
                 "文件前缀: {:?}",
+                spec_all.tokens
+            );
+            assert_eq!(
+                split.exact_hits, exact.hits,
+                "exact 候选: {:?}",
                 spec_all.tokens
             );
         };
@@ -2134,6 +2201,7 @@ mod tests {
             .find(|h| engine.volumes[h.vol as usize].guid == g1)
             .expect("hit on first volume");
         assert!(engine.path_of(&hit).is_some());
+        assert_eq!(engine.path_of(&hit).as_deref(), Some("C:\\docs\\alpha.txt"));
 
         // 重扫:store 原地更新 + 代次递增 → 旧 Hit 失效,但访问不得 panic
         engine.handle(EngineMsg::ScanBegin { guid: g1, resume_frn: 0 });

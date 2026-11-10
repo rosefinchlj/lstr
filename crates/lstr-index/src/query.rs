@@ -169,6 +169,31 @@ fn query_tokens(spec: &QuerySpec) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// exact 模式候选集:ready 走 offs 二分、scan 全扫,顺序/过滤与
+/// `walk_candidates` 的 exact 分支逐条一致。旧 exact 查询不受 cap/TOTAL_CAP
+/// 限制,这里同样收集全部同名槽位,供 `query_split_with_exact` 并趟复用。
+pub(crate) fn exact_slots(store: &VolumeStore, spec: &QuerySpec, ex: &[u8]) -> Vec<u32> {
+    let mut slots = Vec::new();
+    if !store.offs.is_empty() {
+        let lo = store.offs.partition_point(|&s| store.name_lc(s) < ex);
+        for &slot in &store.offs[lo..] {
+            if store.name_lc(slot) != ex {
+                break;
+            }
+            if passes_filters(store, slot, spec) {
+                slots.push(slot);
+            }
+        }
+        return slots;
+    }
+    for slot in 0..store.name_off.len() as u32 {
+        if store.name_lc(slot) == ex && passes_filters(store, slot, spec) {
+            slots.push(slot);
+        }
+    }
+    slots
+}
+
 /// 可取消版本:返回 `(slots, total, capped, aborted)`。查询线程传入发查询时
 /// 的 `CANCEL_GEN` 快照,UI 每次新搜索都会刷新该代次,热循环据此提前中止。
 pub(crate) fn query_volume_cancel(
