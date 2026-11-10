@@ -377,20 +377,48 @@ pub fn format_relative_time(ts: i64) -> String {
     } else if diff < 30 * 86400 {
         format!("{} 天前", diff / 86400)
     } else {
-        // 粗略 UTC 日期（预览面板足够用）
-        let days = ts.div_euclid(86400);
-        let z = days + 719468;
-        let era = z.div_euclid(146097);
-        let doe = z - era * 146097;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        let year = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let day = doy - (153 * mp + 2) / 5 + 1;
-        let month = if mp < 10 { mp + 3 } else { mp - 9 };
-        let year = if month <= 2 { year + 1 } else { year };
-        format!("{year:04}-{month:02}-{day:02}")
+        format_local_date(ts)
     }
+}
+
+/// unix 秒 → 本地 "YYYY-MM-DD"。
+/// 走 Win32 `FileTimeToLocalFileTime` + `FileTimeToSystemTime`（自动处理时区/夏令时），
+/// 文件管理器习惯的本地日期；API 异常时回退到粗略 UTC 日期（不应发生）。
+fn format_local_date(ts: i64) -> String {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Time::{FileTimeToLocalFileTime, FileTimeToSystemTime, SYSTEMTIME};
+    // 1601-01-01 → 1970-01-01 的 100ns tick 数（18 位，勿再写错位数）。
+    const UNIX_EPOCH_FILETIME: i128 = 116_444_736_000_000_000;
+    let ticks = ts as i128 * 10_000_000 + UNIX_EPOCH_FILETIME;
+    if (0..=u64::MAX as i128).contains(&ticks) {
+        let t = ticks as u64;
+        let ft = FILETIME {
+            dwLowDateTime: (t & 0xFFFF_FFFF) as u32,
+            dwHighDateTime: (t >> 32) as u32,
+        };
+        let mut local = FILETIME::default();
+        let mut st = SYSTEMTIME::default();
+        unsafe {
+            if FileTimeToLocalFileTime(&ft, &mut local).is_ok()
+                && FileTimeToSystemTime(&local, &mut st).is_ok()
+            {
+                return format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay);
+            }
+        }
+    }
+    // 回退：粗略 UTC 日期（旧实现，仅 API 异常时走到）。
+    let days = ts.div_euclid(86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 pub fn format_size(bytes: u64) -> String {
@@ -577,5 +605,29 @@ mod tests {
         let unc = middle_ellipsis(r"\\server\share\a\b\c\Z", 20);
         assert!(unc.starts_with("\\\\server\\share"), "UNC 根保留: {unc}");
         assert!(unc.ends_with('Z'));
+    }
+
+    #[test]
+    fn local_date_has_canonical_shape() {
+        // 形态断言（避免时区相关断言）：4-2-2 位数字，年份合理。
+        let cases = [
+            0i64,
+            1_600_000_000,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+                - 40 * 86400,
+        ];
+        for ts in cases {
+            let s = format_local_date(ts);
+            let parts: Vec<&str> = s.split('-').collect();
+            assert_eq!(parts.len(), 3, "非 YYYY-MM-DD: {s}");
+            assert_eq!(parts[0].len(), 4, "年份位数: {s}");
+            assert_eq!(parts[1].len(), 2, "月份位数: {s}");
+            assert_eq!(parts[2].len(), 2, "日期位数: {s}");
+            let y: i32 = parts[0].parse().expect("年份可解析");
+            assert!((1970..=3000).contains(&y), "年份合理: {s}");
+        }
     }
 }
