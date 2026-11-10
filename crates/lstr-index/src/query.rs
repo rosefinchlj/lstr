@@ -573,6 +573,35 @@ mod tests {
         assert_eq!(slots.len(), 2);
     }
 
+    /// MAJOR 回归:空卷首扫完成(VolumeReady → compact)后新建文件,
+    /// ≥2 字符纯 ASCII 查询曾被空倒排快路径静默归零。空 store 不得建倒排,
+    /// 插入不得被 scan 模式挡住,查询必须回落 memmem 并命中。
+    #[test]
+    fn empty_compact_then_insert_is_searchable() {
+        let mut s = VolumeStore::new(false);
+        assert!(s.is_scanning());
+        s.compact();
+        assert!(!s.is_scanning(), "空卷 compact 后必须退出 scan 模式");
+        assert!(s.is_empty());
+        assert!(s.ngram_candidates(b"alpha").is_none(), "空 store 无倒排");
+
+        assert!(s.insert(10, 5, 0, b"alpha.txt"));
+        // 每个查询形态都必须命中,且与强制 memmem 路径逐字段一致
+        for q in ["alpha", "al", "ph", "alpha.txt"] {
+            let spec = QuerySpec { tokens: vec![q.into()], ..Default::default() };
+            let (slots, total, _) = query_volume(&s, &spec, 100);
+            assert_eq!(total, 1, "查询 {q:?} 应命中空卷 compact 后新建的文件");
+            assert_eq!(s.name(slots[0]), b"alpha.txt");
+            assert_equivalent(&s, &spec);
+        }
+        // 继续新建:倒排要到下次 compact 才建,查询仍走 memmem 兜底
+        assert!(s.insert(11, 5, 0, b"beta.log"));
+        let spec = QuerySpec { tokens: vec!["be".into()], ..Default::default() };
+        let (_, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 1);
+        assert_equivalent(&s, &spec);
+    }
+
     #[test]
     fn empty_tokens_list_by_filters() {
         // H5:只有过滤器(无文字 token)时按过滤条件全量列举,而不是返回空。
@@ -730,6 +759,27 @@ mod tests {
         // scan 模式(无索引,快路径应自动兜底)就对拍
         query_batch(&s, &mut rng);
         s.compact();
+        assert!(!s.is_scanning(), "非空 compact 后必须退出 scan 模式");
+
+        // 空 store 回归:删光存活项再 compact(空卷 compact 路径),之后
+        // 插入的条目必须仍可查;倒排保持 None → 查询走 memmem 兜底。
+        for frn in alive.drain(..) {
+            s.remove(frn);
+        }
+        s.compact();
+        assert!(!s.is_scanning(), "空卷 compact 后也必须退出 scan 模式");
+        assert!(s.is_empty());
+        for _ in 0..64 {
+            let frn = next_frn;
+            next_frn += 1;
+            let name = random_name(&mut rng);
+            let attrs = if rng.below(5) == 0 { 0x10 } else { 0 };
+            s.insert(frn, 0, attrs, name.as_bytes());
+            alive.push(frn);
+        }
+        assert!(s.reindex_slots().is_empty(), "无倒排时插入不进 overlay");
+        query_batch(&s, &mut rng);
+
         for step in 0..1200 {
             match rng.below(100) {
                 0..=44 => {
