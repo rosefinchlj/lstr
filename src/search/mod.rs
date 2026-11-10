@@ -34,6 +34,15 @@ const APPS_RELOAD_INTERVAL: Duration = Duration::from_secs(90);
 /// 窗口,布尔会出现「队列里有请求但标志已清」的假阴性;计数不会。
 static QUERY_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
+/// 分项计时强制落日志开关(部署后验收用):设置 `LSTR_PROFILE_QUERY=1`
+/// 后,即使单次查询低于慢查询阈值也把 stage/split/finalize 分项写进
+/// engine.log;默认仍只在 >15ms(查询)/>3ms(finalize)时记录。
+fn profile_queries() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LSTR_PROFILE_QUERY").is_some())
+}
+
 /// 出队了一个请求:等待计数 -1(saturating,防 debug 断言下溢)。
 fn query_inflight_dec() {
     let _ = QUERY_INFLIGHT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -800,7 +809,7 @@ fn finalize_entries(
     let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
     // 测试不写 APPDATA 日志;生产上 finalize >3ms 时落一条分项,便于现场定位。
     #[cfg(not(test))]
-    if total_ms > 3.0 {
+    if total_ms > 3.0 || profile_queries() {
         lstr_index::snapshot::debug_log(&format!(
             "search: finalize {total_ms:.1}ms rank={t_rank:.1}ms ids={t_ids:.1}ms names={t_names:.1}ms pin={t_pin:.1}ms rest={rest_ms:.1}ms entries={}",
             entries.len()
@@ -1471,7 +1480,7 @@ fn run_worker(
         let entries = finalize_entries(entries, &request, &history, &config, keyword_rows);
         let diag_finalize = t_finalize.elapsed().as_secs_f32() * 1000.0;
         let diag_total = started.elapsed().as_secs_f32() * 1000.0;
-        if diag_total > 15.0 && !request.query.text.is_empty() {
+        if (diag_total > 15.0 || profile_queries()) && !request.query.text.is_empty() {
             lstr_index::snapshot::debug_log(&format!(
                 "search: stage gen={} split={:.1}ms apps={:.1}ms exact={:.1}ms finalize={:.1}ms total={:.1}ms text={:?}",
                 request.generation,

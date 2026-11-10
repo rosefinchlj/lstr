@@ -161,7 +161,7 @@ impl BuiltinProvider {
         let file_fill_ms = t_files.elapsed().as_secs_f32() * 1000.0;
         // 测试里不写 APPDATA 日志(只用 release 基准/真实部署观测)。
         #[cfg(not(test))]
-        if engine_ms + folder_fill_ms + file_fill_ms > 15.0 {
+        if engine_ms + folder_fill_ms + file_fill_ms > 15.0 || super::profile_queries() {
             lstr_index::snapshot::debug_log(&format!(
                 "search: split engine={engine_ms:.1}ms folder_fill={folder_fill_ms:.1}ms(folder_meta={folder_meta}) file_fill={file_fill_ms:.1}ms(file_meta={file_meta}) hits={}+{} text={:?}",
                 outcome.folder_hits.len(),
