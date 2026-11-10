@@ -3108,13 +3108,18 @@ impl LstrApp {
                 Stroke::new(1.0, theme.hair),
                 StrokeKind::Inside,
             );
+            // 键帽框与两个文字的垂直中心统一到框中心(footer_top+18)：
+            // 以前文字都从 +12.5 起画，而两段字号不同 → 文字视觉中心比框低
+            // 1-2px，键帽和标签看起来不在一条线上。
+            let key_y = footer_top + 10.0 + (16.0 - key_galley.size().y) * 0.5;
+            let label_y = footer_top + 18.0 - label_galley.size().y * 0.5;
             painter.galley(
-                egui::pos2(x + 4.0, footer_top + 12.5),
+                egui::pos2(x + 4.0, key_y),
                 key_galley,
                 theme.dim,
             );
             painter.galley(
-                egui::pos2(x + key_w + 4.0, footer_top + 12.5),
+                egui::pos2(x + key_w + 4.0, label_y),
                 label_galley,
                 theme.dim,
             );
