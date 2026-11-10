@@ -15,9 +15,16 @@ use crate::store::{fold_ascii, VolumeStore, ATTR_INTERNAL};
 pub const FILE_ATTRIBUTE_DIRECTORY_U16: u16 = 0x0010;
 
 /// 查询取消代次:UI 每次发出新搜索前写入最新 generation;查询线程在
-/// 热循环里每 4096 个命中读一次,发现代次变化即提前中止,避免旧查询
-/// (如单字符 "a" 命中 200 万条要 600ms+)把新击键堵在队列里。
+/// 热循环里每 [`CANCEL_CHECK_EVERY`] 个候选/命中读一次,发现代次变化即
+/// 提前中止,避免旧查询(如单字符 "a" 命中 200 万条要 600ms+)把新击键
+/// 堵在队列里。一条候选检查一次性原子读,1024 候选 ≈ 10-40µs,
+/// 被取代的查询最迟在数百 µs 内中止(远低于 2ms 目标)。
 pub static CANCEL_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// 取消检查步长(候选/命中条数)。所有候选遍历路径统一用它:
+/// 空 token 枚举、单字符位图、n-gram 候选链、memmem 命中流。
+const CANCEL_CHECK_EVERY: usize = 1024;
+const CANCEL_CHECK_MASK: usize = CANCEL_CHECK_EVERY - 1;
 
 /// total 精确计数的上限:单字符/高频 token(如 "a")能命中 200 万条,
 /// 逐条计数是 600ms 级的成本,而 UI 也只会显示「10万+」。
@@ -64,7 +71,7 @@ impl QuerySpec {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hit {
     pub vol: u32,
     pub slot: u32,
@@ -105,8 +112,23 @@ pub fn passes_filters(store: &VolumeStore, slot: u32, spec: &QuerySpec) -> bool 
         }
     }
     let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY_U16 != 0;
+    // 快路径:All 且无 ext/组过滤时无需看名字;Folders 同理(目录判定只看
+    // attrs)。单字符 "a" 要扫 290 万 slot,旧实现每条都做 name_lc + 后缀
+    // 比较,是 folders 路 39ms 的主因;这里让绝大多数候选只读 attrs。
+    let need_name = spec.ext.is_some()
+        || !spec.group_exts.is_empty()
+        || matches!(spec.kind, KindFilter::Files | KindFilter::Programs);
+    if !need_name {
+        return match spec.kind {
+            KindFilter::All => true,
+            KindFilter::Folders => is_dir,
+            KindFilter::Files | KindFilter::Programs => unreachable!(),
+        };
+    }
     let name = store.name_lc(slot);
-    let is_exe = name.ends_with(b".exe");
+    // 只有 Files/Programs 需要 .exe 判定;All/Folders 不再无谓计算。
+    let is_exe = matches!(spec.kind, KindFilter::Files | KindFilter::Programs)
+        && name.ends_with(b".exe");
     let kind_ok = match spec.kind {
         KindFilter::All => true,
         KindFilter::Folders => is_dir,
@@ -138,6 +160,15 @@ pub fn query_volume(store: &VolumeStore, spec: &QuerySpec, cap: usize) -> (Vec<u
     (slots, total, capped)
 }
 
+/// 归一化 token(去空、小写折叠),各查询路径共用。
+fn query_tokens(spec: &QuerySpec) -> Vec<Vec<u8>> {
+    spec.tokens
+        .iter()
+        .filter(|t| !t.is_empty())
+        .map(|t| fold_ascii(t.as_bytes()))
+        .collect()
+}
+
 /// 可取消版本:返回 `(slots, total, capped, aborted)`。查询线程传入发查询时
 /// 的 `CANCEL_GEN` 快照,UI 每次新搜索都会刷新该代次,热循环据此提前中止。
 pub(crate) fn query_volume_cancel(
@@ -146,22 +177,95 @@ pub(crate) fn query_volume_cancel(
     cap: usize,
     cancel: Option<u64>,
 ) -> (Vec<u32>, usize, bool, bool) {
-    let tokens: Vec<Vec<u8>> = spec
-        .tokens
-        .iter()
-        .filter(|t| !t.is_empty())
-        .map(|t| fold_ascii(t.as_bytes()))
-        .collect();
+    let tokens = query_tokens(spec);
+    // 精确模式沿用旧语义:收集与 total 都不受 cap/TOTAL_CAP 限制(名字完全
+    // 一致的条目本来就少,旧实现直接返回全部;wfn 补齐依赖这个行为)。
+    let unbounded = !tokens.is_empty() && spec.exact.is_some();
+    let cap_eff = if unbounded { usize::MAX } else { cap };
+    let mut slots: Vec<u32> = Vec::with_capacity(256);
+    let mut total = 0usize;
+    let mut capped = false;
+    let aborted = walk_candidates(store, spec, &tokens, cancel, &mut |slot| {
+        total += 1;
+        if !unbounded && total >= TOTAL_CAP {
+            return false; // total 已到显示上限,停止扫描(收集也随之中止)
+        }
+        if slots.len() < cap_eff {
+            slots.push(slot);
+        } else {
+            capped = true;
+        }
+        true
+    });
+    (slots, total, capped, aborted)
+}
+
+/// 单卷「文件夹 + 全部」一次遍历收集。一次候选遍历同时产出:
+/// - `all_slots`:All-kind 命中的前 `all_cap` 条(含文件夹),对应旧 files 路
+///   的引擎候选前缀(应用层再滤掉文件夹并截断);
+/// - `folder_slots`:Folders 命中的前 `folder_cap` 条,对应旧 folders 路;
+/// - `total_all`:All-kind 精确计数(TOTAL_CAP 封顶);
+/// - `total_folders`:Folders 精确计数(TOTAL_CAP 封顶)。
+/// 两个 total 各自独立封顶,与两次独立查询逐字节一致;旧实现要跑两遍引擎,
+/// 现在候选生成/过滤只跑一遍。
+pub(crate) fn query_volume_split_cancel(
+    store: &VolumeStore,
+    spec: &QuerySpec,
+    folder_cap: usize,
+    all_cap: usize,
+    cancel: Option<u64>,
+) -> (Vec<u32>, Vec<u32>, usize, usize, bool) {
+    debug_assert!(spec.exact.is_none(), "split 查询不使用 exact 模式");
+    let tokens = query_tokens(spec);
+    let mut all_slots: Vec<u32> = Vec::with_capacity(256);
+    let mut folder_slots: Vec<u32> = Vec::with_capacity(256);
+    let mut total_all = 0usize;
+    let mut total_folders = 0usize;
+    let mut all_done = false;
+    let mut folder_done = false;
+    let aborted = walk_candidates(store, spec, &tokens, cancel, &mut |slot| {
+        if all_done && folder_done {
+            return false;
+        }
+        let is_dir = store.is_dir(slot);
+        if !all_done {
+            total_all += 1;
+            if total_all >= TOTAL_CAP {
+                all_done = true; // 与旧 All 查询一致:第 TOTAL_CAP 条只计数不收集
+            } else if all_slots.len() < all_cap {
+                all_slots.push(slot);
+            }
+        }
+        if is_dir && !folder_done {
+            total_folders += 1;
+            if total_folders >= TOTAL_CAP {
+                folder_done = true;
+            } else if folder_slots.len() < folder_cap {
+                folder_slots.push(slot);
+            }
+        }
+        !(all_done && folder_done)
+    });
+    (all_slots, folder_slots, total_all, total_folders, aborted)
+}
+
+/// 候选遍历内核:按 [`QuerySpec`] 的同一套语义(空 token 枚举 / 精确 / 单字符
+/// 位图 / n-gram / memmem)产出通过过滤的 slot,顺序与旧实现完全一致。
+/// `emit` 返回 false 表示调用方已集齐、停止扫描;返回值 = 是否被新查询中止。
+fn walk_candidates(
+    store: &VolumeStore,
+    spec: &QuerySpec,
+    tokens: &[Vec<u8>],
+    cancel: Option<u64>,
+    emit: &mut impl FnMut(u32) -> bool,
+) -> bool {
     if tokens.is_empty() {
         // H5:空 token(单独 ext:rs / path:C:\dir 等过滤器查询)按过滤器全量列举,
         // 逐 slot 走 passes_filters(名字/类型/扩展名/组),收集封顶 candidate_cap,
         // total 精确统计。旧实现在此直接返回空 → 内置 Ready 后这两类筛选静默 0 结果。
-        let mut slots = Vec::with_capacity(256);
-        let mut total = 0usize;
-        let mut capped = false;
         for slot in 0..store.name_off.len() as u32 {
-            if slot & 4095 == 0 && cancelled(cancel) {
-                return (slots, total, capped, true);
+            if slot & CANCEL_CHECK_MASK as u32 == 0 && cancelled(cancel) {
+                return true;
             }
             if store.attrs[slot as usize] & ATTR_INTERNAL != 0 {
                 continue;
@@ -169,58 +273,45 @@ pub(crate) fn query_volume_cancel(
             if !passes_filters(store, slot, spec) {
                 continue;
             }
-            total += 1;
-            if total >= TOTAL_CAP {
+            if !emit(slot) {
                 break;
             }
-            if slots.len() < cap {
-                slots.push(slot);
-            } else {
-                capped = true;
-            }
         }
-        return (slots, total, capped, false);
+        return false;
     }
     // 精确模式:wfn 语义,直接二分 offs(ready 模式);scan 模式退化为逐项比对
     if cancelled(cancel) {
-        return (Vec::new(), 0, false, true);
+        return true;
     }
     if let Some(ex) = &spec.exact {
         let exb = ex.as_bytes();
-        let mut slots = Vec::new();
         if !store.offs.is_empty() {
             let lo = store.offs.partition_point(|&s| store.name_lc(s) < exb);
             for &slot in &store.offs[lo..] {
-                if store.name_lc(slot) == exb {
-                    if passes_filters(store, slot, spec) {
-                        slots.push(slot);
-                    }
-                } else {
+                if store.name_lc(slot) != exb {
                     break;
                 }
+                if passes_filters(store, slot, spec) && !emit(slot) {
+                    return false;
+                }
             }
-            let total = slots.len();
-            return (slots, total, false, false);
+            return false;
         }
         for slot in 0..store.name_off.len() as u32 {
-            if store.name_lc(slot) == exb && passes_filters(store, slot, spec) {
-                slots.push(slot);
+            if store.name_lc(slot) == exb && passes_filters(store, slot, spec) && !emit(slot) {
+                return false;
             }
         }
-        let total = slots.len();
-        return (slots, total, false, false);
+        return false;
     }
 
     // E:单字符 ASCII 查询(打字过程中的临时串)直接用名字字母位图过滤,
     // 否则要对整卷 names_lc 做 memmem + 每个命中二分,20 万~200 万命中就是数百 ms。
     if tokens.len() == 1 && tokens[0].len() == 1 && tokens[0][0].is_ascii_alphabetic() {
         let bit = 1u32 << (tokens[0][0] - b'a');
-        let mut slots: Vec<u32> = Vec::with_capacity(256);
-        let mut total = 0usize;
-        let mut capped = false;
         for slot in 0..store.name_off.len() as u32 {
-            if slot & 4095 == 0 && cancelled(cancel) {
-                return (slots, total, capped, true);
+            if slot & CANCEL_CHECK_MASK as u32 == 0 && cancelled(cancel) {
+                return true;
             }
             if store.char_mask[slot as usize] & bit == 0 {
                 continue;
@@ -228,17 +319,11 @@ pub(crate) fn query_volume_cancel(
             if !passes_filters(store, slot, spec) {
                 continue;
             }
-            total += 1;
-            if total >= TOTAL_CAP {
+            if !emit(slot) {
                 break;
             }
-            if slots.len() < cap {
-                slots.push(slot);
-            } else {
-                capped = true;
-            }
         }
-        return (slots, total, capped, false);
+        return false;
     }
 
     // 生成 token 取最长(一般最稀有)
@@ -254,87 +339,24 @@ pub(crate) fn query_volume_cancel(
     // memmem 验证;候选序(slot 升序 ≡ name_off 序)与 memmem 偏移序一致,
     // 结果与全量扫描路径完全相同(同序同分),只是省掉全量扫描与逐命中二分。
     if let Some(base) = store.ngram_candidates(gen) {
-        return query_ngram_path(store, spec, &tokens, gen_idx, gen, base, cap, cancel);
+        return walk_ngram(store, spec, tokens, gen_idx, gen, base, cancel, emit);
     }
-    query_volume_memmem_scan(store, spec, &tokens, gen_idx, gen, cap, cancel)
+    walk_memmem(store, spec, tokens, gen_idx, gen, cancel, emit)
 }
 
-/// memmem 全量扫描路径(倒排不可用时兜底;等价性测试用它对拍快路径)。
-/// 语义:按 names_lc 偏移序枚举 gen 的全部命中 → slot 解析(丢弃陈项)→
-/// 同条目去重 → 其余 token AND → 过滤 → total 精确计数(TOTAL_CAP 封顶)、
-/// 收集封顶 cap。
-pub(crate) fn query_volume_memmem_scan(
-    store: &VolumeStore,
-    spec: &QuerySpec,
-    tokens: &[Vec<u8>],
-    gen_idx: usize,
-    gen: &[u8],
-    cap: usize,
-    cancel: Option<u64>,
-) -> (Vec<u32>, usize, bool, bool) {
-    let mut slots: Vec<u32> = Vec::with_capacity(256);
-    let mut total = 0usize;
-    let mut capped = false;
-    let mut last_slot: Option<u32> = None; // 同一条目内多次命中只算一次
-
-    let finder = memchr::memmem::Finder::new(gen);
-    let mut seen = 0usize;
-    for off in finder.find_iter(&store.names_lc) {
-        seen += 1;
-        if seen & 4095 == 0 && cancelled(cancel) {
-            return (slots, total, capped, true);
-        }
-        // 命中偏移 → slot(off_index 二分 + 陈项过滤;就地改名的幽灵命中在此被丢弃)
-        let Some(slot) = store.slot_at_offset(off) else {
-            continue;
-        };
-        let start = store.name_off[slot as usize] as usize;
-        let end = start + store.name(slot).len();
-        if off + gen.len() > end {
-            continue; // 越界兜底(\0 已保证不会发生)
-        }
-        if last_slot == Some(slot) {
-            continue;
-        }
-        last_slot = Some(slot);
-        // 其余 token AND
-        let name = store.name_lc(slot);
-        if !tokens
-            .iter()
-            .enumerate()
-            .all(|(i, t)| i == gen_idx || memchr::memmem::find(name, t).is_some())
-        {
-            continue;
-        }
-        if !passes_filters(store, slot, spec) {
-            continue;
-        }
-        total += 1;
-        if total >= TOTAL_CAP {
-            break;
-        }
-        if slots.len() < cap {
-            slots.push(slot);
-        } else {
-            capped = true;
-        }
-    }
-    (slots, total, capped, false)
-}
-
-/// n-gram 快路径主体。候选序 = base 链(slot 升序)++ overlay(name_off 序):
+/// n-gram 快路径遍历。候选序 = base 链(slot 升序)++ overlay(name_off 序):
 /// compact 后 slot 序 ≡ name_off 序;overlay 槽(新增/改名)的名字区偏移恒大于
 /// 构建期偏移,故拼接后仍是全局偏移序 —— 与 memmem 路径的输出同序同分。
-fn query_ngram_path(
+fn walk_ngram(
     store: &VolumeStore,
     spec: &QuerySpec,
     tokens: &[Vec<u8>],
     gen_idx: usize,
     gen: &[u8],
     mut cands: Vec<u32>,
-    cap: usize,
     cancel: Option<u64>,
-) -> (Vec<u32>, usize, bool, bool) {
+    emit: &mut impl FnMut(u32) -> bool,
+) -> bool {
     // overlay:倒排构建后的新增/改名 slot 逐个验证(不在倒排里,或旧名
     // posting 已失效)。字母位图先粗筛(子串出现 ⇒ 名字含 gen 的全部字母),
     // 再 memmem 验证;renames>0 时 name_off 跳到名字区尾,按偏移重排。
@@ -363,12 +385,9 @@ fn query_ngram_path(
     // ≥4 字符候选是 trigram 交集超集,须逐个验证 gen 真实出现;
     // 2/3 字符链是精确命中集,免验证。
     let verify_gen = gen.len() >= 4;
-    let mut slots: Vec<u32> = Vec::with_capacity(256);
-    let mut total = 0usize;
-    let mut capped = false;
     for (i, &slot) in cands.iter().enumerate() {
-        if i & 4095 == 4095 && cancelled(cancel) {
-            return (slots, total, capped, true);
+        if i & CANCEL_CHECK_MASK == CANCEL_CHECK_MASK && cancelled(cancel) {
+            return true;
         }
         let name = store.name_lc(slot);
         if verify_gen && memchr::memmem::find(name, gen).is_none() {
@@ -379,6 +398,113 @@ fn query_ngram_path(
             .iter()
             .enumerate()
             .all(|(j, t)| j == gen_idx || memchr::memmem::find(name, t).is_some())
+        {
+            continue;
+        }
+        if !passes_filters(store, slot, spec) {
+            continue;
+        }
+        if !emit(slot) {
+            return false;
+        }
+    }
+    false
+}
+
+/// memmem 全量扫描遍历(倒排不可用时兜底;等价性测试用独立实现做 oracle)。
+fn walk_memmem(
+    store: &VolumeStore,
+    spec: &QuerySpec,
+    tokens: &[Vec<u8>],
+    gen_idx: usize,
+    gen: &[u8],
+    cancel: Option<u64>,
+    emit: &mut impl FnMut(u32) -> bool,
+) -> bool {
+    let finder = memchr::memmem::Finder::new(gen);
+    let mut seen = 0usize;
+    let mut last_slot: Option<u32> = None; // 同一条目内多次命中只算一次
+    for off in finder.find_iter(&store.names_lc) {
+        seen += 1;
+        if seen & CANCEL_CHECK_MASK == 0 && cancelled(cancel) {
+            return true;
+        }
+        // 命中偏移 → slot(off_index 二分 + 陈项过滤;就地改名的幽灵命中在此被丢弃)
+        let Some(slot) = store.slot_at_offset(off) else {
+            continue;
+        };
+        let start = store.name_off[slot as usize] as usize;
+        let end = start + store.name(slot).len();
+        if off + gen.len() > end {
+            continue; // 越界兜底(\0 已保证不会发生)
+        }
+        if last_slot == Some(slot) {
+            continue;
+        }
+        last_slot = Some(slot);
+        // 其余 token AND
+        let name = store.name_lc(slot);
+        if !tokens
+            .iter()
+            .enumerate()
+            .all(|(i, t)| i == gen_idx || memchr::memmem::find(name, t).is_some())
+        {
+            continue;
+        }
+        if !passes_filters(store, slot, spec) {
+            continue;
+        }
+        if !emit(slot) {
+            return false;
+        }
+    }
+    false
+}
+
+/// memmem 全量扫描路径(倒排不可用时兜底;等价性测试用它对拍快路径)。
+/// 语义:按 names_lc 偏移序枚举 gen 的全部命中 → slot 解析(丢弃陈项)→
+/// 同条目去重 → 其余 token AND → 过滤 → total 精确计数(TOTAL_CAP 封顶)、
+/// 收集封顶 cap。
+pub(crate) fn query_volume_memmem_scan(
+    store: &VolumeStore,
+    spec: &QuerySpec,
+    tokens: &[Vec<u8>],
+    gen_idx: usize,
+    gen: &[u8],
+    cap: usize,
+    cancel: Option<u64>,
+) -> (Vec<u32>, usize, bool, bool) {
+    let mut slots: Vec<u32> = Vec::with_capacity(256);
+    let mut total = 0usize;
+    let mut capped = false;
+    let mut last_slot: Option<u32> = None; // 同一条目内多次命中只算一次
+
+    let finder = memchr::memmem::Finder::new(gen);
+    let mut seen = 0usize;
+    for off in finder.find_iter(&store.names_lc) {
+        seen += 1;
+        if seen & CANCEL_CHECK_MASK == 0 && cancelled(cancel) {
+            return (slots, total, capped, true);
+        }
+        // 命中偏移 → slot(off_index 二分 + 陈项过滤;就地改名的幽灵命中在此被丢弃)
+        let Some(slot) = store.slot_at_offset(off) else {
+            continue;
+        };
+        let start = store.name_off[slot as usize] as usize;
+        let end = start + store.name(slot).len();
+        if off + gen.len() > end {
+            continue; // 越界兜底(\0 已保证不会发生)
+        }
+        if last_slot == Some(slot) {
+            continue;
+        }
+        last_slot = Some(slot);
+        // 其余 token AND
+        let name = store.name_lc(slot);
+        if !tokens
+            .iter()
+            .enumerate()
+            .all(|(i, t)| i == gen_idx || memchr::memmem::find(name, t).is_some())
         {
             continue;
         }
@@ -554,6 +680,213 @@ mod tests {
         assert_eq!(total, 100);
         assert_eq!(slots.len(), 10);
         assert!(capped);
+    }
+
+    /// 任务 4 基准(手动运行,操作全局 CANCEL_GEN,不进默认套件):
+    /// 取消检查的候选粒度 —— 在遍历中途改写代次,统计「换代次后还多走了
+    /// 多少候选才中止」,再乘单候选实测成本折算中止延迟。
+    /// `cargo test -p lstr-index --release --lib bench_cancel_granularity -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual bench: mutates global CANCEL_GEN"]
+    fn bench_cancel_granularity() {
+        let mut s = VolumeStore::new(false);
+        s.insert(5, 0, 0x10, b"root");
+        for i in 0..1_000_000u64 {
+            s.insert(1000 + i, 5, 0, format!("alpha_{i:06}.txt").as_bytes());
+        }
+        s.compact();
+        // 慢路径(memmem + 逐命中二分)便于在中途改写代次。
+        let spec = QuerySpec {
+            tokens: vec!["_".into()],
+            kind: KindFilter::All,
+            ext: Some("txt".into()),
+            ..Default::default()
+        };
+        let tokens = query_tokens(&spec);
+        let my = CANCEL_GEN.load(Ordering::Relaxed);
+        let mut emitted = 0usize;
+        let mut cancel_at = 0usize;
+        let t0 = std::time::Instant::now();
+        let aborted = walk_candidates(&s, &spec, &tokens, Some(my), &mut |_slot| {
+            emitted += 1;
+            if emitted == 100_000 {
+                CANCEL_GEN.store(my + 1, Ordering::Relaxed);
+                cancel_at = emitted;
+            }
+            true
+        });
+        let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+        CANCEL_GEN.store(my, Ordering::Relaxed);
+        assert!(aborted, "换代次后遍历必须中止");
+        let overshoot = emitted - cancel_at;
+        println!(
+            "[cancel] memmem: emitted={emitted} 换代次后多走 {overshoot} 候选才中止 (stride={CANCEL_CHECK_EVERY}), 耗时 {elapsed:.3}ms"
+        );
+        assert!(
+            overshoot <= 2 * CANCEL_CHECK_EVERY,
+            "中止粒度应 ≤{CANCEL_CHECK_EVERY} 候选(加一次检查相位), got {overshoot}"
+        );
+
+        // 单字符位图路径(生产 "a" 的主路径):满库扫描总耗时 → 每 1024 候选
+        // 的上界延迟。无目录 + Folders 过滤 → 扫完 1M 条不做任何收集。
+        let spec_bitmap = QuerySpec {
+            tokens: vec!["a".into()],
+            kind: KindFilter::Folders,
+            ext: Some("txt".into()),
+            ..Default::default()
+        };
+        let t1 = std::time::Instant::now();
+        let (_, total, _, _) = query_volume_cancel(&s, &spec_bitmap, 2000, None);
+        let bitmap_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(total, 0);
+        let per_candidate_ns = bitmap_ms * 1_000_000.0 / 1_000_000.0;
+        let bound_us = per_candidate_ns * CANCEL_CHECK_EVERY as f64 / 1000.0;
+        println!(
+            "[cancel] bitmap+ext: 1M 全扫 {bitmap_ms:.3}ms → 每候选 {per_candidate_ns:.2}ns, 取消上界 {bound_us:.3}µs"
+        );
+        // 生产形态(无 ext/组过滤):passes_filters 快路径只读 attrs。
+        let spec_plain = QuerySpec {
+            tokens: vec!["a".into()],
+            kind: KindFilter::Folders,
+            ..Default::default()
+        };
+        let t2 = std::time::Instant::now();
+        let (_, total2, _, _) = query_volume_cancel(&s, &spec_plain, 2000, None);
+        let plain_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(total2, 0);
+        let plain_ns = plain_ms * 1_000_000.0 / 1_000_000.0;
+        let plain_bound_us = plain_ns * CANCEL_CHECK_EVERY as f64 / 1000.0;
+        println!(
+            "[cancel] bitmap(attrs-only): 1M 全扫 {plain_ms:.3}ms → 每候选 {plain_ns:.2}ns, 取消上界 {plain_bound_us:.3}µs"
+        );
+        assert!(plain_ms * 3.0 < 10.0, "2.9M 条生产规模全扫应在 10ms 内(旧实现 folders 路 39ms)");
+    }
+
+    /// 任务 1 对拍:一次 split 遍历 ≡ 两次独立查询(folders 路 + All 路)。
+    /// 逐项比较 slots 顺序与两个 total;覆盖单字符位图、2/3 字符链、≥4 字符
+    /// trigram 验证、ext/组过滤、空 token 过滤器、scan 模式与 overlay。
+    fn assert_split_matches_two_pass(s: &VolumeStore, spec: &QuerySpec, cap: usize) {
+        let mut spec_all = spec.clone();
+        spec_all.kind = KindFilter::All;
+        let mut spec_folders = spec.clone();
+        spec_folders.kind = KindFilter::Folders;
+        let all = query_volume_cancel(s, &spec_all, cap, None);
+        let folders = query_volume_cancel(s, &spec_folders, cap, None);
+        let (all_slots, folder_slots, total_all, total_folders, aborted) =
+            query_volume_split_cancel(s, &spec_all, cap, cap, None);
+        assert!(!aborted);
+        assert_eq!(all_slots, all.0, "All 前缀顺序不一致: {:?}", spec.tokens);
+        assert_eq!(total_all, all.1, "total_all 不一致: {:?}", spec.tokens);
+        assert_eq!(
+            folder_slots, folders.0,
+            "Folders 前缀顺序不一致: {:?}",
+            spec.tokens
+        );
+        assert_eq!(
+            total_folders, folders.1,
+            "total_folders 不一致: {:?}",
+            spec.tokens
+        );
+    }
+
+    #[test]
+    fn split_query_matches_two_pass_on_mixed_store() {
+        let mut s = VolumeStore::new(false);
+        s.insert(5, 0, 0x10, b"root");
+        for i in 0..20_000u64 {
+            let slot_kind = i % 10;
+            let name = match slot_kind {
+                0 => format!("ai_dir_{i:05}"),
+                1 => format!("ai_file_{i:05}.txt"),
+                2 => format!("ai_tool_{i:05}.exe"),
+                3 => format!("tail_{i:05}.log"),
+                4 => format!("main_{i:05}.rs"),
+                5 => format!("报告_{i:05}.docx"),
+                6 => format!("alpha_{i:05}.tmp"),
+                _ => format!("zip_{i:05}.dat"),
+            };
+            let attrs = if slot_kind == 0 { 0x10 } else { 0 };
+            s.insert_meta(
+                1000 + i,
+                5,
+                attrs,
+                name.as_bytes(),
+                1_600_000_000 + (i % 1000) as i64,
+            );
+        }
+        s.compact();
+        for spec in [
+            QuerySpec { tokens: vec!["ai".into()], ..Default::default() },
+            QuerySpec { tokens: vec!["a".into()], ..Default::default() },
+            QuerySpec { tokens: vec!["alph".into()], ..Default::default() },
+            QuerySpec {
+                tokens: vec!["ai".into()],
+                ext: Some("txt".into()),
+                ..Default::default()
+            },
+            QuerySpec {
+                tokens: vec!["tool".into()],
+                group_exts: vec!["exe".into()],
+                ..Default::default()
+            },
+            QuerySpec {
+                tokens: Vec::new(),
+                ext: Some("rs".into()),
+                ..Default::default()
+            },
+            QuerySpec {
+                tokens: vec!["ai".into()],
+                mtime_after: Some(1_600_000_500),
+                ..Default::default()
+            },
+        ] {
+            assert_split_matches_two_pass(&s, &spec, 1000);
+        }
+
+        // overlay:改名 + 追加后,快路径与双路仍逐项一致。
+        s.insert(1001, 5, 0, b"ai_renamed.txt");
+        s.insert(21_000, 5, 0, b"ai_appended.txt");
+        for spec in [
+            QuerySpec { tokens: vec!["ai".into()], ..Default::default() },
+            QuerySpec { tokens: vec!["appended".into()], ..Default::default() },
+        ] {
+            assert_split_matches_two_pass(&s, &spec, 1000);
+        }
+        // scan 模式(memmem 兜底路径)也一致。
+        let mut scan = VolumeStore::new(false);
+        scan.insert(5, 0, 0x10, b"root");
+        scan.insert(10, 5, 0x10, b"ai_dir");
+        scan.insert(11, 5, 0, b"ai_file.txt");
+        scan.insert(12, 5, 0, b"ai_tool.exe");
+        assert!(scan.is_scanning());
+        for spec in [
+            QuerySpec { tokens: vec!["ai".into()], ..Default::default() },
+            QuerySpec { tokens: vec!["a".into()], ..Default::default() },
+        ] {
+            assert_split_matches_two_pass(&scan, &spec, 1000);
+        }
+    }
+
+    /// total 边界:All 计数先撞 TOTAL_CAP(100k)而 Folders 未撞时,split 必须
+    /// 继续扫到 Folders 也到顶/库尾,两个 total 与旧双路各自的截断口径一致。
+    #[test]
+    fn split_total_cap_matches_two_pass() {
+        let mut s = VolumeStore::new(false);
+        s.insert(5, 0, 0x10, b"root");
+        for i in 0..120_000u64 {
+            let attrs = if i % 2 == 0 { 0x10 } else { 0 };
+            s.insert(1000 + i, 5, attrs, format!("a_{i:06}.txt").as_bytes());
+        }
+        s.compact();
+        let spec = QuerySpec { tokens: vec!["a".into()], ..Default::default() };
+        assert_split_matches_two_pass(&s, &spec, 1000);
+        let (all_slots, folder_slots, total_all, total_folders, aborted) =
+            query_volume_split_cancel(&s, &spec, 1000, 1000, None);
+        assert!(!aborted);
+        assert_eq!(total_all, TOTAL_CAP, "All 计数应在 100k 截断");
+        assert_eq!(total_folders, 60_000, "Folders 计数未撞上限,应精确");
+        assert_eq!(all_slots.len(), 1000);
+        assert_eq!(folder_slots.len(), 1000);
     }
 
     #[test]
