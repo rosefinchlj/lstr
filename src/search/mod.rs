@@ -983,6 +983,12 @@ fn run_worker(
         let mut entries = Vec::new();
         let mut total = 0usize;
         let mut error = None;
+        // 分项耗时（诊断「引擎 35ms 花在哪」）：folders/files/exact 各一次全引擎查询，
+        // apps 应用索引，finalize 合并打分排序。>15ms 的慢查询落 engine.log。
+        let mut diag_split_folders = 0f32;
+        let mut diag_split_files = 0f32;
+        let mut diag_apps = 0f32;
+        let mut diag_exact = 0f32;
         // 自定义关键字行（g rust → 用 Google 搜索）：之后钉在结果顶部，不参与打分。
         let mut keyword_rows: Vec<Entry> = Vec::new();
 
@@ -1056,7 +1062,11 @@ fn run_worker(
                             // All 统计后扣掉文件夹数,两路 total 同口径且不重复。
                             let mut folder_total = 0usize;
                             let mut file_total = 0usize;
-                            match b.search_split(&request.query, &request.filters, folder_fetch, true)
+                            let t_folders = Instant::now();
+                            let r_folders =
+                                b.search_split(&request.query, &request.filters, folder_fetch, true);
+                            diag_split_folders = t_folders.elapsed().as_secs_f32() * 1000.0;
+                            match r_folders
                             {
                                 Ok((mut folders, count)) => {
                                     folder_total = count;
@@ -1065,7 +1075,11 @@ fn run_worker(
                                 }
                                 Err(err) => error = Some(err),
                             }
-                            match b.search_split(&request.query, &request.filters, file_fetch, false)
+                            let t_files = Instant::now();
+                            let r_files =
+                                b.search_split(&request.query, &request.filters, file_fetch, false);
+                            diag_split_files = t_files.elapsed().as_secs_f32() * 1000.0;
+                            match r_files
                             {
                                 Ok((mut files, count_all)) => {
                                     file_total = count_all.saturating_sub(folder_total);
@@ -1136,7 +1150,9 @@ fn run_worker(
                         }
                     }
                     if request.filters.is_empty() && !in_folder_context {
+                        let t_apps = Instant::now();
                         let mut app_hits = apps.search(&request.query.text, request.limit);
+                        diag_apps = t_apps.elapsed().as_secs_f32() * 1000.0;
                         total += app_hits.len();
                         entries.append(&mut app_hits);
                         // 内置命令也参与“全部”搜索（打开设置等）。
@@ -1161,8 +1177,11 @@ fn run_worker(
                             if (force_builtin || phase != lstr_index::Phase::Fallback)
                                 && request.filters.time.is_none()
                             {
-                                if let Ok((mut exact, _)) =
-                                    b.search_exact(&request.query, &request.filters, 50)
+                                let t_exact = Instant::now();
+                                let r_exact =
+                                    b.search_exact(&request.query, &request.filters, 50);
+                                diag_exact = t_exact.elapsed().as_secs_f32() * 1000.0;
+                                if let Ok((mut exact, _)) = r_exact
                                 {
                                     entries.append(&mut exact);
                                 }
@@ -1285,7 +1304,23 @@ fn run_worker(
             }
         }
 
+        let t_finalize = Instant::now();
         let entries = finalize_entries(entries, &request, &history, &config, keyword_rows);
+        let diag_finalize = t_finalize.elapsed().as_secs_f32() * 1000.0;
+        let diag_total = started.elapsed().as_secs_f32() * 1000.0;
+        if diag_total > 15.0 && !request.query.text.is_empty() {
+            lstr_index::snapshot::debug_log(&format!(
+                "search: stage gen={} folders={:.1}ms files={:.1}ms apps={:.1}ms exact={:.1}ms finalize={:.1}ms total={:.1}ms text={:?}",
+                request.generation,
+                diag_split_folders,
+                diag_split_files,
+                diag_apps,
+                diag_exact,
+                diag_finalize,
+                diag_total,
+                request.query.text
+            ));
+        }
 
 send_response(&tx, &request, Response {
             generation: request.generation,
