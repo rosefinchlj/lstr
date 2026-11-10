@@ -829,19 +829,11 @@ fn finalize_entries_with_pending(
         for entry in entries {
             let name_lower = entry.name.to_lowercase();
             let is_exact = !needle_lower.is_empty() && name_lower == needle_lower;
-            let id_lower = entry.id.to_lowercase();
-            let mode = pending.modes(&id_lower).and_then(|modes| {
-                let used = pending_uses.entry(id_lower.clone()).or_insert(0);
-                let mode = modes.get(*used).copied();
-                *used += 1;
-                mode
-            });
             // 普通条目只需要前 deliver 个有效候选;精确同名要扫到每种
             // (kind,name) 的 6 条上限,因为它们会被 pin 到最前面。
+            // 预算外/已满额/同名重复的候选直接跳过,不再做 id 归一化与
+            // PendingMeta 记账(它们本来就要被去重/截断丢掉)。
             if !is_exact && non_exact >= deliver {
-                continue;
-            }
-            if seen_ids.contains(&id_lower) {
                 continue;
             }
             let name_key = (entry.kind, name_lower);
@@ -850,6 +842,21 @@ fn finalize_entries_with_pending(
                     continue;
                 }
             } else if seen_names.contains(&name_key) {
+                continue;
+            }
+            let id_lower = entry.id.to_lowercase();
+            // 绝大多数 id 只有一个标记;只有 split+exact 同 id 才需要游标。
+            let mode = match pending.modes(&id_lower) {
+                Some([mode]) => Some(*mode),
+                Some(modes) => {
+                    let used = pending_uses.entry(id_lower.clone()).or_insert(0);
+                    let mode = modes.get(*used).copied();
+                    *used += 1;
+                    mode
+                }
+                None => None,
+            };
+            if seen_ids.contains(&id_lower) {
                 continue;
             }
             let filled = match mode {
