@@ -91,14 +91,30 @@ pub fn foreground_explorer_folder() -> Option<PathBuf> {
 
 /// 一次 ShellWindows 枚举里先试 HWND 精确匹配，再试标题近似匹配。
 /// 返回匹配到的 Shell 窗口 HWND（标题兜底时可能不是原前台窗口，但至少是真实窗口）。
+///
+/// Win11 标签页资源管理器：同一窗口的多个标签是多个 IWebBrowser2，但共享
+/// 同一个顶层 HWND。只按 HWND 取第一个会选到**非活动标签**（实测：活动标签
+/// 在 C:\...\4.2.0.13，却解析成另一个标签"文档"）。同 HWND 多候选时用
+/// 窗口标题（= 活动标签名）与目录名精确匹配来消歧。
 unsafe fn resolve_foreground(hwnd: isize, title: &str) -> Option<(isize, PathBuf)> {
     let list = enumerate_with_hwnd();
-    if let Some(exact) = list
+    let mut exact: Vec<(isize, PathBuf)> = list
         .iter()
-        .find(|(candidate, _)| *candidate == hwnd)
+        .filter(|(candidate, _)| *candidate == hwnd)
         .cloned()
-    {
-        return Some(exact);
+        .collect();
+    if exact.len() > 1 && !title.is_empty() {
+        if let Some(hit) = exact.iter().find(|(_, path)| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().eq_ignore_ascii_case(title))
+                .unwrap_or(false)
+        }) {
+            return Some(hit.clone());
+        }
+    }
+    if !exact.is_empty() {
+        // 标题对不上（重命名中/虚拟视图）：保持旧行为取第一个。
+        return Some(exact.remove(0));
     }
     if title.is_empty() {
         return None;
@@ -149,6 +165,9 @@ pub fn navigate_active_to(folder: &str) -> Result<(), String> {
         return Err("没有记录的资源管理器窗口".to_string());
     };
     let url = path_to_file_url(folder);
+    // 记录时的活动目录：标签页窗口里用它挑出「活动标签」那个浏览器
+    // （同 HWND 的多个标签共享顶层窗口，只按 HWND 取第一个会跳到非活动标签）。
+    let remembered = last_folder().lock().ok().and_then(|guard| guard.clone());
     with_com(|| unsafe {
         let Ok(shell_windows): Result<IShellWindows, _> =
             CoCreateInstance(&ShellWindows, None, CLSCTX_ALL)
@@ -156,6 +175,8 @@ pub fn navigate_active_to(folder: &str) -> Result<(), String> {
             return Err("无法连接 ShellWindows".to_string());
         };
         let count = shell_windows.Count().unwrap_or(0).max(0);
+        let mut first_hwnd_match: Option<i32> = None;
+        let mut active_tab: Option<i32> = None;
         for index in 0..count.min(64) {
             let Ok(dispatch) = shell_windows.Item(&int_variant(index)) else {
                 continue;
@@ -169,17 +190,40 @@ pub fn navigate_active_to(folder: &str) -> Result<(), String> {
             if window_hwnd.0 != hwnd {
                 continue;
             }
-            let target = BSTR::from(url.as_str());
-            let result = browser
-                .Navigate(&target, None, None, None, None)
-                .map_err(|err| format!("资源管理器跳转失败: {err}"));
-            log_explorer(&format!("navigate hwnd={hwnd} url={url} result={result:?}"));
-            return result;
+            if first_hwnd_match.is_none() {
+                first_hwnd_match = Some(index);
+            }
+            if let Some(want) = &remembered {
+                if let Ok(location) = browser.LocationURL() {
+                    if let Some(path) = folder_path_from_url(&location.to_string()) {
+                        if PathBuf::from(&path) == *want {
+                            active_tab = Some(index);
+                            break;
+                        }
+                    }
+                }
+            }
         }
+        let Some(chosen) = active_tab.or(first_hwnd_match) else {
+            log_explorer(&format!(
+                "navigate failed: Explorer HWND {hwnd} no longer in ShellWindows"
+            ));
+            return Err("目标资源管理器窗口已关闭".to_string());
+        };
+        let Ok(dispatch) = shell_windows.Item(&int_variant(chosen)) else {
+            return Err("目标资源管理器窗口已关闭".to_string());
+        };
+        let Ok(browser): Result<IWebBrowser2, _> = dispatch.cast() else {
+            return Err("目标资源管理器窗口已关闭".to_string());
+        };
+        let target = BSTR::from(url.as_str());
+        let result = browser
+            .Navigate(&target, None, None, None, None)
+            .map_err(|err| format!("资源管理器跳转失败: {err}"));
         log_explorer(&format!(
-            "navigate failed: Explorer HWND {hwnd} no longer in ShellWindows"
+            "navigate hwnd={hwnd} tab={chosen} url={url} result={result:?}"
         ));
-        Err("目标资源管理器窗口已关闭".to_string())
+        result
     })
     .unwrap_or_else(|| Err("COM 初始化失败".to_string()))
 }
