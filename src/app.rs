@@ -1316,7 +1316,9 @@ impl LstrApp {
             return;
         }
         match shell::reveal_entry(&entry) {
-            Ok(()) => self.hide(ctx),
+            // 定位是旁观操作（不消费搜索结果）：收起时保留输入与结果，
+            // 下次唤出继续上一次搜索。只有「打开/运行」才算消费。
+            Ok(()) => self.hide_keep(ctx),
             Err(err) => self.toast(ctx, err),
         }
     }

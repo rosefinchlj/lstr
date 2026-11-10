@@ -99,10 +99,11 @@ pub fn reveal_entry(entry: &Entry) -> Result<(), String> {
     if entry.kind == Kind::Folder {
         return shell_execute("open", path);
     }
-    // 路径必须带引号：explorer 的 /select, 在空格处截断，
-    // 例如 C:\Program Files\... 会静默定位失败。
+    // raw_arg：命令行原样拼成 `explorer.exe /select,"C:\Program Files\..."`。
+    // 不能用 .arg()——Rust 会把内部引号转义成 \"，explorer 的解析器不认，
+    // 带空格的路径依旧静默失败（实测：Program Files 下的文件定位不出来）。
     Command::new("explorer.exe")
-        .arg(format!("/select,\"{}\"", path.display()))
+        .raw_arg(format!("/select,\"{}\"", path.display()))
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("定位失败: {e}"))
