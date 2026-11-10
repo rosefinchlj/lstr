@@ -283,18 +283,41 @@ pub fn thread_io_background_end() {
     }
 }
 
+/// 1601-01-01 → 1970-01-01 之间的 100ns tick 数(369 年 × 86400 × 10^7,
+/// 即 116_444_736_000_000_000)。旧实现误写成 20 位
+/// (`11_644_473_600_000_000_000`,多两个 0),所有 FILETIME 换算结果因此
+/// 恒为巨大负数,`find_meta` 的 mtime 在 `modified > 0` 判定下全部被当成
+/// 「未知」。正确性由 2024-01-01 的固定 FILETIME 样本单测锁死。
+const FILETIME_UNIX_EPOCH_TICKS: u128 = 116_444_736_000_000_000;
+
+/// 合理上限:9999-12-31T23:59:59Z 的 unix 秒。真实文件的 FILETIME 不可能
+/// 超过它;超出只可能是损坏/伪造值,按无效(0)处理。
+const MAX_SANE_UNIX_SECS: i128 = 253_402_300_799;
+
+/// FILETIME(100ns tick,u64)→ unix 秒。0 = 无效/未知。
+///
+/// 保留既有语义:0 tick 表示「没有时间」;早于 1970 的时间戳(负数)以及
+/// 超出合理范围的异常值同样归 0,避免负 mtime 进入 rank/UI。1970-01-01
+/// 整点本身换算为 0,与「未知」共用哨兵值 —— 该边界只影响纪元瞬间。
+fn filetime_to_unix_secs(ticks: u64) -> i64 {
+    if ticks == 0 {
+        return 0;
+    }
+    let secs = (ticks as i128 - FILETIME_UNIX_EPOCH_TICKS as i128) / 10_000_000;
+    if secs <= 0 || secs > MAX_SANE_UNIX_SECS {
+        0
+    } else {
+        secs as i64
+    }
+}
+
 /// `FindFirstFileW` 单条 / 目录枚举共用的一套字段换算(size/mtime/is_dir)。
 /// 两条路径必须走同一份换算,否则批量填充会对不上逐条查询。
 fn win32_meta(ffd: &windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW) -> FileMeta {
     let size = ((ffd.nFileSizeHigh as u64) << 32) | ffd.nFileSizeLow as u64;
     let ticks = ((ffd.ftLastWriteTime.dwHighDateTime as u64) << 32)
         | ffd.ftLastWriteTime.dwLowDateTime as u64;
-    // FILETIME → unix 秒(0 = 无效)
-    let mtime = if ticks == 0 {
-        0
-    } else {
-        ((ticks as i128 - 11_644_473_600_000_000_000u128 as i128) / 10_000_000) as i64
-    };
+    let mtime = filetime_to_unix_secs(ticks);
     let is_dir = ffd.dwFileAttributes & 0x10 != 0;
     FileMeta { size, mtime, is_dir }
 }
@@ -406,6 +429,39 @@ pub fn list_dir_meta(dir: &str) -> Option<DirMeta> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 固定样本的 FILETIME → unix 秒换算:2024-01-01T00:00:00Z 的 FILETIME
+    /// 是 133_485_408_000_000_000(已知常量),对应 unix 1_704_067_200。
+    /// 同时锁死「0/负数/异常值归 0」的防御语义。
+    #[test]
+    fn filetime_to_unix_secs_matches_known_samples() {
+        assert_eq!(filetime_to_unix_secs(133_485_408_000_000_000), 1_704_067_200);
+        // 2000-01-01T00:00:00Z = unix 946_684_800。
+        assert_eq!(filetime_to_unix_secs(125_911_584_000_000_000), 946_684_800);
+
+        // 0 tick = 没有时间;1970 纪元之前(负数秒)与异常巨大值一律归 0。
+        assert_eq!(filetime_to_unix_secs(0), 0);
+        assert_eq!(filetime_to_unix_secs(1), 0);
+        assert_eq!(filetime_to_unix_secs(FILETIME_UNIX_EPOCH_TICKS as u64), 0);
+        assert_eq!(filetime_to_unix_secs(FILETIME_UNIX_EPOCH_TICKS as u64 - 1), 0);
+        assert_eq!(filetime_to_unix_secs(u64::MAX), 0);
+    }
+
+    /// win32_meta 必须把 FILETIME 拆出的 ticks 交给同一个换算,且 size/is_dir
+    /// 不受影响(回归:旧常数多两个 0 时这里是巨大负数)。
+    #[test]
+    fn win32_meta_maps_filetime_to_positive_unix_seconds() {
+        let ticks: u64 = 133_485_408_000_000_000;
+        let mut ffd = windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW::default();
+        ffd.ftLastWriteTime.dwLowDateTime = ticks as u32;
+        ffd.ftLastWriteTime.dwHighDateTime = (ticks >> 32) as u32;
+        ffd.nFileSizeLow = 123;
+        ffd.dwFileAttributes = 0x10;
+        assert_eq!(
+            win32_meta(&ffd),
+            FileMeta { size: 123, mtime: 1_704_067_200, is_dir: true }
+        );
+    }
 
     /// 对拍:目录枚举(按名查)与逐条 FindFirstFileW 在真实文件系统上逐字段
     /// 一致。覆盖 500 条(大小写混写/子目录/中文名)、大小写不同名查询、
