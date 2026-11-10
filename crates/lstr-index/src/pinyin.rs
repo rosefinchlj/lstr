@@ -53,6 +53,57 @@ impl PinyinCache {
         let i = self.slots.binary_search(&slot).ok()?;
         Some((&self.initials[i], &self.full[i]))
     }
+
+    /// 局部刷新:只重算 `slots` 里这些 slot 的拼音条目(新增/改名/删除)。
+    ///
+    /// 分段保存不 compact,不能靠 compact 后的全量 rebuild 把新条目带进缓存,
+    /// 也不该在引擎线程上重建 250 万条。缓存只含非 ASCII 名(<1%),局部刷新
+    /// 规模 = 上次 compact 以来的 delta/改名数(受 COMPACT_DELTA 约束),
+    /// 毫秒级;保存期间查询延迟不受影响。
+    pub fn refresh_slots(&mut self, store: &VolumeStore, slots: &[u32]) {
+        let mut affected: Vec<u32> = slots
+            .iter()
+            .copied()
+            .filter(|&s| (s as usize) < store.name_off.len())
+            .collect();
+        affected.sort_unstable();
+        affected.dedup();
+        if affected.is_empty() {
+            return;
+        }
+        let mut rows: Vec<(u32, String, String)> = self
+            .slots
+            .iter()
+            .copied()
+            .zip(self.initials.iter().cloned())
+            .zip(self.full.iter().cloned())
+            .filter_map(|((slot, ini), full)| {
+                (affected.binary_search(&slot).is_err()).then_some((slot, ini, full))
+            })
+            .collect();
+        for slot in affected {
+            if store.attrs[slot as usize] & crate::store::ATTR_INTERNAL != 0 {
+                continue;
+            }
+            let name = store.name(slot);
+            if name.is_ascii() {
+                continue;
+            }
+            let Ok(s) = std::str::from_utf8(name) else {
+                continue;
+            };
+            let ini = initials_of(s);
+            let full = full_of(s);
+            if ini.is_empty() {
+                continue;
+            }
+            rows.push((slot, ini, full));
+        }
+        rows.sort_unstable_by_key(|&(slot, _, _)| slot);
+        self.slots = rows.iter().map(|&(slot, _, _)| slot).collect();
+        self.initials = rows.iter().map(|(_, i, _)| i.clone()).collect();
+        self.full = rows.iter().map(|(_, _, f)| f.clone()).collect();
+    }
     /// 拼音候选:全部 token 命中(前缀或子串)。
     pub fn search<'a>(
         &'a self,
@@ -141,5 +192,39 @@ mod tests {
         let tokens: Vec<Vec<u8>> = vec![b"wenjian".to_vec()];
         let hits: Vec<u32> = cache.search(&s, &tokens, 100).collect();
         assert_eq!(hits.len(), 1);
+    }
+
+    /// 分段保存不 compact:新增/改名的非 ASCII 条目必须靠局部刷新进缓存,
+    /// 改成 ASCII 名的槽必须从缓存移除(否则旧拼音会误命中)。
+    #[test]
+    fn refresh_slots_tracks_new_rename_and_ascii() {
+        let mut s = VolumeStore::new(false);
+        s.insert(5, 0, 0x10, b"root");
+        s.insert(10, 5, 0, "报告.docx".as_bytes());
+        s.compact();
+        let mut cache = PinyinCache::rebuild(&s);
+        let slot = s.find_slot(10).unwrap();
+
+        // 改名(仍是 CJK):旧拼音被替换
+        s.insert(10, 5, 0, "文件.txt".as_bytes());
+        cache.refresh_slots(&s, &[slot]);
+        let hits: Vec<u32> = cache
+            .search(&s, &[b"wenjian".to_vec()], 100)
+            .collect();
+        assert_eq!(hits, vec![slot]);
+        let hits: Vec<u32> = cache.search(&s, &[b"bg".to_vec()], 100).collect();
+        assert!(hits.is_empty(), "旧拼音条目必须被移除");
+
+        // 新增 delta 非 ASCII slot
+        s.insert(11, 5, 0, "图片.png".as_bytes());
+        let new_slot = s.find_slot(11).unwrap();
+        cache.refresh_slots(&s, &[new_slot]);
+        let hits: Vec<u32> = cache.search(&s, &[b"tp".to_vec()], 100).collect();
+        assert_eq!(hits, vec![new_slot]);
+
+        // 再改成 ASCII:缓存移除,不再命中拼音
+        s.insert(10, 5, 0, b"report.txt");
+        cache.refresh_slots(&s, &[slot]);
+        assert!(cache.get(slot).is_none());
     }
 }
