@@ -326,10 +326,9 @@ fn pin_exact_name_matches(entries: &mut Vec<Entry>, needle: &str) {
                 .iter()
                 .any(|alias| alias.to_lowercase() == needle)
     };
-    // 没有命中就不搬动元素：短查询每次都全量 drain 没有必要。
-    if !entries.iter().any(|entry| is_exact(entry)) {
-        return;
-    }
+    // 一遍分桶：命中项进 exact（其余进 rest），没有命中时 exact 为空，
+    // 顺序与旧实现完全相同。旧实现先 any 扫一遍再 drain 扫一遍，
+    // 每个候选的名字被 to_lowercase 两次；命中的查询尤其常见（短查询）。
     let mut exact = Vec::new();
     let mut rest = Vec::with_capacity(entries.len());
     for entry in entries.drain(..) {
@@ -338,6 +337,10 @@ fn pin_exact_name_matches(entries: &mut Vec<Entry>, needle: &str) {
         } else {
             rest.push(entry);
         }
+    }
+    if exact.is_empty() {
+        *entries = rest;
+        return;
     }
     // 组内保持原有分数顺序（exact.append 不重排）。
     exact.append(&mut rest);
@@ -501,6 +504,162 @@ mod pin_tests {
         );
     }
 
+    /// 基准:finalize 约 480 个候选的分项成本。release 下运行:
+    /// `cargo test -p lstr --release bench_finalize_candidates -- --nocapture`
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release 基准")]
+    fn bench_finalize_candidates() {
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let mut entries: Vec<Entry> = Vec::new();
+        {
+            let mut hist = history.lock().unwrap();
+            for i in 0..320 {
+                let name = if i % 40 == 0 { "ai".to_string() } else { format!("ai_report_{i:03}.txt") };
+                let e = entry_at(
+                    &format!("file{i}"),
+                    &name,
+                    Kind::File,
+                    &format!(r"D:\work\project{i:03}\{name}"),
+                );
+                if i % 4 == 0 { hist.seed(&e, 3 + i % 20, 1_700_000_000 + i as u64); }
+                entries.push(e);
+            }
+            for i in 0..120 {
+                let e = entry_at(
+                    &format!("dir{i}"),
+                    &format!("ai_dir_{i:03}"),
+                    Kind::Folder,
+                    &format!(r"E:\use\proj{i:03}\ai_dir_{i:03}"),
+                );
+                if i % 6 == 0 { hist.seed(&e, 2, 1_700_000_000); }
+                entries.push(e);
+            }
+            for i in 0..40 {
+                let mut e = entry_at(
+                    &format!("app{i}"),
+                    &format!("A.I. Studio {i}"),
+                    Kind::App,
+                    &format!(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\App{i}.lnk"),
+                );
+                e.pinyin = Some("ai studio".to_string());
+                hist.seed(&e, 5, 1_700_000_000);
+                entries.push(e);
+            }
+        }
+        entries.push(command("cmd:settings", "打开设置"));
+        let req = request("ai", 8);
+        let cfg = Config::default();
+        // 预热
+        for _ in 0..3 {
+            let _ = finalize_entries(entries.clone(), &req, &history, &cfg, Vec::new());
+        }
+        let iters = 30;
+        let mut samples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            let out = finalize_entries(entries.clone(), &req, &history, &cfg, Vec::new());
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(out.len(), 100);
+            samples.push(ms);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "[bench-finalize] candidates={} p50={:.2}ms p90={:.2}ms min={:.2}ms",
+            entries.len(),
+            samples[iters / 2],
+            samples[iters * 9 / 10],
+            samples[0]
+        );
+    }
+
+    /// 基准:文件型 SQLite 上「旧逐候选 2 次 SQL」vs「新批量快照」的成本对照。
+    /// `cargo test -p lstr --release bench_finalize_file_db -- --nocapture`
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release 基准:文件型 SQLite")]
+    fn bench_finalize_file_db() {
+        let db = std::env::temp_dir().join(format!("lstr-hist-bench-{}.db", std::process::id()));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+        }
+        let history = Arc::new(Mutex::new(History::open_test_db(&db)));
+        let mut entries: Vec<Entry> = Vec::new();
+        {
+            let mut hist = history.lock().unwrap();
+            // 1000 条历史(与生产上限一致),其中前 120 条与候选同 id。
+            for i in 0..1000 {
+                let e = entry_at(
+                    &format!("hist{i}"),
+                    &format!("hist_{i}.txt"),
+                    Kind::File,
+                    &format!(r"D:\h\{i}\hist_{i}.txt"),
+                );
+                hist.seed(&e, 1 + i as u32 % 30, 1_700_000_000 + i as u64);
+            }
+            for i in 0..320 {
+                let e = entry_at(
+                    &format!("file{i}"),
+                    &format!("ai_report_{i:03}.txt"),
+                    Kind::File,
+                    &format!(r"D:\work\project{i:03}\ai_report_{i:03}.txt"),
+                );
+                entries.push(e);
+            }
+            for i in 0..120 {
+                let e = entry_at(
+                    &format!("dir{i}"),
+                    &format!("ai_dir_{i:03}"),
+                    Kind::Folder,
+                    &format!(r"E:\use\proj{i:03}\ai_dir_{i:03}"),
+                );
+                entries.push(e);
+            }
+            for i in 0..40 {
+                let mut e = entry_at(
+                    &format!("app{i}"),
+                    &format!("A.I. Studio {i}"),
+                    Kind::App,
+                    &format!(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\App{i}.lnk"),
+                );
+                e.pinyin = Some("ai studio".to_string());
+                entries.push(e);
+            }
+        }
+        let req = request("ai", 8);
+        let cfg = Config::default();
+        let hist = history.lock().unwrap();
+        // 旧 rank 的逐候选主成本:每候选 2 次 SQL。
+        let mut sql_samples = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            for e in &entries {
+                let _ = hist.score(&e.id);
+                let _ = hist.query_boost("ai", &e.id);
+            }
+            sql_samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        drop(hist);
+        let mut samples = Vec::new();
+        for _ in 0..15 {
+            let t = Instant::now();
+            let out = finalize_entries(entries.clone(), &req, &history, &cfg, Vec::new());
+            assert_eq!(out.len(), 100);
+            samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        sql_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "[bench-finalize-db] candidates={} 旧逐候选 2×SQL p50={:.2}ms | 新 finalize(批量快照) p50={:.2}ms p90={:.2}ms",
+            entries.len(),
+            sql_samples[2],
+            samples[7],
+            samples[13],
+        );
+        drop(history);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+        }
+    }
+
     #[test]
     fn exact_name_pin_survives_candidate_truncation() {
         // 105 条前缀命中靠历史分压过 3 条噪声路径里的精确同名：
@@ -546,6 +705,11 @@ fn finalize_entries(
     config: &Config,
     keyword_rows: Vec<Entry>,
 ) -> Vec<Entry> {
+    // 分项计时:唯一慢查询日志的补充,>3ms 时落 engine.log 定位 rank/去重/
+    // 置顶哪一段退化(优化前真实机器 7.3ms 几乎全在 rank 的逐候选 SQL/规则
+    // 归一化上)。计时本身 5 次 Instant::now ≈ 0.1µs。
+    let t_start = Instant::now();
+    let mut t_mark = t_start;
     if let Ok(history) = history.lock() {
         rank::rank_with(
             &mut entries,
@@ -555,45 +719,40 @@ fn finalize_entries(
             &request.rank,
         );
     }
+    let t_rank = t_mark.elapsed().as_secs_f64() * 1000.0;
+    t_mark = Instant::now();
 
-    // 两遍去重：先算 keep 掩码再 retain（借用不跨 retain）。
+    // 去重：retain 闭包持有 seen 集合，一遍完成（旧实现先算 Vec<bool> 掩码
+    // 再 retain，两遍且多一次分配；结果完全相同：保留首次出现的条目）。
     // Windows 路径/ID 大小写不敏感，内置索引与 Everything 对同一个路径给的
     // 大小写可能不同，所以 id 先归一化成小写再比较，否则同一条目出现两行。
-    let keep_ids: Vec<bool> = {
-        let mut seen_ids: HashSet<String> = HashSet::new();
-        entries
-            .iter()
-            .map(|entry| seen_ids.insert(entry.id.to_lowercase()))
-            .collect()
-    };
-    let mut keep_iter = keep_ids.into_iter();
-    entries.retain(|_| keep_iter.next().unwrap_or(false));
+    let mut seen_ids: HashSet<String> = HashSet::with_capacity(entries.len());
+    entries.retain(|entry| seen_ids.insert(entry.id.to_lowercase()));
+    let t_ids = t_mark.elapsed().as_secs_f64() * 1000.0;
+    t_mark = Instant::now();
     // 同名条目（不同路径下的 clip 文件夹、debug/release 同名 exe）只保留排名最高的一个。
     // 例外：精确同名（用户就是打的名字，如 use → E:\use）保留前 6 个，
     // 多个同名目录是正常需求，全砍掉会让 E:\use 被系统深处同名目录挤掉。
     let needle_lower = request.query.text.to_lowercase();
-    let keep_names: Vec<bool> = {
-        let mut seen_names = HashSet::new();
-        let mut exact_counts: std::collections::HashMap<(Kind, String), usize> =
-            std::collections::HashMap::new();
-        entries
-            .iter()
-            .map(|entry| {
-                let key = (entry.kind, entry.name.to_lowercase());
-                if !needle_lower.is_empty() && key.1 == needle_lower {
-                    let count = exact_counts.entry(key).or_insert(0);
-                    *count += 1;
-                    *count <= 6
-                } else {
-                    seen_names.insert(key)
-                }
-            })
-            .collect()
-    };
-    let mut keep_iter = keep_names.into_iter();
-    entries.retain(|_| keep_iter.next().unwrap_or(false));
+    let mut seen_names = HashSet::with_capacity(entries.len());
+    let mut exact_counts: std::collections::HashMap<(Kind, String), usize> =
+        std::collections::HashMap::new();
+    entries.retain(|entry| {
+        let key = (entry.kind, entry.name.to_lowercase());
+        if !needle_lower.is_empty() && key.1 == needle_lower {
+            let count = exact_counts.entry(key).or_insert(0);
+            *count += 1;
+            *count <= 6
+        } else {
+            seen_names.insert(key)
+        }
+    });
+    let t_names = t_mark.elapsed().as_secs_f64() * 1000.0;
+    t_mark = Instant::now();
     // 名称完全一致的结果硬置顶：档位权重可能被用户调整，或被历史/位置加权翻过。
     pin_exact_name_matches(&mut entries, &needle_lower);
+    let t_pin = t_mark.elapsed().as_secs_f64() * 1000.0;
+    t_mark = Instant::now();
     // 列表可滚动：多送一些候选（最多 100 条），UI 只按窗口高度展示前几条，
     // 滚轮可以继续往下看——不再一屏截断。
     let deliver = request.limit.max(100);
@@ -637,6 +796,17 @@ fn finalize_entries(
             entries = pinned;
         }
     }
+    let rest_ms = t_mark.elapsed().as_secs_f64() * 1000.0;
+    let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+    // 测试不写 APPDATA 日志;生产上 finalize >3ms 时落一条分项,便于现场定位。
+    #[cfg(not(test))]
+    if total_ms > 3.0 {
+        lstr_index::snapshot::debug_log(&format!(
+            "search: finalize {total_ms:.1}ms rank={t_rank:.1}ms ids={t_ids:.1}ms names={t_names:.1}ms pin={t_pin:.1}ms rest={rest_ms:.1}ms entries={}",
+            entries.len()
+        ));
+    }
+    let _ = (t_rank, t_ids, t_names, t_pin, rest_ms, total_ms);
     entries
 }
 

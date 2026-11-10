@@ -56,6 +56,37 @@ fn heuristic_cap(cfg: &RankConfig) -> i32 {
     }
 }
 
+/// 一次查询内复用的打分上下文：小写查询词、归一化噪声规则、历史批量快照。
+/// 旧实现逐候选做 `q.trim().to_lowercase()`、逐候选逐规则 `to_lowercase`
+/// （默认 70+ 条规则 × 数百候选）、逐候选两次 SQLite 查询，finalize 因此
+/// 占 7ms。这里全部预计算一次，公式与逐条版本逐字节等价。
+pub struct RankPlan {
+    needle: String,
+    /// (已 trim/小写/反斜杠→正斜杠, 原始 penalty)。规则表的模式是配置常量，
+    /// 同一查询内不会变，预归一化不改变匹配结果。
+    noise: Vec<(String, i32)>,
+    snapshot: crate::history::RankSnapshot,
+}
+
+impl RankPlan {
+    pub fn new(q: &str, history: &History, cfg: &RankConfig) -> Self {
+        let needle = q.trim().to_lowercase();
+        let noise = cfg
+            .noise_rules
+            .iter()
+            .filter_map(|rule| {
+                let pattern = rule.pattern.trim().to_lowercase().replace('\\', "/");
+                (!pattern.is_empty()).then_some((pattern, rule.penalty))
+            })
+            .collect();
+        Self {
+            snapshot: history.rank_snapshot(&needle),
+            needle,
+            noise,
+        }
+    }
+}
+
 /// 按分数从高到低稳定排序（使用设置面板里的排序权重）。
 pub fn rank_with(
     entries: &mut Vec<Entry>,
@@ -64,8 +95,9 @@ pub fn rank_with(
     app_boost: i32,
     cfg: &RankConfig,
 ) {
+    let plan = RankPlan::new(q, history, cfg);
     entries.sort_by_cached_key(|entry| {
-        std::cmp::Reverse(score_entry_with(entry, q, history, app_boost, cfg))
+        std::cmp::Reverse(score_entry_planned(entry, &plan, app_boost, cfg))
     });
 }
 
@@ -89,8 +121,21 @@ pub fn score_entry_with(
     app_boost: i32,
     cfg: &RankConfig,
 ) -> i32 {
-    let needle = q.trim().to_lowercase();
-    let history_points = (history.score(&entry.id) * HISTORY_WEIGHT)
+    let plan = RankPlan::new(q, history, cfg);
+    score_entry_planned(entry, &plan, app_boost, cfg)
+}
+
+/// 与 [`score_entry_with`] 同公式，复用一次查询级上下文（见 [`RankPlan`]）。
+pub fn score_entry_planned(
+    entry: &Entry,
+    plan: &RankPlan,
+    app_boost: i32,
+    cfg: &RankConfig,
+) -> i32 {
+    let needle = &plan.needle;
+    let name_lc = entry.name.to_lowercase();
+    let path_lc = full_path_lowercase(entry);
+    let history_points = (plan.snapshot.score(&entry.id) * HISTORY_WEIGHT)
         .round()
         .clamp(0.0, cfg.history_cap.max(0) as f32) as i32;
     // 启动项（应用 + 可执行程序）加权：用户优先看到可以直接启动的东西。
@@ -109,28 +154,28 @@ pub fn score_entry_with(
         return history_points + launch_points + kind_preference(entry.kind) + folder_points;
     }
 
-    let match_points = match_tier(entry, &needle, cfg);
+    let match_points = match_tier(entry, needle, cfg, &name_lc, &path_lc);
     if match_points == 0 {
         return 0;
     }
     // 精确同名：路径越浅越可能是用户要找的那个（E:\use vs Perl 测试目录）。
     // 同时压过 USERPROFILE 加权——深埋在用户目录里的同名目录不该赢过根目录。
     let exact_shallow_points = if match_points == cfg.exact {
-        let depth = entry.full_path().matches('\\').count() as i32;
+        let depth = path_lc.matches('\\').count() as i32;
         (EXACT_SHALLOW_DEPTH - depth).max(0) * EXACT_SHALLOW_UNIT
     } else {
         0
     };
     // 拉丁字母查询命中中文应用/程序拼音时，启动目标应排到普通文件前面。
     let pinyin_app_points = if matches!(entry.kind, Kind::App | Kind::Program)
-        && !entry.name.to_lowercase().contains(&needle)
+        && !name_lc.contains(needle)
     {
         let mut hit = false;
         if let Some(pinyin) = &entry.pinyin {
-            hit = pinyin.to_lowercase().contains(&needle);
+            hit = pinyin.to_lowercase().contains(needle);
         }
         if !hit {
-            hit = entry.initial.to_lowercase().contains(&needle);
+            hit = entry.initial.to_lowercase().contains(needle);
         }
         if hit { 450 } else { 0 }
     } else {
@@ -142,22 +187,27 @@ pub fn score_entry_with(
         + folder_points
         + pinyin_app_points
         + exact_shallow_points
-        + recency_points(entry.modified, cfg)
-        + path_adjustment(entry, &needle, cfg)
+        + recency_points(entry.modified, cfg, plan.snapshot.now())
+        + path_adjustment(entry, &path_lc, needle, cfg, &plan.noise)
         // P1-1：同一查询词下用户上次选过这个结果时加权。
         // 全局 frecency 回答「常用吗」，query_boost 回答「搜这个词时要的是哪个」。
-        + history.query_boost(&needle, &entry.id)
+        + plan.snapshot.boost(&entry.id)
+}
+
+/// `Entry::full_path()` 的小写版本，一次分配；旧实现每候选调用 2-3 次
+/// `full_path()`（每次都 `display().to_string()`）。
+fn full_path_lowercase(entry: &Entry) -> String {
+    match &entry.path {
+        Some(path) => path.display().to_string().to_lowercase(),
+        None => entry.name.to_lowercase(),
+    }
 }
 
 /// 最近修改过的文件更可能是目标（轻量加分，不压过匹配档位）。
-fn recency_points(modified: Option<i64>, cfg: &RankConfig) -> i32 {
+fn recency_points(modified: Option<i64>, cfg: &RankConfig, now: i64) -> i32 {
     let Some(ts) = modified else {
         return 0;
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     let age = (now - ts).max(0);
     let boost = cfg.recent_boost.max(0);
     if age <= 7 * 86400 {
@@ -227,27 +277,52 @@ fn is_build_dir_pattern(pattern: &str) -> bool {
 fn noise_penalty(path: &str, needle: &str, kind: Kind, cfg: &RankConfig) -> i32 {
     // 规则表按小写正斜杠保存，路径也统一归一化（含大小写）后再匹配。
     let normalized_path = path.replace('\\', "/").to_lowercase();
+    let rules: Vec<(String, i32)> = cfg
+        .noise_rules
+        .iter()
+        .filter_map(|rule| {
+            let pattern = rule.pattern.trim().to_lowercase().replace('\\', "/");
+            (!pattern.is_empty()).then_some((pattern, rule.penalty))
+        })
+        .collect();
+    noise_penalty_prepared(&normalized_path, needle, kind, cfg, &rules)
+}
+
+/// [`noise_penalty`] 的预归一化规则版本（rank 热路径用，避免逐候选重复
+/// trim/lowercase 70+ 条规则）。
+fn noise_penalty_prepared(
+    normalized_path: &str,
+    needle: &str,
+    kind: Kind,
+    cfg: &RankConfig,
+    rules: &[(String, i32)],
+) -> i32 {
     let mut worst = 0;
-    for rule in &cfg.noise_rules {
-        let pattern = rule.pattern.trim().to_lowercase().replace('\\', "/");
-        if pattern.is_empty() || !normalized_path.contains(&pattern) {
+    for (pattern, penalty) in rules {
+        if !normalized_path.contains(pattern) {
             continue;
         }
         // 构建目录下的 .exe 是正常程序产物，不罚。
-        if kind == Kind::Program && is_build_dir_pattern(&pattern) {
+        if kind == Kind::Program && is_build_dir_pattern(pattern) {
             continue;
         }
         // 「用户在找噪声目录本身」：查询词包含在片段里，如 cache / temp。
         if needle.len() >= 2 && pattern.contains(needle) {
             continue;
         }
-        worst = worst.max(rule.penalty.clamp(0, 500));
+        worst = worst.max((*penalty).clamp(0, 500));
     }
     worst * cfg.noise_strength.clamp(0, 200) / 100
 }
 
-fn path_adjustment(entry: &Entry, needle: &str, cfg: &RankConfig) -> i32 {
-    let path = entry.full_path().to_lowercase();
+fn path_adjustment(
+    entry: &Entry,
+    path: &str,
+    needle: &str,
+    cfg: &RankConfig,
+    rules: &[(String, i32)],
+) -> i32 {
+    let normalized_path = path.replace('\\', "/");
     let cap = heuristic_cap(cfg);
     // 分成「条目自身细节」和「环境上下文」两块额度：
     // - 细节（短名、浅路径）决定同一档位内谁更靠前，不能被上下文挤掉；
@@ -278,7 +353,7 @@ fn path_adjustment(entry: &Entry, needle: &str, cfg: &RankConfig) -> i32 {
     hint += context.min(cap - detail_cap);
 
     // 噪声惩罚是「排除」信号，不受上界限制：该沉下去的就要沉下去。
-    hint - noise_penalty(&path, needle, entry.kind, cfg)
+    hint - noise_penalty_prepared(&normalized_path, needle, entry.kind, cfg, rules)
 }
 
 /// 路径边界匹配：dir 本身，或 dir 后紧跟路径分隔符才算在目录下。
@@ -291,7 +366,13 @@ fn is_under_path(path: &str, dir: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('\\') || rest.starts_with('/'))
 }
 
-fn match_tier(entry: &Entry, needle: &str, cfg: &RankConfig) -> i32 {
+fn match_tier(
+    entry: &Entry,
+    needle: &str,
+    cfg: &RankConfig,
+    name: &str,
+    path_lc: &str,
+) -> i32 {
     if entry.kind == Kind::Command {
         for alias in crate::search::command_aliases(&entry.id) {
             let alias = alias.to_lowercase();
@@ -306,7 +387,6 @@ fn match_tier(entry: &Entry, needle: &str, cfg: &RankConfig) -> i32 {
             }
         }
     }
-    let name = entry.name.to_lowercase();
     if name == needle {
         return cfg.exact;
     }
@@ -391,7 +471,7 @@ fn match_tier(entry: &Entry, needle: &str, cfg: &RankConfig) -> i32 {
         }
     }
 
-    if entry.full_path().to_lowercase().contains(needle) {
+    if path_lc.contains(needle) {
         return cfg.path_only;
     }
 
@@ -743,6 +823,19 @@ mod tests {
         assert_eq!(heuristic_cap(&tight), 20, "档位差很小时保底 20");
     }
 
+    fn adj(entry: &Entry, needle: &str, cfg: &RankConfig) -> i32 {
+        let path = full_path_lowercase(entry);
+        let rules: Vec<(String, i32)> = cfg
+            .noise_rules
+            .iter()
+            .filter_map(|rule| {
+                let pattern = rule.pattern.trim().to_lowercase().replace('\\', "/");
+                (!pattern.is_empty()).then_some((pattern, rule.penalty))
+            })
+            .collect();
+        path_adjustment(entry, &path, needle, cfg, &rules)
+    }
+
     #[test]
     fn path_context_is_bounded_by_heuristic_cap() {
         // 旧用例名不副实：49 分永远碰不到 80。这里让 cwd + 短名 + 浅路径
@@ -752,7 +845,7 @@ mod tests {
         let cwd = std::env::current_dir().expect("cwd");
         let mut hot = entry("hot", "a", Kind::Folder);
         hot.path = Some(cwd.join("a"));
-        let hint = path_adjustment(&hot, "a", &cfg);
+        let hint = adj(&hot, "a", &cfg);
         assert!(
             hint <= cap,
             "位置启发式不应跨越匹配档位: hint={hint}, cap={cap}"
@@ -770,8 +863,8 @@ mod tests {
         short.path = Some(cwd.join("a"));
         let mut deep = entry("deep", "a-very-long-folder-name", Kind::Folder);
         deep.path = Some(cwd.join("deep").join("deeper").join("deeper").join("x"));
-        let short_hint = path_adjustment(&short, "a", &cfg);
-        let deep_hint = path_adjustment(&deep, "a", &cfg);
+        let short_hint = adj(&short, "a", &cfg);
+        let deep_hint = adj(&deep, "a", &cfg);
         assert!(
             short_hint > deep_hint,
             "cwd 内短名/浅路径仍应更靠前: short={short_hint}, deep={deep_hint}"

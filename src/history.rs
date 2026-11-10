@@ -44,6 +44,50 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// 单次查询用的历史只读快照：一次 SQL 取出全部 frecency 行与该查询词的选择行，
+/// rank 逐候选查 HashMap，不再每条候选一次 SQL（300+ 候选 × 2 次查询是 finalize
+/// 的主要成本）。公式与 [`History::score`] / [`History::query_boost`] 完全一致。
+pub(crate) struct RankSnapshot {
+    scores: HashMap<String, (u32, i64)>,
+    boosts: HashMap<String, (i64, i64)>,
+    now: u64,
+}
+
+fn score_value(count: u32, last: i64, now: u64) -> f32 {
+    let last = last.max(0) as u64;
+    let age = now.saturating_sub(last) as f64;
+    count as f32 + 2.0 * (-(age / DECAY_SECS)).exp() as f32
+}
+
+fn boost_value(hits: i64, last: i64, now: u64) -> i32 {
+    let age = now.saturating_sub(last.max(0) as u64) as f64;
+    let recency = (-(age / QUERY_DECAY_SECS)).exp();
+    (hits as f64 * 60.0 * recency)
+        .round()
+        .clamp(0.0, QUERY_BOOST_CAP) as i32
+}
+
+impl RankSnapshot {
+    /// 快照建立时刻（unix 秒），供 rank 的 recency 复用，避免逐候选取系统时间。
+    pub(crate) fn now(&self) -> i64 {
+        self.now as i64
+    }
+
+    /// 与 `History::score` 同公式；未知 id 返回 0。
+    pub(crate) fn score(&self, id: &str) -> f32 {
+        self.scores
+            .get(id)
+            .map_or(0.0, |&(count, last)| score_value(count, last, self.now))
+    }
+
+    /// 与 `History::query_boost` 同公式；无记录/空查询返回 0。
+    pub(crate) fn boost(&self, entry_id: &str) -> i32 {
+        self.boosts
+            .get(entry_id)
+            .map_or(0, |&(hits, last)| boost_value(hits, last, self.now))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistItem {
     pub count: u32,
@@ -107,6 +151,12 @@ impl History {
     #[cfg(test)]
     pub fn in_memory() -> Self {
         Self::open_memory()
+    }
+
+    /// 基准用:打开真实的文件型 SQLite(路径由测试指定,不碰 APPDATA)。
+    #[cfg(test)]
+    pub(crate) fn open_test_db(path: &Path) -> Self {
+        Self::open(path).expect("open test history db")
     }
 
     /// 首次运行把旧 history.json 导入 SQLite（表为空才迁移），
@@ -177,6 +227,10 @@ impl History {
 
     /// P1-1：同一查询词下的历史选择加成。次数越多、越近，分越高。
     /// 上限 240，保证不会盖过「名称完全一致 = 1000」这类匹配档位。
+    ///
+    /// 生产 rank 走 [`Self::rank_snapshot`] 的批量快照；逐条版本保留为快照
+    /// 语义的对照基准（单测直接断言两者同值）。
+    #[allow(dead_code)]
     pub fn query_boost(&self, query: &str, entry_id: &str) -> i32 {
         let key = query.trim().to_lowercase();
         if key.is_empty() {
@@ -187,29 +241,70 @@ impl History {
             params![key, entry_id],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         );
-        let Ok((hits, last)) = result else {
-            return 0;
-        };
-        let age = now_secs().saturating_sub(last.max(0) as u64) as f64;
-        let recency = (-(age / QUERY_DECAY_SECS)).exp();
-        (hits as f64 * 60.0 * recency)
-            .round()
-            .clamp(0.0, QUERY_BOOST_CAP) as i32
+        match result {
+            Ok((hits, last)) => boost_value(hits, last, now_secs()),
+            Err(_) => 0,
+        }
     }
 
     /// frecency 分数：`count + 2 * e^(-age_days / 7)`；未知条目返回 0。
+    /// 同 [`Self::query_boost`]：逐条基准，生产 rank 用批量快照。
+    #[allow(dead_code)]
     pub fn score(&self, id: &str) -> f32 {
         let result = self.db.query_row(
             "SELECT count, last FROM history WHERE id = ?1",
             params![id],
             |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?)),
         );
-        let Ok((count, last)) = result else {
-            return 0.0;
-        };
-        let last = last.max(0) as u64;
-        let age = now_secs().saturating_sub(last) as f64;
-        count as f32 + 2.0 * (-(age / DECAY_SECS)).exp() as f32
+        match result {
+            Ok((count, last)) => score_value(count, last, now_secs()),
+            Err(_) => 0.0,
+        }
+    }
+
+    /// rank 批量快照：一次取全部 frecency 行（上限 1000）与该查询词的选择行。
+    /// 等价于逐候选调用 [`Self::score`] / [`Self::query_boost`]，只是把 N 次
+    /// SQL 折成 2 次；`now` 在快照建立时取一次（衰减是秒级，排序结果不变）。
+    pub(crate) fn rank_snapshot(&self, query: &str) -> RankSnapshot {
+        let mut scores = HashMap::new();
+        if let Ok(mut stmt) = self.db.prepare("SELECT id, count, last FROM history") {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            }) {
+                for row in rows.flatten() {
+                    scores.insert(row.0, (row.1, row.2));
+                }
+            }
+        }
+        let key = query.trim().to_lowercase();
+        let mut boosts = HashMap::new();
+        if !key.is_empty() {
+            if let Ok(mut stmt) = self
+                .db
+                .prepare("SELECT entry_id, hits, last FROM query_hits WHERE query = ?1")
+            {
+                if let Ok(rows) = stmt.query_map(params![key], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                }) {
+                    for row in rows.flatten() {
+                        boosts.insert(row.0, (row.1, row.2));
+                    }
+                }
+            }
+        }
+        RankSnapshot {
+            scores,
+            boosts,
+            now: now_secs(),
+        }
     }
 
     /// 按最后使用时间倒序返回历史条目快照。
@@ -363,6 +458,41 @@ mod tests {
         history.seed(&entry("often"), 10, now);
         assert!(history.score("recent") > history.score("old"));
         assert!(history.score("often") > history.score("recent"));
+    }
+
+    /// rank 的批量快照必须与逐条 `score` / `query_boost` 同值(包括未知 id、
+    /// 不匹配的 query、过期行)。这是 finalize 去掉逐候选 SQL 后的正确性锁。
+    #[test]
+    fn rank_snapshot_matches_per_entry_queries() {
+        let mut history = History::in_memory();
+        let now = now_secs();
+        for (id, count, age) in [
+            ("alpha", 3u32, 0u64),
+            ("beta", 7, 6 * 86400),
+            ("gamma", 1, 40 * 86400),
+            ("delta", 12, 900),
+        ] {
+            history.seed(&entry(id), count, now.saturating_sub(age));
+        }
+        let target = entry("alpha");
+        history.record_query("re", &target);
+        history.record_query("re", &target);
+        history.record_query("other", &target);
+
+        let snap = history.rank_snapshot("  RE ");
+        for id in ["alpha", "beta", "gamma", "delta", "missing"] {
+            let direct = history.score(id);
+            let batched = snap.score(id);
+            assert!(
+                (direct - batched).abs() < 1e-6,
+                "score({id}) 不一致: {direct} vs {batched}"
+            );
+            let direct = history.query_boost("re", id);
+            let batched = snap.boost(id);
+            assert_eq!(direct, batched, "query_boost({id}) 不一致");
+        }
+        let empty = history.rank_snapshot("");
+        assert_eq!(empty.boost("alpha"), history.query_boost("", "alpha"));
     }
 
     #[test]
