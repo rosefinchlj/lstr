@@ -143,6 +143,9 @@ pub struct LstrApp {
     selected: usize,
     total: usize,
     elapsed_ms: f32,
+    /// 全链路耗时(请求发出 → 结果回到 UI 帧,含排队/IPC/帧等待)。
+    /// 与 elapsed_ms(引擎纯执行)并列显示,定位「引擎快但手感慢」。
+    ui_total_ms: Option<f32>,
     error: Option<String>,
     /// 自研索引状态行(渐进启动:构建中/未启用提示;错误条优先)。
     index_note: Option<String>,
@@ -281,6 +284,7 @@ impl LstrApp {
             selected: 0,
             total: 0,
             elapsed_ms: 0.0,
+            ui_total_ms: None,
             error: None,
             index_note: None,
             index_note_since: None,
@@ -501,6 +505,7 @@ impl LstrApp {
                     base_folder,
                 );
                 self.search_sent_at = Some(Instant::now());
+                self.ui_total_ms = None;
                 self.waiting = true;
                 self.dirty_at = None;
             } else {
@@ -513,6 +518,7 @@ impl LstrApp {
                 // 诊断：总延迟 vs 服务端执行时间。差值 = 排队/唤醒开销。
                 if let Some(sent) = self.search_sent_at.take() {
                     let total_ms = sent.elapsed().as_millis();
+                    self.ui_total_ms = Some(total_ms as f32);
                     if total_ms > 250 {
                         lstr_index::snapshot::debug_log(&format!(
                             "search: ui total={}ms execute={:.1}ms entries={} total={}",
@@ -2588,13 +2594,15 @@ impl LstrApp {
         } else {
             format!(
                 // total 计数在 10 万处截断(见 query::TOTAL_CAP),显示为近似值。
-                "{} 个结果 · {:.2}s{}",
+                // 总=按键请求发出到结果上屏(含排队/IPC/帧等待);引擎=worker 内纯执行。
+                "{} 个结果 · 总 {:.0}ms · 引擎 {:.0}ms{}",
                 if self.total >= 100_000 {
                     "10万+".to_string()
                 } else {
                     self.total.to_string()
                 },
-                self.elapsed_ms / 1000.0,
+                self.ui_total_ms.unwrap_or(self.elapsed_ms),
+                self.elapsed_ms,
                 if self.scrollable { " · 滚轮查看更多" } else { "" }
             )
         };
