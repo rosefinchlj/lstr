@@ -98,8 +98,9 @@ impl AppIndex {
                     2
                 } else if py_contains {
                     3
-                } else if fuzzy::score_dense(&entry.name, &needle).is_some() {
-                    // 子序列模糊：vsc → Visual Studio Code（带密度门槛）。
+                } else if fuzzy::score_gated(&entry.name, &needle).is_some() {
+                    // 子序列模糊：vsc → Visual Studio Code（逐字符闸门：
+                    // 散字母伪匹配如 rust → Blend for Visual Studio 直接拒绝）。
                     4
                 } else {
                     // 拼音容错（wxin → weixin）：对「首字母串」「全拼串」逐段

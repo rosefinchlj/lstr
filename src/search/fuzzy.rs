@@ -124,6 +124,23 @@ pub fn score_dense(text: &str, needle: &str) -> Option<i32> {
     }
 }
 
+/// 逐字符质量闸门：每个命中字符必须是词首/驼峰边界，或与前一个命中字符**连续**。
+/// 拒绝「散字母」伪匹配——rust → "Blend for Visual Studio" 里 r 在 for 中间、
+/// u 在 Visual 中间，即使 s(Studio 词首)+t(连续) 的加分让它过了密度门槛 。
+/// 保留真实模式：vsc → Visual Studio Code（全词首）、code/chrome（连续子串）。
+/// 仅用于应用名的模糊匹配；拼音容错仍走 score_dense（wxin → weixin）。
+pub fn score_gated(text: &str, needle: &str) -> Option<i32> {
+    let (score, positions) = subsequence(text, needle)?;
+    let chars: Vec<char> = text.chars().collect();
+    for (k, &pos) in positions.iter().enumerate() {
+        let consecutive = k > 0 && pos == positions[k - 1] + 1;
+        if !(consecutive || is_boundary(&chars, pos)) {
+            return None;
+        }
+    }
+    Some(score)
+}
+
 fn is_boundary(chars: &[char], i: usize) -> bool {
     if i == 0 {
         return true;
@@ -164,6 +181,17 @@ mod tests {
         assert!(positions("Notepad", "xyz").is_none());
         assert!(positions("ab", "abc").is_none());
         assert!(positions("", "a").is_none());
+    }
+
+    #[test]
+    fn gated_rejects_scattered_false_positive() {
+        // rust 散落在 "Blend for Visual Studio"（r 在 for、u 在 Visual 中间）→ 拒绝
+        assert!(score_gated("Blend for Visual Studio", "rust").is_none());
+        // 词首/连续构成的真实匹配保留
+        assert!(score_gated("Visual Studio Code", "vsc").is_some());
+        assert!(score_gated("Visual Studio Code", "code").is_some());
+        assert!(score_gated("Google Chrome", "chrome").is_some());
+        assert!(score_gated("RustDesk", "rust").is_some());
     }
 
     #[test]
