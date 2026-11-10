@@ -2610,7 +2610,20 @@ impl LstrApp {
             // 会画到日期文字下面（UI 冲突的根因）。
             let is_path_row = matches!(entry.kind, Kind::File | Kind::Folder | Kind::Program);
             let full_path = entry.full_path();
-            let lead = if entry.id.starts_with("qs:") { "已打开 · " } else { "" };
+            // 路径行的拼音命中标注:应用行副标题有「应用 · 拼音 xx」,文件行
+            // 也要让用户看出结果不是名字字面命中(如 weixin → 微信资料)。
+            // 判定只看名字/查询 token,不额外做 IO;path 模式是浏览目录,不标。
+            let pinyin_path_hit =
+                is_path_row && !path_mode && is_pinyin_path_hit(&entry.name, &query.text);
+            // 「已打开」(对话框 Quick Switch 的近期目录)与「拼音」是两种
+            // 不同来源提示:同时满足时保留两者,读作「已打开 · 拼音 · …」,
+            // 先交代条目已在打开列表里,再说明本次为何命中。
+            let lead = match (entry.id.starts_with("qs:"), pinyin_path_hit) {
+                (true, true) => "已打开 · 拼音 · ",
+                (true, false) => "已打开 · ",
+                (false, true) => "拼音 · ",
+                (false, false) => "",
+            };
             let time_text = if is_path_row {
                 entry
                     .modified
@@ -5212,6 +5225,33 @@ fn split_at_chars(text: &str, count: usize) -> (String, String) {
     (head, tail)
 }
 
+/// 路径行是否属于「拼音命中」。
+///
+/// 条件(全部满足):
+/// - 查询非空;
+/// - **每个** token 都不被名字(小写)包含 —— 任一 token 字面命中就说明
+///   结果不是靠拼音进来的(token 级判断,多词查询「微信 资料」不会误标);
+/// - 至少一个 token 是纯 ASCII(中文 token 本身就不可能是拼音输入);
+/// - 名字含非 ASCII 字符(纯 ASCII 名字的拼音 key 只是名字小写,不存在
+///   「拼音命中」语义)。
+fn is_pinyin_path_hit(name: &str, query_text: &str) -> bool {
+    let name_lc = name.to_lowercase();
+    let mut any_token = false;
+    let mut any_ascii = false;
+    for token in query_text.split_whitespace() {
+        if token.is_empty() {
+            continue;
+        }
+        let token_lc = token.to_lowercase();
+        if name_lc.contains(&token_lc) {
+            return false;
+        }
+        any_token = true;
+        any_ascii |= token_lc.is_ascii();
+    }
+    any_token && any_ascii && !name.is_ascii()
+}
+
 /// 预览面板的「修改」行。None = mtime 未知(索引 0 且 FS 查询失败),
 /// 面板不显示该行;有值时走与结果列表同一套相对时间格式化。
 fn preview_modified_line(entry: &Entry) -> Option<String> {
@@ -5305,6 +5345,38 @@ mod path_layout_tests {
         assert_eq!(split_path_head(fake_measure, "abc", 0.0), 0);
         // 测出来恒为 0 时视为全部放得下，避免除零/死循环。
         assert_eq!(split_path_head(|_| 0.0, "abc", 5.0), 3);
+    }
+
+    /// 问题 2：文件结果靠拼音命中时副标题要标「拼音 · 」。
+    #[test]
+    fn pinyin_path_hit_marks_ascii_query_on_cjk_name() {
+        assert!(is_pinyin_path_hit("LstrAcc-微信资料", "weixin"));
+        assert!(is_pinyin_path_hit("LstrAcc-微信资料", "wxzl"));
+        // 多 token 都是 ASCII 且都不在名字里：仍是拼音命中。
+        assert!(is_pinyin_path_hit("LstrAcc-微信资料", "weixin ziliao"));
+    }
+
+    /// token 级判断：任一 token 直接出现在名字里就不算拼音命中，
+    /// 避免「微信 资料」「lstracc weixin」这类混合查询误标。
+    #[test]
+    fn pinyin_path_hit_rejects_literal_token_match() {
+        assert!(!is_pinyin_path_hit("LstrAcc-微信资料", "微信"));
+        assert!(!is_pinyin_path_hit("LstrAcc-微信资料", "微信 资料"));
+        assert!(!is_pinyin_path_hit("LstrAcc-微信资料", "lstracc weixin"));
+        // 大小写不敏感：字面命中同样拒绝。
+        assert!(!is_pinyin_path_hit("LstrAcc-微信资料", "LSTRACC"));
+    }
+
+    /// 拼音标注只对「非 ASCII 名字 + 纯 ASCII token」成立。
+    #[test]
+    fn pinyin_path_hit_requires_cjk_name_and_ascii_token() {
+        // 纯 ASCII 名字没有拼音语义。
+        assert!(!is_pinyin_path_hit("report.txt", "weixin"));
+        // 非 ASCII token 不是拼音输入。
+        assert!(!is_pinyin_path_hit("微信资料", "资料拼音"));
+        // 空查询不标。
+        assert!(!is_pinyin_path_hit("微信资料", ""));
+        assert!(!is_pinyin_path_hit("微信资料", "   "));
     }
 
     /// 预览面板的修改时间行:Entry.modified 有值(候选用索引 mtime 填充,

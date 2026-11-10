@@ -52,8 +52,10 @@ pub struct QuerySpec {
     pub kind: KindFilter,
     /// 小写扩展名(无点)。
     pub ext: Option<String>,
-    /// 小写路径前缀(如 `c:\users\x\desktop`);带盘符时引擎只在对应卷查询,
-    /// 深路径对收集结果做后置过滤(total 为近似值)。
+    /// 小写路径前缀(如 `c:\users\x\desktop`);带盘符时引擎只在对应卷查询。
+    /// 深路径对收集结果做后置过滤:目录自身不计入(只匹配其后代);
+    /// 小结果集(本卷 total 未超 cap)时 total 按过滤后实际条数修正,
+    /// 超出 cap 时为近似值。
     pub path_prefix: Option<String>,
     /// 类型组的扩展名集合(小写、无点)。
     pub group_exts: Vec<String>,
@@ -76,6 +78,26 @@ pub fn volume_bit(letter: char) -> u32 {
     } else {
         0
     }
+}
+
+/// 深路径前缀匹配。`path`/`prefix` 按调用约定均已小写。
+///
+/// - 目录自身(path == prefix)**不算**:`path:E:\dir` 只返回 dir 的后代,
+///   不把 dir 自己列出来;
+/// - prefix 末尾是分隔符时直接匹配其后所有内容(`e:\dir\`);
+/// - 否则要求 prefix 后紧跟 `\` 或 `/` —— 同前缀兄弟目录不能被误命中
+///   (`e:\dir2` 不匹配 `e:\dir`)。
+///
+/// 空 prefix 视为不限制(旧行为:所有路径 starts_with("") 都为真)。
+pub fn path_in_prefix(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    path.len() > prefix.len()
+        && path.starts_with(prefix)
+        && (prefix.ends_with('\\')
+            || prefix.ends_with('/')
+            || matches!(path.as_bytes()[prefix.len()], b'\\' | b'/'))
 }
 
 impl QuerySpec {
@@ -587,6 +609,29 @@ pub fn pinyin_match(initials: &[u8], full: &[u8], tokens: &[Vec<u8>]) -> bool {
 mod tests {
     use super::*;
     use crate::store::VolumeStore;
+
+    /// 深路径前缀:目录自身不算命中;同前缀兄弟目录不误命中;末尾分隔符
+    /// 与正/反斜杠后代都按预期。
+    #[test]
+    fn path_in_prefix_excludes_directory_itself_and_siblings() {
+        let prefix = r"e:\data\lstracc-文档";
+        // 目录自身:path == prefix → 不算
+        assert!(!path_in_prefix(prefix, prefix));
+        // 后代(反斜杠/正斜杠)命中
+        assert!(path_in_prefix(r"e:\data\lstracc-文档\a.txt", prefix));
+        assert!(path_in_prefix(r"e:\data\lstracc-文档/sub", prefix));
+        // 同前缀兄弟目录及其子项不得命中(前缀后必须紧跟分隔符)
+        assert!(!path_in_prefix(r"e:\data\lstracc-文档2", prefix));
+        assert!(!path_in_prefix(r"e:\data\lstracc-文档2\a.txt", prefix));
+        // prefix 自带末尾分隔符:直接匹配其后所有内容
+        let with_sep = r"e:\data\lstracc-文档\";
+        assert!(path_in_prefix(r"e:\data\lstracc-文档\a.txt", with_sep));
+        assert!(!path_in_prefix(r"e:\data\lstracc-文档2\a.txt", with_sep));
+        // 空 prefix 保持旧语义(不限制)
+        assert!(path_in_prefix(r"e:\anything", ""));
+        // 完全不同的路径
+        assert!(!path_in_prefix(r"e:\other\a.txt", prefix));
+    }
 
     #[test]
     fn query_is_cancelled_when_newer_generation_arrives() {

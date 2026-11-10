@@ -154,6 +154,11 @@ impl VolumeState {
 /// 线程回去服务查询,打字期间的单次等待从「一整轮」降到「一块」。
 const DEFAULT_APPLY_CHUNK: usize = 512;
 
+/// 每轮 maintain 每卷最多回填的 mtime 条数。USN 记录不带 mtime,增量条目
+/// 插入后为 0;`FindFirstFileW` 实测约 22µs/条,128 条 ≈ 3ms/轮,宿主空闲
+/// 循环间隔数百 ms,可接受且不会把查询线程堵住(查询路径本身不做 FS IO)。
+pub const MTIME_BACKFILL_PER_ROUND: usize = 128;
+
 /// 就绪卷两次**全量**快照的最小间隔(秒)。
 ///
 /// 依据(2026-11 实测):USN 稳态下就绪卷每 ~60s 全量保存一次,C 卷 117 万条
@@ -254,6 +259,9 @@ pub struct Engine {
     /// 剩余块由宿主稍后继续消化。宿主(search worker)注入,复用 0294602
     /// 「打字时查询优先于索引维护」的判定,把优先级检查扩展到 apply 中段。
     query_yield: Option<Box<dyn Fn() -> bool + Send>>,
+    /// mtime 回填探针:路径 → unix 秒(None = 文件已删/无权限)。None 时用
+    /// 生产实现 `win::find_meta`;测试注入假探针,避免依赖真实磁盘。
+    mtime_probe: Option<Box<dyn Fn(&str) -> Option<i64> + Send>>,
     /// 让路发生次数(诊断/基准断言:批间让路必须真的发生过)。
     apply_yields: u64,
     /// 正在进行的可中断全量保存(一次一个卷)。保存期间 store 冻结:
@@ -275,6 +283,7 @@ impl Engine {
             pending_applies: Vec::new(),
             apply_chunk_records: DEFAULT_APPLY_CHUNK,
             query_yield: None,
+            mtime_probe: None,
             apply_yields: 0,
             save_task: None,
             deferred_msgs: std::collections::VecDeque::new(),
@@ -872,6 +881,12 @@ impl Engine {
         self.query_yield = hook;
     }
 
+    /// 注入 mtime 回填探针(路径 → unix 秒;None = 已删/无权限,丢弃不重试)。
+    /// 生产不注入(None)时走 `win::find_meta`;测试注入假探针即可离线验证。
+    pub fn set_mtime_probe(&mut self, probe: Option<Box<dyn Fn(&str) -> Option<i64> + Send>>) {
+        self.mtime_probe = probe;
+    }
+
     /// 调整分批块大小(条);0 = 关闭分批(一次性 apply)。测试/基准用;
     /// 生产路径用默认值([`DEFAULT_APPLY_CHUNK`])。
     pub fn set_apply_chunk_records(&mut self, n: usize) {
@@ -1115,6 +1130,7 @@ impl Engine {
                 out.aborted = true;
                 break;
             }
+            let total_base = out.total;
             out.total += total;
             out.capped |= capped;
             // 命中一律带上索引 mtime(0=未知),候选排序零 FS。
@@ -1141,13 +1157,18 @@ impl Engine {
                     }
                 }
             }
-            // 深路径前缀后置过滤
+            // 深路径前缀后置过滤:目录自身不算命中(见 path_in_prefix)。
             if let Some(prefix) = &spec.path_prefix {
                 hits.retain(|h| {
                     self.path_of(h)
-                        .map(|p| p.to_lowercase().starts_with(prefix))
-                        .unwrap_or(false)
+                        .is_some_and(|p| crate::query::path_in_prefix(&p.to_lowercase(), prefix))
                 });
+            }
+            // 本卷过滤前 total 未超 cap → hit 已全部收集、未截断,过滤后
+            // 用实际保留数修正 total;超 cap 时 hits 被截断,保持近似值。
+            let vol_total = out.total - total_base;
+            if vol_total <= cap {
+                out.total = total_base + hits.len();
             }
             out.hits.append(&mut hits);
         }
@@ -1220,6 +1241,8 @@ impl Engine {
                 out.aborted = true;
                 break;
             }
+            let total_all_base = out.total_all;
+            let total_folders_base = out.total_folders;
             out.total_all += total_all;
             out.total_folders += total_folders;
             // 命中一律带上索引 mtime(0=未知),候选排序零 FS。
@@ -1286,23 +1309,25 @@ impl Engine {
                 out.aborted = true;
                 break;
             }
-            // 深路径前缀后置过滤(total 为近似值,与旧实现一致)
+            // 深路径前缀后置过滤:目录自身不算命中(见 path_in_prefix)。
             if let Some(prefix) = &spec.path_prefix {
-                all_hits.retain(|h| {
+                let in_prefix = |h: &Hit| {
                     self.path_of(h)
-                        .map(|p| p.to_lowercase().starts_with(prefix))
-                        .unwrap_or(false)
-                });
-                folder_hits.retain(|h| {
-                    self.path_of(h)
-                        .map(|p| p.to_lowercase().starts_with(prefix))
-                        .unwrap_or(false)
-                });
-                exact_hits.retain(|h| {
-                    self.path_of(h)
-                        .map(|p| p.to_lowercase().starts_with(prefix))
-                        .unwrap_or(false)
-                });
+                        .is_some_and(|p| crate::query::path_in_prefix(&p.to_lowercase(), prefix))
+                };
+                all_hits.retain(|h| in_prefix(h));
+                folder_hits.retain(|h| in_prefix(h));
+                exact_hits.retain(|h| in_prefix(h));
+            }
+            // total 精确化(与 Engine::query 同规则):本卷过滤前计数未超 cap
+            // 时 hit 已全部收集,用过滤后实际保留数修正;超 cap 保持近似。
+            let vol_total_all = out.total_all - total_all_base;
+            if vol_total_all <= cap {
+                out.total_all = total_all_base + all_hits.len();
+            }
+            let vol_total_folders = out.total_folders - total_folders_base;
+            if vol_total_folders <= cap {
+                out.total_folders = total_folders_base + folder_hits.len();
             }
             // 文件前缀 = All 前缀里的非文件夹项(旧 files 路在应用层用 kind_of
             // 丢文件夹;这里等价地按 attrs 目录位提前剔除,少了无用路径拼接)。
@@ -1386,6 +1411,86 @@ impl Engine {
         self.pinyin.get(hit.vol as usize)?.get(hit.slot)
     }
 
+    /// 取一条真实 mtime:测试注入的探针优先,生产回落 `win::find_meta`。
+    fn probe_mtime(&self, path: &str) -> Option<i64> {
+        match &self.mtime_probe {
+            Some(probe) => probe(path),
+            None => crate::win::find_meta(path).map(|(_, mtime, _)| mtime),
+        }
+    }
+
+    /// 限量回填 USN 增量条目的真实 mtime(查询路径不做 FS IO 的配套)。
+    ///
+    /// 每卷每轮最多 [`MTIME_BACKFILL_PER_ROUND`] 个 slot;`mtime != 0`
+    /// (已被其它记录/上一轮填过)直接丢弃。probe 返回 None(文件已删/无权限)
+    /// 也丢弃 —— 不再重试,避免对死路径每轮反复 stat。首扫/对账窗口跳过:
+    /// 首扫的 mtime 由目录枚举写入,store 尚未定型。
+    ///
+    /// 返回是否真的写入了 mtime。这是 maintain 的「有事可做」信号,不影响
+    /// 落盘语义(dirty 由这里置位,保存循环照常按节流处理)。
+    fn backfill_mtime(&mut self) -> bool {
+        let mut wrote = false;
+        for i in 0..self.volumes.len() {
+            if self.volumes[i].syncing {
+                continue;
+            }
+            let generation = self.volumes[i].generation;
+            let batch = {
+                let Some(store) = self.volumes[i].store.as_mut() else { continue };
+                if store.is_scanning() {
+                    continue; // 首扫 mtime 来自目录枚举,等 VolumeReady 后再看
+                }
+                store.take_mtime_pending(MTIME_BACKFILL_PER_ROUND)
+            };
+            if batch.is_empty() {
+                continue;
+            }
+            // 同一 slot 可能因多条 USN 记录重复登记:批内先去重,避免同一
+            // 路径重复 stat。批间重复由「mtime 已非 0」检查兜底。
+            let mut slots = batch;
+            slots.sort_unstable();
+            slots.dedup();
+            let mut found: Vec<(u32, i64)> = Vec::with_capacity(slots.len());
+            for slot in slots {
+                let Some(store) = self.volumes[i].store.as_ref() else { break };
+                if slot as usize >= store.len()
+                    || store.mtime[slot as usize] != 0
+                    || store.name(slot).is_empty()
+                {
+                    continue;
+                }
+                let hit = Hit { vol: i as u32, slot, generation, mtime: 0 };
+                // 父链断裂/祖先已删(path_of None):无法定位真实文件,丢弃。
+                let Some(path) = self.path_of(&hit) else { continue };
+                if let Some(mtime) = self.probe_mtime(&path) {
+                    if mtime > 0 {
+                        found.push((slot, mtime));
+                    }
+                }
+            }
+            if found.is_empty() {
+                continue;
+            }
+            let changed = {
+                let Some(store) = self.volumes[i].store.as_mut() else { continue };
+                let mut changed = false;
+                for (slot, mtime) in found {
+                    if (slot as usize) < store.len() && store.mtime[slot as usize] == 0 {
+                        store.mtime[slot as usize] =
+                            mtime.clamp(0, u32::MAX as i64) as u32;
+                        changed = true;
+                    }
+                }
+                changed
+            };
+            if changed {
+                self.volumes[i].dirty = true;
+                wrote = true;
+            }
+        }
+        wrote
+    }
+
     /// 空闲维护:需要的卷 compact + 落盘(旁车优先,全量降频)。
     /// 返回是否做了事(调用方可据此让路)。
     pub fn maintain(&mut self) -> bool {
@@ -1434,6 +1539,11 @@ impl Engine {
                 self.volumes[i].dirty = true;
                 did = true;
             }
+        }
+        // USN 增量条目的 mtime 回填:compact 已重建 pending,这里拿到的 slot
+        // 与当前 store 一致。限量(每卷 128/轮),避免长时间占住引擎线程。
+        if self.backfill_mtime() {
+            did = true;
         }
         let now = Instant::now();
         // 旁车写盘:几 KB 原子写(毫秒级),不与查询抢窗口;每卷独立节流。
@@ -1893,6 +2003,20 @@ mod tests {
         engine.handle(EngineMsg::VolumeReady { guid, journal_id: 7, next_usn: 100, count: 3 });
     }
 
+    /// 空卷的握手序列:直接进入 ready(scan_mode=false),随后到达的 Records
+    /// 走 USN 增量插入路径(mtime=0),正好覆盖待回填场景。
+    fn feed_ready_empty(engine: &mut Engine, guid: u128, letter: char) {
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter,
+            journal_id: 7,
+            next_usn: 100,
+            est_records: 0,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        engine.handle(EngineMsg::VolumeReady { guid, journal_id: 7, next_usn: 100, count: 0 });
+    }
+
     /// 任务 1 的引擎级对拍:一次 `query_split` ≡ 旧 folders/files 两次 query。
     /// 覆盖两卷、CJK 拼音候选、路径前缀、ext 过滤、单字符位图与 n-gram 路径。
     #[test]
@@ -1999,6 +2123,167 @@ mod tests {
         ] {
             check(&spec);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 问题 1 验收:USN Records 插入的条目 mtime=0,时间筛选一律不通过;
+    /// maintain 用可注入探针回填后(多卷各自),同一条目应立刻可被时间筛选命中。
+    #[test]
+    fn usn_mtime_backfill_enables_time_filter_on_all_volumes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const DIR: u32 = 0x0010;
+        const MTIME: i64 = 1_750_000_000;
+        let dir = temp_index_dir("mtime-backfill");
+        let (gc, ge) = (0x501u128, 0x502u128);
+        let mut engine = engine_with(&dir);
+        feed_ready_empty(&mut engine, gc, 'C');
+        feed_ready_empty(&mut engine, ge, 'E');
+        engine.handle(EngineMsg::Records {
+            guid: gc,
+            recs: vec![
+                rec(10, 0, DIR, "docs"),
+                rec(11, 10, 0, "alpha.txt"),
+                rec(12, 10, 0, "beta.txt"),
+            ],
+            next_usn: 200,
+        });
+        engine.handle(EngineMsg::Records {
+            guid: ge,
+            recs: vec![rec(20, 0, DIR, "notes"), rec(21, 20, 0, "gamma.txt")],
+            next_usn: 200,
+        });
+
+        // 回填前:mtime 全为 0 → 时间筛选命中不到(问题现场)。
+        let alpha = QuerySpec {
+            tokens: vec!["alpha".into()],
+            mtime_after: Some(MTIME - 1),
+            ..Default::default()
+        };
+        assert_eq!(engine.query(&alpha).total, 0, "mtime=0 不得通过时间筛选");
+        let gamma = QuerySpec {
+            tokens: vec!["gamma".into()],
+            mtime_after: Some(MTIME - 1),
+            ..Default::default()
+        };
+        assert_eq!(engine.query(&gamma).total, 0);
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        engine.set_mtime_probe(Some(Box::new(move |_path| {
+            probe_calls.fetch_add(1, Ordering::Relaxed);
+            Some(MTIME)
+        })));
+        assert!(engine.maintain(), "回填写入后 maintain 应报告做了事");
+        assert_eq!(calls.load(Ordering::Relaxed), 5, "两条卷的 5 个条目都应探测");
+
+        // 两个卷的 slot 都回填到索引 mtime。
+        for (vol, frn) in [(0usize, 11u64), (1usize, 21u64)] {
+            let store = engine.volumes[vol].store.as_ref().unwrap();
+            let slot = store.find_slot(frn).expect("entry");
+            assert_eq!(
+                store.mtime[slot as usize] as i64, MTIME,
+                "vol {vol} frn {frn} 的 mtime 应已回填"
+            );
+            assert!(store.mtime_pending.is_empty(), "回填后 pending 应清空");
+        }
+        assert_eq!(engine.query(&alpha).total, 1, "回填后时间筛选必须命中 C 卷");
+        assert_eq!(engine.query(&gamma).total, 1, "回填后时间筛选必须命中 E 卷");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 问题 1:probe 返回 None(文件已删/无权限)→ 丢弃该 slot,后续 maintain
+    /// 不得再次尝试(探针调用计数可断言)。
+    #[test]
+    fn missing_mtime_probe_is_dropped_without_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        let dir = temp_index_dir("mtime-missing");
+        let guid = 0x511u128;
+        let mut engine = engine_with(&dir);
+        feed_ready_empty(&mut engine, guid, 'C');
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(30, 0, 0, "gone.txt"), rec(31, 0, 0, "kept.txt")],
+            next_usn: 200,
+        });
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (probe_calls, probe_seen) = (calls.clone(), seen.clone());
+        engine.set_mtime_probe(Some(Box::new(move |path| {
+            probe_calls.fetch_add(1, Ordering::Relaxed);
+            probe_seen.lock().unwrap().push(path.to_string());
+            // 只让 gone.txt 探测失败;kept.txt 正常回填。
+            if path.ends_with("gone.txt") {
+                None
+            } else {
+                Some(1_750_000_000)
+            }
+        })));
+
+        assert!(engine.maintain());
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "两条各探测一次");
+        {
+            let store = engine.volumes[0].store.as_ref().unwrap();
+            let gone = store.find_slot(30).unwrap();
+            let kept = store.find_slot(31).unwrap();
+            assert_eq!(store.mtime[gone as usize], 0, "探测失败保持未知");
+            assert_eq!(store.mtime[kept as usize], 1_750_000_000);
+            assert!(store.mtime_pending.is_empty(), "失败条目也必须出队");
+        }
+        // 后续 maintain 不得重试 gone.txt(None 视为终态)。
+        engine.maintain();
+        engine.maintain();
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "失败条目只探测一次");
+        let gone_hits = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.ends_with("gone.txt"))
+            .count();
+        assert_eq!(gone_hits, 1, "gone.txt 只应被探测一次");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 问题 1:单轮每卷最多回填 [`MTIME_BACKFILL_PER_ROUND`] 条,避免一次
+    /// maintain 对大量 USN 条目做 FS 探测把查询线程堵住。
+    #[test]
+    fn mtime_backfill_is_rate_limited_per_round() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let dir = temp_index_dir("mtime-limit");
+        let guid = 0x521u128;
+        let mut engine = engine_with(&dir);
+        feed_ready_empty(&mut engine, guid, 'C');
+        let recs: Vec<Rec> = (0..300u64)
+            .map(|i| rec(1000 + i, crate::store::ROOT_FRN, 0, &format!("f{i:03}.txt")))
+            .collect();
+        engine.handle(EngineMsg::Records { guid, recs, next_usn: 200 });
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        engine.set_mtime_probe(Some(Box::new(move |_| {
+            probe_calls.fetch_add(1, Ordering::Relaxed);
+            Some(1_750_000_000)
+        })));
+
+        assert_eq!(MTIME_BACKFILL_PER_ROUND, 128);
+        engine.maintain();
+        assert_eq!(calls.load(Ordering::Relaxed), 128, "首轮只处理 128 条");
+        assert_eq!(
+            engine.volumes[0].store.as_ref().unwrap().mtime_pending.len(),
+            172,
+            "未处理条目保留到下一轮"
+        );
+        engine.maintain();
+        assert_eq!(calls.load(Ordering::Relaxed), 256);
+        assert_eq!(
+            engine.volumes[0].store.as_ref().unwrap().mtime_pending.len(),
+            44
+        );
+        engine.maintain();
+        assert_eq!(calls.load(Ordering::Relaxed), 300);
+        assert!(engine.volumes[0].store.as_ref().unwrap().mtime_pending.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2819,6 +3104,60 @@ mod tests {
         spec.vol_mask = Some(crate::query::volume_bit('C'));
         spec.path_prefix = Some("f:\\".into());
         assert_eq!(engine.query(&spec).total, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 问题 3 验收:path: 前缀不得把目录自身算进结果,同前缀兄弟目录
+    /// (`...-文档2`)也不能被 `path:...-文档` 命中;小结果集 total 必须
+    /// 按过滤后实际条数精确给出(query 与 split 双路)。
+    #[test]
+    fn path_prefix_excludes_self_and_sibling_and_fixes_total() {
+        const DIR: u32 = 0x0010;
+        let dir = temp_index_dir("path-prefix-self");
+        let guid = 0x601u128;
+        let mut engine = engine_with(&dir);
+        feed_ready_empty(&mut engine, guid, 'C');
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![
+                rec(10, 0, DIR, "LstrAcc-文档"),
+                rec(11, 10, 0, "a.txt"),
+                rec(12, 10, 0, "b.txt"),
+                rec(13, 10, 0, "c.txt"),
+                rec(14, 10, DIR, "sub"),
+                rec(20, 0, DIR, "LstrAcc-文档2"),
+                rec(21, 20, 0, "sibling.txt"),
+            ],
+            next_usn: 200,
+        });
+
+        // 前缀小写(生产 build_spec 已统一小写),路径比较时由引擎 lower。
+        let prefix = r"c:\lstracc-文档";
+        let spec = QuerySpec { path_prefix: Some(prefix.into()), ..Default::default() };
+        let out = engine.query(&spec);
+        let names: Vec<String> = out.hits.iter().map(|h| engine.entry_name(h)).collect();
+        assert_eq!(out.total, 4, "目录自身/兄弟目录不计入,total 必须精确");
+        assert_eq!(out.hits.len(), 4);
+        for expected in ["a.txt", "b.txt", "c.txt", "sub"] {
+            assert!(names.iter().any(|n| n == expected), "缺少 {expected}: {names:?}");
+        }
+        for unexpected in ["LstrAcc-文档", "LstrAcc-文档2", "sibling.txt"] {
+            assert!(!names.iter().any(|n| n == unexpected), "不应命中 {unexpected}: {names:?}");
+        }
+
+        // split 双路:total_all / total_folders 同规则精确化。
+        let split = engine.query_split(&spec);
+        assert_eq!(split.total_all, 4, "split total_all 必须精确");
+        assert_eq!(split.total_folders, 1, "只应统计前缀下的 sub 目录");
+        assert_eq!(split.file_hits.len(), 3);
+        assert_eq!(split.folder_hits.len(), 1);
+
+        // 前缀自带末尾分隔符时同样匹配其全部后代。
+        let with_sep = QuerySpec {
+            path_prefix: Some(format!(r"{prefix}\")),
+            ..Default::default()
+        };
+        assert_eq!(engine.query(&with_sep).total, 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

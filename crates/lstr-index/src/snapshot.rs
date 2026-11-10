@@ -1196,7 +1196,12 @@ mod tests {
         assert_eq!(ls.name(slot), b"alpha.txt");
         // v4:mtime 列落盘/读回(0=未知)。
         assert_eq!(ls.mtime[slot as usize], 1_700_000_123);
-        assert_eq!(ls.mtime[ls.find_slot(11).unwrap() as usize], 0);
+        let unknown = ls.find_slot(11).unwrap();
+        assert_eq!(ls.mtime[unknown as usize], 0);
+        // 加载(from_parts)必须按 mtime 列重建待回填队列,否则重启后
+        // USN 增量条目仍永久过不了时间筛选。
+        assert!(ls.mtime_pending.contains(&unknown), "mtime=0 条目应待回填");
+        assert!(!ls.mtime_pending.contains(&slot), "已知 mtime 不登记");
         assert_eq!(ls.char_mask.len(), ls.name_off.len());
         assert_eq!(ls.offs.len(), ls.name_off.len());
         // 有序性保持

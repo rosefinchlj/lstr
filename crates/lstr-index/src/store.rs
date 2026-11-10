@@ -337,6 +337,10 @@ pub struct VolumeStore {
     /// slot → 最后修改时间(unix 秒;0=未知)。目录枚举(首扫/watcher 刷新)写入,
     /// USN journal 路径没有时间信息(保持 0)。内置时间筛选依赖这一列。
     pub mtime: Vec<u32>,
+    /// mtime 仍为 0 的 slot 队列(USN 增量插入/恢复名时登记)。引擎空闲时
+    /// 限量探测真实 mtime 回填(见 `Engine::maintain`),查询路径不做 FS IO。
+    /// compact/快照加载后由 [`Self::rebuild_mtime_pending`] 重建。
+    pub mtime_pending: Vec<u32>,
     /// slot → 小写名里出现的 ASCII 字母位图(bit0=a .. bit25=z)。
     /// 单字符查询用它把 memmem 全量扫描降为按位快速筛(短串是打字延迟的主因)。
     pub char_mask: Vec<u32>,
@@ -410,6 +414,7 @@ impl VolumeStore {
             parent: Vec::new(),
             attrs: Vec::new(),
             mtime: Vec::new(),
+            mtime_pending: Vec::new(),
             char_mask: Vec::new(),
             base_len: 0,
             scan_mode: true,
@@ -459,6 +464,7 @@ impl VolumeStore {
             parent,
             attrs,
             mtime,
+            mtime_pending: Vec::new(),
             char_mask,
             base_len,
             scan_mode: false,
@@ -482,11 +488,43 @@ impl VolumeStore {
         // 加载即建倒排:快照格式不变(不持久化倒排),重建耗时有界(实测见
         // bench_wide_query_phase_profile),避免版本升级触发全量重扫。
         s.rebuild_ngram();
+        // 快照里的 mtime=0 条目(USN 增量写入的)同样需要回填:重建待探测
+        // 队列,否则重启后这些条目仍永久过不了时间筛选。
+        s.rebuild_mtime_pending();
         s
     }
 
     pub fn len(&self) -> usize {
         self.name_off.len()
+    }
+
+    /// 登记「mtime 未知」的 slot(USN 插入/恢复名)。查询路径不做 FS IO,
+    /// 真实 mtime 由引擎空闲维护回填。
+    #[inline]
+    fn note_mtime_pending(&mut self, slot: u32, mtime: u32, name: &[u8]) {
+        if mtime == 0 && !name.is_empty() {
+            self.mtime_pending.push(slot);
+        }
+    }
+
+    /// 按当前列重建待回填队列(O(n) 一次)。compact 重排 slot、快照加载
+    /// (from_parts)后必须调用:旧 slot 编号在重排后失效,只能按 mtime 列重扫。
+    /// 重复登记无害:引擎 drain 时会因 mtime 已非 0 而丢弃。
+    pub fn rebuild_mtime_pending(&mut self) {
+        let pending: Vec<u32> = (0..self.name_off.len() as u32)
+            .filter(|&slot| self.mtime[slot as usize] == 0 && !self.name(slot).is_empty())
+            .collect();
+        self.mtime_pending = pending;
+    }
+
+    /// 取走最多 `max` 个待回填 slot(从尾部切,避免大规模前缀 drain 的
+    /// memmove;处理顺序无关)。未取走的留在队列里,下一轮继续。
+    pub fn take_mtime_pending(&mut self, max: usize) -> Vec<u32> {
+        let n = max.min(self.mtime_pending.len());
+        if n == 0 {
+            return Vec::new();
+        }
+        self.mtime_pending.split_off(self.mtime_pending.len() - n)
     }
 
     /// compact 后已归并的 slot 数。快照按「base(FRN 序)+ delta(FRN 排序后归并)」
@@ -518,6 +556,7 @@ impl VolumeStore {
             + self.parent.len() * 4
             + self.attrs.len() * 2
             + self.mtime.len() * 4
+            + self.mtime_pending.len() * 4
             + self.char_mask.len() * 4
             + self.ngram_heap_bytes()
     }
@@ -864,6 +903,7 @@ impl VolumeStore {
                         | (attrs as u16 & !ATTR_INTERNAL)
                         | if parent_frn == ROOT_FRN { ATTR_ROOT_CHILD } else { 0 };
                     self.mtime[old as usize] = mtime;
+                    self.note_mtime_pending(old, mtime, name);
                     return false;
                 }
                 // 就地更新:slot 身份不变 —— 目录改名后子项的父指针仍然有效
@@ -891,6 +931,7 @@ impl VolumeStore {
                     | (attrs as u16 & !ATTR_INTERNAL)
                     | if parent_frn == ROOT_FRN { ATTR_ROOT_CHILD } else { 0 };
                 self.mtime[old as usize] = mtime;
+                self.note_mtime_pending(old, mtime, name);
                 if self.noise_enabled {
                     // 父/名变了,重新判噪(结果可能解除或加深)
                     self.attrs[old as usize] &= !ATTR_NOISE;
@@ -921,6 +962,7 @@ impl VolumeStore {
         }
         self.attrs.push(a);
         self.mtime.push(mtime);
+        self.note_mtime_pending(slot, mtime, name);
         self.char_mask.push(mask_of_bytes(name));
         self.delta.push(slot);
         // 倒排 overlay:索引构建后的新增槽不进倒排(重建留给 compact),
@@ -1232,6 +1274,8 @@ impl VolumeStore {
         //     (live 为空)同样结束,否则空卷会永远停留在 scanning。
         self.rebuild_ngram();
         self.scan_mode = false;
+        // slot 已整体重排,旧的待回填编号全部失效;按新列重建一次。
+        self.rebuild_mtime_pending();
     }
 }
 
@@ -1263,6 +1307,32 @@ mod tests {
         // 反复 compact 不应再有任何工作(旧实现在这里会永远重建)
         s.compact();
         assert!(!s.needs_compact());
+    }
+
+    /// mtime 待回填队列:插入(含 USN 的 mtime=0)登记;已知 mtime 不登记;
+    /// compact 重排 slot 后按 mtime 列重建,旧队列不得残留失效编号。
+    #[test]
+    fn mtime_pending_rebuilds_after_compact() {
+        let mut s = VolumeStore::new(false);
+        insert(&mut s, 100, 5, 0x10, "dir");
+        s.compact(); // ready:后续 insert 走增量更新/追加路径
+        s.insert_meta(101, 100, 0, b"unknown.txt", 0);
+        s.insert_meta(102, 100, 0, b"known.txt", 1_700_000_000);
+        assert_eq!(s.mtime_pending.len(), 2, "dir + unknown.txt");
+
+        // 后续 USN 记录带来真实 mtime:就地更新(不再登记新 pending),
+        // 旧 pending 项由引擎 drain 按 mtime != 0 丢弃。
+        s.insert_meta(101, 100, 0, b"unknown.txt", 1_700_000_001);
+        assert_eq!(s.mtime_pending.len(), 2);
+        s.compact();
+        assert_eq!(s.mtime_pending.len(), 1, "compact 重建后只剩 mtime=0 的 dir");
+        let slot = s.mtime_pending[0];
+        assert_eq!(s.mtime[slot as usize], 0);
+        assert_eq!(s.name(slot), b"dir");
+
+        // 新插入的未知 mtime 条目继续登记。
+        s.insert_meta(103, 100, 0, b"new.txt", 0);
+        assert_eq!(s.mtime_pending.len(), 2);
     }
 
     /// 空卷首扫完成:compact 后即使 live 为空也必须退出 scan 模式,且不建
