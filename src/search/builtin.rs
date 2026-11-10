@@ -54,6 +54,17 @@ impl BuiltinProvider {
             }
         }
     }
+
+    /// 单次 All-kind 查询的双路结果,panic 隔离与 query_spec 相同。
+    fn query_split_spec(&self, spec: &QuerySpec) -> lstr_index::SplitOutcome {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.engine.query_split(spec))) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                lstr_index::snapshot::debug_log("search: engine.query_split panicked, returning empty");
+                lstr_index::SplitOutcome::default()
+            }
+        }
+    }
 }
 
 impl BuiltinProvider {
@@ -88,8 +99,10 @@ impl BuiltinProvider {
         })
     }
 
-    /// 「全部」双路:kind 过滤在引擎侧完成,语义与 Everything 的
-    /// folder:/!folder: 一致。
+    /// 旧「全部」双路实现:folders/files 各跑一次全引擎。生产路径已改为
+    /// [`Self::search_split_once`];这里保留为对拍 oracle(见 tests 里的
+    /// `split_once_matches_two_pass_with_real_files`)。
+    #[cfg(test)]
     pub fn search_split(
         &self,
         query: &Query,
@@ -105,6 +118,63 @@ impl BuiltinProvider {
                 kind != Kind::Folder
             }
         })
+    }
+
+    /// 「全部」双路合并版:一次 All-kind 引擎查询拿到文件夹前缀、文件前缀与
+    /// 两个精确计数,再按各自预算产出 Entry。返回
+    /// `(folders, files, folder_total, all_total)`;旧 files 路总数 =
+    /// `all_total - folder_total`。结果与旧双路逐条一致(对拍测试锁死)。
+    pub fn search_split_once(
+        &self,
+        query: &Query,
+        filters: &SearchFilters,
+        folder_limit: usize,
+        file_limit: usize,
+    ) -> Result<(Vec<Entry>, Vec<Entry>, usize, usize), String> {
+        let mut spec = build_spec(query, filters);
+        spec.kind = KindFilter::All;
+        // 一次性分项剖析:引擎候选(eval)与收尾(path_of/find_meta/Entry)分开计时。
+        // 旧双路里 files 路 15.8ms vs folders 8.4ms 的根因就在这里 —— 引擎两部分
+        // 几乎相等,差的是 files 路要为 4 倍的候选逐条 FindFirstFileW。
+        let t_engine = std::time::Instant::now();
+        let outcome = self.query_split_spec(&spec);
+        let engine_ms = t_engine.elapsed().as_secs_f32() * 1000.0;
+        let mut folders = Vec::with_capacity(outcome.folder_hits.len().min(folder_limit));
+        let mut files = Vec::with_capacity(outcome.file_hits.len().min(file_limit));
+        let t_folders = std::time::Instant::now();
+        let folder_meta = self.fill_entries(
+            &outcome.folder_hits,
+            query,
+            folder_limit,
+            |kind| kind == Kind::Folder,
+            &mut folders,
+        );
+        let folder_fill_ms = t_folders.elapsed().as_secs_f32() * 1000.0;
+        let t_files = std::time::Instant::now();
+        let file_meta = self.fill_entries(
+            &outcome.file_hits,
+            query,
+            file_limit,
+            |kind| kind != Kind::Folder,
+            &mut files,
+        );
+        let file_fill_ms = t_files.elapsed().as_secs_f32() * 1000.0;
+        // 测试里不写 APPDATA 日志(只用 release 基准/真实部署观测)。
+        #[cfg(not(test))]
+        if engine_ms + folder_fill_ms + file_fill_ms > 15.0 {
+            lstr_index::snapshot::debug_log(&format!(
+                "search: split engine={engine_ms:.1}ms folder_fill={folder_fill_ms:.1}ms(folder_meta={folder_meta}) file_fill={file_fill_ms:.1}ms(file_meta={file_meta}) hits={}+{} text={:?}",
+                outcome.folder_hits.len(),
+                outcome.file_hits.len(),
+                query.text
+            ));
+        }
+        Ok((
+            folders,
+            files,
+            outcome.total_folders,
+            outcome.total_all,
+        ))
     }
 
     /// 完全同名:索引内 offs 二分,毫秒级(替代 wfn: 二次 IPC)。
@@ -155,18 +225,33 @@ impl BuiltinProvider {
         let mut spec = build_spec(query, filters);
         spec.kind = kind_filter;
         let outcome = self.query_spec(&spec);
-        let want_pinyin = query.text.is_ascii();
-
         let mut entries = Vec::with_capacity(outcome.hits.len().min(limit));
-        for hit in &outcome.hits {
+        let _ = self.fill_entries(&outcome.hits, query, limit, keep, &mut entries);
+        Ok((entries, outcome.total))
+    }
+
+    /// Hit → Entry 的统一收尾:limit 预算、名字/kind 过滤、路径拼接、懒填元数据、
+    /// 类型漂移校正。旧 `run` 与新的合并双路共用这一份逻辑,保证两条路径的
+    /// Entry 字段与顺序逐条一致。
+    /// 返回实际发起的 `FindFirstFileW` 次数(剖析用:files 路慢在元数据条数)。
+    fn fill_entries(
+        &self,
+        hits: &[lstr_index::Hit],
+        query: &Query,
+        limit: usize,
+        keep: impl Fn(Kind) -> bool,
+        entries: &mut Vec<Entry>,
+    ) -> usize {
+        let want_pinyin = query.text.is_ascii();
+        let mut meta_calls = 0usize;
+        for hit in hits {
             // H3:limit 契约 —— 调用方预算(40-120/60-500)必须生效,
             // 不能对最多 2000×卷 的全部候选逐条 find_meta 后才返回。
             if entries.len() >= limit {
                 break;
             }
-            let Some(path) = self.engine.path_of(hit) else {
-                continue;
-            };
+            // 先做零成本的名字/kind 过滤,再拼路径:旧实现先 path_of(沿父链
+            // 逐级分配 String),被 kind 丢弃的文件夹候选也白付了整条路径成本。
             let name = self.engine.entry_name(hit);
             if name.is_empty() {
                 continue;
@@ -176,7 +261,11 @@ impl BuiltinProvider {
             if !keep(kind) {
                 continue;
             }
+            let Some(path) = self.engine.path_of(hit) else {
+                continue;
+            };
             // 懒填元数据:FindFirstFileW(约 100 条 × ~20µs);不存在=USN 延迟,丢弃
+            meta_calls += 1;
             let Some((size, modified, fs_dir)) = idx_win::find_meta(&path) else {
                 continue;
             };
@@ -200,7 +289,7 @@ impl BuiltinProvider {
                 pinyin,
             });
         }
-        Ok((entries, outcome.total))
+        meta_calls
     }
 }
 
@@ -555,6 +644,214 @@ pub fn make_engine(cfg: &crate::config::IndexConfig) -> Engine {
 mod tests {
     use super::*;
     use crate::search::query::parse;
+    use lstr_index::{Op, Phase, Rec};
+
+    struct RealIndex {
+        provider: BuiltinProvider,
+        test_dir: std::path::PathBuf,
+        snap_dir: std::path::PathBuf,
+    }
+
+    /// 真实临时索引 fixture:从盘符到 cwd 的目录链 + 测试目录,全部作为引擎
+    /// 记录的父链,子项落到真实文件系统(files 个文件 / dirs 个目录 + 特殊项)。
+    /// 让 find_meta、kind_of、拼音、类型漂移都走生产路径。
+    fn real_index(files: usize, dirs: usize, tag: &str) -> Option<RealIndex> {
+        use std::path::Component;
+
+        let base = std::env::current_dir().expect("cwd");
+        let Some(Component::Prefix(prefix)) = base.components().next() else {
+            return None; // 非盘符路径(UNC)不做文件系统对拍
+        };
+        let prefix = prefix.as_os_str().to_string_lossy().to_string();
+        let letter = prefix.chars().next().filter(|c| c.is_ascii_alphabetic())?;
+        let rel: Vec<String> = base
+            .components()
+            .skip(1)
+            .filter_map(|c| match c {
+                Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        let tag = format!("lstr-prov-{tag}-{}", std::process::id());
+        let test_dir = base.join("target-opt").join(&tag);
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let mut names = Vec::new();
+        for i in 0..files {
+            let name = format!("ai_file_{i:04}.txt");
+            std::fs::write(test_dir.join(&name), b"x").unwrap();
+            names.push((name, false));
+        }
+        for i in 0..dirs {
+            let name = format!("ai_dir_{i:04}");
+            std::fs::create_dir_all(test_dir.join(&name)).unwrap();
+            names.push((name, true));
+        }
+        for name in ["ai_tool.exe", "报告_ai.txt", "AI_CAPS.TXT"] {
+            std::fs::write(test_dir.join(name), b"x").unwrap();
+            names.push((name.to_string(), false));
+        }
+        let missing = "ai_missing.txt"; // 索引有、磁盘无:两条路径都必须丢弃
+
+        let snap_dir =
+            std::env::temp_dir().join(format!("lstr-prov-snap-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&snap_dir);
+        let mut engine = Engine::new(EngineConfig {
+            index_dir: snap_dir.clone(),
+            exclude_noise: false,
+            candidate_cap: 2000,
+            volumes: Vec::new(),
+        });
+        let guid = 0x5151u128;
+        engine.handle(lstr_index::EngineMsg::VolumeMeta {
+            guid,
+            letter,
+            journal_id: 7,
+            next_usn: 100,
+            est_records: 0,
+        });
+        engine.handle(lstr_index::EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        let mut recs = Vec::new();
+        let mut parent = 0u64;
+        let mut chain: Vec<String> = rel.clone();
+        chain.push("target-opt".to_string());
+        for (j, name) in chain.iter().enumerate() {
+            let frn = 100 + j as u64;
+            recs.push(Rec {
+                frn,
+                parent_frn: parent,
+                attrs: 0x10,
+                op: Op::Upsert,
+                name: name.clone(),
+                mtime: 0,
+            });
+            parent = frn;
+        }
+        let test_dir_frn = 100 + rel.len() as u64 + 1;
+        recs.push(Rec {
+            frn: test_dir_frn,
+            parent_frn: parent,
+            attrs: 0x10,
+            op: Op::Upsert,
+            name: tag.clone(),
+            mtime: 0,
+        });
+        for (i, (name, is_dir)) in names.iter().enumerate() {
+            recs.push(Rec {
+                frn: 1000 + i as u64,
+                parent_frn: test_dir_frn,
+                attrs: if *is_dir { 0x10 } else { 0 },
+                op: Op::Upsert,
+                name: name.clone(),
+                mtime: 0,
+            });
+        }
+        recs.push(Rec {
+            frn: 2000,
+            parent_frn: test_dir_frn,
+            attrs: 0,
+            op: Op::Upsert,
+            name: missing.to_string(),
+            mtime: 0,
+        });
+        let count = recs.len() as u32;
+        engine.handle(lstr_index::EngineMsg::Records { guid, recs, next_usn: 100 });
+        engine.handle(lstr_index::EngineMsg::VolumeReady {
+            guid,
+            journal_id: 7,
+            next_usn: 100,
+            count,
+        });
+        assert_eq!(engine.status().phase, Phase::Ready);
+        Some(RealIndex {
+            provider: BuiltinProvider::new(engine),
+            test_dir,
+            snap_dir,
+        })
+    }
+
+    impl Drop for RealIndex {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.test_dir);
+            let _ = std::fs::remove_dir_all(&self.snap_dir);
+        }
+    }
+
+    /// 任务 1 的端到端对拍:同一份真实临时索引上,合并后的 `search_split_once`
+    /// 与旧双路 `search_split ×2` 的 Entry 顺序/字段/total 完全一致。
+    #[test]
+    fn split_once_matches_two_pass_with_real_files() {
+        let Some(fx) = real_index(120, 60, "parity") else { return };
+        for (text, folder_limit, file_limit) in [
+            ("ai", 80usize, 320usize),
+            ("a", 80, 320),
+            ("ai ext:txt", 80, 320),
+        ] {
+            let query = parse(text, Scope::All);
+            let filters = SearchFilters::default();
+            let legacy_folders = fx.provider.search_split(&query, &filters, folder_limit, true).unwrap();
+            let legacy_files = fx.provider.search_split(&query, &filters, file_limit, false).unwrap();
+            let (folders, files, folder_total, all_total) = fx
+                .provider
+                .search_split_once(&query, &filters, folder_limit, file_limit)
+                .unwrap();
+            assert_eq!(folders, legacy_folders.0, "folders 顺序/字段不一致: {text}");
+            assert_eq!(files, legacy_files.0, "files 顺序/字段不一致: {text}");
+            assert_eq!(folder_total, legacy_folders.1, "folder_total 不一致: {text}");
+            assert_eq!(all_total, legacy_files.1, "all_total 不一致: {text}");
+        }
+    }
+
+    /// 任务 2 基准(手动运行):真实文件系统上旧双路 vs 合并单次的耗时,
+    /// 以及引擎评估/Entry 收尾(路径拼接 + FindFirstFileW)的分项。
+    /// `cargo test -p lstr --release bench_split_phase_profile -- --nocapture`
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release 基准:真实文件系统元数据")]
+    fn bench_split_phase_profile() {
+        let Some(fx) = real_index(400, 100, "bench") else { return };
+        let query = parse("ai", Scope::All);
+        let filters = SearchFilters::default();
+        let samples = |mut f: Box<dyn FnMut() + '_>, warm: usize, iters: usize| {
+            let mut out = Vec::new();
+            for i in 0..(warm + iters) {
+                let t = std::time::Instant::now();
+                f();
+                if i >= warm {
+                    out.push(t.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            out.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (out[iters / 2], out[iters - 1])
+        };
+        let (old_fold_p50, _) = samples(
+            Box::new(|| {
+                fx.provider.search_split(&query, &filters, 80, true).unwrap();
+            }),
+            1,
+            5,
+        );
+        let (old_file_p50, _) = samples(
+            Box::new(|| {
+                fx.provider.search_split(&query, &filters, 320, false).unwrap();
+            }),
+            1,
+            5,
+        );
+        let (new_p50, new_max) = samples(
+            Box::new(|| {
+                fx.provider.search_split_once(&query, &filters, 80, 320).unwrap();
+            }),
+            1,
+            7,
+        );
+        let mut spec = build_spec(&query, &filters);
+        spec.kind = KindFilter::All;
+        let (engine_p50, _) = samples(Box::new(|| { fx.provider.engine.query_split(&spec); }), 2, 7);
+        println!(
+            "[bench-split] real files(500): 旧 folders={old_fold_p50:.2}ms + files={old_file_p50:.2}ms = {:.2}ms | 新 once p50={new_p50:.2}ms max={new_max:.2}ms | 其中引擎 query_split={engine_p50:.2}ms",
+            old_fold_p50 + old_file_p50
+        );
+    }
 
     #[test]
     fn ext_filter_is_normalized_for_index() {

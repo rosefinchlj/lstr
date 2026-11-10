@@ -983,10 +983,10 @@ fn run_worker(
         let mut entries = Vec::new();
         let mut total = 0usize;
         let mut error = None;
-        // 分项耗时（诊断「引擎 35ms 花在哪」）：folders/files/exact 各一次全引擎查询，
-        // apps 应用索引，finalize 合并打分排序。>15ms 的慢查询落 engine.log。
-        let mut diag_split_folders = 0f32;
-        let mut diag_split_files = 0f32;
+        // 分项耗时（诊断「引擎 35ms 花在哪」）：split=一次 All-kind 双路查询
+        // （旧实现 folders/files 各一次）、exact 补齐、apps 应用索引，
+        // finalize 合并打分排序。>15ms 的慢查询落 engine.log。
+        let mut diag_split = 0f32;
         let mut diag_apps = 0f32;
         let mut diag_exact = 0f32;
         // 自定义关键字行（g rust → 用 Google 搜索）：之后钉在结果顶部，不参与打分。
@@ -1058,38 +1058,31 @@ fn run_worker(
                             // H4:内置双路都用同一 spec 时,旧实现把同一个 All-kind
                             // 总数加了两次(total=2N),且 truncation 恒 >0 → 每次
                             // All 查询都走“先发一版 + exact 补”两阶段。
-                            // 现 folders 路按 KindFilter::Folders 统计,files 路按
-                            // All 统计后扣掉文件夹数,两路 total 同口径且不重复。
-                            let mut folder_total = 0usize;
-                            let mut file_total = 0usize;
-                            let t_folders = Instant::now();
-                            let r_folders =
-                                b.search_split(&request.query, &request.filters, folder_fetch, true);
-                            diag_split_folders = t_folders.elapsed().as_secs_f32() * 1000.0;
-                            match r_folders
-                            {
-                                Ok((mut folders, count)) => {
-                                    folder_total = count;
-                                    truncation += count.saturating_sub(folders.len());
+                            // 合并前:folders 路按 KindFilter::Folders 统计,files 路
+                            // 按 All 统计后扣掉文件夹数。现在一次 split 查询同时返回
+                            // total_folders 与 total_all,口径与旧实现逐字节一致;
+                            // 候选遍历从两遍降为一遍。
+                            let t_split = Instant::now();
+                            let r_split = b.search_split_once(
+                                &request.query,
+                                &request.filters,
+                                folder_fetch,
+                                file_fetch,
+                            );
+                            diag_split = t_split.elapsed().as_secs_f32() * 1000.0;
+                            match r_split {
+                                Ok((mut folders, mut files, folder_total, all_total)) => {
+                                    truncation += folder_total.saturating_sub(folders.len());
+                                    let file_total = all_total.saturating_sub(folder_total);
+                                    truncation += file_total.saturating_sub(files.len());
+                                    total += folder_total + file_total;
+                                    // 旧实现先 folders 后 files,保持同一 Entry 顺序。
                                     entries.append(&mut folders);
+                                    entries.append(&mut files);
+                                    needs_exact = truncation > 0;
                                 }
                                 Err(err) => error = Some(err),
                             }
-                            let t_files = Instant::now();
-                            let r_files =
-                                b.search_split(&request.query, &request.filters, file_fetch, false);
-                            diag_split_files = t_files.elapsed().as_secs_f32() * 1000.0;
-                            match r_files
-                            {
-                                Ok((mut files, count_all)) => {
-                                    file_total = count_all.saturating_sub(folder_total);
-                                    truncation += file_total.saturating_sub(files.len());
-                                    entries.append(&mut files);
-                                }
-                                Err(err) => error = error.or(Some(err)),
-                            }
-                            total += folder_total + file_total;
-                            needs_exact = truncation > 0;
                         }
                     } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
                         match provider.search_split(
@@ -1310,10 +1303,9 @@ fn run_worker(
         let diag_total = started.elapsed().as_secs_f32() * 1000.0;
         if diag_total > 15.0 && !request.query.text.is_empty() {
             lstr_index::snapshot::debug_log(&format!(
-                "search: stage gen={} folders={:.1}ms files={:.1}ms apps={:.1}ms exact={:.1}ms finalize={:.1}ms total={:.1}ms text={:?}",
+                "search: stage gen={} split={:.1}ms apps={:.1}ms exact={:.1}ms finalize={:.1}ms total={:.1}ms text={:?}",
                 request.generation,
-                diag_split_folders,
-                diag_split_files,
+                diag_split,
                 diag_apps,
                 diag_exact,
                 diag_finalize,
