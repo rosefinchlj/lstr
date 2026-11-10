@@ -14,7 +14,7 @@ use crate::history::History;
 use lstr_index::{ClientCommand, EngineMsg};
 use crate::model::{Entry, Kind, Query, Scope};
 use crate::search::filters::SearchFilters;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -707,13 +707,94 @@ mod pin_tests {
     }
 }
 
+/// 「候选阶段零 FS」的标记:内置索引产出的 Entry 只带索引内信息
+/// (size/modified 留空),真实 size/mtime 与类型漂移校正延迟到 finalize
+/// 的展示阶段,只对最终候选逐条 `find_meta`。
+///
+/// key = 条目 id 的小写形式(Windows 路径大小写不敏感);
+/// value = 是否需要类型漂移校正(split/单 scope 候选为 true,
+/// 精确同名补齐为 false —— 旧 `search_exact` 也不校正)。
+#[derive(Default)]
+pub(crate) struct PendingMeta {
+    /// 同一 id 可能既是 split 候选(true)又是 exact 副本(false):按标记顺序
+    /// 保存每次出现的语义,finalize 按 rank 后的条目出现顺序消费。
+    map: HashMap<String, Vec<bool>>,
+}
+
+impl PendingMeta {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// 标记一批来自内置索引的候选。顺序必须与条目进入 finalize 的顺序一致:
+    /// split/单 scope 的候选先标记(true),exact 补齐后标记(false)。
+    pub(crate) fn mark(&mut self, entries: &[Entry], correct_kind: bool) {
+        for entry in entries {
+            self.map
+                .entry(entry.id.to_lowercase())
+                .or_default()
+                .push(correct_kind);
+        }
+    }
+
+    fn modes(&self, id_lower: &str) -> Option<&[bool]> {
+        self.map.get(id_lower).map(Vec::as_slice)
+    }
+}
+
+/// 单条最终候选的元数据填充 + 漂移校正;None = 旧路径同样会丢弃。
+/// `correct_kind=false` 用于精确同名补齐(旧 `search_exact` 不校正类型),
+/// 只填 size/mtime。
+fn fill_one_meta(entry: Entry, correct_kind: bool) -> Option<Entry> {
+    let Some(path) = entry.path.as_ref() else {
+        return Some(entry);
+    };
+    let path_str = path.to_string_lossy();
+    let Some((size, modified, fs_dir)) = lstr_index::win::find_meta(&path_str) else {
+        return None;
+    };
+    // 候选阶段按索引 attrs 定的 kind:Folder ⇔ 索引说 is_dir。
+    let index_is_dir = entry.kind == Kind::Folder;
+    if correct_kind && fs_dir != index_is_dir {
+        // 旧路径在候选阶段发现漂移后会按 FS kind 重新过 keep:
+        // folder↔file 的漂移必然跨出当前 scope/双路分组,最终被丢弃。
+        return None;
+    }
+    let mut entry = entry;
+    entry.size = (!fs_dir && size > 0).then_some(size);
+    entry.modified = (modified > 0).then_some(modified);
+    Some(entry)
+}
+
 fn finalize_entries(
-    mut entries: Vec<Entry>,
+    entries: Vec<Entry>,
     request: &Request,
     history: &Arc<Mutex<History>>,
     config: &Config,
     keyword_rows: Vec<Entry>,
 ) -> Vec<Entry> {
+    finalize_entries_with_pending(entries, request, history, config, keyword_rows, None).0
+}
+
+/// finalize 的惰性元数据版:rank 之后、去重/截断之前,只对「会进入最终列表」
+/// 的候选逐条 `find_meta`(普通条目直到攒够 deliver 个有效候选,精确同名每种
+/// kind 最多 6 条),并立即丢弃磁盘已删/无权限/类型漂移的条目。
+///
+/// 必须在去重之前丢弃:否则已删条目会占掉 id/同名去重名额,把后面仍然有效
+/// 的同名候选挤掉(旧路径在候选阶段就丢,不会出现这个问题)。
+/// 返回 `(entries, meta_ms)`,meta_ms 供 worker 的 stage 日志分项。
+fn finalize_entries_with_pending(
+    mut entries: Vec<Entry>,
+    request: &Request,
+    history: &Arc<Mutex<History>>,
+    config: &Config,
+    keyword_rows: Vec<Entry>,
+    pending: Option<&PendingMeta>,
+) -> (Vec<Entry>, f64) {
     // 分项计时:唯一慢查询日志的补充,>3ms 时落 engine.log 定位 rank/去重/
     // 置顶哪一段退化(优化前真实机器 7.3ms 几乎全在 rank 的逐候选 SQL/规则
     // 归一化上)。计时本身 5 次 Instant::now ≈ 0.1µs。
@@ -730,33 +811,94 @@ fn finalize_entries(
     }
     let t_rank = t_mark.elapsed().as_secs_f64() * 1000.0;
     t_mark = Instant::now();
-
-    // 去重：retain 闭包持有 seen 集合，一遍完成（旧实现先算 Vec<bool> 掩码
-    // 再 retain，两遍且多一次分配；结果完全相同：保留首次出现的条目）。
-    // Windows 路径/ID 大小写不敏感，内置索引与 Everything 对同一个路径给的
-    // 大小写可能不同，所以 id 先归一化成小写再比较，否则同一条目出现两行。
-    let mut seen_ids: HashSet<String> = HashSet::with_capacity(entries.len());
-    entries.retain(|entry| seen_ids.insert(entry.id.to_lowercase()));
-    let t_ids = t_mark.elapsed().as_secs_f64() * 1000.0;
-    t_mark = Instant::now();
-    // 同名条目（不同路径下的 clip 文件夹、debug/release 同名 exe）只保留排名最高的一个。
-    // 例外：精确同名（用户就是打的名字，如 use → E:\use）保留前 6 个，
-    // 多个同名目录是正常需求，全砍掉会让 E:\use 被系统深处同名目录挤掉。
     let needle_lower = request.query.text.to_lowercase();
-    let mut seen_names = HashSet::with_capacity(entries.len());
-    let mut exact_counts: std::collections::HashMap<(Kind, String), usize> =
-        std::collections::HashMap::new();
-    entries.retain(|entry| {
-        let key = (entry.kind, entry.name.to_lowercase());
-        if !needle_lower.is_empty() && key.1 == needle_lower {
-            let count = exact_counts.entry(key).or_insert(0);
-            *count += 1;
-            *count <= 6
-        } else {
-            seen_names.insert(key)
+    let deliver = request.limit.max(100);
+    let mut meta_ms = 0.0;
+    let (t_ids, t_names);
+    if let Some(pending) = pending {
+        // 惰性路径:rank 已排好序,边填充边按旧规则去重。无效条目在
+        // seen_* 记账之前就被丢弃,不占名额;后续同名/同 id 候选可正常补位。
+        let t_meta = Instant::now();
+        let mut seen_ids = HashSet::with_capacity(entries.len());
+        let mut seen_names = HashSet::with_capacity(entries.len());
+        let mut exact_counts: HashMap<(Kind, String), usize> = HashMap::with_capacity(8);
+        let mut kept = Vec::with_capacity(deliver.saturating_add(8));
+        let mut non_exact = 0usize;
+        // 同一 id 的 split/exact 副本按出现顺序消费 PendingMeta 里的语义。
+        let mut pending_uses: HashMap<String, usize> = HashMap::new();
+        for entry in entries {
+            let name_lower = entry.name.to_lowercase();
+            let is_exact = !needle_lower.is_empty() && name_lower == needle_lower;
+            let id_lower = entry.id.to_lowercase();
+            let mode = pending.modes(&id_lower).and_then(|modes| {
+                let used = pending_uses.entry(id_lower.clone()).or_insert(0);
+                let mode = modes.get(*used).copied();
+                *used += 1;
+                mode
+            });
+            // 普通条目只需要前 deliver 个有效候选;精确同名要扫到每种
+            // (kind,name) 的 6 条上限,因为它们会被 pin 到最前面。
+            if !is_exact && non_exact >= deliver {
+                continue;
+            }
+            if seen_ids.contains(&id_lower) {
+                continue;
+            }
+            let name_key = (entry.kind, name_lower);
+            if is_exact {
+                if exact_counts.get(&name_key).copied().unwrap_or(0) >= 6 {
+                    continue;
+                }
+            } else if seen_names.contains(&name_key) {
+                continue;
+            }
+            let filled = match mode {
+                Some(correct_kind) => fill_one_meta(entry, correct_kind),
+                None => Some(entry),
+            };
+            let Some(entry) = filled else { continue };
+            seen_ids.insert(id_lower);
+            if is_exact {
+                *exact_counts.entry(name_key).or_insert(0) += 1;
+            } else {
+                seen_names.insert(name_key);
+                non_exact += 1;
+            }
+            kept.push(entry);
         }
-    });
-    let t_names = t_mark.elapsed().as_secs_f64() * 1000.0;
+        entries = kept;
+        meta_ms = t_meta.elapsed().as_secs_f64() * 1000.0;
+        t_ids = 0.0;
+        t_names = 0.0;
+    } else {
+        // 无内置候选:保持旧行为,对全部候选去重(不再有 FS 调用,也没有
+        // 需要丢弃的无效条目)。
+        // 去重：retain 闭包持有 seen 集合，一遍完成（旧实现先算 Vec<bool> 掩码
+        // 再 retain，两遍且多一次分配；结果完全相同：保留首次出现的条目）。
+        // Windows 路径/ID 大小写不敏感，内置索引与 Everything 对同一个路径给的
+        // 大小写可能不同，所以 id 先归一化成小写再比较，否则同一条目出现两行。
+        let mut seen_ids: HashSet<String> = HashSet::with_capacity(entries.len());
+        entries.retain(|entry| seen_ids.insert(entry.id.to_lowercase()));
+        t_ids = t_mark.elapsed().as_secs_f64() * 1000.0;
+        t_mark = Instant::now();
+        // 同名条目（不同路径下的 clip 文件夹、debug/release 同名 exe）只保留排名最高的一个。
+        // 例外：精确同名（用户就是打的名字，如 use → E:\use）保留前 6 个，
+        // 多个同名目录是正常需求，全砍掉会让 E:\use 被系统深处同名目录挤掉。
+        let mut seen_names = HashSet::with_capacity(entries.len());
+        let mut exact_counts: std::collections::HashMap<(Kind, String), usize> =
+            std::collections::HashMap::new();
+        entries.retain(|entry| {
+            let key = (entry.kind, entry.name.to_lowercase());
+            if !needle_lower.is_empty() && key.1 == needle_lower {
+                let count = exact_counts.entry(key).or_insert(0);
+                *count += 1;
+                *count <= 6
+            } else {
+                seen_names.insert(key)
+            }
+        });
+        t_names = t_mark.elapsed().as_secs_f64() * 1000.0;
+    }
     t_mark = Instant::now();
     // 名称完全一致的结果硬置顶：档位权重可能被用户调整，或被历史/位置加权翻过。
     pin_exact_name_matches(&mut entries, &needle_lower);
@@ -764,7 +906,6 @@ fn finalize_entries(
     t_mark = Instant::now();
     // 列表可滚动：多送一些候选（最多 100 条），UI 只按窗口高度展示前几条，
     // 滚轮可以继续往下看——不再一屏截断。
-    let deliver = request.limit.max(100);
     entries.truncate(deliver);
 
     // 关键字行钉在顶部：它们的名字（「用 Google 搜索：rust」）不含查询词，
@@ -805,18 +946,18 @@ fn finalize_entries(
             entries = pinned;
         }
     }
-    let rest_ms = t_mark.elapsed().as_secs_f64() * 1000.0;
+    let tail_ms = t_mark.elapsed().as_secs_f64() * 1000.0;
     let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
     // 测试不写 APPDATA 日志;生产上 finalize >3ms 时落一条分项,便于现场定位。
     #[cfg(not(test))]
     if total_ms > 3.0 || profile_queries() {
         lstr_index::snapshot::debug_log(&format!(
-            "search: finalize {total_ms:.1}ms rank={t_rank:.1}ms ids={t_ids:.1}ms names={t_names:.1}ms pin={t_pin:.1}ms rest={rest_ms:.1}ms entries={}",
+            "search: finalize {total_ms:.1}ms rank={t_rank:.1}ms meta={meta_ms:.1}ms ids={t_ids:.1}ms names={t_names:.1}ms pin={t_pin:.1}ms tail={tail_ms:.1}ms entries={}",
             entries.len()
         ));
     }
-    let _ = (t_rank, t_ids, t_names, t_pin, rest_ms, total_ms);
-    entries
+    let _ = (t_rank, t_ids, t_names, t_pin, tail_ms, total_ms);
+    (entries, meta_ms)
 }
 
 /// 内置索引能否自带时间筛选:目录枚举(dir 首扫)会把 mtime 写进快照;
@@ -1170,6 +1311,9 @@ fn run_worker(
         let mut diag_exact = 0f32;
         // 自定义关键字行（g rust → 用 Google 搜索）：之后钉在结果顶部，不参与打分。
         let mut keyword_rows: Vec<Entry> = Vec::new();
+        // 内置索引候选的「元数据未填」标记:finalize 内只对最终展示条目
+        // 逐条 find_meta(见 finalize_entries_with_pending),候选阶段零 FS。
+        let mut pending_meta = PendingMeta::new();
 
         if request.query.is_empty() {
             if request.show_history {
@@ -1266,8 +1410,16 @@ fn run_worker(
                                     truncation += file_total.saturating_sub(result.files.len());
                                     total += result.folder_total + file_total;
                                     // 旧实现先 folders 后 files,保持同一 Entry 顺序。
+                                    // 候选只带索引信息:标记后由 finalize 后的
+                                    // finalize 内统一填 FS 元数据。
+                                    pending_meta.mark(&result.folders, true);
+                                    pending_meta.mark(&result.files, true);
                                     entries.append(&mut result.folders);
                                     entries.append(&mut result.files);
+                                    if !result.exact.is_empty() {
+                                        // 精确同名补齐不做类型漂移校正(旧路径也不做)。
+                                        pending_meta.mark(&result.exact, false);
+                                    }
                                     split_exact = Some(result.exact);
                                     needs_exact = truncation > 0;
                                 }
@@ -1375,6 +1527,7 @@ fn run_worker(
                                         b.search_exact(&request.query, &request.filters, 50);
                                     diag_exact = t_exact.elapsed().as_secs_f32() * 1000.0;
                                     if let Ok((mut exact, _)) = r_exact {
+                                        pending_meta.mark(&exact, false);
                                         entries.append(&mut exact);
                                     }
                                 }
@@ -1411,6 +1564,7 @@ fn run_worker(
                                 Ok((mut files, count)) => {
                                     total = count;
                                     needs_exact = count > files.len();
+                                    pending_meta.mark(&files, true);
                                     entries.append(&mut files);
                                 }
                                 Err(err) => error = Some(err),
@@ -1475,6 +1629,7 @@ fn run_worker(
                                 if let Ok((mut exact, _)) =
                                     b.search_exact(&request.query, &request.filters, 50)
                                 {
+                                    pending_meta.mark(&exact, false);
                                     entries.append(&mut exact);
                                 }
                             } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
@@ -1498,17 +1653,29 @@ fn run_worker(
         }
 
         let t_finalize = Instant::now();
-        let entries = finalize_entries(entries, &request, &history, &config, keyword_rows);
-        let diag_finalize = t_finalize.elapsed().as_secs_f32() * 1000.0;
+        // 惰性元数据:finalize 内部在 rank 之后、去重/截断之前只对最终候选
+        // 逐条 find_meta(候选阶段零 FS);meta 耗时从 finalize 里单独拆出。
+        let (entries, meta_ms) = finalize_entries_with_pending(
+            entries,
+            &request,
+            &history,
+            &config,
+            keyword_rows,
+            (!pending_meta.is_empty()).then_some(&pending_meta),
+        );
+        let diag_meta = meta_ms as f32;
+        let diag_finalize =
+            (t_finalize.elapsed().as_secs_f32() * 1000.0 - diag_meta).max(0.0);
         let diag_total = started.elapsed().as_secs_f32() * 1000.0;
         if (diag_total > 15.0 || profile_queries()) && !request.query.text.is_empty() {
             lstr_index::snapshot::debug_log(&format!(
-                "search: stage gen={} split={:.1}ms apps={:.1}ms exact={:.1}ms finalize={:.1}ms total={:.1}ms text={:?}",
+                "search: stage gen={} split={:.1}ms apps={:.1}ms exact={:.1}ms finalize={:.1}ms meta={:.1}ms total={:.1}ms text={:?}",
                 request.generation,
                 diag_split,
                 diag_apps,
                 diag_exact,
                 diag_finalize,
+                diag_meta,
                 diag_total,
                 request.query.text
             ));
