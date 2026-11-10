@@ -181,6 +181,21 @@ impl VolumeStore {
         self.name_off.len()
     }
 
+    /// 各列堆字节数(诊断/内存预算断言用)。不含未收缩的 Vec 容量余量。
+    pub fn heap_bytes(&self) -> usize {
+        let v = |x: &Vec<u8>| x.len();
+        v(&self.names)
+            + v(&self.names_lc)
+            + self.name_off.len() * 4
+            + self.off_index.len() * 8
+            + self.offs.len() * 4
+            + self.frn.len() * 8
+            + self.parent.len() * 4
+            + self.attrs.len() * 2
+            + self.mtime.len() * 4
+            + self.char_mask.len() * 4
+    }
+
     pub fn is_empty(&self) -> bool {
         self.name_off.is_empty()
     }

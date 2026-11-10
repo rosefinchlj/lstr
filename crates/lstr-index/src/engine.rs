@@ -3081,4 +3081,157 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---------- 基准:宽查询分项剖析("ai" 类,250 万条) ----------
+    //
+    // 真实机器(C 卷 117 万条)上 "ai" 引擎执行 ~56ms、命中 17630。这里用
+    // 250 万条合成记录拆分项,决定 bigram/trigram 优化砍哪几块:
+    //   ① memmem 纯扫描(find_iter 只计数,不解析 slot)
+    //   ② 命中→slot 解析(slot_at_offset 二分,无过滤)
+    //   ③ 完整 query_volume_cancel(= ①+②+过滤+收集,引擎单卷主体)
+    //   ④ 拼音匹配(PinyinCache::search,含引擎侧去重量级)
+    //   ⑤ 附:3 字符中频 / 窄 token / 空 token 的完整路径(验收对照基线)
+    // 名字分布对齐真实卷:"ai" ≈1.5%、"con" ≈4%(3 字符中频)、
+    // 窄 token ~50 条、CJK ≈0.2%(拼音候选,部分全拼含 "ai")。
+    // 不设绝对时间断言(避免抖动 flaky);数字打印 --nocapture 可见,
+    // 提交信息与报告引用。唯一断言:各查询形态命中数自洽(设置正确性)。
+
+    const PROFILE_DIRS: u64 = 2000;
+    const PROFILE_FILES: u64 = 2_498_000;
+
+    /// 与真实卷对齐的名字分布。判据顺序固定,保证 "ai"/"con"/窄/CJK 计数确定。
+    fn profile_name(f: u64) -> String {
+        if f % 500 == 3 {
+            // CJK ~0.2%:全拼 shibaibaogao… 含 "ai"(拼音路径真实形态)
+            return format!("失败报告{f:06}.log");
+        }
+        if f % 50000 == 7 {
+            return format!("steadyq{f:08}.bin"); // 窄 token ~50 条
+        }
+        if f % 67 == 0 {
+            let stem = ["main", "email", "detail", "train", "domain"][f as usize % 5];
+            return format!("{stem}_{f:08}.txt"); // "ai" ≈1.49%
+        }
+        if f % 25 == 0 {
+            let stem = ["config", "console", "connect", "control"][f as usize % 4];
+            return format!("{stem}{f:08}.dll"); // "con" ≈3.96%
+        }
+        let stem = ["data", "readme", "notes", "setup", "cache", "driver", "system", "user", "project", "backup"]
+            [f as usize % 10];
+        format!("{stem}_{f:08}.bin")
+    }
+
+    fn profile_store() -> (VolumeStore, PinyinCache) {
+        let mut s = VolumeStore::new(false);
+        for d in 0..PROFILE_DIRS {
+            s.insert(10 + d, crate::store::ROOT_FRN, 0x0010, format!("dir{d:05}").as_bytes());
+        }
+        for f in 0..PROFILE_FILES {
+            let frn = 10 + PROFILE_DIRS + f;
+            let parent = if f % 10 == 9 { 10 + (f / 10 % PROFILE_DIRS) } else { crate::store::ROOT_FRN };
+            s.insert_meta(frn, parent, 0, profile_name(f).as_bytes(), 1_600_000_000 + (f % 1_000_000) as i64);
+        }
+        s.compact();
+        let pinyin = PinyinCache::rebuild(&s);
+        (s, pinyin)
+    }
+
+    fn profile_ms(mut f: impl FnMut() -> usize, warmup: usize, iters: usize) -> (Vec<f64>, usize) {
+        let mut last = 0usize;
+        for _ in 0..warmup {
+            last = f();
+        }
+        let mut samples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            last = f();
+            samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (samples, last)
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-profile 基准(250 万条合成记录)")]
+    fn bench_wide_query_phase_profile() {
+        let t0 = Instant::now();
+        let (store, pinyin) = profile_store();
+        let build_s = t0.elapsed().as_secs_f64();
+        let mb = |n: usize| n as f64 / (1024.0 * 1024.0);
+        println!(
+            "[profile] build: {build_s:.1}s entries={} names={:.1}MB names_lc={:.1}MB 列合计={:.1}MB",
+            store.len(),
+            mb(store.names.len()),
+            mb(store.names_lc.len()),
+            mb(store.heap_bytes()),
+        );
+
+        let ai = QuerySpec { tokens: vec!["ai".into()], ..Default::default() };
+        let con = QuerySpec { tokens: vec!["con".into()], ..Default::default() };
+        let narrow = QuerySpec { tokens: vec!["steadyq".into()], ..Default::default() };
+        let empty = QuerySpec::default();
+        let ai_tokens = vec![b"ai".to_vec()];
+
+        // ① memmem 纯扫描
+        let (s1, hits_raw) = profile_ms(
+            || memchr::memmem::Finder::new("ai").find_iter(&store.names_lc).count(),
+            2,
+            15,
+        );
+        // ② 命中→slot 解析(含陈项过滤,无 token AND/无过滤/无收集)
+        let (s2, hits_resolved) = profile_ms(
+            || {
+                let finder = memchr::memmem::Finder::new("ai");
+                let mut n = 0usize;
+                for off in finder.find_iter(&store.names_lc) {
+                    if store.slot_at_offset(off).is_some() {
+                        n += 1;
+                    }
+                }
+                n
+            },
+            2,
+            15,
+        );
+        // ③ 完整引擎单卷路径("ai")
+        let (s3, ai_total) = profile_ms(|| crate::query::query_volume(&store, &ai, 100).1, 2, 25);
+        // ④ 拼音匹配
+        let (s4, py_hits) = profile_ms(|| pinyin.search(&store, &ai_tokens, 100).count(), 2, 25);
+        // ⑤ 其他查询形态完整路径(验收对照的「改前」基线)
+        let (s_con, con_total) = profile_ms(|| crate::query::query_volume(&store, &con, 100).1, 2, 15);
+        let (s_narrow, narrow_total) = profile_ms(|| crate::query::query_volume(&store, &narrow, 100).1, 2, 15);
+        let (s_empty, empty_total) = profile_ms(|| crate::query::query_volume(&store, &empty, 800).1, 2, 10);
+        // 拼音缓存重建耗时(快照「加载时重建」方案的成本依据)
+        let (s_rebuild, py_entries) = profile_ms(|| PinyinCache::rebuild(&store).slots.len(), 1, 3);
+
+        let p = |samples: &[f64]| (percentile(samples, 0.5), percentile(samples, 0.9));
+        let (ai_p50, ai_p90) = p(&s3);
+        println!("[profile] ai   hits_raw={hits_raw} resolved={hits_resolved} total={ai_total} (expect≈{} files+{} dirs)", 37_300, 0);
+        println!(
+            "[profile] ai   ①memmem扫描 p50={:.2}ms p90={:.2}ms | ②+slot解析 p50={:.2}ms | ③完整查询 p50={ai_p50:.2}ms p90={ai_p90:.2}ms",
+            p(&s1).0, p(&s1).1, p(&s2).0,
+        );
+        println!(
+            "[profile] pinyin entries={} rebuild p50={:.1}ms | 'ai' pinyin p50={:.2}ms hits={py_hits}",
+            py_entries, p(&s_rebuild).0, p(&s4).0,
+        );
+        println!(
+            "[profile] con  total={con_total} p50={:.2}ms p90={:.2}ms",
+            p(&s_con).0, p(&s_con).1,
+        );
+        println!(
+            "[profile] narrow total={narrow_total} p50={:.2}ms p90={:.2}ms",
+            p(&s_narrow).0, p(&s_narrow).1,
+        );
+        println!(
+            "[profile] empty total={empty_total} p50={:.2}ms p90={:.2}ms",
+            p(&s_empty).0, p(&s_empty).1,
+        );
+        // 自洽:解析数应等于完整 total 与拼音之和的量级(拼音命中与名字命中部分重叠)
+        assert_eq!(ai_total, hits_resolved, "memmem→slot 解析数必须等于完整 total(单 token 无过滤)");
+        assert!(ai_total > 30_000 && ai_total < 50_000, "ai 命中量级应≈1.5%(真实 17630/117万), got {ai_total}");
+        assert!(con_total > 80_000, "con 中频量级, got {con_total}");
+        assert!(narrow_total >= 40 && narrow_total <= 60, "窄 token ~50, got {narrow_total}");
+        assert!(py_entries > 4_000, "CJK 拼音候选 ~0.2%, got {py_entries}");
+    }
 }
