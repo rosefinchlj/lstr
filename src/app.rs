@@ -2629,7 +2629,7 @@ impl LstrApp {
             let time_text = if is_path_row {
                 entry
                     .modified
-                    .map(ui::format_relative_time)
+                    .map(ui::format_list_time)
                     .unwrap_or_default()
             } else {
                 String::new()
@@ -2645,24 +2645,20 @@ impl LstrApp {
             } else {
                 String::new()
             };
-            let meta = match (size_text.is_empty(), time_text.is_empty()) {
-                (true, true) => String::new(),
-                (false, true) => size_text,
-                (true, false) => time_text,
-                (false, false) => format!("{size_text} · {time_text}"),
-            };
-            // 按**实际渲染宽度**预留 meta 区：全局 TEXT_SCALE=1.18 会放大字体，
-            // 固定像素估算（76/122）会算窄，右对齐的日期从预留区左缘溢出、
-            // 盖住路径尾巴。这里用与绘制完全相同的字体测量，再留右缘 10px +
-            // 与路径的 4px 间隔。
-            let meta_w = if meta.is_empty() {
-                0.0
-            } else {
-                painter
-                    .layout_no_wrap(meta.clone(), ui::mono_font(11.0), theme.dim)
-                    .size()
-                    .x
-                    + 14.0
+            // 右侧两列，各自右对齐锚点（跨行对齐的前提）：
+            //   时间列锚点 = 右缘 - 10；大小列锚点 = 时间列左侧 8px。
+            // 预留宽度按列固定值计算（时间列 88 / 大小列 64，字体缩放已计入）。
+            const TIME_COL_W: f32 = 88.0;
+            const SIZE_COL_W: f32 = 64.0;
+            const META_GAP: f32 = 8.0;
+            const META_MARGIN: f32 = 10.0;
+            let has_size = !size_text.is_empty();
+            let has_time = !time_text.is_empty();
+            let meta_w = match (has_size, has_time) {
+                (false, false) => 0.0,
+                (true, false) => META_MARGIN + SIZE_COL_W,
+                (false, true) => META_MARGIN + TIME_COL_W,
+                (true, true) => META_MARGIN + TIME_COL_W + META_GAP + SIZE_COL_W,
             };
             let mut title_job = match &fuzzy_hit {
                 Some(positions) => ui::text_job_positions(
@@ -2823,11 +2819,27 @@ impl LstrApp {
                 );
             }
 
-            if !meta.is_empty() {
+            // 两列各自右对齐：时间贴右缘，大小在时间列左侧一列——
+            // 跨行对齐不随文字宽度漂移（相对时间「N 天前」已被定宽日期取代）。
+            if !time_text.is_empty() {
                 painter.text(
-                    egui::pos2(row_rect.right() - 10.0, row_rect.center().y),
+                    egui::pos2(row_rect.right() - META_MARGIN, row_rect.center().y),
                     Align2::RIGHT_CENTER,
-                    meta.as_str(),
+                    time_text.as_str(),
+                    ui::mono_font(11.0),
+                    theme.dim,
+                );
+            }
+            if !size_text.is_empty() {
+                let x = if time_text.is_empty() {
+                    row_rect.right() - META_MARGIN
+                } else {
+                    row_rect.right() - META_MARGIN - TIME_COL_W - META_GAP
+                };
+                painter.text(
+                    egui::pos2(x, row_rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    size_text.as_str(),
                     ui::mono_font(11.0),
                     theme.dim,
                 );

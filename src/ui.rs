@@ -385,6 +385,28 @@ pub fn format_relative_time(ts: i64) -> String {
 /// 走 Win32 `FileTimeToLocalFileTime` + `FileTimeToSystemTime`（自动处理时区/夏令时），
 /// 文件管理器习惯的本地日期；API 异常时回退到粗略 UTC 日期（不应发生）。
 fn format_local_date(ts: i64) -> String {
+    match local_systemtime(ts) {
+        Some(st) => format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay),
+        None => {
+            // 回退：粗略 UTC 日期（旧实现，仅 API 异常时走到）。
+            let days = ts.div_euclid(86400);
+            let z = days + 719468;
+            let era = z.div_euclid(146097);
+            let doe = z - era * 146097;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            let year = yoe + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let day = doy - (153 * mp + 2) / 5 + 1;
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            let year = if month <= 2 { year + 1 } else { year };
+            format!("{year:04}-{month:02}-{day:02}")
+        }
+    }
+}
+
+/// unix 秒 → 本地 SYSTEMTIME（时区/夏令时由 Win32 处理，与 format_local_date 同源）。
+fn local_systemtime(ts: i64) -> Option<windows::Win32::Foundation::SYSTEMTIME> {
     use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
     // windows crate 0.62 的模块归属：FileTimeToLocalFileTime 在 Storage::FileSystem，
     // FileTimeToSystemTime 在 System::Time（别按直觉猜 System::Time 全在这）。
@@ -393,35 +415,41 @@ fn format_local_date(ts: i64) -> String {
     // 1601-01-01 → 1970-01-01 的 100ns tick 数（18 位，勿再写错位数）。
     const UNIX_EPOCH_FILETIME: i128 = 116_444_736_000_000_000;
     let ticks = ts as i128 * 10_000_000 + UNIX_EPOCH_FILETIME;
-    if (0..=u64::MAX as i128).contains(&ticks) {
-        let t = ticks as u64;
-        let ft = FILETIME {
-            dwLowDateTime: (t & 0xFFFF_FFFF) as u32,
-            dwHighDateTime: (t >> 32) as u32,
-        };
-        let mut local = FILETIME::default();
-        let mut st = SYSTEMTIME::default();
-        unsafe {
-            if FileTimeToLocalFileTime(&ft, &mut local).is_ok()
-                && FileTimeToSystemTime(&local, &mut st).is_ok()
-            {
-                return format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay);
-            }
+    if !(0..=u64::MAX as i128).contains(&ticks) {
+        return None;
+    }
+    let t = ticks as u64;
+    let ft = FILETIME {
+        dwLowDateTime: (t & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: (t >> 32) as u32,
+    };
+    let mut local = FILETIME::default();
+    let mut st = SYSTEMTIME::default();
+    unsafe {
+        if FileTimeToLocalFileTime(&ft, &mut local).is_ok()
+            && FileTimeToSystemTime(&local, &mut st).is_ok()
+        {
+            return Some(st);
         }
     }
-    // 回退：粗略 UTC 日期（旧实现，仅 API 异常时走到）。
-    let days = ts.div_euclid(86400);
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    format!("{year:04}-{month:02}-{day:02}")
+    None
+}
+
+/// 列表页的紧凑时间（本地时区）：今天 `HH:mm` / 今年 `MM-DD` / 更早 `YYYY-MM-DD`。
+/// 定宽短格式，配合右侧右对齐列实现跨行对齐（相对时间「N 天前」宽度不定，
+/// 会让大小列左缘参差）；预览面板仍用 format_relative_time（空间充足、可读性优先）。
+pub fn format_list_time(ts: i64) -> String {
+    let Some(st) = local_systemtime(ts) else {
+        return format_local_date(ts);
+    };
+    let now = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    if st.wYear == now.wYear && st.wMonth == now.wMonth && st.wDay == now.wDay {
+        format!("{:02}:{:02}", st.wHour, st.wMinute)
+    } else if st.wYear == now.wYear {
+        format!("{:02}-{:02}", st.wMonth, st.wDay)
+    } else {
+        format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay)
+    }
 }
 
 pub fn format_size(bytes: u64) -> String {
