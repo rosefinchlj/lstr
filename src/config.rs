@@ -414,7 +414,8 @@ pub struct ThemeConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            hotkey: "double-space".to_string(),
+            // 默认唤起热键：双击 Ctrl（Listary 式）；double-space 仍是合法选项。
+            hotkey: crate::hotkey::DEFAULT_HOTKEY.to_string(),
             max_results: 8,
             width: 640.0,
             height: None,
@@ -484,6 +485,9 @@ impl Config {
                 cfg.index.backend = normalize_backend(&cfg.index.backend);
                 cfg.index.normalize_volumes();
                 cfg.index.normalize();
+                // 唤起热键：手写 config.toml 的非法值（如裸字母）回退默认，
+                // 避免静默变成「永不生效」或全局吞键。
+                cfg.hotkey = crate::hotkey::normalize_hotkey_or_default(&cfg.hotkey);
                 cfg
             },
             Err(err) => {
@@ -633,6 +637,32 @@ mod tests {
         let mut cfg = IndexConfig { journal_poll_ms: 800, ..IndexConfig::default() };
         cfg.normalize();
         assert_eq!(cfg.journal_poll_ms, 800);
+    }
+
+    /// 唤起热键：默认是 double-ctrl；非法配置串 load 时回退默认。
+    #[test]
+    fn hotkey_defaults_to_double_ctrl_and_falls_back_on_garbage() {
+        let cfg = Config::default();
+        assert_eq!(cfg.hotkey, "double-ctrl", "默认唤起热键回归：双击 Ctrl");
+
+        // 归一化路径：合法值保持规范形（double-space 仍是合法选项）。
+        assert_eq!(
+            crate::hotkey::normalize_hotkey_or_default("Double-Space"),
+            "double-space"
+        );
+        assert_eq!(
+            crate::hotkey::normalize_hotkey_or_default("ALT+Q"),
+            "alt+q"
+        );
+        // 非法输入回退默认，而不是静默失效。
+        assert_eq!(
+            crate::hotkey::normalize_hotkey_or_default("q"),
+            "double-ctrl"
+        );
+        assert_eq!(
+            crate::hotkey::normalize_hotkey_or_default("whatever"),
+            "double-ctrl"
+        );
     }
 
     #[test]
