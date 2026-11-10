@@ -708,8 +708,8 @@ mod pin_tests {
 }
 
 /// 「候选阶段零 FS」的标记:内置索引产出的 Entry 只带索引内信息
-/// (size/modified 留空),真实 size/mtime 与类型漂移校正延迟到 finalize
-/// 的展示阶段,只对最终候选逐条 `find_meta`。
+/// (size 留空,modified 取索引 mtime),真实 size/mtime 与类型漂移校正延迟到
+/// finalize 的展示阶段,只对最终候选逐条 `find_meta`。
 ///
 /// key = 条目 id 的小写形式(Windows 路径大小写不敏感);
 /// value = 是否需要类型漂移校正(split/单 scope 候选为 true,
@@ -749,6 +749,13 @@ impl PendingMeta {
 /// 单条最终候选的元数据填充 + 漂移校正;None = 旧路径同样会丢弃。
 /// `correct_kind=false` 用于精确同名补齐(旧 `search_exact` 不校正类型),
 /// 只填 size/mtime。
+///
+/// modified 的取舍:rank 在进入本函数之前已经用候选的**索引 mtime**
+/// (`Hit.mtime` → `Entry.modified`)算过 recency,零 FS;这里再用 FS 的
+/// `find_meta` 覆盖为**最新值**供预览面板展示。两者可能不同(文件在最近
+/// 一次索引扫描后又被修改),这是刻意取舍:排序要避免每个候选一次 FS
+/// 调用,展示则要求时间新鲜。索引 mtime 为 0(未知)时,本函数从 FS 拿到
+/// 的值仍可补上,从而不影响展示。
 fn fill_one_meta(entry: Entry, correct_kind: bool) -> Option<Entry> {
     let Some(path) = entry.path.as_ref() else {
         return Some(entry);
@@ -1318,8 +1325,9 @@ fn run_worker(
         let mut diag_exact = 0f32;
         // 自定义关键字行（g rust → 用 Google 搜索）：之后钉在结果顶部，不参与打分。
         let mut keyword_rows: Vec<Entry> = Vec::new();
-        // 内置索引候选的「元数据未填」标记:finalize 内只对最终展示条目
-        // 逐条 find_meta(见 finalize_entries_with_pending),候选阶段零 FS。
+        // 内置索引候选的惰性元数据标记:modified 已由候选阶段用索引 mtime
+        // 填好(供 rank 零 FS 打分),size/展示用 mtime 由 finalize 只对最终
+        // 展示条目逐条 find_meta(见 finalize_entries_with_pending)。
         let mut pending_meta = PendingMeta::new();
 
         if request.query.is_empty() {
@@ -1417,8 +1425,7 @@ fn run_worker(
                                     truncation += file_total.saturating_sub(result.files.len());
                                     total += result.folder_total + file_total;
                                     // 旧实现先 folders 后 files,保持同一 Entry 顺序。
-                                    // 候选只带索引信息:标记后由 finalize 后的
-                                    // finalize 内统一填 FS 元数据。
+                                    // 候选只带索引信息,由 finalize 内统一填 FS 元数据。
                                     pending_meta.mark(&result.folders, true);
                                     pending_meta.mark(&result.files, true);
                                     entries.append(&mut result.folders);

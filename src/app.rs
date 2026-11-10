@@ -3265,11 +3265,11 @@ impl LstrApp {
             );
             y += 16.0;
         }
-        if let Some(modified) = entry.modified {
+        if let Some(line) = preview_modified_line(entry) {
             painter.text(
                 egui::pos2(pane.left() + 8.0, y),
                 Align2::LEFT_TOP,
-                format!("修改   {}", ui::format_relative_time(modified)),
+                line,
                 ui::mono_font(11.0),
                 theme.sub,
             );
@@ -5034,6 +5034,14 @@ fn split_at_chars(text: &str, count: usize) -> (String, String) {
     (head, tail)
 }
 
+/// 预览面板的「修改」行。None = mtime 未知(索引 0 且 FS 查询失败),
+/// 面板不显示该行;有值时走与结果列表同一套相对时间格式化。
+fn preview_modified_line(entry: &Entry) -> Option<String> {
+    entry
+        .modified
+        .map(|ts| format!("修改   {}", ui::format_relative_time(ts)))
+}
+
 fn dialog_hint(scope: Scope) -> &'static str {
     match scope {
         Scope::Folder => "搜索文件夹并跳转…",
@@ -5119,5 +5127,28 @@ mod path_layout_tests {
         assert_eq!(split_path_head(fake_measure, "abc", 0.0), 0);
         // 测出来恒为 0 时视为全部放得下，避免除零/死循环。
         assert_eq!(split_path_head(|_| 0.0, "abc", 5.0), 3);
+    }
+
+    /// 预览面板的修改时间行:Entry.modified 有值(候选用索引 mtime 填充,
+    /// finalize 再用 FS mtime 刷新)时必须可达,未知时不显示。
+    #[test]
+    fn preview_shows_modified_line_when_entry_has_mtime() {
+        let mut entry = Entry {
+            id: r"C:\tools\notes.md".to_string(),
+            kind: Kind::File,
+            name: "notes.md".to_string(),
+            path: Some(std::path::PathBuf::from(r"C:\tools\notes.md")),
+            size: Some(3),
+            modified: Some(1_704_067_200), // 2024-01-01
+            pinyin: None,
+            initial: "N".to_string(),
+            tone: 0,
+        };
+        let line = preview_modified_line(&entry).expect("有 mtime 必须显示修改行");
+        assert!(line.starts_with("修改   "), "格式不对: {line}");
+        assert!(line.len() > "修改   ".len(), "修改行不能为空: {line}");
+
+        entry.modified = None;
+        assert!(preview_modified_line(&entry).is_none(), "未知 mtime 不显示");
     }
 }

@@ -675,6 +675,54 @@ mod tests {
             <= RankConfig::default().recent_boost);
     }
 
+    /// 修复 FILETIME 换算后候选带索引 mtime:其余分数完全相同的条目由
+    /// recency 决定顺序,分差严格等于 config 的 recent_boost(而非写死)。
+    #[test]
+    fn newer_mtime_wins_among_otherwise_equal_entries() {
+        let now = now() as i64;
+        let cfg = RankConfig::default();
+        let mut fresh = entry("fresh", "notes.md", Kind::File);
+        fresh.modified = Some(now - 3600);
+        let mut stale = entry("stale", "notes.md", Kind::File);
+        stale.modified = Some(now - 400 * 86400);
+        let history = History::in_memory();
+
+        let fresh_score = score_entry_with(&fresh, "notes", &history, 0, &cfg);
+        let stale_score = score_entry_with(&stale, "notes", &history, 0, &cfg);
+        assert_eq!(
+            fresh_score - stale_score,
+            cfg.recent_boost,
+            "同匹配档位下只应差 recency 权重"
+        );
+
+        // 输入顺序故意把旧的放前面,rank 后新的必须排第一。
+        let mut entries = vec![stale, fresh];
+        rank_with(&mut entries, "notes", &history, 0, &cfg);
+        assert_eq!(entries[0].id, "fresh");
+        assert_eq!(entries[1].id, "stale");
+    }
+
+    /// 索引 mtime=0 时候选回落 None:recency 不计分,不改变同分条目的顺序。
+    #[test]
+    fn unknown_mtime_falls_back_to_none_without_reordering() {
+        let now = now() as i64;
+        let cfg = RankConfig::default();
+        let unknown = entry("unknown", "notes.md", Kind::File); // modified=None
+        let mut stale = entry("stale", "notes.md", Kind::File);
+        stale.modified = Some(now - 400 * 86400); // 超过 30 天,recency=0
+        let history = History::in_memory();
+
+        assert_eq!(
+            score_entry_with(&unknown, "notes", &history, 0, &cfg),
+            score_entry_with(&stale, "notes", &history, 0, &cfg),
+            "未知 mtime 不能凭空加分"
+        );
+        let mut entries = vec![unknown, stale];
+        rank_with(&mut entries, "notes", &history, 0, &cfg);
+        assert_eq!(entries[0].id, "unknown", "同分稳定排序应保持输入顺序");
+        assert_eq!(entries[1].id, "stale");
+    }
+
     #[test]
     fn exact_match_prefers_shallow_paths() {
         // E:\use 与深埋的同名目录都能精确命中时，浅路径优先。

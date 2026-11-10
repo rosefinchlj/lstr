@@ -174,10 +174,10 @@ impl BuiltinProvider {
     /// 旧 files 路总数 = `all_total - folder_total`。
     ///
     /// 候选阶段只做索引内可完成的工作(名字/kind/路径/过滤/限流),不碰
-    /// 文件系统:size/modified 留空(旧路径 `find_meta` 的 mtime 换算在当前
-    /// `win32_meta` 下恒不满足 `modified > 0`,Entry.modified 同样是 None);
-    /// 真实 size/mtime 与类型漂移校正在搜索线程 finalize 时只对最终展示
-    /// 条目统一填充(见 `search::finalize_entries_with_pending`)。
+    /// 文件系统:size 留空;modified 取索引 mtime(`Hit.mtime`,0=未知),
+    /// 供 rank 的 recency 加权使用,零 FS 调用。真实 size/mtime 与类型漂移
+    /// 校正在搜索线程 finalize 时只对最终展示条目统一填充(见
+    /// `search::finalize_entries_with_pending`)。
     pub fn search_split_once(
         &self,
         query: &Query,
@@ -287,7 +287,8 @@ impl BuiltinProvider {
     }
 
     /// 候选阶段收尾(零 FS):limit 预算、空名/kind 过滤、路径拼接。
-    /// size/modified 留空,后续由展示层对最终条目统一填充。
+    /// `modified` 来自索引 mtime(0 → None),`size` 留空;展示值由 finalize
+    /// 对最终条目统一从 FS 刷新。
     fn collect_entries(
         &self,
         hits: &[lstr_index::Hit],
@@ -315,7 +316,7 @@ impl BuiltinProvider {
             let Some(path) = self.engine.path_of(hit) else {
                 continue;
             };
-            entries.push(pending_entry(path, name, kind, want_pinyin));
+            entries.push(pending_entry(path, name, kind, want_pinyin, hit.mtime));
         }
     }
 
@@ -333,7 +334,7 @@ impl BuiltinProvider {
             let Some(path) = self.engine.path_of(hit) else { continue };
             let name = self.engine.entry_name(hit);
             let kind = kind_of(&name, self.engine.is_dir(hit));
-            entries.push(pending_entry(path, name, kind, want_pinyin));
+            entries.push(pending_entry(path, name, kind, want_pinyin, hit.mtime));
             if entries.len() >= limit {
                 break;
             }
@@ -427,12 +428,17 @@ impl BuiltinProvider {
 
 }
 
-/// 候选 Entry 构造(零 FS):`size`/`modified` 留空。旧路径在候选阶段用
-/// `find_meta` 填的 mtime 在当前 `win32_meta` 换算下恒为负,不满足
-/// `modified > 0`,因此 Entry.modified 同样是 None,rank 的 recency 口径
-/// 不变;真实 size/mtime 与类型漂移校正由
-/// `search::finalize_entries_with_pending` 在展示前对最终条目执行。
-fn pending_entry(path: String, name: String, kind: Kind, want_pinyin: bool) -> Entry {
+/// 候选 Entry 构造(零 FS):`size` 留空,`modified` 取索引 mtime
+/// (0 = 未知 → None)。rank 的 recency 加权因此完全用索引数据,不产生
+/// 任何 FS 调用;真实 size 与展示用 mtime 由
+/// `search::finalize_entries_with_pending` 在展示前对最终条目刷新。
+fn pending_entry(
+    path: String,
+    name: String,
+    kind: Kind,
+    want_pinyin: bool,
+    mtime: i64,
+) -> Entry {
     let pinyin = (want_pinyin && pinyin::has_cjk(&name)).then(|| pinyin::keys(&name));
     Entry {
         tone: tone_for(&path),
@@ -442,7 +448,7 @@ fn pending_entry(path: String, name: String, kind: Kind, want_pinyin: bool) -> E
         name,
         path: Some(std::path::PathBuf::from(path)),
         size: None,
-        modified: None,
+        modified: (mtime > 0).then_some(mtime),
         pinyin,
     }
 }
@@ -1080,6 +1086,56 @@ mod tests {
         }
     }
 
+    /// 候选 Entry 的 modified 直接来自索引 mtime(Hit.mtime),零 FS:
+    /// 手工改写 Hit.mtime 后 collect_entries 必须原样带出;0 = 未知 → None。
+    #[test]
+    fn candidate_entries_take_mtime_from_hit() {
+        let Some(fx) = real_index(20, 3, "hit-mtime") else { return };
+        let query = parse("ai", Scope::All);
+        let filters = SearchFilters::default();
+        let mut spec = build_spec(&query, &filters);
+        spec.kind = KindFilter::All;
+        let outcome = fx.provider.engine.query(&spec);
+        let mut hit = *outcome.hits.first().expect("fixture 应至少有一个候选");
+
+        hit.mtime = 1_700_000_123;
+        let mut entries = Vec::new();
+        fx.provider.collect_entries(&[hit], &query, 10, |_| true, &mut entries);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].modified, Some(1_700_000_123));
+        assert_eq!(entries[0].size, None, "候选阶段不查 FS size");
+
+        hit.mtime = 0;
+        let mut entries = Vec::new();
+        fx.provider.collect_entries(&[hit], &query, 10, |_| true, &mut entries);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].modified, None, "索引 mtime=0 回落 None");
+    }
+
+    /// 展示阶段用 FS mtime 覆盖候选的索引 mtime:rank 之后预览面板要看到
+    /// 磁盘上的最新时间,而不是可能过期的索引值。
+    #[test]
+    fn display_mtime_is_refreshed_from_fs_after_rank() {
+        let Some(fx) = real_index(10, 2, "display-mtime") else { return };
+        let path = fx.test_dir.join("ai_tool.exe");
+        let path_str = path.display().to_string();
+        let entry = Entry {
+            id: path_str.clone(),
+            kind: Kind::File,
+            name: "ai_tool.exe".to_string(),
+            path: Some(path.clone()),
+            size: None,
+            modified: Some(1), // 故意用错误的索引值,验证会被 FS 覆盖
+            pinyin: None,
+            initial: "A".to_string(),
+            tone: 0,
+        };
+        let filled = super::super::fill_one_meta(entry, true).expect("文件存在,必须填充成功");
+        let expected = disk_mtime(&path);
+        assert!(expected > 0, "测试文件应有真实 mtime");
+        assert_eq!(filled.modified, Some(expected), "展示 mtime 必须来自 FS");
+    }
+
     /// 惰性填充对拍:候选阶段零 FS 的 Entry 交给 `fill_one_meta` 逐条补
     /// size/mtime/漂移校正,必须与旧候选阶段逐条 `find_meta` 的结果逐字段相等。
     /// 真实临时 FS 覆盖:子目录、大小写不同名、已删、无权限、目录/文件类型
@@ -1444,7 +1500,24 @@ mod tests {
             new_final.iter().filter(|e| e.name == "ai").count(),
             "已删同名条目不能占用精确同名名额"
         );
-        assert_eq!(old_final, new_final, "已删同名场景最终 Entry 不一致");
+        // mtime 修复后不能再断言 full Entry 相等:本测试删除文件会更新
+        // 父目录的 FS mtime,旧路径在候选阶段取元数据、新路径在 finalize
+        // 取元数据,两次 FS 快照可能相差 1 秒(索引 mtime 也滞后于删除)。
+        // 本测试只关心同名名额与顺序;recency 的排序语义由 rank 单测覆盖。
+        let without_mtime = |entries: Vec<Entry>| -> Vec<Entry> {
+            entries
+                .into_iter()
+                .map(|mut entry| {
+                    entry.modified = None;
+                    entry
+                })
+                .collect()
+        };
+        assert_eq!(
+            without_mtime(old_final),
+            without_mtime(new_final),
+            "已删同名场景最终 Entry 不一致(modified 除外)"
+        );
     }
 
     /// 类型漂移的精确同名条目:旧路径的 split 候选在候选阶段被丢弃,但
