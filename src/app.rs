@@ -2298,10 +2298,47 @@ impl LstrApp {
     ) {
         let theme = self.theme;
         if entries.is_empty() {
-            // 空查询（还没开始搜索）不显示任何文案——「暂无记录」会被误解成搜不到。
+            // 空查询（还没开始搜索）：显示搜索技巧引导面板。
             if query.is_empty() {
                 self.needle_target = 0.0;
                 self.scrollable = false;
+                // 两列：左键名（sub 色）+ 右说明（dim 色），行距 24。
+                let tips: [(&str, &str); 6] = [
+                    ("c:  d:", "只在这些盘符搜 · -c: 排除某盘"),
+                    ("ext:rs", "按扩展名 · path:D:\\目录 限定目录"),
+                    ("a 微信", "搜应用 · f 文件 · > 命令"),
+                    ("拼音", "全拼或首字母，如 wx → 微信"),
+                    ("Tab", "切换范围 · Alt+← 返回 · Esc 收起"),
+                    ("Ctrl+G", "对打开/保存对话框搜索并填入"),
+                ];
+                let key_x = rect.left() + 28.0;
+                let desc_x = rect.left() + 108.0;
+                let mut y = list_top + 18.0;
+                painter.text(
+                    egui::pos2(key_x, y),
+                    Align2::LEFT_TOP,
+                    "搜索技巧",
+                    ui::text_font(12.0),
+                    theme.sub,
+                );
+                y += 26.0;
+                for (key, desc) in tips {
+                    painter.text(
+                        egui::pos2(key_x, y),
+                        Align2::LEFT_TOP,
+                        key,
+                        ui::mono_font(11.5),
+                        theme.sub,
+                    );
+                    painter.text(
+                        egui::pos2(desc_x, y),
+                        Align2::LEFT_TOP,
+                        desc,
+                        ui::mono_font(11.5),
+                        theme.dim,
+                    );
+                    y += 24.0;
+                }
                 return;
             }
             // 查询在途（防抖/排队/执行中）时，不要立刻显示「没有匹配项」：

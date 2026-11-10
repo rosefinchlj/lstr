@@ -483,6 +483,9 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
         exact: None,
         mtime_after: None,
         mtime_before: None,
+        // 盘符过滤（c:/d: 限定、-c: 排除）：交给引擎在卷循环直接跳过，
+        // 省掉整卷扫描；0 掩码（全排除）→ 查询结果为空。
+        vol_mask: query.drive_mask(),
     };
     if let Some(location) = &filters.location {
         let p = location.path().display().to_string().to_lowercase();

@@ -103,10 +103,31 @@ pub struct Query {
     pub text: String,
     pub ext: Option<String>,
     pub path_filter: Option<String>,
+    /// 限定盘符（bit i = 'A'+i）：`c: d: 关键词`。0 = 不限制。
+    pub drives_include: u32,
+    /// 排除盘符（bit i = 'A'+i）：`-c: 关键词`。0 = 不排除。
+    pub drives_exclude: u32,
 }
 
 impl Query {
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.ext.is_none() && self.path_filter.is_none()
+        self.text.is_empty()
+            && self.ext.is_none()
+            && self.path_filter.is_none()
+            && self.drives_include == 0
+            && self.drives_exclude == 0
+    }
+
+    /// 盘符约束的最终卷掩码：None=不限制，Some(mask)=只查这些卷（可能为空）。
+    pub fn drive_mask(&self) -> Option<u32> {
+        if self.drives_include == 0 && self.drives_exclude == 0 {
+            return None;
+        }
+        let base = if self.drives_include == 0 {
+            (1u32 << 26) - 1
+        } else {
+            self.drives_include
+        };
+        Some(base & !self.drives_exclude)
     }
 }

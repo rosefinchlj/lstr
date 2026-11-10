@@ -63,6 +63,19 @@ pub struct QuerySpec {
     pub mtime_after: Option<i64>,
     /// 修改时间上界(unix 秒,含)。
     pub mtime_before: Option<i64>,
+    /// 卷掩码(bit i='A'+i):None=不限制,Some(mask)=只在这些卷查询
+    /// (mask 为 0 表示排除掉了所有卷,查询结果为空)。
+    pub vol_mask: Option<u32>,
+}
+
+/// 盘符字母 → 卷掩码位(bit i = 'A'+i)。非字母返回 0。
+pub fn volume_bit(letter: char) -> u32 {
+    let upper = letter.to_ascii_uppercase();
+    if upper.is_ascii_uppercase() {
+        1u32 << (upper as u32 - 'A' as u32)
+    } else {
+        0
+    }
 }
 
 impl QuerySpec {

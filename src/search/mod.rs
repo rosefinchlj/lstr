@@ -427,6 +427,8 @@ mod pin_tests {
                 text: text.to_string(),
                 ext: None,
                 path_filter: None,
+                drives_include: 0,
+                drives_exclude: 0,
             },
             limit,
             keywords: Vec::new(),
@@ -1687,6 +1689,22 @@ fn run_worker(
             }
         }
 
+        // 盘符过滤兜底：内置引擎已按卷掩码查询；Everything/历史等其余来源的
+        // 路径条目在这里统一裁掉（应用/命令无盘符，不受影响）。
+        if let Some(mask) = request.query.drive_mask() {
+            entries.retain(|e| {
+                let Some(path) = &e.path else { return true };
+                let s = path.to_string_lossy();
+                let mut chars = s.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => {
+                        mask & lstr_index::query::volume_bit(letter) != 0
+                    }
+                    _ => true,
+                }
+            });
+        }
+
         let t_finalize = Instant::now();
         // 惰性元数据:finalize 内部在 rank 之后、去重/截断之前只对最终候选
         // 逐条 find_meta(候选阶段零 FS);meta 耗时从 finalize 里单独拆出。
@@ -2005,6 +2023,8 @@ mod tests {
                 text: "abc".to_string(),
                 ext: None,
                 path_filter: None,
+                drives_include: 0,
+                drives_exclude: 0,
             },
             limit: 10,
             keywords: Vec::new(),

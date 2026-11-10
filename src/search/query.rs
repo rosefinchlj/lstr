@@ -15,6 +15,8 @@ pub fn parse(raw: &str, scope: Scope) -> Query {
 
     let mut ext = None;
     let mut path_filter = None;
+    let mut drives_include = 0u32;
+    let mut drives_exclude = 0u32;
     let mut words = Vec::new();
 
     for token in text.split_whitespace() {
@@ -22,6 +24,14 @@ pub fn parse(raw: &str, scope: Scope) -> Query {
             ext = Some(value.to_string());
         } else if let Some(value) = strip_prefix_ci(token, "path:") {
             path_filter = Some(value.to_string());
+        } else if let Some((letter, exclude)) = parse_drive_token(token) {
+            // `c:` / `C:` → 限定该盘；`-c:` → 排除该盘。可用空格分隔多个。
+            let bit = 1u32 << (letter as u32 - 'A' as u32);
+            if exclude {
+                drives_exclude |= bit;
+            } else {
+                drives_include |= bit;
+            }
         } else {
             words.push(token);
         }
@@ -33,7 +43,25 @@ pub fn parse(raw: &str, scope: Scope) -> Query {
         text: words.join(" "),
         ext,
         path_filter,
+        drives_include,
+        drives_exclude,
     }
+}
+
+/// 盘符 token：`x:`（xy 仅单个 ASCII 字母，大小写均可）= 限定；
+/// `-x:` = 排除。其余（`abc:`、`x:\foo` 等）不是盘符 token，按普通词处理
+/// （`x:\foo` 走 path: 语义由 browse/调用方处理）。
+fn parse_drive_token(token: &str) -> Option<(char, bool)> {
+    let bytes = token.as_bytes();
+    let (letter, exclude) = match bytes.len() {
+        2 if bytes[1] == b':' => (bytes[0], false),
+        3 if bytes[0] == b'-' && bytes[2] == b':' => (bytes[1], true),
+        _ => return None,
+    };
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    Some((letter.to_ascii_uppercase() as char, exclude))
 }
 
 fn strip_prefix_ci<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
@@ -71,6 +99,26 @@ mod tests {
         assert_eq!(query.text, "");
         assert_eq!(query.ext, Some("rs".to_string()));
         assert_eq!(query.path_filter, None);
+    }
+
+    #[test]
+    fn drive_tokens_include_and_exclude() {
+        // c: d: 限定两盘，-e: 排除第三盘，三者都不进搜索词
+        let q = parse("c: d: ai -e:", Scope::All);
+        assert_eq!(q.text, "ai");
+        assert_eq!(q.drives_include, (1 << 2) | (1 << 3));
+        assert_eq!(q.drives_exclude, 1 << 4);
+        assert_eq!(q.drive_mask(), Some(((1 << 2) | (1 << 3)) & !(1 << 4)));
+        // 只有排除：默认在全部盘里排除 C
+        let q = parse("-C: foo", Scope::All);
+        assert_eq!(q.text, "foo");
+        assert_eq!(q.drive_mask(), Some(((1u32 << 26) - 1) & !(1 << 2)));
+        // 只有盘符没有词：不视为空查询（进入筛选式浏览）
+        assert!(!parse("c:", Scope::All).is_empty());
+        // 非法 token 按普通词处理：多字符前缀 / 带反斜杠的路径
+        let q = parse("abc: c:\\foo", Scope::All);
+        assert_eq!(q.text, "abc: c:\\foo");
+        assert!(q.drive_mask().is_none());
     }
 
     #[test]

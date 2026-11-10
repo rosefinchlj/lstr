@@ -1093,6 +1093,12 @@ impl Engine {
                     }
                 }
             }
+            // 盘符过滤(c:/d: 限定、-c: 排除):卷不在掩码内直接跳过
+            if let Some(mask) = spec.vol_mask {
+                if mask & crate::query::volume_bit(v.letter) == 0 {
+                    continue;
+                }
+            }
             let Some(store) = &v.store else { continue };
             let generation = v.generation;
             // H5:仅过滤器(无名字 token)的查询没有名字锚点,候选池容易被
@@ -1192,6 +1198,12 @@ impl Engine {
                     if want != v.letter.to_ascii_lowercase() as u8 {
                         continue;
                     }
+                }
+            }
+            // 盘符过滤(与 Engine::query 一致)
+            if let Some(mask) = spec.vol_mask {
+                if mask & crate::query::volume_bit(v.letter) == 0 {
+                    continue;
                 }
             }
             let Some(store) = &v.store else { continue };
@@ -2775,8 +2787,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 就绪卷收到带高水位游标的 VolumeMeta(Full 计划的扫描起点高水位):
-    /// 游标对 (journal_id, next_usn) 不得被覆盖 —— 否则到随后的 ScanBegin
+    /// 盘符掩码：vol_mask 只查选中卷，排除卷不参与；全排除=零结果；
+    /// 与 path_prefix 的盘符过滤叠加时取交集。
+    #[test]
+    fn vol_mask_restricts_query_to_selected_volumes() {
+        let dir = temp_index_dir("vol-mask");
+        let (gc, gf) = (0x77u128, 0x78u128);
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, gc, 'C');
+        feed_ready(&mut engine, gf, 'F');
+
+        let mut spec = QuerySpec { tokens: vec!["alpha".into()], ..Default::default() };
+        // 默认：两卷各 1 条（两卷喂了同名夹具）
+        assert_eq!(engine.query(&spec).total, 2);
+        // 只要 C：1 条且命中都在 C 卷
+        spec.vol_mask = Some(crate::query::volume_bit('C'));
+        let only_c = engine.query(&spec);
+        assert_eq!(only_c.total, 1);
+        let c_idx = engine.volumes.iter().position(|v| v.letter == 'C').unwrap() as u32;
+        assert!(only_c.hits.iter().all(|h| h.vol == c_idx));
+        // 排除 C（=只要 F）：1 条且命中都在 F 卷
+        spec.vol_mask = Some(((1u32 << 26) - 1) & !crate::query::volume_bit('C'));
+        let only_f = engine.query(&spec);
+        assert_eq!(only_f.total, 1);
+        let f_idx = engine.volumes.iter().position(|v| v.letter == 'F').unwrap() as u32;
+        assert!(only_f.hits.iter().all(|h| h.vol == f_idx));
+        // 全排除：0
+        spec.vol_mask = Some(0);
+        assert_eq!(engine.query(&spec).total, 0);
+        // 与 path_prefix 叠加：path 指 F、mask 只要 C → 0
+        spec.vol_mask = Some(crate::query::volume_bit('C'));
+        spec.path_prefix = Some("f:\\".into());
+        assert_eq!(engine.query(&spec).total, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 就绪卷收到带高水位游标的 VolumeMeta(Full 计划的扫描起点高水位):    /// 游标对 (journal_id, next_usn) 不得被覆盖 —— 否则到随后的 ScanBegin
     /// 之间存在「游标超前于内容」的窄落盘窗口。增量计划的 VolumeMeta 本就是
     /// 握手回显,跳过不改变语义;未就绪卷(重扫窗口)仍正常接受。
     #[test]

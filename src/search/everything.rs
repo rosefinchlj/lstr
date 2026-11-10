@@ -295,6 +295,8 @@ mod tests {
             text: text.to_string(),
             ext: ext.map(str::to_string),
             path_filter: path.map(str::to_string),
+            drives_include: 0,
+            drives_exclude: 0,
         }
     }
 
