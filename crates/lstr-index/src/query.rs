@@ -364,7 +364,10 @@ fn walk_ngram(
     if !re.is_empty() {
         let gen_mask = crate::store::mask_of_bytes(gen);
         let mut ov: Vec<u32> = Vec::new();
-        for &slot in re {
+        for (j, &slot) in re.iter().enumerate() {
+            if j & CANCEL_CHECK_MASK == CANCEL_CHECK_MASK && cancelled(cancel) {
+                return true;
+            }
             if store.attrs[slot as usize] & ATTR_INTERNAL != 0 {
                 continue;
             }
@@ -375,8 +378,16 @@ fn walk_ngram(
                 ov.push(slot);
             }
         }
+        // 排序本身不可中断:入场前先看一次代次;改名风暴 overlay 最大 ~8 万,
+        // sort 是这条路径上唯一的非循环段(实测 ~1-3ms)。
+        if cancelled(cancel) {
+            return true;
+        }
         if store.has_pending_rename() {
             ov.sort_unstable_by_key(|&s| store.name_off[s as usize]);
+        }
+        if cancelled(cancel) {
+            return true;
         }
         // base 里被改名的槽是旧名假阳性,剔除(新名由 overlay 覆盖)
         cands.retain(|&s| !store.base_posting_stale(s));

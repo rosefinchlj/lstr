@@ -1118,6 +1118,12 @@ impl Engine {
                     }
                 }
             }
+            // 拼音扫描/排序段不可中断(缓存 ~0.2% 条目、candidate_cap 封顶);
+            // 段后补一次代次检查,保证旧查询不会带完整结果继续拼路径。
+            if crate::query::CANCEL_GEN.load(std::sync::atomic::Ordering::Relaxed) != cancel_my {
+                out.aborted = true;
+                break;
+            }
             // 深路径前缀后置过滤(total 为近似值,与旧实现一致)
             if let Some(prefix) = &spec.path_prefix {
                 all_hits.retain(|h| {
