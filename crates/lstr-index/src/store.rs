@@ -42,6 +42,286 @@ const COMPACT_DELTA: usize = 32_768;
 /// compact 触发阈值:死 slot 占比(分子)。
 const COMPACT_DEAD: u32 = 4096;
 
+/// n-gram 字母表大小:可打印非空格 ASCII(0x21..=0x7E)。
+/// 空格与非 ASCII 视为分隔符(切分 run):全字母表 token 的子串出现必然
+/// 完整落在某个 run 内,因此按 run 提取 n-gram 对这类 token 精确
+/// (≤3 字符零假阳性/零假阴性;含字母表外字节的 token 走 memmem 兜底)。
+const NG_ALPHA: usize = 94;
+/// bigram 链数 = 94²。
+const NG_BIGRAM: usize = NG_ALPHA * NG_ALPHA;
+/// trigram 链数 = 94³(平坦表,约 6.6MB,换 O(1) 查找)。
+const NG_TRIGRAM: usize = NG_ALPHA * NG_ALPHA * NG_ALPHA;
+
+#[inline]
+fn ng_alpha(b: u8) -> Option<u32> {
+    // then_some 是急切求值,b-0x21 会先算;必须用 then 保持惰性
+    (b >= 0x21 && b <= 0x7E).then(|| (b - 0x21) as u32)
+}
+
+#[inline]
+fn varint_len(mut v: u32) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+/// 一条倒排链在 postings 缓冲里的起点与命中 slot 数(字节终点可由
+/// 「解码 len 条」推出,不冗余存储)。
+#[derive(Clone, Copy)]
+struct NgList {
+    start: u32,
+    len: u32,
+}
+
+/// 倒排链解码迭代器:varint(delta) 累加还原 slot 升序序列,按条数终止。
+struct NgDecode<'a> {
+    buf: &'a [u8],
+    pos: usize,
+    remaining: u32,
+    acc: u32,
+}
+
+impl Iterator for NgDecode<'_> {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let mut v = 0u32;
+        let mut shift = 0;
+        loop {
+            let b = self.buf[self.pos];
+            self.pos += 1;
+            v |= ((b & 0x7F) as u32) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        self.acc = self.acc.wrapping_add(v);
+        Some(self.acc)
+    }
+}
+
+/// n-gram 倒排索引(加速 ≥2 字符子串查询,替代 memmem 全量扫描)。
+///
+/// 构建时机 = compact/from_parts(列一致有序态);覆盖 slot 0..base_len,
+/// 之后新增/改名的 slot 由 store.reindex overlay 承载(查询时 memmem 验证)。
+/// 链内 slot 升序(compact 后 slot 序 ≡ name_off 序),delta varint 编码。
+/// bigram/trigram 键空间独立,各用一个 postings 缓冲(构建期两个回填闭包
+/// 各借各的缓冲,免共享可变借用)。
+pub struct NgramIndex {
+    /// bigram 倒排链字节(varint delta;链首项 delta = slot 本身)。
+    postings_b: Vec<u8>,
+    /// trigram 倒排链字节。
+    postings_t: Vec<u8>,
+    /// [c1*94+c2] → 链。
+    bigram: Vec<NgList>,
+    /// [(c1*94+c2)*94+c3] → 链。
+    trigram: Vec<NgList>,
+}
+
+impl NgramIndex {
+    /// 两遍构建:先计数+精确测编码长度(决定 postings 容量,避免倍增虚胖),
+    /// 再按每链游标回填。stamp 存「最近一次命中 slot+1」,同一条目内去重,
+    /// 0 值同时表示「本条目尚未写过该 n-gram」(delta 前驱 = stamp-1)。
+    ///
+    /// 注意:不过滤 DEAD/NOISE 槽(未 compact 的快照可能带内部位,死槽原地
+    /// 复活后仍需可查);查询端以 attrs 过滤兜底,多余的 posting 可忽略。
+    pub fn build(names_lc: &[u8], name_off: &[u32]) -> Self {
+        let n = name_off.len();
+        let mut stamp_b = vec![0u32; NG_BIGRAM];
+        let mut stamp_t = vec![0u32; NG_TRIGRAM];
+        let mut len_b = vec![0u32; NG_BIGRAM];
+        let mut len_t = vec![0u32; NG_TRIGRAM];
+        let mut size_b = vec![0u32; NG_BIGRAM];
+        let mut size_t = vec![0u32; NG_TRIGRAM];
+        // pass 1:每链命中数 + varint 字节数(两遍同序遍历,链内 slot 升序)
+        for slot in 0..n as u32 {
+            let name = slice_at(names_lc, name_off[slot as usize] as usize);
+            for_each_ngram(name, &mut |k| {
+                if stamp_b[k] != slot + 1 {
+                    size_b[k] += varint_len(ng_delta(stamp_b[k], slot)) as u32;
+                    stamp_b[k] = slot + 1;
+                    len_b[k] += 1;
+                }
+            }, &mut |k| {
+                if stamp_t[k] != slot + 1 {
+                    size_t[k] += varint_len(ng_delta(stamp_t[k], slot)) as u32;
+                    stamp_t[k] = slot + 1;
+                    len_t[k] += 1;
+                }
+            });
+        }
+        // 前缀和 → 链起点;游标 = 起点副本(pass 2 回填用)
+        let mut off_b = Vec::with_capacity(NG_BIGRAM + 1);
+        let mut off_t = Vec::with_capacity(NG_TRIGRAM + 1);
+        let mut total = 0u32;
+        off_b.push(0);
+        for &s in &size_b {
+            total += s;
+            off_b.push(total);
+        }
+        let mut total = 0u32;
+        off_t.push(0);
+        for &s in &size_t {
+            total += s;
+            off_t.push(total);
+        }
+        let mut postings_b = vec![0u8; off_b[NG_BIGRAM] as usize];
+        let mut cur_b = off_b[..NG_BIGRAM].to_vec();
+        let total_t = off_t[NG_TRIGRAM];
+        let mut postings_t = vec![0u8; total_t as usize];
+        let mut cur_t = off_t[..NG_TRIGRAM].to_vec();
+        // pass 2:重提取并按链游标回填(stamp 重置:0 = 本条目未写过)
+        stamp_b.fill(0);
+        stamp_t.fill(0);
+        for slot in 0..n as u32 {
+            let name = slice_at(names_lc, name_off[slot as usize] as usize);
+            for_each_ngram(name, &mut |k| {
+                if stamp_b[k] != slot + 1 {
+                    let delta = ng_delta(stamp_b[k], slot);
+                    cur_b[k] += ng_write(&mut postings_b, cur_b[k] as usize, delta) as u32;
+                    stamp_b[k] = slot + 1;
+                }
+            }, &mut |k| {
+                if stamp_t[k] != slot + 1 {
+                    let delta = ng_delta(stamp_t[k], slot);
+                    cur_t[k] += ng_write(&mut postings_t, cur_t[k] as usize, delta) as u32;
+                    stamp_t[k] = slot + 1;
+                }
+            });
+        }
+        let bigram = (0..NG_BIGRAM)
+            .map(|k| NgList { start: off_b[k], len: len_b[k] })
+            .collect();
+        let trigram = (0..NG_TRIGRAM)
+            .map(|k| NgList { start: off_t[k], len: len_t[k] })
+            .collect();
+        Self { postings_b, postings_t, bigram, trigram }
+    }
+
+    /// 解码一条 bigram 链(升序 slot)追加到 out。
+    fn decode_b(&self, r: NgList, out: &mut Vec<u32>) {
+        out.extend(NgDecode {
+            buf: &self.postings_b,
+            pos: r.start as usize,
+            remaining: r.len,
+            acc: 0,
+        });
+    }
+
+    /// 解码一条 trigram 链(升序 slot)追加到 out。
+    fn decode_t(&self, r: NgList, out: &mut Vec<u32>) {
+        out.extend(NgDecode {
+            buf: &self.postings_t,
+            pos: r.start as usize,
+            remaining: r.len,
+            acc: 0,
+        });
+    }
+
+    /// 把 trigram 链 r 与升序 acc 归并求交(acc 原地收缩)。
+    fn intersect_t(&self, r: NgList, acc: &mut Vec<u32>) {
+        let mut merged = Vec::with_capacity(acc.len().min(r.len as usize));
+        let mut it = NgDecode {
+            buf: &self.postings_t,
+            pos: r.start as usize,
+            remaining: r.len,
+            acc: 0,
+        };
+        let mut next = it.next();
+        let mut i = 0;
+        while i < acc.len() {
+            let a = acc[i];
+            while let Some(x) = next {
+                if x < a {
+                    next = it.next();
+                } else {
+                    break;
+                }
+            }
+            match next {
+                Some(x) if x == a => {
+                    merged.push(a);
+                    next = it.next();
+                    i += 1;
+                }
+                Some(_) => i += 1,
+                None => break,
+            }
+        }
+        *acc = merged;
+    }
+
+    /// 诊断/内存预算:postings + 两张链表字节数。
+    pub fn heap_bytes(&self) -> usize {
+        self.postings_b.len()
+            + self.postings_t.len()
+            + self.bigram.len() * 8
+            + self.trigram.len() * 8
+    }
+}
+
+/// 链内 delta:首项为 slot 本身,其余为与前一命中 slot 的差(≥1)。
+#[inline]
+fn ng_delta(stamp: u32, slot: u32) -> u32 {
+    if stamp == 0 {
+        slot
+    } else {
+        slot - (stamp - 1)
+    }
+}
+
+/// 在 buf[p..] 原地写 varint,返回写入字节数。
+#[inline]
+fn ng_write(buf: &mut [u8], p: usize, mut v: u32) -> usize {
+    let mut n = 0;
+    while v >= 0x80 {
+        buf[p + n] = v as u8 | 0x80;
+        v >>= 7;
+        n += 1;
+    }
+    buf[p + n] = v as u8;
+    n + 1
+}
+
+/// trigram 平坦表键(调用方保证字节在字母表内)。
+#[inline]
+fn ng_trigram_key(c1: u8, c2: u8, c3: u8) -> usize {
+    ((ng_alpha(c1).unwrap() * NG_ALPHA as u32 + ng_alpha(c2).unwrap()) * NG_ALPHA as u32
+        + ng_alpha(c3).unwrap()) as usize
+}
+
+/// 遍历名字里全部 bigram/trigram 键(按 run 切分;分隔符重置 run)。
+/// `b` 收 bigram 键 c1*94+c2,`t` 收 trigram 键 (c1*94+c2)*94+c3。
+#[inline]
+fn for_each_ngram(name: &[u8], b: &mut impl FnMut(usize), t: &mut impl FnMut(usize)) {
+    let (mut p1, mut p2) = (None::<u32>, None::<u32>);
+    for &byte in name {
+        match ng_alpha(byte) {
+            None => {
+                p1 = None;
+                p2 = None;
+            }
+            Some(c) => {
+                if let Some(x) = p2 {
+                    b((x * NG_ALPHA as u32 + c) as usize);
+                }
+                if let (Some(x), Some(y)) = (p1, p2) {
+                    t(((x * NG_ALPHA as u32 + y) * NG_ALPHA as u32 + c) as usize);
+                }
+                p1 = p2;
+                p2 = Some(c);
+            }
+        }
+    }
+}
+
 pub struct VolumeStore {
     pub names: Vec<u8>,
     pub names_lc: Vec<u8>,
@@ -78,10 +358,19 @@ pub struct VolumeStore {
     noise_anchors: std::collections::HashSet<u64>,
     /// 噪声排除开关(关=不分类、不回收)。
     pub noise_enabled: bool,
+    /// n-gram 倒排(覆盖 0..ngram_base_len;scan 模式为 None,查询退 memmem)。
+    ngram: Option<NgramIndex>,
+    /// 倒排构建时的 slot 总数;之后的追加/改名进 reindex overlay。
+    ngram_base_len: u32,
+    /// 倒排构建后的新增 slot 与改名的 base slot(查询时逐个 memmem 验证)。
+    /// 追加按 slot 升序进入;base 改名以 reindex_mark 去重。
+    reindex: Vec<u32>,
+    /// base slot 改名去重位图(slot < ngram_base_len 才置位)。
+    reindex_mark: Vec<u64>,
 }
 
 /// 名字里出现的 ASCII 字母位图(bit0=a .. bit25=z);非字母字节忽略。
-fn mask_of_bytes(name: &[u8]) -> u32 {
+pub(crate) fn mask_of_bytes(name: &[u8]) -> u32 {
     let mut m = 0u32;
     for &b in name {
         let c = b.to_ascii_lowercase();
@@ -125,6 +414,10 @@ impl VolumeStore {
             unresolved: HashMap::new(),
             noise_anchors: std::collections::HashSet::new(),
             noise_enabled,
+            ngram: None,
+            ngram_base_len: 0,
+            reindex: Vec::new(),
+            reindex_mark: Vec::new(),
         }
     }
 
@@ -150,7 +443,7 @@ impl VolumeStore {
             .iter()
             .map(|&o| mask_of_bytes(slice_at(&names_lc, o as usize)))
             .collect();
-        Self {
+        let mut s = Self {
             names,
             names_lc,
             name_off,
@@ -174,7 +467,15 @@ impl VolumeStore {
             .collect(),
             noise_anchors: std::collections::HashSet::new(),
             noise_enabled,
-        }
+            ngram: None,
+            ngram_base_len: 0,
+            reindex: Vec::new(),
+            reindex_mark: Vec::new(),
+        };
+        // 加载即建倒排:快照格式不变(不持久化倒排),重建耗时有界(实测见
+        // bench_wide_query_phase_profile),避免版本升级触发全量重扫。
+        s.rebuild_ngram();
+        s
     }
 
     pub fn len(&self) -> usize {
@@ -194,6 +495,86 @@ impl VolumeStore {
             + self.attrs.len() * 2
             + self.mtime.len() * 4
             + self.char_mask.len() * 4
+            + self.ngram_heap_bytes()
+    }
+
+    /// 倒排堆字节:postings + 链表 + overlay。
+    pub fn ngram_heap_bytes(&self) -> usize {
+        self.ngram.as_ref().map_or(0, NgramIndex::heap_bytes)
+            + self.reindex.len() * 4
+            + self.reindex_mark.len() * 8
+    }
+
+    /// 重建倒排(compact/from_parts 尾部调用;列处于一致有序态)。
+    /// pub(crate):bench 测构建耗时用。
+    pub(crate) fn rebuild_ngram(&mut self) {
+        self.ngram_base_len = self.name_off.len() as u32;
+        self.reindex.clear();
+        self.reindex_mark.clear();
+        self.reindex_mark.resize((self.name_off.len() + 63) / 64, 0);
+        self.ngram = Some(NgramIndex::build(&self.names_lc, &self.name_off));
+    }
+
+    #[inline]
+    fn reindex_marked(&self, slot: u32) -> bool {
+        self.reindex_mark
+            .get((slot / 64) as usize)
+            .is_some_and(|&w| w & (1u64 << (slot % 64)) != 0)
+    }
+
+    #[inline]
+    fn mark_reindexed(&mut self, slot: u32) {
+        if let Some(w) = self.reindex_mark.get_mut((slot / 64) as usize) {
+            *w |= 1u64 << (slot % 64);
+        }
+    }
+
+    /// n-gram 快路径候选:gen(已小写折叠)全部字节在字母表内且有索引时,
+    /// 返回升序候选 slot(链内 slot 序 ≡ name_off 序 ≡ memmem 命中序)。
+    /// None = 无索引(scan 模式)/token 不可索引 → 调用方走 memmem 兜底。
+    ///
+    /// - 2/3 字符:单链即精确命中集(子串出现 ⇔ n-gram 在链上);
+    /// - ≥4 字符:全部连续 trigram 链求交(最短链起步)= 超集,调用方逐个
+    ///   memmem 验证。
+    pub(crate) fn ngram_candidates(&self, gen: &[u8]) -> Option<Vec<u32>> {
+        let idx = self.ngram.as_ref()?;
+        if gen.len() < 2 || gen.iter().any(|&b| ng_alpha(b).is_none()) {
+            return None;
+        }
+        let mut out: Vec<u32> = Vec::new();
+        if gen.len() == 2 {
+            let k = (ng_alpha(gen[0]).unwrap() * NG_ALPHA as u32 + ng_alpha(gen[1]).unwrap()) as usize;
+            idx.decode_b(idx.bigram[k], &mut out);
+        } else if gen.len() == 3 {
+            let k = ng_trigram_key(gen[0], gen[1], gen[2]);
+            idx.decode_t(idx.trigram[k], &mut out);
+        } else {
+            let mut refs: Vec<NgList> = gen
+                .windows(3)
+                .map(|w| idx.trigram[ng_trigram_key(w[0], w[1], w[2])])
+                .collect();
+            refs.sort_unstable_by_key(|r| r.len);
+            idx.decode_t(refs[0], &mut out);
+            for &r in &refs[1..] {
+                if out.is_empty() {
+                    break;
+                }
+                idx.intersect_t(r, &mut out);
+            }
+        }
+        Some(out)
+    }
+
+    /// overlay:倒排构建后的新增/改名 slot(查询端逐个 memmem 验证)。
+    pub(crate) fn reindex_slots(&self) -> &[u32] {
+        &self.reindex
+    }
+
+    /// base 倒排对该 slot 是否已失效(改名后旧名 posting 是假阳性,须跳过,
+    /// 由 overlay 用新名覆盖)。
+    #[inline]
+    pub(crate) fn base_posting_stale(&self, slot: u32) -> bool {
+        self.reindex_marked(slot)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -456,6 +837,12 @@ impl VolumeStore {
                     self.names_lc.push(0);
                     self.off_index.push((self.name_off[old as usize], old));
                     self.char_mask[old as usize] = mask_of_bytes(name);
+                    // base 槽改名:旧名 posting 失效 → 标记跳过 + 进 overlay
+                    // (查询端按新名 memmem 验证);delta 槽建槽时已在 overlay。
+                    if (old as usize) < self.ngram_base_len as usize && !self.reindex_marked(old) {
+                        self.mark_reindexed(old);
+                        self.reindex.push(old);
+                    }
                 }
                 self.parent[old as usize] = new_p;
                 self.attrs[old as usize] = (self.attrs[old as usize] & ATTR_INTERNAL)
@@ -494,6 +881,11 @@ impl VolumeStore {
         self.mtime.push(mtime);
         self.char_mask.push(mask_of_bytes(name));
         self.delta.push(slot);
+        // 倒排 overlay:索引构建后的新增槽不进倒排(重建留给 compact),
+        // 查询时逐个 memmem 验证;scan 模式无索引,首次 compact 全量建。
+        if !scanning {
+            self.reindex.push(slot);
+        }
         // 索引策略:scan 模式只索引目录(父查找只需要目录,内存省 78%);
         // journal 模式索引全部(改名/删除要按 FRN 定位)。
         if scanning {
@@ -760,10 +1152,6 @@ impl VolumeStore {
         names_lc.shrink_to_fit();
         let off_index: Vec<(u32, u32)> =
             name_off.iter().enumerate().map(|(i, &o)| (o, i as u32)).collect();
-        let char_mask: Vec<u32> = name_off
-            .iter()
-            .map(|&o| mask_of_bytes(slice_at(&names_lc, o as usize)))
-            .collect();
         self.names = names;
         self.names_lc = names_lc;
         self.name_off = name_off;
@@ -790,6 +1178,8 @@ impl VolumeStore {
         self.base_len = self.name_off.len() as u32;
         self.dead_count = 0;
         self.renames = 0;
+        // 10. 列已一致有序:重建倒排,清空 overlay
+        self.rebuild_ngram();
     }
 }
 
