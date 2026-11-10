@@ -172,6 +172,10 @@ pub struct LstrApp {
     tray: Option<TrayState>,
     toast: Option<(String, Instant)>,
     clear_armed_at: Option<Instant>,
+    /// 退出命令二次确认：首次触发记时刻，3 秒内再次触发才真正退出。
+    quit_armed_at: Option<Instant>,
+    /// 退出原因（写 engine.log 用）：window/tray/cmd:quit/hotkey。
+    exit_reason: &'static str,
     last_height: f32,
     needle_y: f32,
     needle_target: f32,
@@ -308,6 +312,8 @@ impl LstrApp {
             tray,
             toast: None,
             clear_armed_at: None,
+            quit_armed_at: None,
+            exit_reason: "window",
             last_height: 0.0,
             needle_y: 0.0,
             needle_target: 0.0,
@@ -649,7 +655,10 @@ impl LstrApp {
                 }
             }
             Some(TrayAction::Settings) => self.open_settings(ctx),
-            Some(TrayAction::Quit) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Some(TrayAction::Quit) => {
+                self.exit_reason = "tray";
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             None => {}
         }
     }
@@ -1333,7 +1342,21 @@ impl LstrApp {
                 Ok(()) => self.toast(ctx, "Everything 已启动".to_string()),
                 Err(err) => self.toast(ctx, err),
             },
-            "cmd:quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            "cmd:quit" => {
+                // 二次确认：命令页里的「退出 lstr」太容易误触（点一下整个程序
+                // 就消失，体感像崩溃）。首次回车/点击给提示，3 秒内再次触发才退出。
+                let armed = self
+                    .quit_armed_at
+                    .map(|t| t.elapsed() < Duration::from_secs(3))
+                    .unwrap_or(false);
+                if armed {
+                    self.exit_reason = "cmd:quit";
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    self.quit_armed_at = Some(Instant::now());
+                    self.toast(ctx, "再按一次回车确认退出（3 秒内有效）".to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -2458,46 +2481,12 @@ impl LstrApp {
             } else {
                 &query.text
             };
-            let mut title_job = match &fuzzy_hit {
-                Some(positions) => ui::text_job_positions(
-                    &entry.name,
-                    positions,
-                    &ui::text_font(14.5),
-                    theme.text,
-                    theme.amber,
-                ),
-                None => ui::text_job(
-                    &entry.name,
-                    title_q,
-                    &ui::text_font(14.5),
-                    theme.text,
-                    theme.amber,
-                ),
-            };
-            title_job.wrap.max_width = row_rect.width() - 54.0 - 76.0;
-            title_job.wrap.max_rows = 1;
-            title_job.wrap.overflow_character = Some('…');
-            // egui 默认优先在连字符/标点处断行：长文件名 "lstr-9cc85..." 只剩
-            // 一个连字符在第 5 个字符，会被截成 "lstr-…"。break_anywhere 让
-            // 它在真实宽度边缘截断，窗口拉宽就能多看几个字。
-            title_job.wrap.break_anywhere = true;
-            let title_galley = painter.layout_job(title_job);
-            let title_width = title_galley.size().x;
-            let title_height = title_galley.size().y;
-            painter.galley(
-                egui::pos2(row_rect.left() + 54.0, row_rect.top() + 5.0),
-                title_galley,
-                theme.text,
-            );
-
-            // 长路径不再中段省略：从第一行「文件名之后」开始接排，
-            // 放不下的部分折到第二行行首继续，两行合起来是完整路径，行高不变。
+            // 路径行判定与 meta（修改时间；选中且开启时并列大小）先在标题前算好：
+            // meta 占右侧固定宽度，标题/路径的可用宽度都必须扣掉它，否则长路径
+            // 会画到日期文字下面（UI 冲突的根因）。
             let is_path_row = matches!(entry.kind, Kind::File | Kind::Folder | Kind::Program);
             let full_path = entry.full_path();
             let lead = if entry.id.starts_with("qs:") { "已打开 · " } else { "" };
-            // meta（修改时间；选中且开启时并列大小）：
-            // 时间对路径行**始终显示**（相对时间：刚刚/N 分钟前/N 天前/日期），
-            // 让列表页可直接判断新旧；大小仍是选中行才画，避免每行挤压路径。
             let time_text = if is_path_row {
                 entry
                     .modified
@@ -2528,6 +2517,41 @@ impl LstrApp {
             } else {
                 76.0
             };
+            let mut title_job = match &fuzzy_hit {
+                Some(positions) => ui::text_job_positions(
+                    &entry.name,
+                    positions,
+                    &ui::text_font(14.5),
+                    theme.text,
+                    theme.amber,
+                ),
+                None => ui::text_job(
+                    &entry.name,
+                    title_q,
+                    &ui::text_font(14.5),
+                    theme.text,
+                    theme.amber,
+                ),
+            };
+            title_job.wrap.max_width = (row_rect.width() - 54.0 - meta_w - 6.0).max(24.0);
+            title_job.wrap.max_rows = 1;
+            title_job.wrap.overflow_character = Some('…');
+            // egui 默认优先在连字符/标点处断行：长文件名 "lstr-9cc85..." 只剩
+            // 一个连字符在第 5 个字符，会被截成 "lstr-…"。break_anywhere 让
+            // 它在真实宽度边缘截断，窗口拉宽就能多看几个字。
+            title_job.wrap.break_anywhere = true;
+            let title_galley = painter.layout_job(title_job);
+            let title_width = title_galley.size().x;
+            let title_height = title_galley.size().y;
+            painter.galley(
+                egui::pos2(row_rect.left() + 54.0, row_rect.top() + 5.0),
+                title_galley,
+                theme.text,
+            );
+
+            // 长路径不再中段省略：从第一行「文件名之后」开始接排，
+            // 放不下的部分折到第二行行首继续，两行合起来是完整路径，行高不变。
+            // （is_path_row/full_path/lead/meta/meta_w 已在标题前算好）
             // 是否折两行按「实际渲染宽度」判断而不是字符数：中文字符宽约为
             // ASCII 的两倍，按字符数判断会让视觉上已超宽的路径仍被单行省略。
             let mono = ui::mono_font(11.5);
@@ -2574,7 +2598,7 @@ impl LstrApp {
                 }
                 if !tail.is_empty() {
                     let mut tail_job = ui::text_job(&tail, needle, &mono, theme.sub, theme.amber);
-                    tail_job.wrap.max_width = row_rect.width() - 54.0 - 10.0;
+                    tail_job.wrap.max_width = (row_rect.width() - 54.0 - meta_w - 10.0).max(24.0);
                     tail_job.wrap.max_rows = 1;
                     tail_job.wrap.break_anywhere = true;
                     // 极端超长路径的兜底：正常窗口宽度两行足够，不会走到省略。
@@ -2628,7 +2652,7 @@ impl LstrApp {
                     theme.sub,
                     theme.amber,
                 );
-                sub_job.wrap.max_width = row_rect.width() - 54.0 - 10.0;
+                sub_job.wrap.max_width = (row_rect.width() - 54.0 - meta_w - 10.0).max(24.0);
                 sub_job.wrap.max_rows = 1;
                 sub_job.wrap.overflow_character = Some('…');
                 sub_job.wrap.break_anywhere = true;
@@ -4925,6 +4949,9 @@ impl eframe::App for LstrApp {
     /// 旧 worker(实测多次出现怪状态)。这里同步发关闭指令并等其退出(有
     /// 超时);worker 收到 Shutdown 后走 write_clean_exit_flag 优雅退出。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 退出原因落 engine.log：下次出现「窗口突然消失」可直接定性，
+        // 不用再靠时间线推断（window=关窗/Esc 等未标记路径，tray=托盘退出）。
+        lstr_index::snapshot::debug_log(&format!("ui exit reason={}", self.exit_reason));
         self.service
             .graceful_shutdown(std::time::Duration::from_secs(6));
     }
