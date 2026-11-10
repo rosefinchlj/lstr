@@ -1,7 +1,8 @@
 //! P0-2：资源管理器内「直接键入搜索」（type-to-search）。
 //!
-//! 与 `hotkey.rs` 的 Raw Input 通道严格分离：
-//! - Raw Input（`RIDEV_INPUTSINK`）只**观察**按键，用来识别双击 Space，不能拦截；
+//! 与 `hotkey.rs` 的唤起热键通道严格分离：
+//! - 唤起热键（`hotkey.rs`）的 LL 钩子只**观察**按键（双击修饰键 / Ctrl+G），
+//!   无条件 `CallNextHookEx`，不能拦截；
 //! - 本模块用 `WH_KEYBOARD_LL` 低级钩子，是唯一能**吞键**的通道。
 //!
 //! 安全边界（这是全局钩子，判定错了会吃掉用户正常打字）：
