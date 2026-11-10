@@ -17,12 +17,18 @@ pub struct PathQuery {
 /// Everything 语法（`path:E:\foo`）、`>`/`a `/`f ` 前缀都不会误判。
 /// 只打 `D:`（冒号后没分隔符）也算——按 Listary 习惯直接列 D:\ 根目录，
 /// 否则会落进 Everything 被当成「D 盘全盘」查询（三百万条候选、排序无意义）。
+/// **例外**：`D: <词>`（冒号后跟空白）不按路径浏览处理——这是搜索框的
+/// 盘符过滤语法（`d: ap` = 只在 D 盘搜 ap），交给 query::parse 的 drive token。
 pub fn parse(raw: &str) -> Option<PathQuery> {
     let trimmed = raw.trim_start();
     let bytes = trimmed.as_bytes();
     let is_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
     let is_unc = trimmed.starts_with("\\\\");
     if !is_drive && !is_unc {
+        return None;
+    }
+    // `d: <词>`：冒号后是空白 → 盘符过滤，不是目录浏览。
+    if is_drive && matches!(bytes.get(2), Some(b' ' | b'\t')) {
         return None;
     }
     // "D:" / "D:prog"：冒号后没有分隔符，统一按 D:\ 根目录处理，
@@ -141,6 +147,16 @@ mod tests {
         let pq = parse("d:prog").expect("盘符 + 过滤词");
         assert_eq!(pq.dir, r"d:\");
         assert_eq!(pq.filter, "prog");
+    }
+
+    #[test]
+    fn spaced_drive_is_filter_not_browse() {
+        // `d: ap`（冒号后跟空白）是盘符过滤语法，不能吞成目录浏览。
+        assert!(parse("d: ap").is_none(), "d: 空格后跟词 = 盘符过滤");
+        assert!(parse("c:\tdir").is_none(), "制表符同理");
+        // 无空白的老行为不受影响
+        assert!(parse("d:prog").is_some());
+        assert!(parse("d:\\prog").is_some());
     }
 
     #[test]
