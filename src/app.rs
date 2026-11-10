@@ -2688,12 +2688,19 @@ impl LstrApp {
             let title_galley = painter.layout_job(title_job);
             let title_width = title_galley.size().x;
             let title_height = title_galley.size().y;
-            // 两行内容的垂直布局：标题 + 6px 行距 + 副标题(路径)，整块在行内
-            // 垂直居中（row_height 可配置 36-52，写死 5/25 在 44 时两行只隔 3px）。
+            // 两行内容垂直布局：标题 + 行距 + 副标题(路径)，整块在**高亮底**内
+            // 居中。高亮底是 row_rect.shrink2(0, 2.0)（上下各缩 2px），所以容器
+            // 高度取 row_h-4；内容超高时先把行距压到 2px，绝不越出高亮。
             const SUB_LINE_H: f32 = 16.0; // mono 11.5 × TEXT_SCALE 的近似行高
-            let content_h = title_height + 6.0 + SUB_LINE_H;
-            let y_title = row_rect.top() + ((theme.row_h - content_h) / 2.0).max(2.0);
-            let y_sub = y_title + title_height + 6.0;
+            let inner_h = theme.row_h - 4.0;
+            let mut line_gap = 4.0;
+            let mut content_h = title_height + line_gap + SUB_LINE_H;
+            if content_h > inner_h {
+                line_gap = (inner_h - title_height - SUB_LINE_H).max(2.0);
+                content_h = title_height + line_gap + SUB_LINE_H;
+            }
+            let y_title = row_rect.top() + 2.0 + ((inner_h - content_h) / 2.0).max(0.0);
+            let y_sub = y_title + title_height + line_gap;
             painter.galley(
                 egui::pos2(row_rect.left() + 54.0, y_title),
                 title_galley,
