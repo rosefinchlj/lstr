@@ -385,8 +385,11 @@ pub fn format_relative_time(ts: i64) -> String {
 /// 走 Win32 `FileTimeToLocalFileTime` + `FileTimeToSystemTime`（自动处理时区/夏令时），
 /// 文件管理器习惯的本地日期；API 异常时回退到粗略 UTC 日期（不应发生）。
 fn format_local_date(ts: i64) -> String {
-    use windows::Win32::Foundation::FILETIME;
-    use windows::Win32::System::Time::{FileTimeToLocalFileTime, FileTimeToSystemTime, SYSTEMTIME};
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    // windows crate 0.62 的模块归属：FileTimeToLocalFileTime 在 Storage::FileSystem，
+    // FileTimeToSystemTime 在 System::Time（别按直觉猜 System::Time 全在这）。
+    use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    use windows::Win32::System::Time::FileTimeToSystemTime;
     // 1601-01-01 → 1970-01-01 的 100ns tick 数（18 位，勿再写错位数）。
     const UNIX_EPOCH_FILETIME: i128 = 116_444_736_000_000_000;
     let ticks = ts as i128 * 10_000_000 + UNIX_EPOCH_FILETIME;
