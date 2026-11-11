@@ -184,7 +184,7 @@ impl BuiltinProvider {
         let mut spec = build_spec(query, filters);
         spec.kind = KindFilter::All;
         // 时间筛选时 mod.rs 不会补 exact(Everything 分支才支持),这里不做无用功。
-        let exact_needle = filters.time.is_none().then(|| {
+        let exact_needle = (filters.time.is_none() && !filters.matches.regex).then(|| {
             if filters.matches.case_sensitive {
                 query.text.clone()
             } else {
@@ -472,7 +472,11 @@ fn scope_kind_filter(scope: Scope) -> KindFilter {
 /// Query + SearchFilters → 引擎查询规格。
 pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
     let mut spec = QuerySpec {
-        tokens: query.text.split_whitespace().map(String::from).collect(),
+        tokens: if filters.matches.regex {
+            Vec::new()
+        } else {
+            query.text.split_whitespace().map(String::from).collect()
+        },
         kind: match query.scope {
             Scope::Folder => KindFilter::Folders,
             Scope::Program => KindFilter::Programs,
@@ -494,6 +498,7 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
         vol_mask: query.drive_mask(),
         case_sensitive: filters.matches.case_sensitive,
         whole_word: filters.matches.whole_word,
+        regex: (filters.matches.regex && !query.text.is_empty()).then(|| query.text.clone()),
     };
     if let Some(location) = &filters.location {
         let p = location.path().display().to_string().to_lowercase();
@@ -1777,6 +1782,20 @@ mod tests {
         assert_eq!(spec.ext.as_deref(), Some("rs"));
         let spec = build_spec(&parse("ext:.arj", Scope::All), &filters);
         assert_eq!(spec.ext.as_deref(), Some("arj"));
+    }
+
+    #[test]
+    fn regex_spec_keeps_pattern_and_drops_tokens() {
+        let mut filters = SearchFilters::default();
+        filters.matches.regex = true;
+        let spec = build_spec(
+            &crate::search::query::parse_regex(r"ext:rs ^api-.*\.dll$", Scope::All),
+            &filters,
+        );
+        assert_eq!(spec.regex.as_deref(), Some(r"ext:rs ^api-.*\.dll$"));
+        assert!(spec.tokens.is_empty(), "正则模式不能再按空白拆 token");
+        assert_eq!(spec.ext, None, "正则里的 ext: 不能被当成筛选语法");
+        assert!(spec.exact.is_none());
     }
 
     #[test]

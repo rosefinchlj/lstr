@@ -1,5 +1,19 @@
 use crate::model::{Query, Scope};
 
+/// 正则模式：整串原样作为 pattern，不解析 `ext:` / `path:` / 盘符 / 作用域
+/// 前缀（正则里的这些文本是模式的一部分）。作用域仍由当前 Tab 决定。
+pub fn parse_regex(raw: &str, scope: Scope) -> Query {
+    Query {
+        raw: raw.to_string(),
+        scope,
+        text: raw.trim().to_string(),
+        ext: None,
+        path_filter: None,
+        drives_include: 0,
+        drives_exclude: 0,
+    }
+}
+
 pub fn parse(raw: &str, scope: Scope) -> Query {
     let trimmed = raw.trim();
 
@@ -162,5 +176,15 @@ mod tests {
         let query = parse("apple", Scope::All);
         assert_eq!(query.scope, Scope::All);
         assert_eq!(query.text, "apple");
+    }
+
+    #[test]
+    fn regex_parse_keeps_raw_pattern_and_ignores_tokens() {
+        let query = parse_regex(r"ext:rs .*\.dll$", Scope::File);
+        assert_eq!(query.scope, Scope::File);
+        assert_eq!(query.text, r"ext:rs .*\.dll$");
+        assert_eq!(query.ext, None, "正则里的 ext: 是模式的一部分");
+        assert_eq!(query.path_filter, None);
+        assert_eq!(query.drive_mask(), None);
     }
 }

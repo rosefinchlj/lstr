@@ -1148,6 +1148,7 @@ impl Engine {
             // 拼音候选(仅 ASCII 查询;名字里不含查询词时靠拼音命中)
             if !spec.case_sensitive
                 && !spec.whole_word
+                && spec.regex.is_none()
                 && !spec.tokens.is_empty()
                 && spec.tokens.iter().all(|t| t.is_ascii())
             {
@@ -1292,6 +1293,7 @@ impl Engine {
             // 的两个 total 口径完全一致。
             if !spec.case_sensitive
                 && !spec.whole_word
+                && spec.regex.is_none()
                 && !spec.tokens.is_empty()
                 && spec.tokens.iter().all(|t| t.is_ascii())
             {

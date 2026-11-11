@@ -9,6 +9,9 @@
 //! - 名字区 `\0` 结尾保证命中不跨条目,仍按起点校验兜底。
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use regex::bytes::{Regex, RegexBuilder};
 
 use crate::store::{fold_ascii, VolumeStore, ATTR_INTERNAL, NO_PARENT};
 
@@ -26,7 +29,7 @@ pub(crate) struct MatchMatcher {
 
 impl MatchMatcher {
     pub(crate) fn new(spec: &QuerySpec) -> Option<Self> {
-        if !spec.case_sensitive && !spec.whole_word {
+        if spec.regex.is_some() || (!spec.case_sensitive && !spec.whole_word) {
             return None;
         }
         let tokens: Vec<Vec<u8>> = spec
@@ -64,6 +67,115 @@ impl MatchMatcher {
 #[inline]
 fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
+}
+
+// ---------- 正则模式 ----------
+
+/// 单条缓存（同一 worker 顺序查一个正则；换模式自然替换）。
+fn regex_cache() -> &'static Mutex<Option<(String, bool, Arc<Regex>)>> {
+    static CACHE: OnceLock<Mutex<Option<(String, bool, Arc<Regex>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// 供 UI 在发查询前预编译：非法正则直接提示，不把空结果伪装成“没找到”。
+pub fn validate_regex(pattern: &str, case_sensitive: bool) -> Result<(), String> {
+    RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+pub(crate) fn compiled_regex(spec: &QuerySpec) -> Option<Arc<Regex>> {
+    let pattern = spec.regex.as_deref()?;
+    if let Ok(mut cache) = regex_cache().lock() {
+        if let Some((cached, case, regex)) = cache.as_ref() {
+            if cached == pattern && *case == spec.case_sensitive {
+                return Some(Arc::clone(regex));
+            }
+        }
+        let regex = Arc::new(
+            RegexBuilder::new(pattern)
+                .case_insensitive(!spec.case_sensitive)
+                .build()
+                .ok()?,
+        );
+        *cache = Some((pattern.to_string(), spec.case_sensitive, Arc::clone(&regex)));
+        return Some(regex);
+    }
+    None
+}
+
+/// 从正则里抽一段最长的字面量（≥2 字节）做 n-gram 预筛；抽不到就全扫。
+fn regex_literal(pattern: &str) -> Option<Vec<u8>> {
+    let bytes = pattern.as_bytes();
+    let mut best: &[u8] = &[];
+    let mut start: Option<usize> = None;
+    for (i, &byte) in bytes.iter().enumerate() {
+        let literal = byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-';
+        if literal {
+            start.get_or_insert(i);
+        } else if let Some(s) = start.take() {
+            if i - s > best.len() {
+                best = &bytes[s..i];
+            }
+        }
+    }
+    if let Some(s) = start {
+        if bytes.len() - s > best.len() {
+            best = &bytes[s..];
+        }
+    }
+    (best.len() >= 2).then(|| fold_ascii(best))
+}
+
+fn walk_regex(
+    store: &VolumeStore,
+    spec: &QuerySpec,
+    regex: &Regex,
+    literal: Option<&[u8]>,
+    matcher: Option<&PathMatcher>,
+    cancel: Option<u64>,
+    emit: &mut impl FnMut(u32) -> bool,
+) -> bool {
+    let mut consider = |slot: u32| -> bool {
+        if !passes_filters(store, slot, spec) {
+            return true;
+        }
+        if matcher.is_some_and(|m| !m.matches(store, slot)) {
+            return true;
+        }
+        if regex.is_match(store.name(slot)) {
+            emit(slot)
+        } else {
+            true
+        }
+    };
+    if let Some(lit) = literal {
+        if let Some(candidates) = store.ngram_candidates(lit) {
+            for (i, slot) in candidates.into_iter().enumerate() {
+                if i & CANCEL_CHECK_MASK == 0 && cancelled(cancel) {
+                    return true;
+                }
+                if !consider(slot) {
+                    return false;
+                }
+            }
+            return false;
+        }
+    }
+    for slot in 0..store.name_off.len() as u32 {
+        if slot & CANCEL_CHECK_MASK as u32 == 0 && cancelled(cancel) {
+            return true;
+        }
+        if store.attrs[slot as usize] & ATTR_INTERNAL != 0 {
+            continue;
+        }
+        if !consider(slot) {
+            return false;
+        }
+    }
+    false
 }
 
 fn token_matches(name: &[u8], token: &[u8], whole_word: bool) -> bool {
@@ -214,6 +326,8 @@ pub struct QuerySpec {
     pub case_sensitive: bool,
     /// 全词匹配：每个 token 前后必须是词边界（ASCII 字母数字为词字符）。
     pub whole_word: bool,
+    /// 正则模式：整个输入作为 bytes 正则；设置后忽略 tokens。
+    pub regex: Option<String>,
 }
 
 /// 盘符字母 → 卷掩码位(bit i = 'A'+i)。非字母返回 0。
@@ -398,8 +512,38 @@ pub(crate) fn query_volume_cancel(
     cap: usize,
     cancel: Option<u64>,
 ) -> (Vec<u32>, usize, bool, bool) {
-    let tokens = query_tokens(spec);
     let matcher = spec.path_prefix.as_deref().and_then(PathMatcher::new);
+    if let Some(pattern) = spec.regex.as_deref() {
+        let Some(regex) = compiled_regex(spec) else {
+            return (Vec::new(), 0, false, false);
+        };
+        let literal = regex_literal(pattern);
+        let mut slots: Vec<u32> = Vec::with_capacity(256);
+        let mut total = 0usize;
+        let mut capped = false;
+        let aborted = walk_regex(
+            store,
+            spec,
+            &regex,
+            literal.as_deref(),
+            matcher.as_ref(),
+            cancel,
+            &mut |slot| {
+                total += 1;
+                if total >= TOTAL_CAP {
+                    return false;
+                }
+                if slots.len() < cap {
+                    slots.push(slot);
+                } else {
+                    capped = true;
+                }
+                true
+            },
+        );
+        return (slots, total, capped, aborted);
+    }
+    let tokens = query_tokens(spec);
     let match_matcher = MatchMatcher::new(spec);
     // 精确模式沿用旧语义:收集与 total 都不受 cap/TOTAL_CAP 限制(名字完全
     // 一致的条目本来就少,旧实现直接返回全部;wfn 补齐依赖这个行为)。
@@ -446,8 +590,52 @@ pub(crate) fn query_volume_split_cancel(
     cancel: Option<u64>,
 ) -> (Vec<u32>, Vec<u32>, usize, usize, bool) {
     debug_assert!(spec.exact.is_none(), "split 查询不使用 exact 模式");
-    let tokens = query_tokens(spec);
     let matcher = spec.path_prefix.as_deref().and_then(PathMatcher::new);
+    if let Some(pattern) = spec.regex.as_deref() {
+        let Some(regex) = compiled_regex(spec) else {
+            return (Vec::new(), Vec::new(), 0, 0, false);
+        };
+        let literal = regex_literal(pattern);
+        let mut all_slots: Vec<u32> = Vec::with_capacity(256);
+        let mut folder_slots: Vec<u32> = Vec::with_capacity(256);
+        let mut total_all = 0usize;
+        let mut total_folders = 0usize;
+        let mut all_done = false;
+        let mut folder_done = false;
+        let aborted = walk_regex(
+            store,
+            spec,
+            &regex,
+            literal.as_deref(),
+            matcher.as_ref(),
+            cancel,
+            &mut |slot| {
+                if all_done && folder_done {
+                    return false;
+                }
+                let is_dir = store.is_dir(slot);
+                if !all_done {
+                    total_all += 1;
+                    if total_all >= TOTAL_CAP {
+                        all_done = true;
+                    } else if all_slots.len() < all_cap {
+                        all_slots.push(slot);
+                    }
+                }
+                if is_dir && !folder_done {
+                    total_folders += 1;
+                    if total_folders >= TOTAL_CAP {
+                        folder_done = true;
+                    } else if folder_slots.len() < folder_cap {
+                        folder_slots.push(slot);
+                    }
+                }
+                !(all_done && folder_done)
+            },
+        );
+        return (all_slots, folder_slots, total_all, total_folders, aborted);
+    }
+    let tokens = query_tokens(spec);
     let match_matcher = MatchMatcher::new(spec);
     let mut all_slots: Vec<u32> = Vec::with_capacity(256);
     let mut folder_slots: Vec<u32> = Vec::with_capacity(256);
@@ -1458,6 +1646,110 @@ mod tests {
         };
         let (_, total, _) = query_volume(&s, &spec, 100);
         assert_eq!(total, 1);
+    }
+
+    fn regex_oracle(store: &VolumeStore, pattern: &str, case_sensitive: bool) -> Vec<String> {
+        let regex = RegexBuilder::new(pattern)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .expect("测试正则应合法");
+        (0..store.name_off.len() as u32)
+            .filter(|&slot| store.attrs[slot as usize] & ATTR_INTERNAL == 0)
+            .filter(|&slot| regex.is_match(store.name(slot)))
+            .map(|slot| String::from_utf8_lossy(store.name(slot)).into_owned())
+            .collect()
+    }
+
+    fn regex_query(store: &VolumeStore, pattern: &str, case_sensitive: bool) -> Vec<String> {
+        let spec = QuerySpec {
+            regex: Some(pattern.to_string()),
+            case_sensitive,
+            ..Default::default()
+        };
+        let (slots, _, _) = query_volume(store, &spec, 2000);
+        slots
+            .into_iter()
+            .map(|slot| String::from_utf8_lossy(store.name(slot)).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn regex_matches_and_respects_case_flag() {
+        let mut s = VolumeStore::new(false);
+        for (i, name) in ["README.md", "readme.txt", "api-ms-win-core-file.dll", "foo.log"]
+            .iter()
+            .enumerate()
+        {
+            s.insert(100 + i as u64, 0, 0, name.as_bytes());
+        }
+        s.compact();
+
+        let mut got = regex_query(&s, r"^readme", false);
+        got.sort();
+        assert_eq!(got, vec!["README.md", "readme.txt"]);
+        let got = regex_query(&s, r"^readme", true);
+        assert_eq!(got, vec!["readme.txt"]);
+
+        let got = regex_query(&s, r"^api-.*\.dll$", true);
+        assert_eq!(got, vec!["api-ms-win-core-file.dll"]);
+        let mut expected = regex_oracle(&s, r"^api-.*\.dll$", true);
+        expected.sort();
+        let mut got = got;
+        got.sort();
+        assert_eq!(got, expected, "字面量预筛结果必须与逐条正则一致");
+    }
+
+    /// 没有字面量的正则（只能全扫）也要与 oracle 一致。
+    #[test]
+    fn regex_without_literal_falls_back_to_full_scan() {
+        let mut s = VolumeStore::new(false);
+        for (i, name) in ["2024-11", "abc", "1234-56", "2024-11-11"]
+            .iter()
+            .enumerate()
+        {
+            s.insert(100 + i as u64, 0, 0, name.as_bytes());
+        }
+        s.compact();
+        let pattern = r"^\d{4}-\d{2}$";
+        let mut got = regex_query(&s, pattern, true);
+        got.sort();
+        let mut expected = regex_oracle(&s, pattern, true);
+        expected.sort();
+        assert_eq!(got, expected);
+        assert!(got.contains(&"2024-11".to_string()));
+    }
+
+    #[test]
+    fn regex_respects_path_prefix() {
+        let mut s = VolumeStore::new(false);
+        s.insert(10, 0, 0x10, b"target");
+        s.insert(11, 10, 0, b"a.txt");
+        s.insert(12, 0, 0x10, b"other");
+        s.insert(13, 12, 0, b"b.txt");
+        s.compact();
+        let spec = QuerySpec {
+            regex: Some(r".*\.txt$".to_string()),
+            path_prefix: Some(r"d:\target".to_string()),
+            ..Default::default()
+        };
+        let (slots, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 1);
+        assert_eq!(s.name(slots[0]), b"a.txt");
+    }
+
+    #[test]
+    fn invalid_regex_returns_empty_instead_of_panicking() {
+        let mut s = VolumeStore::new(false);
+        s.insert(10, 0, 0, b"anything.txt");
+        s.compact();
+        assert!(validate_regex("[", false).is_err());
+        let spec = QuerySpec {
+            regex: Some("[".to_string()),
+            ..Default::default()
+        };
+        let (slots, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 0);
+        assert!(slots.is_empty());
     }
 
     struct Lcg(u64);

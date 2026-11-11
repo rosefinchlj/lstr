@@ -249,7 +249,11 @@ impl SearchService {
         // 通知查询线程:更旧的查询可以立即放弃(打字时 "a"→"ai" 不再排队 600ms)。
         lstr_index::query::CANCEL_GEN
             .store(self.generation, std::sync::atomic::Ordering::Relaxed);
-        let query = query::parse(raw, scope);
+        let query = if filters.matches.regex {
+            query::parse_regex(raw, scope)
+        } else {
+            query::parse(raw, scope)
+        };
         // 先计数再发送:搜索线程的分批 apply 让路钩子据此提前收手,
         // 查询不会再等一整轮消息消化(实测对账期一次最多等数百 ms)。
         QUERY_INFLIGHT.fetch_add(1, Ordering::Relaxed);
@@ -835,7 +839,10 @@ fn finalize_entries_with_pending(
     let t_rank = t_mark.elapsed().as_secs_f64() * 1000.0;
     t_mark = Instant::now();
     let case_sensitive = request.filters.matches.case_sensitive;
-    let needle_lower = if case_sensitive {
+    let needle_lower = if request.filters.matches.regex {
+        // 正则模式没有“精确同名”语义：pattern 本身不是文件名。
+        String::new()
+    } else if case_sensitive {
         request.query.text.clone()
     } else {
         request.query.text.to_lowercase()
@@ -1286,8 +1293,9 @@ fn run_worker(args: WorkerArgs) {
 
         // P0-2：目录上下文。用户显式输入路径模式时退出，手输 path: 时以用户为准，
         // 避免把「在当前目录里搜」悄悄套到用户指定的另一个目录上。
-        let in_folder_context =
-            request.base_folder.is_some() && browse::parse(&request.query.raw).is_none();
+        let in_folder_context = request.base_folder.is_some()
+            && !request.filters.matches.regex
+            && browse::parse(&request.query.raw).is_none();
         if in_folder_context && request.query.path_filter.is_none() {
             if let Some(folder) = &request.base_folder {
                 let dir = folder.to_string_lossy().into_owned();
@@ -1299,7 +1307,11 @@ fn run_worker(args: WorkerArgs) {
 
         // 路径模式（D:\foo\bar、\\server\share）：直接列目录，
         // 不碰 Everything，也不必为它懒启动 PowerShell 枚举 UWP。
-        if let Some(path_query) = browse::parse(&request.query.raw) {
+        if let Some(path_query) = if request.filters.matches.regex {
+            None
+        } else {
+            browse::parse(&request.query.raw)
+        } {
             let path_query = browse::resolve_exact(path_query);
             let started = Instant::now();
             let filter = path_query.filter.to_lowercase();
@@ -1362,11 +1374,12 @@ fn run_worker(args: WorkerArgs) {
             continue;
         }
 
-        let needs_uwp = match request.query.scope {
-            Scope::App => true,
-            Scope::All => !request.query.is_empty() && !in_folder_context,
-            _ => false,
-        };
+        let needs_uwp = !request.filters.matches.regex
+            && match request.query.scope {
+                Scope::App => true,
+                Scope::All => !request.query.is_empty() && !in_folder_context,
+                _ => false,
+            };
         if needs_uwp && !uwp_started {
             uwp_started = true;
             let uwp_tx = uwp_tx.clone();
@@ -1434,7 +1447,10 @@ fn run_worker(args: WorkerArgs) {
                 Scope::All => {
                     // 有筛选时只搜文件：位置/时间/类型对应用和命令没有意义，
                     // 硬塞进来只会让人疑惑「选了 D 盘怎么还出现微信」。
-                    if request.filters.is_empty() && !in_folder_context {
+                    if request.filters.is_empty()
+                        && !in_folder_context
+                        && !request.filters.matches.regex
+                    {
                         keyword_rows = keyword_entries(&request.keywords, &request.query.text);
                     }
                     let mut needs_exact = false;
@@ -1450,6 +1466,7 @@ fn run_worker(args: WorkerArgs) {
                         && !force_builtin
                         && phase != lstr_index::Phase::Ready
                         && !time_forced
+                        && !request.filters.matches.regex
                         && everything.is_some();
                     let fetch = fetch_count(&request.query, request.limit);
                     let folder_fetch = (fetch / 5).clamp(40, 120);
@@ -1566,7 +1583,10 @@ fn run_worker(args: WorkerArgs) {
                             }
                         }
                     }
-                    if request.filters.is_empty() && !in_folder_context {
+                    if request.filters.is_empty()
+                        && !in_folder_context
+                        && !request.filters.matches.regex
+                    {
                         let t_apps = Instant::now();
                         let mut app_hits = apps.search(&request.query.text, request.limit);
                         diag_apps = t_apps.elapsed().as_secs_f32() * 1000.0;

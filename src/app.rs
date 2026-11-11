@@ -149,6 +149,8 @@ pub struct LstrApp {
     /// 与 elapsed_ms(引擎纯执行)并列显示,定位「引擎快但手感慢」。
     ui_total_ms: Option<f32>,
     error: Option<String>,
+    /// 正则模式下的编译错误（不触发搜索，单独提示，不显示“点击启动 Everything”）。
+    regex_error: Option<String>,
     /// 自研索引状态行(渐进启动:构建中/未启用提示;错误条优先)。
     index_note: Option<String>,
     /// 状态行首次出现时间(>300ms 才显示,避免闪烁)。
@@ -302,6 +304,7 @@ impl LstrApp {
             elapsed_ms: 0.0,
             ui_total_ms: None,
             error: None,
+            regex_error: None,
             index_note: None,
             index_note_since: None,
             index_drives: None,
@@ -688,6 +691,31 @@ impl LstrApp {
     }
 
     fn poll_search(&mut self, ctx: &egui::Context) {
+        // 正则先在 UI 侧编译：非法表达式不发给 worker，避免“空结果=没找到”的误导。
+        if self.filters.matches.regex {
+            let pattern = self.input.trim();
+            self.regex_error = if pattern.is_empty() {
+                None
+            } else {
+                lstr_index::query::validate_regex(pattern, self.filters.matches.case_sensitive)
+                    .err()
+                    .map(|err| {
+                        // regex 的错误带多行源码指针，这里压成单行，避免撑破 24px 提示条。
+                        let detail = err.split_whitespace().collect::<Vec<_>>().join(" ");
+                        format!("正则无效: {detail}")
+                    })
+            };
+            if self.regex_error.is_some() {
+                self.dirty_at = None;
+                self.waiting = false;
+                self.entries.clear();
+                self.total = 0;
+                // 让仍在路上的旧响应失效，避免它覆盖错误态。
+                self.pending_gen = 0;
+            }
+        } else {
+            self.regex_error = None;
+        }
         if let Some(deadline) = self.dirty_at {
             if Instant::now() >= deadline {
                 let base_folder = if self.typing_global {
@@ -929,7 +957,7 @@ impl LstrApp {
             if tips_active {
                 list_h = list_h.max(300.0);
             }
-            let banner_h = if self.error.is_some() || self.index_note.is_some() { 30.0 } else { 0.0 };
+            let banner_h = if self.error.is_some() || self.regex_error.is_some() || self.index_note.is_some() { 30.0 } else { 0.0 };
             let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
             let computed_h = (SEARCH_H
                 + TABS_H
@@ -1116,7 +1144,7 @@ impl LstrApp {
         }
 
         // 路径模式回退：Alt+↑ 或（筛选为空时）Backspace 一次退一整级。
-        if crate::search::browse::parse(&self.input).is_some() {
+        if self.path_mode() {
             if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowUp)) {
                 self.path_up(ctx);
                 return;
@@ -1258,6 +1286,11 @@ impl LstrApp {
     }
 
     fn set_scope(&mut self, ctx: &egui::Context, scope: Scope) {
+        // 正则是文件名语义，应用/命令页没有可执行的正则匹配。
+        if self.filters.matches.regex && matches!(scope, Scope::App | Scope::Command) {
+            self.toast(ctx, "正则模式只搜文件 / 文件夹 / 程序".to_string());
+            return;
+        }
         strip_prefix(&mut self.input);
         self.scope = scope;
         self.trigger(ctx);
@@ -1305,7 +1338,7 @@ impl LstrApp {
         }
         // 路径模式：Enter 文件夹 = 继续深入；想在资源管理器打开用 Ctrl+Enter。
         // 普通模式下 Enter 文件夹仍保持打开行为，只有 → 下钻。
-        if entry.kind == Kind::Folder && crate::search::browse::parse(&self.input).is_some() {
+        if entry.kind == Kind::Folder && self.path_mode() {
             self.descend_index(ctx, index);
             return;
         }
@@ -1588,7 +1621,7 @@ impl LstrApp {
         } else {
             entries.len() as f32 * row_h
         };
-        let banner_h = if self.error.is_some() || self.index_note.is_some() { 30.0 } else { 0.0 };
+        let banner_h = if self.error.is_some() || self.regex_error.is_some() || self.index_note.is_some() { 30.0 } else { 0.0 };
         let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
         let preview_w = if self.preview_open { 216.0 } else { 0.0 };
         let height = if self.settings_open {
@@ -1656,7 +1689,9 @@ impl LstrApp {
                         28.0,
                     ),
                 );
-                let hint = if self.dialog.is_some() {
+                let hint = if self.filters.matches.regex {
+                    "输入正则表达式…".to_string()
+                } else if self.dialog.is_some() {
                     dialog_hint(query.scope).to_string()
                 } else if let Some(folder) = &self.typing_folder {
                     if self.typing_global {
@@ -1874,7 +1909,7 @@ impl LstrApp {
 
                 let banner_top = list_top + list_h.min(view_h) + LIST_GAP;
                 let mut extra_top = banner_top;
-                if self.error.is_none() {
+                if self.error.is_none() && self.regex_error.is_none() {
                     if let Some(note) = self.index_note.clone() {
                         let banner = Rect::from_min_size(
                             egui::pos2(rect.left() + PAD, extra_top),
@@ -1939,6 +1974,26 @@ impl LstrApp {
                             Err(err) => self.toast(ctx, err),
                         }
                     }
+                    extra_top += 30.0;
+                }
+                if let Some(error) = self.regex_error.clone() {
+                    let banner = Rect::from_min_size(
+                        egui::pos2(rect.left() + PAD, extra_top),
+                        egui::vec2(rect.width() - 2.0 * PAD, 24.0),
+                    );
+                    painter.rect_filled(banner, CornerRadius::same(7), theme.amber_soft);
+                    painter.circle_filled(
+                        egui::pos2(banner.left() + 11.0, banner.center().y),
+                        3.0,
+                        theme.amber,
+                    );
+                    painter.text(
+                        egui::pos2(banner.left() + 21.0, banner.center().y),
+                        Align2::LEFT_CENTER,
+                        error,
+                        ui::text_font(11.5),
+                        theme.text,
+                    );
                     extra_top += 30.0;
                 }
                 if preview_w > 0.0 {
@@ -2063,7 +2118,7 @@ impl LstrApp {
     fn paint_filters(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
         let theme = self.theme;
         // 路径模式本身就是位置筛选，按钮仅在普通搜索下生效。
-        let path_mode = crate::search::browse::parse(&self.input).is_some();
+        let path_mode = self.path_mode();
         let y = rect.top() + SEARCH_H + TABS_H + 2.0;
         let mut x = rect.left() + PAD;
 
@@ -2364,6 +2419,11 @@ impl LstrApp {
                     FilterChoice::Match(toggle) => {
                         let next = !self.filters.matches.get(*toggle);
                         self.filters.matches.set(*toggle, next);
+                        if self.filters.matches.regex
+                            && matches!(self.scope, Scope::App | Scope::Command)
+                        {
+                            self.scope = Scope::All;
+                        }
                         self.trigger(ui.ctx());
                         return;
                     }
@@ -2533,7 +2593,7 @@ impl LstrApp {
                 ui::text_font(15.0),
                 theme.text,
             );
-            let empty_hint = if crate::search::browse::parse(&self.input).is_some() {
+            let empty_hint = if self.path_mode() {
                 "目录为空、不存在或无权限"
             } else if self.dialog.is_some() {
                 match query.scope {
@@ -2601,7 +2661,7 @@ impl LstrApp {
         let mut clicked = None;
         let mut drag_started = None;
         let q = query.text.to_lowercase();
-        let path_mode = crate::search::browse::parse(&self.input).is_some();
+        let path_mode = self.path_mode();
         // 副标题（等宽字体）的字符预算：用实际字符宽度换算，尽量把行宽用满。
         let mono_char_w = ui::mono_font(11.5);
         let char_w = painter
@@ -3178,7 +3238,7 @@ impl LstrApp {
             theme.dim
         };
 
-        let path_mode = crate::search::browse::parse(&self.input).is_some();
+        let path_mode = self.path_mode();
         let selected_is_folder = self
             .entries
             .get(self.selected)
@@ -3284,6 +3344,12 @@ impl LstrApp {
             }
         }
         true
+    }
+
+    /// 是否处于路径模式（PathTyping）。正则模式下输入 `D:\...` 也按正则处理，
+    /// 不能误进目录浏览。
+    fn path_mode(&self) -> bool {
+        !self.filters.matches.regex && crate::search::browse::parse(&self.input).is_some()
     }
 
     /// 文件夹结果：就地展开（Listary 式下钻）。输入框替换为 `路径\` 进入路径模式，
