@@ -2458,22 +2458,27 @@ impl LstrApp {
     fn paint_filters(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
         let theme = self.theme;
         let y = rect.top() + SEARCH_H + TABS_H + 2.0;
-        // 路径/浏览模式本身就是位置筛选，按钮保留但置灰。
-        let path_mode = self.path_ui();
+        // PathTyping 下筛选不生效；Browse 下位置由面包屑决定，其余筛选可用。
+        let typing = self.path_mode();
+        let browse = self.in_browse();
         let mut x = rect.left() + PAD;
 
         let chips: [(FilterMenuKind, String, bool); 4] = [
             (
                 FilterMenuKind::Location,
-                format!(
-                    "位置 · {}",
-                    self.filters
-                        .location
-                        .as_ref()
-                        .map(|location| location.label())
-                        .unwrap_or_else(|| "全部".to_string())
-                ),
-                self.filters.location.is_some(),
+                if browse {
+                    "位置 · 当前目录".to_string()
+                } else {
+                    format!(
+                        "位置 · {}",
+                        self.filters
+                            .location
+                            .as_ref()
+                            .map(|location| location.label())
+                            .unwrap_or_else(|| "全部".to_string())
+                    )
+                },
+                !browse && self.filters.location.is_some(),
             ),
             (
                 FilterMenuKind::Time,
@@ -2506,7 +2511,9 @@ impl LstrApp {
 
         let mut clicked = None;
         for (kind, label, active) in chips {
-            let color = if path_mode {
+            // PathTyping 全部禁用；Browse 只禁用「位置」（由面包屑决定）。
+            let disabled = typing || (browse && kind == FilterMenuKind::Location);
+            let color = if disabled {
                 theme.dim
             } else if active {
                 theme.amber
@@ -2515,15 +2522,15 @@ impl LstrApp {
             };
             let galley = painter.layout_no_wrap(label, ui::text_font(11.0), color);
             // 激活的 chip 右侧留出单独的 × 命中区：只清这一项，不影响其它条件。
-            let clear_w = if active && !path_mode { 14.0 } else { 0.0 };
+            let clear_w = if active && !disabled { 14.0 } else { 0.0 };
             let width = galley.size().x + 28.0 + clear_w;
             let chip = Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, 22.0));
             let response = ui.interact(
                 chip,
                 Id::new(("lstr-filter-chip", kind.index())),
-                if path_mode { Sense::hover() } else { Sense::click() },
+                if disabled { Sense::hover() } else { Sense::click() },
             );
-            if !path_mode {
+            if !disabled {
                 if active {
                     painter.rect_filled(chip, CornerRadius::same(6), theme.amber_soft);
                 } else if response.hovered() {
@@ -2560,7 +2567,7 @@ impl LstrApp {
                 color,
                 Stroke::NONE,
             ));
-            let clear_rect = if active && !path_mode {
+            let clear_rect = if active && !disabled {
                 Some(Rect::from_min_size(
                     egui::pos2(chip.right() - 15.0, chip.top() + 4.0),
                     egui::vec2(12.0, 14.0),
@@ -2577,7 +2584,7 @@ impl LstrApp {
                     theme.amber,
                 );
             }
-            if response.clicked() && !path_mode {
+            if response.clicked() && !disabled {
                 // 用指针位置区分「点 ×」和「点 chip 打开菜单」；两个独立
                 // interact 重叠时父级会吞掉子级的 click，这里手工命中测试。
                 let clicked_clear = clear_rect.is_some_and(|rect| {
@@ -2596,7 +2603,7 @@ impl LstrApp {
         }
 
         // 有筛选或匹配选项时才出现清除入口。
-        if (!self.filters.is_empty() || !self.filters.matches.is_default()) && !path_mode {
+        if (!self.filters.is_empty() || !self.filters.matches.is_default()) && !typing {
             // 窄窗口下四个 chip 已接近占满，清除退化为单字符 ×，避免压到 chip。
             let label = if x + 84.0 > rect.right() - PAD {
                 "×"
@@ -2622,15 +2629,11 @@ impl LstrApp {
             x = clear.right();
         }
 
-        if path_mode {
+        if typing {
             painter.text(
                 egui::pos2(x + 8.0, y + 11.0),
                 Align2::LEFT_CENTER,
-                if self.in_browse() {
-                    "浏览模式中筛选不生效"
-                } else {
-                    "路径模式中筛选不生效"
-                },
+                "路径模式中筛选不生效",
                 ui::mono_font(10.0),
                 theme.dim,
             );
@@ -3073,7 +3076,8 @@ impl LstrApp {
         let mut clicked = None;
         let mut drag_started = None;
         let q = query.text.to_lowercase();
-        let path_mode = self.path_ui();
+        // Browse 下不是“浏览目录条目”而是递归搜索结果，关键词照常高亮。
+        let path_mode = self.path_mode();
         // 副标题（等宽字体）的字符预算：用实际字符宽度换算，尽量把行宽用满。
         let mono_char_w = ui::mono_font(11.5);
         let char_w = painter
@@ -3797,6 +3801,8 @@ impl LstrApp {
             return false;
         }
         self.browse_root = Some(std::path::PathBuf::from(entry.full_path()));
+        // 位置由面包屑决定；其它筛选（时间/类型/匹配）保留并继续生效。
+        self.filters.location = None;
         self.input.clear();
         self.selected = 0;
         self.scroll_y = 0.0;

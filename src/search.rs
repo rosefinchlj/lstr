@@ -1093,6 +1093,12 @@ fn browse_response(
     let started = Instant::now();
     let needle = filter.to_lowercase();
     let scope = request.query.scope;
+    // 只在 Browse（browse_root）下应用本地筛选；PathTyping 的筛选条按旧语义不生效。
+    let local_filters = request.browse_root.is_some();
+    let time_after = local_filters
+        .then(|| request.filters.time.map(|time| time.since_unix()))
+        .flatten();
+    let group = local_filters.then_some(request.filters.group).flatten();
     let mut entries: Vec<Entry> = dir_cache
         .children(dir)
         .iter()
@@ -1102,6 +1108,26 @@ fn browse_response(
             Scope::Program => entry.kind == Kind::Program,
             Scope::File => entry.kind == Kind::File,
             Scope::App | Scope::Command => false,
+        })
+        .filter(|entry| {
+            time_after.is_none_or(|after| entry.modified.is_some_and(|mtime| mtime >= after))
+        })
+        .filter(|entry| {
+            // 类型筛选只过滤文件，文件夹保留用于继续导航。
+            if entry.kind == Kind::Folder {
+                return true;
+            }
+            group.is_none_or(|group| {
+                entry
+                    .name
+                    .rsplit_once('.')
+                    .is_some_and(|(_, ext)| {
+                        group
+                            .extensions()
+                            .iter()
+                            .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+                    })
+            })
         })
         .filter(|entry| {
             needle.is_empty()
@@ -1395,9 +1421,41 @@ fn run_worker(args: WorkerArgs) {
             ));
         }
 
+        // P0-2：深路径浏览模式。空过滤词=列直接子项（导航）；有过滤词=在
+        // 当前目录下递归搜索（走正常引擎 + path_prefix=root），因此子文件夹
+        // 里的内容也能命中，时间/类型/匹配选项同样生效。
+        if let Some(root) = request.browse_root.clone() {
+            let raw = request.query.raw.clone();
+            if raw.trim().is_empty() {
+                let mut dir = root.to_string_lossy().into_owned();
+                if !dir.ends_with(['\\', '/']) {
+                    dir.push('\\');
+                }
+                let response = browse_response(
+                    &dir,
+                    "",
+                    &request,
+                    &mut dir_cache,
+                    &history,
+                    &config,
+                );
+                send_response(&tx, &request, response);
+                ctx.request_repaint();
+                continue;
+            }
+            let scope = request.query.scope;
+            request.query = if request.filters.matches.regex {
+                query::parse_regex(&raw, scope)
+            } else {
+                query::parse_plain(&raw, scope)
+            };
+            request.query.path_filter = Some(root.to_string_lossy().into_owned());
+        }
+
         // P0-2：目录上下文。用户显式输入路径模式时退出，手输 path: 时以用户为准，
         // 避免把「在当前目录里搜」悄悄套到用户指定的另一个目录上。
         let in_folder_context = request.base_folder.is_some()
+            && request.browse_root.is_none()
             && !request.filters.matches.regex
             && browse::parse(&request.query.raw).is_none();
         if in_folder_context && request.query.path_filter.is_none() {
@@ -1409,31 +1467,11 @@ fn run_worker(args: WorkerArgs) {
             }
         }
 
-        // P0-2：深路径浏览模式：UI 已经拆出 root，输入框只放过滤词。
-        // 必须优先于 base_folder/path 解析，且不能走 resolve_exact（否则过滤词
-        // 恰好是已存在目录时会自动闯进去，面包屑和结果根不一致）。
-        if let Some(root) = request.browse_root.clone() {
-            let mut dir = root.to_string_lossy().into_owned();
-            if !dir.ends_with(['\\', '/']) {
-                dir.push('\\');
-            }
-            let filter = request.query.raw.trim();
-            let response = browse_response(
-                &dir,
-                filter,
-                &request,
-                &mut dir_cache,
-                &history,
-                &config,
-            );
-            send_response(&tx, &request, response);
-            ctx.request_repaint();
-            continue;
-        }
-
         // 路径模式（D:\foo\bar、\\server\share）：直接列目录，
         // 不碰 Everything，也不必为它懒启动 PowerShell 枚举 UWP。
-        if let Some(path_query) = if request.filters.matches.regex {
+        if let Some(path_query) = if request.filters.matches.regex
+            || request.browse_root.is_some()
+        {
             None
         } else {
             browse::parse(&request.query.raw)
@@ -2414,7 +2452,7 @@ mod tests {
     }
 
     #[test]
-    fn browse_root_lists_children_and_skips_resolve_exact() {
+    fn browse_root_empty_filter_lists_children() {
         let _guard = SERVICE_TEST_LOCK.lock().unwrap();
         fn wait(service: &SearchService, generation: u64) -> Response {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2461,24 +2499,9 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["alpha", "beta.txt", "gamma"]);
 
-        // 过滤词恰好是已存在目录名：只过滤出这一项，不能触发 resolve_exact
-        // 自动闯进 alpha（否则会列出 inner.txt）。
-        let generation = service.search_browse(
-            "alpha",
-            crate::model::Scope::All,
-            false,
-            &Default::default(),
-            &Default::default(),
-            false,
-            root.clone(),
-        );
-        let response = wait(&service, generation);
-        assert_eq!(response.entries.len(), 1, "应只过滤出 alpha 本身");
-        assert_eq!(response.entries[0].name, "alpha");
-        assert!(
-            response.entries.iter().all(|e| e.name != "inner.txt"),
-            "browse_root 不能让 resolve_exact 自动进入子目录"
-        );
+        // 非空过滤词不再走 browse_response：worker 改走正常引擎
+        //（path_prefix=root）以支持递归子目录；resolve_exact 不再参与。
+        // 递归 path_prefix 语义由 engine 的 path_prefix 测试覆盖。
 
         drop(service);
         let _ = std::fs::remove_dir_all(&root);

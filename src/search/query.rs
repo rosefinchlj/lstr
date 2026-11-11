@@ -14,6 +14,20 @@ pub fn parse_regex(raw: &str, scope: Scope) -> Query {
     }
 }
 
+/// 浏览模式：输入框只放过滤词，按空白拆 token（多词 AND），但不解析
+/// `ext:` / `path:` / 盘符（这些字符只是普通过滤文本）。
+pub fn parse_plain(raw: &str, scope: Scope) -> Query {
+    Query {
+        raw: raw.to_string(),
+        scope,
+        text: raw.split_whitespace().collect::<Vec<_>>().join(" "),
+        ext: None,
+        path_filter: None,
+        drives_include: 0,
+        drives_exclude: 0,
+    }
+}
+
 pub fn parse(raw: &str, scope: Scope) -> Query {
     let trimmed = raw.trim();
 
@@ -184,6 +198,16 @@ mod tests {
         assert_eq!(query.scope, Scope::File);
         assert_eq!(query.text, r"ext:rs .*\.dll$");
         assert_eq!(query.ext, None, "正则里的 ext: 是模式的一部分");
+        assert_eq!(query.path_filter, None);
+        assert_eq!(query.drive_mask(), None);
+    }
+
+    #[test]
+    fn browse_parse_keeps_filter_literal() {
+        // 浏览模式的输入是过滤词：ext:/path:/盘符都只是普通文本，不能当语法。
+        let query = parse_plain("ext:rs D: alpha", Scope::All);
+        assert_eq!(query.text, "ext:rs D: alpha");
+        assert_eq!(query.ext, None);
         assert_eq!(query.path_filter, None);
         assert_eq!(query.drive_mask(), None);
     }
