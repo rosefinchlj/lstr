@@ -1,12 +1,37 @@
 # lstr
 
-Windows 启动器：Everything 索引 + 原生 Rust/egui 界面。核心是 **搜文件** 和 **启动应用**，目标是比 Listary 更安静、更快、更容易改。
+Windows 启动器：自研文件索引 + Everything 兜底 + 原生 Rust/egui 界面。核心是 **搜文件** 和 **启动应用**，目标是比 Listary 更安静、更快、更容易改。
 
 ## 运行要求
 
 - Windows 10/11（x64）
-- **Everything 1.4+ 正在运行**（文件搜索后端；没运行时会显示提示，应用索引仍可用）
 - 构建需要 Rust 1.85+
+- 搜索后端至少可用其一：
+  - **自研内置索引**：需要管理员授权（UAC 一次）拉起提权 worker；首次构建约 1~3 分钟，期间自动走 Everything 兜底
+  - **Everything 1.4+**（可选）：内置索引未就绪、非 NTFS 卷时兜底
+
+## 索引引擎
+
+搜索来源与实时更新是两件独立的事，设置 → 搜索页分别选择：
+
+**索引引擎**（用谁搜）
+
+| 选项 | 说明 |
+|---|---|
+| 自动（默认） | 内置索引优先；未就绪/不可用时用 Everything 兜底 |
+| 仅内置索引 | 完全不读取 Everything；索引没就绪时结果为空并提示 |
+| 仅 Everything | 只用 Everything，不启动内置索引 worker |
+
+**内置索引实时层**（内置索引怎么追文件变化）
+
+| 选项 | 说明 |
+|---|---|
+| USN journal（默认） | 目录首扫后轮询 NTFS journal；快照完整且游标可信时**免扫直读**；卷打不开 / journal 不可用自动退回目录监视 |
+| 目录监视 | `ReadDirectoryChangesW` 目录通知，零 USN FSCTL；worker 每次启动需整卷对账 |
+
+- 内置索引只覆盖本机固定 NTFS 卷；网络盘 / FAT32 / exFAT 等需 Everything
+- 索引卷勾选立即生效；索引引擎 / 实时层 / 噪声目录改动需重启 lstr
+- 配置文件：`[index]` 的 `backend`（`auto`/`builtin`/`everything`）、`incremental`（`usn`/`watch`）；旧值 `backend="usn"` 自动迁移为 `auto + usn`，`off` 迁移为 `everything`
 
 ## 构建与运行
 
@@ -25,7 +50,7 @@ cargo run
 
 | 操作 | 行为 |
 |---|---|
-| 双击 `Space` | 全局唤出 / 隐藏（Raw Input；空格仍会输入到前台应用） |
+| 双击 `Ctrl` | 全局唤出 / 隐藏（默认热键；设置里可录制为双击 Space/Alt/Shift 或组合键） |
 | 拖动顶部 12px 横条 | 移动窗口（顶部中央有拖动提示线） |
 | 拖动左右/底部边缘或角落 | 调整窗口大小（420×160 ~ 1000×800；尺寸会写回配置） |
 | 再次运行 `lstr.exe` | 已有实例会把窗口唤到前台（不会启动第二份） |
@@ -39,7 +64,7 @@ cargo run
 | `Ctrl+C`（输入框为空时） | 复制选中结果路径 |
 | `Tab` / `Shift+Tab` | 切换类别 |
 | `Alt+←` / `Alt+→` | 切换类别（任意状态都可用） |
-| `Esc` | 第一次清空输入，第二次隐藏 |
+| `Esc` | 收起窗口（保留输入与结果，下次唤出继续）；菜单 / 筛选菜单 / 设置 / 浏览态先逐层关闭 |
 | `Ctrl+P` | 开/关预览面板 |
 | 搜索框右侧**时钟图标** | 历史记录开关：关掉后空查询只显示常用应用，不再显示「最近使用」 |
 | `Ctrl+G`（**已有文件对话框时**） | 打开文件夹搜索；选中文件夹 Enter 跳转，选中文件 Enter 填入。对话框可以位于 lstr 后面 |
@@ -69,7 +94,7 @@ cargo run
 - 匹配选项同样作用于**应用结果**；开启区分大小写/全词/正则后，应用的拼音与模糊兜底关闭，不再出现小写 `ai` 命中 `AI合成` 这类严格模式下的伪匹配
 - 指定目录（Explorer 目录上下文 / `path:` / 浏览模式）只返回文件系统条目，应用、UWP、命令、关键字不会混入
 
-查询也仍支持 Everything 语法：`ext:rs`、`path:E:\foo`、`*.html`（等价 `ext:html`）、`abc*`（前缀）、`*abc`（后缀）、`folder:` 等。另有前缀：
+查询语法在内置索引与 Everything 下通用：`ext:rs`、`path:E:\foo`、`*.html`（等价 `ext:html`）、`abc*`（前缀）、`*abc`（后缀）、`folder:` 等。另有前缀：
 
 - `>`：命令
 - `a 微信`：应用
@@ -83,11 +108,11 @@ cargo run
 - 浏览模式：空过滤词列出直接子项；输入过滤词会在**当前目录下递归搜索子文件夹内容**（位置=当前目录，时间/类型/匹配选项同样生效）
 - 浏览模式：`Alt+↑` / 过滤词为空时 `Backspace` 回上一级，`Alt+↓` 再回到刚离开的子目录；`Ctrl+L` 把完整路径放回输入框继续编辑；`Esc` 先清过滤词，再按一次退出浏览
 - 面包屑祖先可点击跳转，中间放不下时 `…` 点开隐藏层级；普通结果里按 `→` 也会进入浏览模式
-- 路径模式结果最多 200 条，配合滚轮浏览（不受「一屏结果数」限制）
+- 路径模式首屏 200 条，滚到底同样可继续加载（上限同「滚动加载上限」）
 
-> 想全盘搜 D 盘用 Everything 语法：`path:D:\ 关键词`。直接打 `D:` 是浏览 D 盘根目录（Listary 习惯），不会触发「整盘三百万条」的查询。
+> 想全盘搜 D 盘用查询语法：`path:D:\ 关键词`。直接打 `D:` 是浏览 D 盘根目录（Listary 习惯），不会触发「整盘三百万条」的查询。
 
-**模糊匹配**（应用/命令）：子序列命中，`vsc` → Visual Studio Code、`wxin` → 微信（拼音容错）。命中字母逐个下划线标出，排序在子串/拼音之下，文件结果仍走 Everything 子串。带**密度门槛**（平均每字符 ≥12 分）：词首/连续命中通过，纯散布（如 `sz` 散布在长拼音串里）一律拒绝。
+**模糊匹配**（应用/命令）：子序列命中，`vsc` → Visual Studio Code、`wxin` → 微信（拼音容错）。命中字母逐个下划线标出，排序在子串/拼音之下，文件结果保持子串语义（内置索引另有文件名拼音辅助）。带**密度门槛**（平均每字符 ≥12 分）：词首/连续命中通过，纯散布（如 `sz` 散布在长拼音串里）一律拒绝。
 
 **网络搜索 / 自定义关键字**：输入 `触发词 关键词`：
 
@@ -132,9 +157,21 @@ cargo run
 
 首次运行会生成：
 
-- `%APPDATA%\lstr\config.toml`：热键、窗口尺寸、主题、强调色、行高、一屏结果数（`max_results`）、滚动加载上限（`max_load_results`，100–3000）、历史开关（`show_history`）、`[[keyword]]` 自定义关键字、`[rank]` 排序权重与噪声规则
+- `%APPDATA%\lstr\config.toml`：热键、窗口尺寸、主题、强调色、行高、一屏结果数（`max_results`）、滚动加载上限（`max_load_results`，100–3000）、历史开关（`show_history`）、`[[keyword]]` 自定义关键字、`[rank]` 排序权重与噪声规则、`[index]` 索引引擎/实时层/卷
 - 空查询 = 纯「最近使用」：清空历史后列表为空，不补常用应用；已安装应用看「应用」标签
 - `%APPDATA%\lstr\history.db`：打开历史（SQLite，WAL 模式；删除即重置常用排序。老版本的 history.json 首次启动自动迁移并改名 .bak）
+
+`[index]` 常用配置：
+
+```toml
+[index]
+backend = "auto"        # auto(内置优先+Everything兜底) / builtin(仅内置) / everything(仅Everything)
+incremental = "usn"     # usn(默认,USN journal 增量) / watch(纯目录监视)
+volumes = []            # 空 = 全部本机固定 NTFS 卷；如 ["C","D"]
+exclude_noise = true    # 排除 node_modules/.git/target 等
+candidate_cap = 2000    # 单次查询候选收集上限
+journal_poll_ms = 500   # USN 轮询间隔，最小 100
+```
 
 主题内置 **Frost（浅色，默认）** 和 Obsidian（暗色）；设置浮层可切换，或改 `config.toml` 的 `theme.mode`。
 
@@ -154,13 +191,13 @@ exec = "notepad {query}"
 
 `url` 与 `exec` 二选一；`url` 的 `{query}` 会做百分号编码，`exec` 直接替换后按空格拆分程序与参数。改完执行命令 `重新加载`（或 `>reload`）即可生效，不必重启。
 
-## 当前范围（M1 + M2 第一刀）
+## 功能概览
 
 已完成：
 
-- Everything IPC 文件搜索（纯 Rust，无需 Everything64.dll）
+- **文件搜索**：自研内置索引（默认，本地内存索引 + 快照）或 Everything IPC（纯 Rust，无需 Everything64.dll），设置里可切换
 - 开始菜单 `.lnk` + 注册表 App Paths 应用索引（本机 200+ 应用）
-- 中文应用名拼音首字母 + 全拼匹配（`wx` / `weixin` → 微信）；**文件**搜索的拼音只在路径模式（本地列目录）里有效，全局搜索需要输入中文原文——Everything 索引不支持拼音匹配
+- 中文应用名拼音首字母 + 全拼匹配（`wx` / `weixin` → 微信）；**文件**拼音由内置索引提供（Everything 兜底时只支持原文，因为 Everything 索引不含拼音）
 - 历史 / frecency / 噪声路径降权（`node_modules`、`temp`、`target` 等）
 - egui 无边框 + 亚克力 + 琥珀针 + 匹配下划线 + 类别栏
 - 双击 Ctrl 全局热键（可在设置里录制为双击 Alt/Shift 或组合键）、托盘、单实例
@@ -173,7 +210,7 @@ exec = "notepad {query}"
 - **动作菜单**：`→`（光标在末尾，非文件夹）、`Ctrl+K`、`Shift+F10`、右键结果；键盘上下选择，Enter 执行；文件夹用 `Shift+F10` 打开菜单（`→` 保持下钻）
 - **搜索现场保留**：定位 / 打开方式 / 在终端打开 / 管理员运行 / 打开 收起后都会保留输入与结果，再次唤出可继续上次搜索；命令执行与自定义动作按各自语义处理
 - **预览面板**：选中结果右侧显示图标、名称、类型、路径、大小、修改时间（`Ctrl+P` 开关）
-- **设置界面**：命令 `设置` / `>设置` / 齿轮 / `Ctrl+,` 打开；左侧分栏四页——**外观**（主题、强调色、不透明度、圆角、行高、预览）、**行为**（一屏结果数、滚动加载上限、对话框自动唤出、开机自启）、**排序规则**（可视化 DIY，见下）、**维护**（打开配置、重置窗口、清空历史），改动即时生效并写回 config.toml。悬停两个数字滑块可看完整说明
+- **设置界面**：命令 `设置` / `>设置` / 齿轮 / `Ctrl+,` 打开；左侧分栏七页——**外观**（主题、强调色、不透明度、圆角、行高、预览）、**搜索**（索引状态、索引卷、索引引擎、内置索引实时层、噪声目录）、**行为**（一屏结果数、滚动加载上限、对话框自动唤出、开机自启、资源管理器键入即搜）、**排序规则**（可视化 DIY，见下）、**噪声规则**、**维护**（打开配置、重置窗口、清空历史）、**资产**（收藏 / 动作 / 命令）。改动即时生效并写回 config.toml；索引引擎/实时层/噪声目录需重启。悬停两个数字滑块可看完整说明
 - **排序规则可视化 DIY**：设置 → 排序规则页用滑块直接调整 9 个匹配档位（名称完全一致/前缀/子串/多词全含/分隔符不敏感/拼音前缀/拼音子串/模糊/仅路径）+ 历史使用上限、最近修改加成、噪声降权强度；实时生效，底部显示当前优先级顺序，可一键恢复默认；数值保存在 `config.toml` 的 `[rank]` 段
 - **噪声规则可编辑**：设置 → 噪声规则页列出全部降权规则（路径片段 + 独立分值 0~300），可**随时增删改**，改动即时保存并重新搜索；也可在 `config.toml` 的 `[rank].noise_rules` 里批量编辑
 - **开机自启**：写入 `HKCU\...\Run`，设置界面开关
@@ -181,44 +218,42 @@ exec = "notepad {query}"
 - **网络搜索 / 自定义关键字**：`g rust` → Google、`bd`/`b`/`gh`/`so` 内置；`[[keyword]]` 配置 `url`/`exec` 模板，`{query}` 占位；`>reload` 热生效
 - **路径模式（就地翻目录）**：`D:\foo\` 直接列目录（按名字/拼音过滤，文件夹优先，目录 mtime 缓存）；Enter/→ 下钻；深入后切换浏览模式（输入框只放过滤词 + 面包屑，过滤词递归搜子目录，时间/类型/匹配可用），Backspace/Alt↑ 回退、Ctrl+L 编辑完整路径
 - **结果拖出**：结果行可拖拽（`Sense::click_and_drag` + OLE `DoDragDrop`，`CF_HDROP` 数据借 shell 标准 `IDataObject`）；微信/邮件/IDE 直接收到文件，落下成功隐藏窗口并计入 frecency
-- **数据时效性**：文件增删/移动/改名/路径变化走 Everything USN 实时索引，下次搜索即生效；应用索引（开始菜单/App Paths）每 90s 自动重建，「重新加载」命令立即重建，新装/卸载应用最多 90 秒（或手动 reload）生效；空查询「最近使用」会过滤已删除文件和已卸载应用（UNC 路径除外，避免阻塞）
+- **数据时效性**：内置索引默认走 USN journal 增量（快照+游标可信时免扫直读），切到目录监视时走 `ReadDirectoryChangesW`；Everything 兜底时用 Everything 自己的索引。应用索引（开始菜单/App Paths）每 90s 自动重建，「重新加载」命令立即重建，新装/卸载应用最多 90 秒（或手动 reload）生效；空查询「最近使用」会过滤已删除文件和已卸载应用（UNC 路径除外，避免阻塞）
 - **内置索引实时层**：默认 USN journal 增量（目录首扫后按 journal 追变化；快照完整且游标可信时免扫直读，卷打不开/journal 不可用自动退回目录监视）；设置 → 搜索 →「内置索引实时层」可切成纯目录监视（ReadDirectoryChangesW，零 USN FSCTL）
 - **「全部」类型覆盖**：Everything 单次查询会先按修改时间截断再返回，某一类结果可能整类缺席；「全部」改为**文件夹 / 非文件夹两路查询**再合并排序，保证文件夹、文件、程序都能进入排名
 - **精确同名兜底**：常规候选按修改时间截断会漏掉老目录（`E:\use` 搜 `use` 时被一堆「最近修改过的 User*」挤掉），因此每次搜索额外发一次 Everything `wfn:`（全名匹配）查询，结果集极小（约 40 条 / 45ms）；精确同名条目豁免同名去重（最多保留 6 个不同路径），并按路径深浅排序，`E:\use` 这类根目录条目排在最前
-- **筛选条**：位置 / 时间 / 类型三个按钮 + 下拉菜单，把选择翻译成 `path:` / `dm:` / `ext:` 查询段；不需要用户记 Everything 语法；筛选期间只搜文件
+- **筛选条**：位置 / 时间 / 类型三个按钮 + 下拉菜单，把选择翻译成 `path:` / `dm:` / `ext:` 查询段；不需要用户记查询语法；筛选期间只搜文件
 - **结果列表滚动 + 加载更多**：首屏最多送 100 条候选（路径模式 200 条），窗口高度由「一屏结果数」决定（同时限制应用页/最近使用/Quick Switch 的条数），超出部分滚轮滚动、`↑↓`/`Home`/`End` 自动跟随，右侧有滚动条，底部提示「滚轮查看更多」；**滚到列表底部自动续拉**（每档翻倍，默认封顶 1000、设置里可调 100–3000，保留滚动位置与选中行），后端给不出更多时停止。上限越大单次响应越慢（会逐条刷新文件大小/时间并抓更多候选），建议 1000–2000
-- 启动时隐藏到屏幕外，双击 Space / 托盘唤出（RedrawWindow 强制首帧重绘）；唤出时在光标所在屏幕**居中**
+- 启动时隐藏到屏幕外，双击 Ctrl（默认）/ 托盘唤出（RedrawWindow 强制首帧重绘）；唤出时在光标所在屏幕**居中**
 - release 版本不弹控制台窗口（`windows_subsystem = "windows"`）
-- Everything 未运行时提示条可直接点击启动，搜索线程会自动重连；设置里的「一屏结果数」「滚动加载上限」即时生效
+- Everything 未运行时提示条可直接点击启动；内置索引未就绪/不可用时自动用 Everything 兜底，搜索线程会自动重连；设置里的「一屏结果数」「滚动加载上限」即时生效
 - 默认浅色主题（Frost），可通过 `config.toml` 切 Obsidian 暗色
 - 窗口可拖动（顶部条）和缩放（边缘/角落），尺寸在本次运行内保持
 
 未完成（M2+）：
 
-- Explorer 内输入即搜（不是文件对话框的场景）
 - 动作菜单扩展：重命名 / 删除到回收站 / 属性 / 复制文件本体
 - 计算器、收藏置顶（Pin）
 - 预览面板升级：图片缩略图 / 文本速览
 
 ## 已知问题
 
-- 宽泛查询（如单个字符）首次可能较慢：Everything IPC 单次查询 40~200ms 是后端硬成本；已用 30ms 合并防抖、候选集限制、两阶段返回（先出结果再补精确项）缓解。
+- 宽泛查询（如单个字符）在 Everything 兜底时首次可能较慢（IPC 单次 40~200ms 是后端硬成本）；内置索引通常 <100ms。已用 30ms 合并防抖、候选集限制、滚到底加载更多缓解。
 - 同名精确匹配的文件夹可能排在文件前面；已有同名去重。
 - 中文输入法组合期间会按预编辑文本触发搜索（拼音搜索因此是实时的，但文件结果可能闪动）。
 - 文件对话框增强只覆盖标准 Vista+ `#32770`；自绘对话框（部分 Electron/Office/WinUI）不保证；提权对话框会被 UIPI 拦截。
 - `Ctrl+G` 只对**已打开的文件对话框**有意义；没有对话框时按它会提示先打开「打开/保存」对话框。lstr 盖在对话框上时也能识别（会枚举可见的 `#32770`）。
-- 自动唤出只认标准 Vista+ `#32770` 文件对话框；自绘对话框（部分 Electron/Office/WinUI）不触发。双击 Space 手动关掉后，下次对话框拿到前台时仍会再弹（关掉请用设置开关）。
+- 自动唤出只认标准 Vista+ `#32770` 文件对话框；自绘对话框（部分 Electron/Office/WinUI）不触发。用全局热键手动关掉后，下次对话框拿到前台时仍会再弹（关掉请用设置开关）。
 - Quick Switch 的 Explorer 枚举走 `ShellWindows` COM（`LocationURL`），只收真实存在的文件系统目录；管理员权限的 Explorer 窗口枚举不到。
 - 非 NTFS 卷（exFAT U 盘、网络驱动器）的文件变化时效由 Everything 自己的索引方式决定（默认非 NTFS 靠轮询/重扫，可能有延迟）。
 - 筛选条只在普通搜索生效：路径模式（`D:\`）与「应用/命令」类别下按钮不参与查询。
-- 文件搜索不支持拼音输入中文名（Everything 索引不含拼音）；应用和路径模式下的浏览过滤支持拼音。
+- Everything 兜底时文件搜索不支持拼音输入中文名（Everything 索引不含拼音）；内置索引支持文件名拼音，应用搜索始终支持拼音。
 - 「全部」首屏展示排序后的前 100 条候选（路径模式 200 条），滚到底继续加载到设置上限（默认 1000、最多 3000）；Everything 侧总数仍完整显示在底部。
-- 搜索分两阶段返回：文件夹+文件候选先出（约 0.25s），wfn 精确补齐随后覆盖（约 0.35s）；结果未被截断时直接跳过第二阶段。
+- USN journal 被重置/回绕（journal_id 变化或保存的游标超出范围）时，该卷会退回目录扫描对账；目录监视在大量文件变更/通知缓冲溢出时也会触发整卷对账，可能消耗一段时间的 I/O。
 - 应用索引 90s TTL 重建在 worker 线程同步执行（几十 ms），重建瞬间 UWP 条目会短暂消失（懒加载约 2 秒后回来）。
 - 保存对话框的 `is_save` 通过标题识别（保存/另存/Save）；不同语言/应用可能漏判。
 - UWP 枚举当前走 PowerShell 回退（后台线程，约 2 秒后可用）；COM 版本需补 `Win32_UI_Shell_Common` feature。
 - 设置浮层、「打开方式…」「管理员运行」已接线但未逐一自动化验证（键盘自动化焦点不稳，建议手测）。
-- “打开方式…”与管理员运行已接线，但未逐一自动化验证。
 - 窗口尺寸/位置只在本次运行内保持；重启后回到配置宽度并在唤出时居中。
 - 托盘图标、单实例已验证；托盘右键菜单未做自动化测试。
 - 未签名，首次运行可能触发 SmartScreen。
@@ -232,26 +267,36 @@ src/
   ui.rs                主题、字体、文本布局、图标/尺寸工具
   model.rs             Entry / Query / Scope
   config.rs            config.toml
-  history.rs           history.json
+  history.rs           打开历史（SQLite）
+  assets.rs / assets_ui.rs  收藏 / 动作 / 命令
+  search.rs            SearchService（latest-wins）、finalize、后端调度
   search/
-    mod.rs             SearchService（工作线程、latest-wins）、关键字行生成
+    builtin.rs         自研索引适配（查询、惰性元数据）
     everything.rs      Everything IPC 后端
-    query.rs           查询解析（前缀/ext:/path:）
+    query.rs           查询解析（前缀 / ext: / path: / 正则）
     browse.rs          路径模式（列目录、mtime 缓存）
-    filters.rs         筛选条模型（位置/时间/类型 → 查询段）
+    filters.rs         筛选条模型（位置/时间/类型/匹配）
     fuzzy.rs           子序列模糊匹配（DP 最优命中位置）
-    apps.rs            开始菜单 + App Paths 索引
-    pinyin.rs          拼音首字母
+    pinyin.rs          拼音首字母 / 全拼
     rank.rs            排序（匹配层级 + 历史 + 路径降权）
+    apps.rs / uwp.rs   开始菜单、App Paths、UWP 应用索引
   win/
-    hotkey.rs          双击 Space（Raw Input）
-    window.rs           亚克力、DWM 圆角、置顶、定位、前台
-    tray.rs             托盘图标与菜单
-    single_instance.rs  命名互斥体
-    shell.rs            打开 / 定位 / 提权 / URL / 命令行
-    dialog.rs           文件对话框探测 / 填入 / 跳转
-    dialogwatch.rs      WinEvent hook：对话框自动唤出
-    explorer.rs         ShellWindows 枚举（Quick Switch 数据源）
-    dragdrop.rs         结果拖出（OLE DoDragDrop + CF_HDROP）
+    hotkey.rs          全局热键（双击 Ctrl 等）
+    window.rs          亚克力、DWM 圆角、置顶、定位、前台
+    tray.rs            托盘图标与菜单
+    single_instance.rs 命名互斥体
+    shell.rs           打开 / 定位 / 提权 / URL / 命令行
+    dialog.rs          文件对话框探测 / 填入 / 跳转
+    dialogwatch.rs     WinEvent hook：对话框自动唤出
+    explorer.rs        ShellWindows 枚举（Quick Switch 数据源）
+    dragdrop.rs        结果拖出（OLE DoDragDrop + CF_HDROP）
+    typing.rs          Explorer 内键入即搜（键盘钩子）
+crates/lstr-index/     自研索引引擎
+  engine.rs            内存索引、查询、增量 apply
+  dirscan.rs           目录枚举首扫 / 单目录刷新
+  watch.rs             ReadDirectoryChangesW 目录监视
+  usnwatch.rs          USN journal 轮询护栏（熔断 / 游标校验）
+  worker.rs            提权 worker、卷线程
+  snapshot.rs / sidecar.rs / store.rs  快照 / 旁车游标 / 列式存储
 tools/drive_lstr.py    自动化验收脚本（Unicode 输入）
 ```
