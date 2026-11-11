@@ -61,10 +61,9 @@ pub fn connect_and_handshake_at(
 ) -> Result<HANDLE, String> {
     let deadline = Instant::now() + timeout;
     let handshake = &handshake;
-    #[allow(unused_assignments)]
-    let mut last_err = String::new();
     loop {
-        match win::open_pipe_client(pipe_name) {
+        // 每轮只保留「本轮失败原因」；到期时返回最后一次，避免跨轮可变状态。
+        let last_err = match win::open_pipe_client(pipe_name) {
             Ok(client) => {
                 let hello = Frame::Hello {
                     proto: crate::PROTO_VERSION,
@@ -85,14 +84,12 @@ pub fn connect_and_handshake_at(
                     }
                     None => {
                         win::close(client);
-                        last_err = "no welcome".into();
+                        "no welcome".to_string()
                     }
                 }
             }
-            Err(err) => {
-                last_err = err;
-            }
-        }
+            Err(err) => err,
+        };
         if Instant::now() >= deadline {
             return Err(last_err);
         }

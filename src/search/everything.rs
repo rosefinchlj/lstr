@@ -262,7 +262,6 @@ pub(crate) fn tone_for(value: &str) -> u32 {
 
 const FILETIME_UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
 
-#[allow(dead_code)]
 fn filetime_ticks_to_unix(ticks: u64) -> Option<i64> {
     if ticks == 0 {
         None

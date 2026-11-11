@@ -159,20 +159,20 @@ impl SearchService {
         std::thread::Builder::new()
             .name("lstr-search".to_string())
             .spawn(move || {
-                run_worker(
-                    request_rx,
-                    response_tx,
-                    worker_history,
-                    worker_config,
+                run_worker(WorkerArgs {
+                    rx: request_rx,
+                    tx: response_tx,
+                    history: worker_history,
+                    config: worker_config,
                     ctx,
-                    worker_apps_dirty,
-                    worker_status,
+                    apps_dirty: worker_apps_dirty,
+                    status_slot: worker_status,
                     index_cmd_rx,
-                    worker_volume_mask,
-                    done_s,
-                    done_w,
-                    done_c,
-                )
+                    volume_mask: worker_volume_mask,
+                    shutdown_client: done_s,
+                    worker_collected: done_w,
+                    client_done: done_c,
+                })
             })
             .expect("spawn search worker");
         Self {
@@ -988,8 +988,9 @@ fn builtin_index_has_mtime(index: &crate::config::IndexConfig) -> bool {
     index.scan_mode == "dir" || index.backend == "usn"
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_worker(
+/// 搜索 worker 的启动参数：字段多且都是「一次注入、全程只读」的句柄，
+/// 打包成结构体避免长参数列表（也便于调用点按名字对照）。
+struct WorkerArgs {
     rx: Receiver<Request>,
     tx: Sender<Response>,
     history: Arc<Mutex<History>>,
@@ -1002,7 +1003,23 @@ fn run_worker(
     shutdown_client: Arc<AtomicBool>,
     worker_collected: Arc<AtomicBool>,
     client_done: Arc<AtomicBool>,
-) {
+}
+
+fn run_worker(args: WorkerArgs) {
+    let WorkerArgs {
+        rx,
+        tx,
+        history,
+        config,
+        ctx,
+        apps_dirty,
+        status_slot,
+        index_cmd_rx,
+        volume_mask,
+        shutdown_client,
+        worker_collected,
+        client_done,
+    } = args;
     // 显式选择「仅内置索引」:此时无论引擎是否就绪,都不再回落 Everything,
     // 否则与设置页文案矛盾(旧实现在 Fallback 时仍把查询发给 Everything)。
     let force_builtin = config.index.backend == "builtin";

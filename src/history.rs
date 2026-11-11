@@ -230,7 +230,7 @@ impl History {
     ///
     /// 生产 rank 走 [`Self::rank_snapshot`] 的批量快照；逐条版本保留为快照
     /// 语义的对照基准（单测直接断言两者同值）。
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn query_boost(&self, query: &str, entry_id: &str) -> i32 {
         let key = query.trim().to_lowercase();
         if key.is_empty() {
@@ -249,7 +249,7 @@ impl History {
 
     /// frecency 分数：`count + 2 * e^(-age_days / 7)`；未知条目返回 0。
     /// 同 [`Self::query_boost`]：逐条基准，生产 rank 用批量快照。
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn score(&self, id: &str) -> f32 {
         let result = self.db.query_row(
             "SELECT count, last FROM history WHERE id = ?1",

@@ -327,11 +327,6 @@ pub fn keep_volume_open(letter: char) -> Option<VolumeHandle> {
     VolumeHandle::open(letter).ok()
 }
 
-#[allow(dead_code)]
-pub fn close_handle(h: HANDLE) {
-    win::close(h);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
