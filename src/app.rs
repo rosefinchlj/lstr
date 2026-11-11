@@ -232,6 +232,10 @@ pub struct LstrApp {
     /// 只在选择真正变化（键盘/hover）时把选中行滚回可视区；
     /// 每帧都做会把滚轮滚动立刻拽回去。
     scroll_to_selection: bool,
+    /// 「加载更多」请求在途：响应到达时保留当前滚动位置与选中项。
+    more_pending: bool,
+    /// 本次查询已加载到后端给不出更多（或到上限），滚到底不再空转。
+    more_exhausted: bool,
     /// 筛选条选择：位置 / 时间 / 类型（按钮操作，不输入 Everything 语法）。
     filters: SearchFilters,
     /// 打开中的筛选下拉菜单。
@@ -378,6 +382,8 @@ impl LstrApp {
             scroll_y: 0.0,
             scrollable: false,
             scroll_to_selection: false,
+            more_pending: false,
+            more_exhausted: false,
             filters: SearchFilters::default(),
             filter_menu: None,
             dialog_retry_until: None,
@@ -795,11 +801,28 @@ impl LstrApp {
                         ));
                     }
                 }
+                let prev_len = self.entries.len();
+                let was_more = self.more_pending;
+                self.more_pending = false;
                 self.entries = response.entries;
                 self.total = response.total;
                 self.elapsed_ms = response.elapsed_ms;
                 self.error = response.error;
-                self.scroll_y = 0.0;
+                if was_more {
+                    // 加载更多：保留滚动位置与选中项，让用户接着往下扫。
+                    // 后端给不出新条目（去重后数量没涨）= 已经到底，停止续拉。
+                    lstr_index::snapshot::debug_log(&format!(
+                        "ui: load more gen={} entries={} total={}",
+                        response.generation,
+                        self.entries.len(),
+                        self.total
+                    ));
+                    if self.entries.len() <= prev_len {
+                        self.more_exhausted = true;
+                    }
+                } else {
+                    self.scroll_y = 0.0;
+                }
                 self.waiting = false;
                 self.needle_ready = false;
                 if self.selected >= self.entries.len() {
@@ -816,6 +839,9 @@ impl LstrApp {
         // 一旦输入/筛选变化就进入「搜索中」：防抖的 150ms 里结果还没回来，
         // 空列表不应该先闪一下「没有匹配项」。
         self.waiting = true;
+        // 新查询从首屏 100 条重新开始，加载更多的状态也必须清零。
+        self.more_pending = false;
+        self.more_exhausted = false;
         // 30ms：只用来合并同一帧内的连击/粘贴，不再人为拖慢输入。
         // 请求在 worker 里是 latest-wins 合并的，逐键查询不会堆积。
         // 打字防抖:150ms 内还有击键就只搜最后的状态,避免每个字符都发一次
@@ -1306,6 +1332,14 @@ impl LstrApp {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::PageUp)) {
             self.move_selection(-6);
         }
+        // Home/End 跳列表首/尾；End 落到末尾后若还有未加载的候选，
+        // paint_rows 的滚到底检测会自动续拉。
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Home)) {
+            self.select_edge(false);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::End)) {
+            self.select_edge(true);
+        }
 
         if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) {
             self.step_scope(ctx, -1);
@@ -1370,6 +1404,41 @@ impl LstrApp {
         // 键盘移动后把选中行滚回可视区（只在选择变化时做，不要每帧做，
         // 否则滚轮滚动会被"保持选中可见"拽回去）。
         self.scroll_to_selection = true;
+    }
+
+    /// Home/End：跳到列表首/尾（和 ↑↓/PageUp/PageDown 一样是列表导航，
+    /// 不移动输入框光标）。
+    fn select_edge(&mut self, last: bool) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.selected = if last { self.entries.len() - 1 } else { 0 };
+        self.hover_suppress_until = Instant::now() + Duration::from_millis(300);
+        self.scroll_to_selection = true;
+    }
+
+    /// 滚到列表底部时加载更多：把交付上限翻倍（100→200→…→1000）并原样
+    /// 重发当前查询。响应到达前不重复触发；后端给不出更多就停止。
+    fn load_more(&mut self, ctx: &egui::Context) {
+        if self.waiting || self.more_pending || self.more_exhausted {
+            return;
+        }
+        // total 是精确命中数：已经全部显示（或本身没有结果）就无需再拉。
+        if self.entries.is_empty() || self.entries.len() >= self.total {
+            self.more_exhausted = true;
+            return;
+        }
+        match self.service.more() {
+            Some(generation) => {
+                self.pending_gen = generation;
+                self.more_pending = true;
+                self.waiting = true;
+                self.search_sent_at = Some(Instant::now());
+                self.ui_total_ms = None;
+                ctx.request_repaint();
+            }
+            None => self.more_exhausted = true,
+        }
     }
 
     fn step_scope(&mut self, ctx: &egui::Context, delta: i32) {
@@ -3122,6 +3191,11 @@ impl LstrApp {
         }
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
         self.scrollable = max_scroll > 0.0;
+        // 滚到底（或键盘 End 跳到末行）时续拉：100→200→…→1000 条。
+        // 响应保留滚动位置，用户接着往下扫即可。
+        if max_scroll > 0.0 && self.scroll_y >= max_scroll - 1.0 {
+            self.load_more(ui.ctx());
+        }
         // 只绘制可视区域，滚动时未显示的行不画也不接收鼠标事件。
         // 滚动条在窗口右缘（可能超出列表裁剪区），用未裁剪的 painter 画。
         let raw_painter = painter.clone();

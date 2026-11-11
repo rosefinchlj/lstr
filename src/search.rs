@@ -28,6 +28,19 @@ use std::time::{Duration, Instant};
 /// 重建成本是枚举开始菜单 + App Paths（本机 200+ 应用，几十 ms），放 worker 线程无感。
 const APPS_RELOAD_INTERVAL: Duration = Duration::from_secs(90);
 
+/// 首屏交付的候选上限。窗口只按「最大结果数」长高，其余靠滚轮查看。
+pub(crate) const MIN_DELIVER: usize = 100;
+/// 滚到列表底部自动「加载更多」的上限（100→200→400→800→1000）。
+/// 内置引擎 candidate_cap 默认 2000，1000 条足够大面积扫视，单次响应也不至于过大。
+pub(crate) const MAX_DELIVER: usize = 1000;
+/// 「加载更多」时单次向索引/Everything 要的候选数上限。
+const MAX_FETCH: usize = 2000;
+
+/// 下一档交付上限；已到顶返回 None（UI 不再发加载更多请求）。
+fn next_deliver(current: usize) -> Option<usize> {
+    (current < MAX_DELIVER).then(|| (current * 2).min(MAX_DELIVER))
+}
+
 /// 等待中的查询请求数:UI 线程发送前 +1,搜索线程出队后 -1。
 /// 引擎分批 apply 的块间让路钩子读它:>0 = 有打字请求在排队,对账/首扫的
 /// 记录 apply 立即收手——0294602「打字时查询优先于索引维护」的 apply 中段
@@ -59,7 +72,10 @@ struct Request {
     /// 诊断用：UI 发出时刻。worker 出队时用它区分「排队慢」还是「执行慢」。
     sent_at: Instant,
     query: Query,
+    /// 窗口「最大结果数」：决定窗口高度，也参与候选抓取/应用条数的预算。
     limit: usize,
+    /// 本次最多交付多少条候选：首屏 [`MIN_DELIVER`]，滚到底翻倍到 [`MAX_DELIVER`]。
+    deliver: usize,
     keywords: Vec<KeywordConfig>,
     /// 对话框模式（Quick Switch）：空查询时把 Explorer 已打开的文件夹置顶。
     dialog_quick: bool,
@@ -105,12 +121,29 @@ fn send_response(tx: &Sender<Response>, request: &Request, response: Response) {
     let _ = tx.send(response);
 }
 
+/// 上一次查询的完整参数：滚到底加载更多时原样重发，只放大交付上限。
+#[derive(Clone)]
+struct LastQuery {
+    raw: String,
+    scope: Scope,
+    dialog_quick: bool,
+    filters: SearchFilters,
+    rank: RankConfig,
+    show_history: bool,
+    base_folder: Option<PathBuf>,
+    browse_root: Option<PathBuf>,
+}
+
 pub struct SearchService {
     tx: Sender<Request>,
     rx: Receiver<Response>,
     generation: u64,
     history: Arc<Mutex<History>>,
     limit: usize,
+    /// 当前「加载更多」的交付上限（100 → 200 → … → [`MAX_DELIVER`]）。
+    deliver: usize,
+    /// 上一次查询参数；`more()` 用它重发同一个查询。
+    last: Option<LastQuery>,
     keywords: Vec<KeywordConfig>,
     /// P0-1：收藏列表，新增收藏后由 UI 同步进来。
     favorites: Vec<crate::assets::Favorite>,
@@ -183,6 +216,8 @@ impl SearchService {
             generation: 0,
             history,
             limit: config.max_results,
+            deliver: MIN_DELIVER,
+            last: None,
             keywords: config.keywords,
             favorites: config.favorites,
             apps_dirty,
@@ -256,6 +291,7 @@ impl SearchService {
             show_history,
             base_folder,
             None,
+            false,
         )
     }
 
@@ -279,6 +315,7 @@ impl SearchService {
             show_history,
             None,
             Some(browse_root),
+            false,
         )
     }
 
@@ -292,7 +329,22 @@ impl SearchService {
         show_history: bool,
         base_folder: Option<PathBuf>,
         browse_root: Option<PathBuf>,
+        keep_deliver: bool,
     ) -> u64 {
+        // 新查询/新上下文回到首屏 100 条；只有 more() 续拉时保留上限。
+        if !keep_deliver {
+            self.deliver = MIN_DELIVER;
+        }
+        self.last = Some(LastQuery {
+            raw: raw.to_string(),
+            scope,
+            dialog_quick,
+            filters: filters.clone(),
+            rank: rank.clone(),
+            show_history,
+            base_folder: base_folder.clone(),
+            browse_root: browse_root.clone(),
+        });
         self.generation += 1;
         // 通知查询线程:更旧的查询可以立即放弃(打字时 "a"→"ai" 不再排队 600ms)。
         lstr_index::query::CANCEL_GEN
@@ -312,6 +364,7 @@ impl SearchService {
                 sent_at: Instant::now(),
                 query,
                 limit: self.limit,
+                deliver: self.deliver,
                 keywords: self.keywords.clone(),
                 dialog_quick,
                 filters: filters.clone(),
@@ -332,6 +385,29 @@ impl SearchService {
     /// 设置里的「最大结果数」改动后立即生效，无需重启。
     pub fn set_limit(&mut self, limit: usize) {
         self.limit = limit.clamp(1, 50);
+    }
+
+    /// 滚到列表底部：把交付上限翻倍并原样重发上一次查询。
+    /// 返回新 generation；已到 [`MAX_DELIVER`] 或还没发过查询时返回 None。
+    pub fn more(&mut self) -> Option<u64> {
+        let last = self.last.clone()?;
+        self.deliver = next_deliver(self.deliver)?;
+        let generation = self.search_with_context(
+            &last.raw,
+            last.scope,
+            last.dialog_quick,
+            &last.filters,
+            &last.rank,
+            last.show_history,
+            last.base_folder,
+            last.browse_root,
+            true,
+        );
+        lstr_index::snapshot::debug_log(&format!(
+            "search: load more deliver={} gen={generation}",
+            self.deliver
+        ));
+        Some(generation)
     }
 
     /// 「重新加载」命令后同步最新关键字，不必重启进程。
@@ -499,6 +575,7 @@ mod pin_tests {
                 suffix: None,
             },
             limit,
+            deliver: MIN_DELIVER,
             keywords: Vec::new(),
             dialog_quick: false,
             filters: SearchFilters::default(),
@@ -776,8 +853,61 @@ mod pin_tests {
             "截断前必须先把精确同名移到最前"
         );
     }
-}
 
+    #[test]
+    fn deliver_cap_grows_for_load_more() {
+        // 滚到底加载更多：同一批候选按 200 条交付（首屏上限被放大）。
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let make_entries = || {
+            (0..250)
+                .map(|i| {
+                    entry_at(
+                        &format!("g{i}"),
+                        &format!("ai-{i:03}"),
+                        Kind::File,
+                        &format!(r"D:\work\{i}\ai-{i:03}"),
+                    )
+                })
+                .collect::<Vec<Entry>>()
+        };
+        let mut req = request("ai", 8);
+        req.deliver = 200;
+        let out = finalize_entries(make_entries(), &req, &history, &Config::default(), Vec::new());
+        assert_eq!(out.len(), 200, "deliver=200 时应交付 200 条");
+
+        // 首屏默认行为不变：仍是 MIN_DELIVER 条。
+        let out = finalize_entries(
+            make_entries(),
+            &request("ai", 8),
+            &history,
+            &Config::default(),
+            Vec::new(),
+        );
+        assert_eq!(out.len(), MIN_DELIVER);
+    }
+
+    #[test]
+    fn load_more_deliver_doubles_and_stops_at_cap() {
+        assert_eq!(next_deliver(MIN_DELIVER), Some(200));
+        assert_eq!(next_deliver(200), Some(400));
+        assert_eq!(next_deliver(400), Some(800));
+        assert_eq!(next_deliver(800), Some(MAX_DELIVER));
+        assert_eq!(next_deliver(MAX_DELIVER), None);
+    }
+
+    #[test]
+    fn fetch_count_grows_after_first_screen() {
+        let q = request("ai", 8).query;
+        // 首屏与原来一致：max_results(8) × 50 = 400。
+        assert_eq!(fetch_count(&q, 8, MIN_DELIVER), 400);
+        // 200 条时原预算（400）仍够用，不额外放大。
+        assert_eq!(fetch_count(&q, 8, 200), 400);
+        // 800 条时按交付量的 2 倍抓候选（同名去重会吃掉一部分）→ 1600。
+        assert_eq!(fetch_count(&q, 8, 800), 1600);
+        // 到交付上限时抓 2000（MAX_FETCH），不再继续放大。
+        assert_eq!(fetch_count(&q, 8, MAX_DELIVER), MAX_FETCH);
+    }
+}
 /// 「候选阶段零 FS」的标记:内置索引产出的 Entry 只带索引内信息
 /// (size 留空,modified 取索引 mtime),真实 size/mtime 与类型漂移校正延迟到
 /// finalize 的展示阶段,只对最终候选逐条 `find_meta`。
@@ -899,7 +1029,7 @@ fn finalize_entries_with_pending(
     } else {
         request.query.text.to_lowercase()
     };
-    let deliver = request.limit.max(100);
+    let deliver = request.limit.max(request.deliver);
     let mut meta_ms = 0.0;
     let (t_ids, t_names);
     if let Some(pending) = pending {
@@ -1153,7 +1283,8 @@ fn browse_response(
         );
     }
     // 浏览目录不是「搜索前 N 条」：放宽上限，列表靠 UI 滚动查看。
-    entries.truncate(request.limit.max(200));
+    // 加载更多时跟随 deliver 一起放大。
+    entries.truncate(request.limit.max(request.deliver).max(200));
     Response {
         generation: request.generation,
         entries,
@@ -1503,7 +1634,7 @@ fn run_worker(args: WorkerArgs) {
                 .unwrap_or_default();
             let mut entries: Vec<Entry> = dir_cache.children(&dir).to_vec();
             let total = entries.len();
-            entries.truncate(request.limit.max(200));
+            entries.truncate(request.limit.max(request.deliver).max(200));
             let _ = tx.send(Response {
                 generation: request.generation,
                 entries,
@@ -1646,8 +1777,10 @@ fn run_worker(args: WorkerArgs) {
                         && !time_forced
                         && !request.filters.matches.regex
                         && everything.is_some();
-                    let fetch = fetch_count(&request.query, request.limit);
-                    let folder_fetch = (fetch / 5).clamp(40, 120);
+                    let fetch = fetch_count(&request.query, request.limit, request.deliver);
+                    // 加载更多时同比例放宽文件夹候选预算；首屏仍以 120 封顶（行为不变）。
+                    let folder_cap = 120 + request.deliver.saturating_sub(MIN_DELIVER) / 4;
+                    let folder_fetch = (fetch / 5).clamp(40, folder_cap);
                     let file_fetch = fetch.saturating_sub(folder_fetch).max(60);
                     let mut truncation = 0usize;
                     // split 并趟产出的精确同名补齐(旧 search_exact 第二趟)。
@@ -1846,7 +1979,7 @@ fn run_worker(args: WorkerArgs) {
                         && (!time_forced || builtin_time_ok);
                     if let Some(b) = &builtin {
                         if used_builtin {
-                            let fetch = fetch_count(&request.query, request.limit);
+                            let fetch = fetch_count(&request.query, request.limit, request.deliver);
                             match b.search(&request.query, &request.filters, fetch) {
                                 Ok((mut files, count)) => {
                                     total = count;
@@ -1857,7 +1990,7 @@ fn run_worker(args: WorkerArgs) {
                                 Err(err) => error = Some(err),
                             }
                         } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
-                            let fetch = fetch_count(&request.query, request.limit);
+                            let fetch = fetch_count(&request.query, request.limit, request.deliver);
                             match provider.search(&request.query, &request.filters, fetch) {
                                 Ok((mut files, count)) => {
                                     total = count;
@@ -1874,7 +2007,7 @@ fn run_worker(args: WorkerArgs) {
                             });
                         }
                     } else if let Some(provider) = &everything {
-                        let fetch = fetch_count(&request.query, request.limit);
+                        let fetch = fetch_count(&request.query, request.limit, request.deliver);
                         match provider.search(&request.query, &request.filters, fetch) {
                             Ok((mut files, count)) => {
                                 total = count;
@@ -1891,7 +2024,7 @@ fn run_worker(args: WorkerArgs) {
                     // 只能看到半成品索引,查不到尚未扫到的文件。
                     if used_builtin && phase != lstr_index::Phase::Ready {
                         if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
-                            let fetch = fetch_count(&request.query, request.limit);
+                            let fetch = fetch_count(&request.query, request.limit, request.deliver);
                             if let Ok((mut extra, count)) =
                                 provider.search(&request.query, &request.filters, fetch)
                             {
@@ -2014,19 +2147,26 @@ send_response(&tx, &request, Response {
     worker_collected.store(true, Ordering::Relaxed);
 }
 
-fn fetch_count(query: &Query, limit: usize) -> usize {
+fn fetch_count(query: &Query, limit: usize, deliver: usize) -> usize {
     let short = query.text.chars().count() < 2
         && query.ext.is_none()
         && query.path_filter.is_none()
         && query.prefix.is_none()
         && query.suffix.is_none();
-    if short {
+    let base = if short {
         80
     } else {
         // 实测 Everything IPC 的瓶颈在查询评估本身（~120ms，与条数基本无关），
         // 300→500 只多花约 8ms，却能给排序多 66% 的候选，值得保留。
         (limit * 50).min(500)
+    };
+    if deliver <= MIN_DELIVER {
+        return base;
     }
+    // 加载更多：按交付条数的 2 倍抓候选——同名/id 去重在常见短查询里会
+    // 吃掉近一半候选（实测搜 "a" 时 250 个候选只剩 122 条），只留 1/4 余量
+    // 会让 deliver=1000 实际只加载到 ~520 条。
+    base.max(deliver.saturating_mul(2)).min(MAX_FETCH)
 }
 
 /// 应用结果也要遵守匹配选项：严格模式下禁止拼音/模糊兜底，避免
@@ -2285,6 +2425,7 @@ mod tests {
                 suffix: None,
             },
             limit: 10,
+            deliver: MIN_DELIVER,
             keywords: Vec::new(),
             dialog_quick: false,
             filters: SearchFilters::default(),
@@ -2587,6 +2728,46 @@ mod tests {
 
         drop(service);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn more_doubles_deliver_until_cap_and_new_search_resets() {
+        let _guard = SERVICE_TEST_LOCK.lock().unwrap();
+        let history = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::history::History::in_memory(),
+        ));
+        let ctx = eframe::egui::Context::default();
+        let mut service = SearchService::new(test_config(), history, ctx);
+        assert!(service.more().is_none(), "还没发过查询时不能续拉");
+        let _ = service.search(
+            "ai",
+            crate::model::Scope::All,
+            false,
+            &SearchFilters::default(),
+            &RankConfig::default(),
+            false,
+        );
+        assert_eq!(service.deliver, MIN_DELIVER);
+        assert!(service.more().is_some());
+        assert_eq!(service.deliver, 200);
+        assert!(service.more().is_some());
+        assert_eq!(service.deliver, 400);
+        assert!(service.more().is_some());
+        assert_eq!(service.deliver, 800);
+        assert!(service.more().is_some());
+        assert_eq!(service.deliver, MAX_DELIVER);
+        assert!(service.more().is_none(), "到上限后应停止");
+
+        // 新查询（输入/筛选变化）必须回到首屏 100，不能继承上一轮的上限。
+        let _ = service.search(
+            "ai2",
+            crate::model::Scope::All,
+            false,
+            &SearchFilters::default(),
+            &RankConfig::default(),
+            false,
+        );
+        assert_eq!(service.deliver, MIN_DELIVER);
     }
 
     #[test]
