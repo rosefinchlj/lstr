@@ -135,6 +135,26 @@ const CRUMB_H: f32 = 22.0;
 const LIST_GAP: f32 = 4.0;
 const FOOTER_H: f32 = 36.0;
 const NEEDLE_H: f32 = 26.0;
+/// 「搜索技巧」面板的排版尺寸。绘制与窗口定高共用同一组常量，
+/// 避免面板高度和底部横幅定位各算各的。
+const HELP_TOP_PAD: f32 = 14.0;
+const HELP_TITLE_H: f32 = 24.0;
+const HELP_GROUP_HEAD_H: f32 = 21.0;
+const HELP_ROW_H: f32 = 19.0;
+const HELP_GROUP_GAP: f32 = 8.0;
+
+/// 空查询帮助面板的内容高度（相对列表顶部）：宽窗口两列，以较高的左列
+/// 为准；窄窗口退化为单列顺排，两列内容相加。
+fn help_panel_height(width: f32) -> f32 {
+    let group = |rows: f32| HELP_GROUP_HEAD_H + rows * HELP_ROW_H + HELP_GROUP_GAP;
+    let left = group(3.0) * 3.0;
+    let head = HELP_TOP_PAD + HELP_TITLE_H;
+    if width >= 560.0 {
+        head + left
+    } else {
+        head + left + group(3.0) + group(4.0)
+    }
+}
 
 pub struct LstrApp {
     cfg: Config,
@@ -960,6 +980,16 @@ impl LstrApp {
         self.typing_global = false;
     }
 
+    /// 空查询 + 空结果：显示「搜索技巧」帮助面板（paint_rows 里绘制）。
+    /// 窗口定高（apply_size）与底部提示条定位（paint）必须用同一判断，
+    /// 否则提示条会叠在帮助内容中间。
+    fn help_tips_active(&self, query_empty: bool) -> bool {
+        query_empty
+            && self.entries.is_empty()
+            && self.browse_root.is_none()
+            && !self.settings_open
+    }
+
     fn apply_size(&mut self, ctx: &egui::Context) {
         if self.resizing {
             return;
@@ -982,14 +1012,15 @@ impl LstrApp {
             // 窗口只长到设置的行数，不会因为候选多就撑满屏幕。
             let rows = self.entries.len().min(self.cfg.max_results);
             let mut list_h = if rows == 0 { 120.0 } else { rows as f32 * self.theme.row_h };
-            // 空态技巧面板（分类两列约 280px）：仅空输入+空结果时撑高窗口，
-            // 一旦有结果或开始输入即恢复按行数计算。
-            let tips_active = rows == 0
-                && self.input.trim().is_empty()
-                && !self.settings_open
-                && self.browse_root.is_none();
+            // 空态技巧面板：仅空查询+空结果时撑高窗口。
+            // 判断必须和 paint_rows 一致（按 parse 后的 query 为空，不是
+            // input.trim() 为空）：`a ` 这类只剩范围前缀的输入也算空查询，
+            // 面板会显示，窗口就不能只按 120px 定高。
+            let tips_active =
+                self.help_tips_active(search::query::parse(&self.input, self.scope).is_empty());
             if tips_active {
-                list_h = list_h.max(300.0);
+                let content_w = (width - PAD - if self.preview_open { 216.0 } else { 0.0 }).max(1.0);
+                list_h = list_h.max(help_panel_height(content_w));
             }
             let banner_h = if self.error.is_some() || self.regex_error.is_some() || self.index_note.is_some() { 30.0 } else { 0.0 };
             let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
@@ -1701,14 +1732,22 @@ impl LstrApp {
         let entries = self.entries.clone();
         let query = search::query::parse(&self.input, self.scope);
         let row_h = theme.row_h;
+        let preview_w = if self.preview_open { 216.0 } else { 0.0 };
         let list_h = if entries.is_empty() {
-            120.0
+            // 帮助面板显示时按面板真实高度算：底部提示条（文件对话框/
+            // 错误条）用 list_h 定位，按空列表的 120 算会叠在帮助内容中间。
+            if self.help_tips_active(query.is_empty()) {
+                help_panel_height(
+                    (self.last_width.max(self.theme.width) - PAD - preview_w).max(1.0),
+                )
+            } else {
+                120.0
+            }
         } else {
             entries.len() as f32 * row_h
         };
         let banner_h = if self.error.is_some() || self.regex_error.is_some() || self.index_note.is_some() { 30.0 } else { 0.0 };
         let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
-        let preview_w = if self.preview_open { 216.0 } else { 0.0 };
         let height = if self.settings_open {
             600.0
         } else {
@@ -2884,7 +2923,7 @@ impl LstrApp {
         let theme = self.theme;
         if entries.is_empty() {
             // 空查询（还没开始搜索）：分类两列的搜索技巧面板。
-            if query.is_empty() && self.browse_root.is_none() {
+            if self.help_tips_active(query.is_empty()) {
                 self.needle_target = 0.0;
                 self.scrollable = false;
                 // 左列「搜索语法」：位置 / 筛选 / 范围；右列「输入与快捷键」。
@@ -2947,7 +2986,7 @@ impl LstrApp {
                         ui::text_font(11.5),
                         theme.sub,
                     );
-                    *y += 21.0;
+                    *y += HELP_GROUP_HEAD_H;
                     for (key, desc) in rows {
                         painter.text(
                             egui::pos2(x + 6.0, *y),
@@ -2963,11 +3002,11 @@ impl LstrApp {
                             ui::mono_font(11.0),
                             theme.dim,
                         );
-                        *y += 19.0;
+                        *y += HELP_ROW_H;
                     }
-                    *y += 8.0;
+                    *y += HELP_GROUP_GAP;
                 };
-                let mut y = list_top + 14.0;
+                let mut y = list_top + HELP_TOP_PAD;
                 painter.text(
                     egui::pos2(x0, y),
                     Align2::LEFT_TOP,
@@ -2975,12 +3014,12 @@ impl LstrApp {
                     ui::text_font(12.0),
                     theme.sub,
                 );
-                y += 24.0;
+                y += HELP_TITLE_H;
                 for group in syntax {
                     draw_group(painter, x0, &mut y, group);
                 }
                 if two_col {
-                    let mut ry = list_top + 14.0 + 24.0;
+                    let mut ry = list_top + HELP_TOP_PAD + HELP_TITLE_H;
                     for group in misc {
                         draw_group(painter, x0 + col_w + 12.0, &mut ry, group);
                     }
