@@ -761,7 +761,7 @@ fn pipe_alive(client: windows::Win32::Foundation::HANDLE) -> bool {
 pub fn worker_launch_args(index: &crate::config::IndexConfig, volume_mask: u32) -> String {
     let mut extra = String::new();
     if index.backend == "usn" {
-        // USN 实时增量层(实验):dirscan 首扫 → journal 轮询(worker 侧带熔断/
+        // USN 实时增量层(可选后端):dirscan 首扫 → journal 轮询(worker 侧带熔断/
         // 游标校验/clean-exit 护栏)。固定 dir 首扫,与设置页文案一致;
         // 这是唯一会下发 --index-journal 的自动路径。
         extra.push_str(" --index-scan-mode dir --index-journal");

@@ -81,7 +81,7 @@ pub struct IndexConfig {
     pub candidate_cap: usize,
     /// 首扫模式:`dir`(默认,目录枚举,零 USN FSCTL)/ `usn`(原 ENUM+journal)。
     /// 2026-11-09 本机 0x3B/Ntfs.sys 蓝屏后默认切到 `dir`。
-    /// 注:backend="usn" 实验后端固定走 dir 首扫 + journal 轮询,不读本字段。
+    /// 注:backend="usn" 增量后端固定走 dir 首扫 + journal 轮询,不读本字段。
     pub scan_mode: String,
     /// `dir` 首扫完成后是否继续轮询 journal 做增量(阶段 2,默认关;
     /// 旧 usn 首扫模式用。backend="usn" 不看此开关,自带 journal 轮询)。
@@ -531,7 +531,7 @@ impl Config {
 /// 后端名归一化:只接受 auto/builtin/usn/everything/off,未知值一律回 auto,
 /// 避免手写 config.toml 里的错拼被静默当成「建内置引擎」。
 ///
-/// `usn` = 实验后端:目录扫描首扫 + USN journal 实时增量(带熔断/游标校验护栏)。
+/// `usn` = 增量后端:目录扫描首扫 + USN journal 实时增量(带熔断/游标校验护栏)。
 /// 它是唯一会启用 USN FSCTL 路径的取值;auto/builtin 保持零 USN FSCTL 不变。
 pub fn normalize_backend(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -614,7 +614,7 @@ mod tests {
         assert_eq!(normalize_backend("  BuIlTiN "), "builtin");
         assert_eq!(normalize_backend("everything"), "everything");
         assert_eq!(normalize_backend("off"), "off");
-        // USN 实验后端:归一化接受,大小写/空白容忍
+        // USN 增量后端:归一化接受,大小写/空白容忍
         assert_eq!(normalize_backend("usn"), "usn");
         assert_eq!(normalize_backend(" USN "), "usn");
         // 手写错拼不再静默创建内置引擎,回落 auto

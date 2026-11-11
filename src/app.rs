@@ -5465,9 +5465,9 @@ impl LstrApp {
         // 两列等宽网格:旧版写死 118px 宽/124px 步进,「仅内置索引(不碰 Everything)」
         // 文字溢出按钮、第 4 个按钮又被窗口右边裁掉;这里按可见宽度均分。
         Self::settings_label(painter, &theme, area.left(), y, "索引后端");
-        // usn = 实验后端:目录扫描首扫 + USN journal 实时增量(带熔断/对账护栏);
+        // usn = 增量后端:目录扫描首扫 + USN journal 实时增量(带熔断/对账护栏);
         // 文案风格与其余四项一致(短句括注)。
-        let backends = [("auto", "自动(内置优先+兜底)"), ("builtin", "仅内置索引(不碰 Everything)"), ("usn", "实验:目录扫描+USN 实时增量"), ("everything", "仅 Everything"), ("off", "关闭内置索引")];
+        let backends = [("auto", "自动(内置优先+兜底)"), ("builtin", "仅内置索引(不碰 Everything)"), ("usn", "目录扫描+USN 实时增量"), ("everything", "仅 Everything"), ("off", "关闭内置索引")];
         let current = self.cfg_index_backend();
         const BACKEND_CHIP_H: f32 = 26.0;
         const BACKEND_CHIP_GAP: f32 = 8.0;
@@ -5518,7 +5518,7 @@ impl LstrApp {
         // 这里用 layout+wrap 按 area 宽度自动折行:文案再长也不会跑出右边界
         // (painter.text 是 no-wrap,旧版单行长段落其实早就被窗口右侧裁掉了)。
         let help = "自动:内置索引未就绪时用 Everything 兜底合并;仅内置:完全不读取 Everything;仅 Everything:只用 Everything 后端。\n\
-实验 usn:目录扫描首扫 + USN journal 实时增量(带熔断/自动对账护栏;journal 重置或连续出错时该卷自动退回目录扫描对账)。\n\
+usn:目录扫描首扫 + USN journal 实时增量(快照完整且游标可信时免扫直读;带熔断/自动对账护栏;journal 重置或连续出错时该卷自动退回目录扫描对账)。\n\
 索引卷勾选立即生效(worker 自动起停该盘扫描);索引后端与噪声目录仍需重启 lstr 生效。\n\
 时间筛选在内置索引(目录扫描)模式下可用。\n\
 内置索引只覆盖本机固定 NTFS 卷;网络盘/FAT32/exFAT 等需 Everything。";

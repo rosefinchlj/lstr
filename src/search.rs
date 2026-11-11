@@ -1205,7 +1205,7 @@ fn finalize_entries_with_pending(
 }
 
 /// 内置索引能否自带时间筛选:目录枚举(dir 首扫)会把 mtime 写进快照;
-/// backend="usn" 实验后端固定走 dir 首扫(见 config 注释),同样有 mtime。
+/// backend="usn" 增量后端固定走 dir 首扫(见 config 注释),同样有 mtime。
 /// 纯 USN 首扫(scan_mode="usn")没有 mtime,时间筛选仍需 Everything。
 fn builtin_index_has_mtime(index: &crate::config::IndexConfig) -> bool {
     index.scan_mode == "dir" || index.backend == "usn"
@@ -2396,7 +2396,7 @@ mod tests {
         index.scan_mode = "usn".to_string();
         assert!(!builtin_index_has_mtime(&index), "纯 USN 首扫无 mtime");
         index.backend = "usn".to_string();
-        assert!(builtin_index_has_mtime(&index), "usn 实验后端固定 dir 首扫,有 mtime");
+        assert!(builtin_index_has_mtime(&index), "usn 后端固定 dir 首扫,有 mtime");
     }
 
     /// 测试隔离:默认配置 backend=auto 会让服务线程真去探活/拉起 worker

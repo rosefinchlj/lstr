@@ -885,7 +885,7 @@ fn volume_loop(
     // 握手 complete=true 表示引擎已加载该卷快照 → 不再整卷重扫,后台对账即可。
     if opts().scan_mode == ScanMode::Dir {
         if opts().journal {
-            // backend="usn" 实验增量层:dirscan 首扫 → USN journal 轮询
+            // backend="usn" 增量层:dirscan 首扫 → USN journal 轮询
             // (熔断器/游标校验/clean-exit 护栏见 usnwatch 模块与 worker_main)。
             journal_incremental_volume(letter, guid, req, &tx, &stop);
             return;
