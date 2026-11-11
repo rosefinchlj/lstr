@@ -3367,7 +3367,9 @@ impl LstrApp {
                     return;
                 };
                 match shell::open_with(&entry) {
-                    Ok(()) => self.hide(ctx),
+                    // 打开方式只是弹系统对话框，不消费搜索结果：保留输入，
+                    // 用户关掉对话框后再唤出仍能继续上一次搜索。
+                    Ok(()) => self.hide_keep(ctx),
                     Err(err) => self.toast(ctx, err),
                 }
             }
@@ -3376,7 +3378,8 @@ impl LstrApp {
                     return;
                 };
                 match shell::open_terminal(&entry) {
-                    Ok(()) => self.hide(ctx),
+                    // 终端是旁观操作（不改动搜索结果），同样保留输入与结果。
+                    Ok(()) => self.hide_keep(ctx),
                     Err(err) => self.toast(ctx, err),
                 }
             }

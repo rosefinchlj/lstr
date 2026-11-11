@@ -4,7 +4,8 @@ use std::os::windows::process::CommandExt; // raw_arg：按原样拼命令行
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use windows::core::PCWSTR;
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::UI::Shell::{SHOpenWithDialog, ShellExecuteW, OAIF_EXEC, OPENASINFO};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 fn wide(value: &str) -> Vec<u16> {
@@ -187,7 +188,30 @@ pub fn open_with(entry: &Entry) -> Result<(), String> {
         .path
         .as_ref()
         .ok_or_else(|| "该结果没有路径".to_string())?;
-    shell_execute("openas", path)
+    let resolved = resolved_target(path);
+    let target = resolved.display().to_string();
+    // ShellExecute 的 "openas" 动词在新系统上静默失败；SHOpenWithDialog 是
+    // Vista+ 的官方入口。它在对话框关闭前阻塞，放到独立 STA 线程：主界面先
+    // 收起、界面线程不冻结（否则对话框一直开着时窗口会被系统标记「未响应」）。
+    std::thread::Builder::new()
+        .name("lstr-open-with".to_string())
+        .spawn(move || {
+            let file = wide(&target);
+            unsafe {
+                let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                let info = OPENASINFO {
+                    pcszFile: PCWSTR(file.as_ptr()),
+                    pcszClass: PCWSTR::null(),
+                    oaifInFlags: OAIF_EXEC,
+                };
+                let _ = SHOpenWithDialog(None, &info);
+                if hr.is_ok() {
+                    CoUninitialize();
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| format!("打开方式失败: {e}"))
 }
 
 pub fn open_config() -> Result<(), String> {
@@ -367,5 +391,11 @@ mod tests {
         assert_eq!(terminal_dir(&entry(Kind::App, Some(r"C:\a\app.lnk"))), None);
         assert_eq!(terminal_dir(&entry(Kind::Command, None)), None);
         assert_eq!(terminal_dir(&entry(Kind::File, None)), None);
+    }
+
+    #[test]
+    fn open_with_requires_a_path() {
+        // 无路径的命令/结果不进 shell，直接给出错误（不弹系统对话框）。
+        assert!(open_with(&entry(Kind::File, None)).is_err());
     }
 }
