@@ -115,7 +115,65 @@ pub fn run_as_admin(entry: &Entry) -> Result<(), String> {
         .path
         .as_ref()
         .ok_or_else(|| "该结果没有路径".to_string())?;
+    // UWP/打包应用：ShellExecute 的 runas 无法解析 shell:AppsFolder。
+    // Windows Terminal 是常用打包应用里明确支持提权的，走它的 App Execution
+    // Alias（wt.exe）；其余打包应用只能明确拒绝，避免弹出一个注定失败的 UAC。
+    if let Some(aumid) = path
+        .to_string_lossy()
+        .strip_prefix("shell:AppsFolder\\")
+    {
+        if aumid.starts_with("Microsoft.WindowsTerminal_") {
+            if let Some(wt) = wt_alias() {
+                return shell_execute("runas", &wt);
+            }
+        }
+        return Err("打包应用（UWP）不支持从启动器提权".to_string());
+    }
     shell_execute("runas", path)
+}
+
+/// Windows Terminal 的 App Execution Alias（不在用户 PATH 里也能按绝对路径
+/// 启动）。未安装时返回 None。
+fn wt_alias() -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    let path = PathBuf::from(local).join(r"Microsoft\WindowsApps\wt.exe");
+    path.exists().then_some(path)
+}
+
+/// 「在终端打开」的目标目录：文件夹=自身，文件/程序=所在目录。
+/// 应用（开始菜单 .lnk / UWP）与命令没有有意义的终端目录。
+pub fn terminal_dir(entry: &Entry) -> Option<PathBuf> {
+    match entry.kind {
+        Kind::Folder => entry.path.clone(),
+        Kind::File | Kind::Program => entry
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf),
+        _ => None,
+    }
+}
+
+/// 在条目所在目录打开终端：优先 Windows Terminal（`wt -d <dir>`），
+/// 不可用时回退 PowerShell（`-NoExit` 保留窗口）。
+pub fn open_terminal(entry: &Entry) -> Result<(), String> {
+    let dir = terminal_dir(entry).ok_or_else(|| "该结果没有可用的目录".to_string())?;
+    let wt = wt_alias();
+    let spawned = match &wt {
+        Some(wt) => Command::new(wt).arg("-d").arg(&dir).spawn(),
+        None => Command::new("wt.exe").arg("-d").arg(&dir).spawn(),
+    };
+    if spawned.is_ok() {
+        return Ok(());
+    }
+    let dir_text = dir.to_string_lossy().replace('\'', "''");
+    Command::new("powershell.exe")
+        .arg("-NoExit")
+        .arg("-Command")
+        .arg(format!("Set-Location -LiteralPath '{dir_text}'"))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开终端失败: {e}"))
 }
 
 /// P0-1：以管理员权限运行程序并带参数（自定义动作 admin = true）。
@@ -266,5 +324,48 @@ mod tests {
         assert_eq!(uri.to_string_lossy(), "ms-settings:appsfeatures");
         let missing = resolved_target(Path::new("no-such-file-xyz.cpl"));
         assert_eq!(missing.to_string_lossy(), "no-such-file-xyz.cpl");
+    }
+
+    fn entry(kind: Kind, path: Option<&str>) -> Entry {
+        Entry {
+            id: "test".to_string(),
+            kind,
+            name: "test".to_string(),
+            path: path.map(PathBuf::from),
+            size: None,
+            modified: None,
+            pinyin: None,
+            initial: String::new(),
+            tone: 0,
+        }
+    }
+
+    #[test]
+    fn terminal_dir_is_folder_itself_or_file_parent() {
+        let folder = entry(Kind::Folder, Some(r"C:\work\project"));
+        assert_eq!(
+            terminal_dir(&folder).as_deref(),
+            Some(Path::new(r"C:\work\project"))
+        );
+
+        let file = entry(Kind::File, Some(r"C:\work\project\notes.txt"));
+        assert_eq!(
+            terminal_dir(&file).as_deref(),
+            Some(Path::new(r"C:\work\project")),
+            "文件应在所在目录打开终端"
+        );
+
+        let program = entry(Kind::Program, Some(r"C:\Tools\app.exe"));
+        assert_eq!(
+            terminal_dir(&program).as_deref(),
+            Some(Path::new(r"C:\Tools"))
+        );
+    }
+
+    #[test]
+    fn terminal_dir_rejects_apps_commands_and_missing_paths() {
+        assert_eq!(terminal_dir(&entry(Kind::App, Some(r"C:\a\app.lnk"))), None);
+        assert_eq!(terminal_dir(&entry(Kind::Command, None)), None);
+        assert_eq!(terminal_dir(&entry(Kind::File, None)), None);
     }
 }

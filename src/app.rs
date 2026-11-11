@@ -1044,6 +1044,17 @@ impl LstrApp {
             return;
         }
 
+        // Windows 标准上下文菜单键：Shift+F10。egui 不暴露独立的菜单键；
+        // Ctrl+K 仍保留。文件夹的 → 继续下钻，两者不冲突。
+        if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F10)) {
+            if self.menu_open {
+                self.menu_open = false;
+            } else {
+                self.open_menu();
+            }
+            return;
+        }
+
         if self.menu_open {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
                 self.menu_step(1);
@@ -2380,6 +2391,7 @@ impl LstrApp {
                         &[
                             ("Esc", "收起（再唤出保留输入）"),
                             ("Ctrl+G", "对话框搜索并填入"),
+                            ("Shift+F10", "动作菜单（文件夹也可）"),
                             ("双击 Ctrl", "唤出"),
                         ],
                     ),
@@ -3355,6 +3367,15 @@ impl LstrApp {
                     return;
                 };
                 match shell::open_with(&entry) {
+                    Ok(()) => self.hide(ctx),
+                    Err(err) => self.toast(ctx, err),
+                }
+            }
+            MenuAction::OpenTerminal => {
+                let Some(entry) = self.entries.get(self.selected).cloned() else {
+                    return;
+                };
+                match shell::open_terminal(&entry) {
                     Ok(()) => self.hide(ctx),
                     Err(err) => self.toast(ctx, err),
                 }
@@ -5000,6 +5021,7 @@ enum MenuAction {
     CopyName,
     Admin,
     OpenWith,
+    OpenTerminal,
     RemoveHistory,
     AddFavorite,
     CustomAction(usize),
@@ -5128,6 +5150,12 @@ fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef]) -> Vec<MenuIt
     let is_command = entry.kind == Kind::Command;
     let is_program = entry.kind == Kind::Program;
     let is_file = entry.kind == Kind::File;
+    // 应用（开始菜单 .lnk / App Paths / UWP）也允许尝试提权：普通 .lnk 与
+    // 系统工具（appwiz.cpl、taskmgr）都能提权；UWP 由执行层给出明确提示。
+    let can_admin = is_program || is_file || (entry.kind == Kind::App && entry.path.is_some());
+    // 「在终端打开」只对文件系统条目有意义（文件夹自身 / 文件所在目录）。
+    let can_terminal = entry.path.is_some()
+        && matches!(entry.kind, Kind::Folder | Kind::File | Kind::Program);
     let mut items = vec![
         MenuItem {
             label: "打开".to_string(),
@@ -5156,7 +5184,7 @@ fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef]) -> Vec<MenuIt
         MenuItem {
             label: "以管理员身份运行".to_string(),
             shortcut: "Ctrl ⇧ ↵",
-            enabled: is_program || is_file,
+            enabled: can_admin,
             action: MenuAction::Admin,
         },
         MenuItem {
@@ -5164,6 +5192,12 @@ fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef]) -> Vec<MenuIt
             shortcut: "",
             enabled: is_file || is_program,
             action: MenuAction::OpenWith,
+        },
+        MenuItem {
+            label: "在终端打开".to_string(),
+            shortcut: "",
+            enabled: can_terminal,
+            action: MenuAction::OpenTerminal,
         },
         MenuItem {
             label: "从最近使用中移除".to_string(),
@@ -5509,5 +5543,73 @@ mod path_layout_tests {
 
         entry.modified = None;
         assert!(preview_modified_line(&entry).is_none(), "未知 mtime 不显示");
+    }
+
+    fn menu_entry(kind: Kind, path: Option<&str>) -> Entry {
+        Entry {
+            id: "test".to_string(),
+            kind,
+            name: "test".to_string(),
+            path: path.map(std::path::PathBuf::from),
+            size: None,
+            modified: None,
+            pinyin: None,
+            initial: String::new(),
+            tone: 0,
+        }
+    }
+
+    fn item(items: &[MenuItem], action: MenuAction) -> MenuItem {
+        items
+            .iter()
+            .find(|item| item.action == action)
+            .cloned()
+            .unwrap_or_else(|| panic!("菜单缺少 {action:?}"))
+    }
+
+    /// 应用条目（开始菜单 .lnk / 系统工具）也要能尝试管理员启动；
+    /// 只有没有路径的应用保持禁用。
+    #[test]
+    fn admin_menu_is_enabled_for_apps_with_paths() {
+        let app = menu_items(
+            &menu_entry(Kind::App, Some(r"C:\Start Menu\Terminal.lnk")),
+            &[],
+        );
+        assert!(item(&app, MenuAction::Admin).enabled);
+        let uwp = menu_items(
+            &menu_entry(
+                Kind::App,
+                Some(r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"),
+            ),
+            &[],
+        );
+        assert!(
+            item(&uwp, MenuAction::Admin).enabled,
+            "打包应用也应可尝试，执行层会给出明确提示"
+        );
+        let no_path = menu_items(&menu_entry(Kind::App, None), &[]);
+        assert!(!item(&no_path, MenuAction::Admin).enabled);
+        let folder = menu_items(&menu_entry(Kind::Folder, Some(r"C:\work")), &[]);
+        assert!(!item(&folder, MenuAction::Admin).enabled, "文件夹不支持提权");
+    }
+
+    /// 「在终端打开」：文件夹 / 文件 / 程序可用，应用与命令不可用。
+    #[test]
+    fn terminal_menu_is_enabled_for_file_system_entries() {
+        for (kind, path) in [
+            (Kind::Folder, r"C:\work"),
+            (Kind::File, r"C:\work\notes.txt"),
+            (Kind::Program, r"C:\Tools\app.exe"),
+        ] {
+            let items = menu_items(&menu_entry(kind, Some(path)), &[]);
+            assert!(item(&items, MenuAction::OpenTerminal).enabled, "{kind:?} 应可终端打开");
+        }
+        for (kind, path) in [
+            (Kind::App, Some(r"C:\Start Menu\Terminal.lnk")),
+            (Kind::Command, None),
+        ] {
+            let items = menu_items(&menu_entry(kind, path), &[]);
+            assert!(!item(&items, MenuAction::OpenTerminal).enabled, "{kind:?} 不应终端打开");
+        }
     }
 }
