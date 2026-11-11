@@ -1552,6 +1552,10 @@ fn run_worker(args: WorkerArgs) {
                         .map(|b| b.engine.status().phase)
                         .unwrap_or(lstr_index::Phase::Fallback);
                     let use_builtin = force_builtin || phase != lstr_index::Phase::Fallback;
+                    // 正则是内置引擎的 bytes regex；Everything 的 PCRE 语法/结果不同，
+                    // 索引未就绪时宁可明确报错，也不把 pattern 当普通文本误搜。
+                    let regex_needs_builtin =
+                        request.filters.matches.regex && !use_builtin;
                     // 时间筛选依赖文件 mtime:USN 不含(方案 §3.2),降级走 Everything
                     let time_forced = request.filters.time.is_some();
                     // 构建期与 Everything 合并(方案 §5.2.2);Ready 后纯内置
@@ -1647,6 +1651,8 @@ fn run_worker(args: WorkerArgs) {
                         }
                         // 截断才需要 wfn 精确兜底；延后到第一版结果发出后再查。
                         needs_exact = truncation > 0;
+                    } else if regex_needs_builtin {
+                        error = Some("正则搜索需要内置索引就绪".to_string());
                     } else if time_forced {
                         error = Some(if force_builtin {
                             "仅内置索引模式不支持时间筛选(USN 不含修改时间)".to_string()
