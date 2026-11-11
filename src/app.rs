@@ -192,6 +192,9 @@ pub struct LstrApp {
     needle_target: f32,
     needle_ready: bool,
     mouse_moved: bool,
+    /// 键盘上下键选择后的短时间内不允许 hover 抢选中：鼠标移动事件和按键
+    /// 落在同一帧时，光标正好停在第三行会把「下移一格」覆盖成第三行。
+    hover_suppress_until: Instant,
     dialog: Option<DialogInfo>,
     settings_open: bool,
     preview_open: bool,
@@ -341,6 +344,7 @@ impl LstrApp {
             needle_target: 0.0,
             needle_ready: false,
             mouse_moved: false,
+            hover_suppress_until: Instant::now(),
             dialog: None,
             settings_open: false,
             preview_open,
@@ -1339,6 +1343,8 @@ impl LstrApp {
         }
         let len = self.entries.len() as i32;
         self.selected = (((self.selected as i32 + delta) % len + len) % len) as usize;
+        // 键盘导航后短暂冻结 hover：同帧的鼠标移动事件不能把选中抢到别的行。
+        self.hover_suppress_until = Instant::now() + Duration::from_millis(300);
         // 键盘移动后把选中行滚回可视区（只在选择变化时做，不要每帧做，
         // 否则滚轮滚动会被"保持选中可见"拽回去）。
         self.scroll_to_selection = true;
@@ -3075,7 +3081,9 @@ impl LstrApp {
         let painter = painter.with_clip_rect(list_area);
         let painter = &painter;
 
-        let pointer_moved = ui.ctx().input(|i| i.pointer.delta() != Vec2::ZERO);
+        // 微小抖动（<2px）不算“真的在动”：Windows 高 DPI 下指针可能每帧
+        // 报 0.5~1px 的噪声，足以在按 ↓ 的同一帧把选中抢到第三行。
+        let pointer_moved = ui.ctx().input(|i| i.pointer.delta().length_sq() > 4.0);
         if pointer_moved {
             self.mouse_moved = true;
         }
@@ -3141,6 +3149,7 @@ impl LstrApp {
                 && self.mouse_moved
                 && pointer_moved
                 && self.shown_at.elapsed() > Duration::from_millis(60)
+                && Instant::now() >= self.hover_suppress_until
             {
                 hovered = Some(index);
             }
