@@ -1420,8 +1420,25 @@ impl LstrApp {
                 self.toast(ctx, "对话框已关闭".to_string());
                 return;
             }
-            if entry.kind == Kind::App || entry.kind == Kind::Command {
+            if entry.kind == Kind::Command {
                 self.toast(ctx, "对话框模式只能选择文件或文件夹".to_string());
+                return;
+            }
+            // 收藏的应用（.lnk / shell:AppsFolder）没有能填进对话框的路径：
+            // 直接交给 shell 启动，和普通模式一致。
+            if entry.kind == Kind::App {
+                match shell::open_entry(&entry) {
+                    Ok(()) => {
+                        self.service.record_open(&entry);
+                        if let Ok(mut history) = self.history.lock() {
+                            history.record_query(&self.input, &entry);
+                        }
+                        self.suppressed_dialog = Some(dialog.hwnd);
+                        self.dialog = None;
+                        self.hide_keep(ctx);
+                    }
+                    Err(err) => self.toast(ctx, format!("打开失败: {err}")),
+                }
                 return;
             }
             let path = entry.full_path();

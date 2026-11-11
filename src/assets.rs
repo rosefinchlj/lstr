@@ -177,6 +177,31 @@ fn folder_entry(path: &Path) -> Entry {
     }
 }
 
+/// 收藏的显示类型按路径判定：真实目录才是文件夹；`.lnk`/`.exe`/`shell:`
+/// （UWP AppsFolder）按应用展示。硬编码成文件夹时，Quick Switch 会把
+/// 「终端」画成文件夹图标、右侧标「文件夹」。
+fn favorite_kind(path: &Path) -> Kind {
+    if path.is_dir() {
+        return Kind::Folder;
+    }
+    if path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .starts_with("shell:")
+    {
+        return Kind::App;
+    }
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("lnk" | "exe" | "url" | "bat" | "cmd" | "msi") => Kind::App,
+        _ => Kind::File,
+    }
+}
+
 pub fn favorite_entry(fav: &Favorite) -> Entry {
     let path = PathBuf::from(&fav.path);
     let name = if fav.name.trim().is_empty() {
@@ -188,7 +213,7 @@ pub fn favorite_entry(fav: &Favorite) -> Entry {
     };
     Entry {
         id: format!("fav:{}", fav.path.to_lowercase()),
-        kind: Kind::Folder,
+        kind: favorite_kind(&path),
         name,
         path: Some(path),
         size: None,
@@ -291,6 +316,29 @@ mod tests {
             query: "report",
             current_folder: "D:\\work",
         }
+    }
+
+    #[test]
+    fn favorite_kind_follows_path_type() {
+        // 目录 → 文件夹；UWP AUMID / .lnk → 应用；普通文件 → 文件。
+        assert_eq!(
+            super::favorite_kind(&std::env::temp_dir()),
+            Kind::Folder
+        );
+        assert_eq!(
+            super::favorite_kind(Path::new(
+                r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
+            )),
+            Kind::App
+        );
+        assert_eq!(
+            super::favorite_kind(Path::new(r"C:\missing\微信.lnk")),
+            Kind::App
+        );
+        assert_eq!(
+            super::favorite_kind(Path::new(r"C:\missing\notes.txt")),
+            Kind::File
+        );
     }
 
     #[test]
