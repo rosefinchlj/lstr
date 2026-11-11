@@ -1731,7 +1731,7 @@ impl LstrApp {
                     gear_rect.center(),
                     Align2::CENTER_CENTER,
                     "⚙",
-                    ui::text_font(14.0),
+                    ui::icon_font(14.0),
                     gear_color,
                 );
                 if gear.clicked() {
@@ -1745,49 +1745,51 @@ impl LstrApp {
                 );
                 let history =
                     ui.interact(history_rect, Id::new("lstr-history-toggle"), Sense::click());
-                if history.hovered() {
+                let history_on = self.cfg.show_history;
+                // 开启态复用筛选条的语言：amber_soft 底 + 琥珀色图标；关闭态只剩
+                // 灰色图标。不再画斜线——那读起来像「禁止」，而且比齿轮丑。
+                if history_on || history.hovered() {
                     painter.rect_filled(
                         history_rect.shrink(1.0),
                         CornerRadius::same(6),
-                        theme.surface_hi,
+                        if history_on {
+                            theme.amber_soft
+                        } else {
+                            theme.surface_hi
+                        },
                     );
                     painter.rect_stroke(
                         history_rect.shrink(1.0),
                         CornerRadius::same(6),
-                        Stroke::new(1.0_f32, theme.hair2),
+                        Stroke::new(
+                            1.0_f32,
+                            if history_on {
+                                theme.amber.gamma_multiply(0.6)
+                            } else {
+                                theme.hair2
+                            },
+                        ),
                         StrokeKind::Inside,
                     );
+                }
+                if history.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                let history_color = if self.cfg.show_history {
-                    if history.hovered() { theme.amber } else { theme.sub }
+                let history_color = if history_on {
+                    theme.amber
                 } else if history.hovered() {
                     theme.sub
                 } else {
                     theme.dim
                 };
-                // 画一个时钟图标（字体缺 U+23F2 之类的 glyph）。
-                let center = history_rect.center();
-                let clock = Stroke::new(1.3_f32, history_color);
-                painter.circle_stroke(center, 7.0, clock);
-                painter.line_segment(
-                    [center, center + egui::vec2(0.0, -4.0)],
-                    clock,
+                // 时钟字形：和齿轮同一字体族、同一字号，竖向墨迹才能对齐。
+                painter.text(
+                    history_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "\u{1F553}",
+                    ui::icon_font(14.0),
+                    history_color,
                 );
-                painter.line_segment(
-                    [center, center + egui::vec2(3.2, 1.6)],
-                    clock,
-                );
-                if !self.cfg.show_history {
-                    // 关闭态：斜线划掉。
-                    painter.line_segment(
-                        [
-                            center + egui::vec2(-6.5, 6.5),
-                            center + egui::vec2(6.5, -6.5),
-                        ],
-                        Stroke::new(1.6_f32, history_color),
-                    );
-                }
                 if history.hovered() {
                     history.clone().on_hover_text(if self.cfg.show_history {
                         "历史记录：开（点击关闭）"

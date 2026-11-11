@@ -92,6 +92,11 @@ pub const TEXT_SCALE: f32 = 1.18;
 /// 关键词高亮用的粗体字体族名。
 pub const BOLD_FAMILY: &str = "lstr-bold";
 
+/// 顶栏图标（齿轮/历史）专用字体族：只放 egui 自带的 emoji-icon-font。
+/// 不走 Proportional：那里排在前面的是 NotoEmoji（带 0.81 缩放），同一排
+/// 图标一旦回退到不同字体，字形大小和基线就对不齐。
+pub const ICON_FAMILY: &str = "lstr-icons";
+
 /// 取同字号的粗体 FontId（高亮片段用）。
 pub fn bold_of(font: &FontId) -> FontId {
     FontId::new(font.size, FontFamily::Name(BOLD_FAMILY.into()))
@@ -103,6 +108,11 @@ pub fn text_font(size: f32) -> FontId {
 
 pub fn mono_font(size: f32) -> FontId {
     FontId::new(size * TEXT_SCALE, FontFamily::Monospace)
+}
+
+/// 图标字号。和同号文本用同一套缩放，但固定落在 ICON_FAMILY 上。
+pub fn icon_font(size: f32) -> FontId {
+    FontId::new(size * TEXT_SCALE, FontFamily::Name(ICON_FAMILY.into()))
 }
 
 /// egui 自带控件（滑块/复选框等）走 TextStyle，字号也要跟着放大。
@@ -213,6 +223,12 @@ pub fn install_fonts(ctx: &egui::Context) {
             .families
             .insert(FontFamily::Name(BOLD_FAMILY.into()), bold_list);
     }
+    // 图标族：齿轮、历史这类符号统一从 egui 自带的 emoji-icon-font 取，
+    // 同一族同一字号，墨迹大小和基线才一致（见 ICON_FAMILY 注释）。
+    fonts.families.insert(
+        FontFamily::Name(ICON_FAMILY.into()),
+        vec!["emoji-icon-font".to_string()],
+    );
     ctx.set_fonts(fonts);
 }
 
