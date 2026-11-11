@@ -495,6 +495,8 @@ mod pin_tests {
                 path_filter: None,
                 drives_include: 0,
                 drives_exclude: 0,
+                prefix: None,
+                suffix: None,
             },
             limit,
             keywords: Vec::new(),
@@ -1521,6 +1523,8 @@ fn run_worker(args: WorkerArgs) {
             || browse::parse(&request.query.raw).is_some();
         let file_filter_active = path_scoped
             || request.query.ext.is_some()
+            || request.query.prefix.is_some()
+            || request.query.suffix.is_some()
             || request.query.path_filter.is_some()
             || request.query.drive_mask().is_some()
             || !request.filters.is_empty();
@@ -1996,7 +2000,11 @@ send_response(&tx, &request, Response {
 }
 
 fn fetch_count(query: &Query, limit: usize) -> usize {
-    let short = query.text.chars().count() < 2 && query.ext.is_none() && query.path_filter.is_none();
+    let short = query.text.chars().count() < 2
+        && query.ext.is_none()
+        && query.path_filter.is_none()
+        && query.prefix.is_none()
+        && query.suffix.is_none();
     if short {
         80
     } else {
@@ -2258,6 +2266,8 @@ mod tests {
                 path_filter: None,
                 drives_include: 0,
                 drives_exclude: 0,
+                prefix: None,
+                suffix: None,
             },
             limit: 10,
             keywords: Vec::new(),

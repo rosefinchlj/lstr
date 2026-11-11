@@ -349,6 +349,10 @@ pub struct QuerySpec {
     pub kind: KindFilter,
     /// 小写扩展名(无点)。
     pub ext: Option<String>,
+    /// 通配前缀（小写）：名字必须以它开头；空 prefix 匹配全部。
+    pub prefix: Option<String>,
+    /// 通配后缀（小写）：名字必须以它结尾。
+    pub suffix: Option<String>,
     /// 小写路径前缀(如 `c:\users\x\desktop`);带盘符时引擎只在对应卷查询。
     /// 深路径对收集结果做后置过滤:目录自身不计入(只匹配其后代);
     /// 小结果集(本卷 total 未超 cap)时 total 按过滤后实际条数修正,
@@ -457,6 +461,8 @@ pub fn passes_filters(store: &VolumeStore, slot: u32, spec: &QuerySpec) -> bool 
     // attrs)。单字符 "a" 要扫 290 万 slot,旧实现每条都做 name_lc + 后缀
     // 比较,是 folders 路 39ms 的主因;这里让绝大多数候选只读 attrs。
     let need_name = spec.ext.is_some()
+        || spec.prefix.is_some()
+        || spec.suffix.is_some()
         || !spec.group_exts.is_empty()
         || matches!(spec.kind, KindFilter::Files | KindFilter::Programs);
     if !need_name {
@@ -467,6 +473,16 @@ pub fn passes_filters(store: &VolumeStore, slot: u32, spec: &QuerySpec) -> bool 
         };
     }
     let name = store.name_lc(slot);
+    if let Some(prefix) = &spec.prefix {
+        if !name.starts_with(prefix.as_bytes()) {
+            return false;
+        }
+    }
+    if let Some(suffix) = &spec.suffix {
+        if !name.ends_with(suffix.as_bytes()) {
+            return false;
+        }
+    }
     // 只有 Files/Programs 需要 .exe 判定;All/Folders 不再无谓计算。
     let is_exe = matches!(spec.kind, KindFilter::Files | KindFilter::Programs)
         && name.ends_with(b".exe");
@@ -744,6 +760,34 @@ fn walk_candidates(
     };
     let emit = &mut emit_path;
     if tokens.is_empty() {
+        // 通配前缀/后缀（`abc*` / `*abc`）：先用字面量走 n-gram 预筛，
+        // 再由 passes_filters 做 starts_with/ends_with 严格校验。
+        if let Some(literal) = spec
+            .prefix
+            .as_deref()
+            .or(spec.suffix.as_deref())
+            .filter(|literal| !literal.is_empty())
+        {
+            if let Some(candidates) =
+                store.ngram_candidates(&fold_ascii(literal.as_bytes()))
+            {
+                for (i, slot) in candidates.into_iter().enumerate() {
+                    if i & CANCEL_CHECK_MASK == 0 && cancelled(cancel) {
+                        return true;
+                    }
+                    if store.attrs[slot as usize] & ATTR_INTERNAL != 0 {
+                        continue;
+                    }
+                    if !passes_filters(store, slot, spec) {
+                        continue;
+                    }
+                    if !emit(slot) {
+                        return false;
+                    }
+                }
+                return false;
+            }
+        }
         // H5:空 token(单独 ext:rs / path:C:\dir 等过滤器查询)按过滤器全量列举,
         // 逐 slot 走 passes_filters(名字/类型/扩展名/组),收集封顶 candidate_cap,
         // total 精确统计。旧实现在此直接返回空 → 内置 Ready 后这两类筛选静默 0 结果。
@@ -1673,6 +1717,59 @@ mod tests {
         let (slots, total, _) = query_volume(&s, &spec, 10);
         assert_eq!(total, 1);
         assert_eq!(s.name(slots[0]), b"foo");
+    }
+
+    #[test]
+    fn wildcard_prefix_and_suffix_filter_names() {
+        let mut s = VolumeStore::new(false);
+        for (i, name) in ["abc.txt", "abc.html", "xabc.txt", "abcd.txt", "report.abc"]
+            .iter()
+            .enumerate()
+        {
+            s.insert(100 + i as u64, 0, 0, name.as_bytes());
+        }
+        s.compact();
+
+        let spec = QuerySpec {
+            prefix: Some("abc.".into()),
+            ..Default::default()
+        };
+        let (slots, total, _) = query_volume(&s, &spec, 100);
+        let mut names: Vec<&[u8]> = slots.iter().map(|&slot| s.name(slot)).collect();
+        names.sort();
+        assert_eq!(total, 2);
+        assert_eq!(names, vec![&b"abc.html"[..], b"abc.txt"]);
+
+        let spec = QuerySpec {
+            suffix: Some(".txt".into()),
+            ..Default::default()
+        };
+        let (slots, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 3);
+        let mut names: Vec<&[u8]> = slots.iter().map(|&slot| s.name(slot)).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![&b"abc.txt"[..], b"abcd.txt", b"xabc.txt"]
+        );
+    }
+
+    /// 通配过滤必须先于 cap：目录/全盘里大量非前缀命中不能把前缀命中挤掉。
+    #[test]
+    fn wildcard_prefix_filters_before_candidate_cap() {
+        let mut s = VolumeStore::new(false);
+        for i in 0..2000u64 {
+            s.insert(1000 + i, 0, 0, format!("zzz{i}.txt").as_bytes());
+        }
+        s.insert(9000, 0, 0, b"abc-target.txt");
+        s.compact();
+        let spec = QuerySpec {
+            prefix: Some("abc".into()),
+            ..Default::default()
+        };
+        let (slots, total, _) = query_volume(&s, &spec, 10);
+        assert_eq!(total, 1);
+        assert_eq!(s.name(slots[0]), b"abc-target.txt");
     }
 
     #[test]

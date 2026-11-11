@@ -68,7 +68,7 @@ cargo run
 - 匹配选项同样作用于**应用结果**；开启区分大小写/全词/正则后，应用的拼音与模糊兜底关闭，不再出现小写 `ai` 命中 `AI合成` 这类严格模式下的伪匹配
 - 指定目录（Explorer 目录上下文 / `path:` / 浏览模式）只返回文件系统条目，应用、UWP、命令、关键字不会混入
 
-查询也仍支持 Everything 语法：`ext:rs`、`path:E:\foo`、`*.html`（等价 `ext:html`）、`folder:` 等。另有前缀：
+查询也仍支持 Everything 语法：`ext:rs`、`path:E:\foo`、`*.html`（等价 `ext:html`）、`abc*`（前缀）、`*abc`（后缀）、`folder:` 等。另有前缀：
 
 - `>`：命令
 - `a 微信`：应用

@@ -11,6 +11,8 @@ pub fn parse_regex(raw: &str, scope: Scope) -> Query {
         path_filter: None,
         drives_include: 0,
         drives_exclude: 0,
+        prefix: None,
+        suffix: None,
     }
 }
 
@@ -25,6 +27,8 @@ pub fn parse_plain(raw: &str, scope: Scope) -> Query {
         path_filter: None,
         drives_include: 0,
         drives_exclude: 0,
+        prefix: None,
+        suffix: None,
     }
 }
 
@@ -45,6 +49,8 @@ pub fn parse(raw: &str, scope: Scope) -> Query {
     let mut path_filter = None;
     let mut drives_include = 0u32;
     let mut drives_exclude = 0u32;
+    let mut prefix = None;
+    let mut suffix = None;
     let mut words = Vec::new();
 
     for token in text.split_whitespace() {
@@ -68,6 +74,20 @@ pub fn parse(raw: &str, scope: Scope) -> Query {
             } else {
                 drives_include |= bit;
             }
+        } else if let Some(value) = token.strip_suffix('*') {
+            // `abc*` / `abc.*`：前缀通配。中间/多个通配暂按普通词处理。
+            if !value.is_empty() && !value.contains(['*', '?']) {
+                prefix = Some(value.to_ascii_lowercase());
+            } else {
+                words.push(token);
+            }
+        } else if let Some(value) = token.strip_prefix('*') {
+            // `*abc`：后缀通配。
+            if !value.is_empty() && !value.contains(['*', '?']) {
+                suffix = Some(value.to_ascii_lowercase());
+            } else {
+                words.push(token);
+            }
         } else {
             words.push(token);
         }
@@ -81,6 +101,8 @@ pub fn parse(raw: &str, scope: Scope) -> Query {
         path_filter,
         drives_include,
         drives_exclude,
+        prefix,
+        suffix,
     }
 }
 
@@ -214,6 +236,26 @@ mod tests {
         let multi = parse("*.tar.gz", Scope::All);
         assert_eq!(multi.ext, None);
         assert_eq!(multi.text, "*.tar.gz");
+    }
+
+    #[test]
+    fn wildcard_prefix_and_suffix_are_parsed() {
+        let prefix = parse("abc.*", Scope::All);
+        assert_eq!(prefix.prefix.as_deref(), Some("abc."));
+        assert_eq!(prefix.text, "");
+
+        let prefix2 = parse("abc*", Scope::All);
+        assert_eq!(prefix2.prefix.as_deref(), Some("abc"));
+
+        let suffix = parse("*abc", Scope::All);
+        assert_eq!(suffix.suffix.as_deref(), Some("abc"));
+        assert_eq!(suffix.text, "");
+
+        // 多个/中间通配暂不支持，按普通词保留。
+        let middle = parse("a*b", Scope::All);
+        assert_eq!(middle.text, "a*b");
+        assert_eq!(middle.prefix, None);
+        assert_eq!(middle.suffix, None);
     }
 
     #[test]

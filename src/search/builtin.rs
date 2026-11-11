@@ -499,6 +499,8 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
         case_sensitive: filters.matches.case_sensitive,
         whole_word: filters.matches.whole_word,
         regex: (filters.matches.regex && !query.text.is_empty()).then(|| query.text.clone()),
+        prefix: query.prefix.clone(),
+        suffix: query.suffix.clone(),
     };
     if let Some(location) = &filters.location {
         let p = location.path().display().to_string().to_lowercase();

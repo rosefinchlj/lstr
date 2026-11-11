@@ -173,7 +173,17 @@ fn build_search_wfn(query: &Query, filters: &SearchFilters) -> String {
 }
 
 fn text_token(query: &Query) -> Option<String> {
-    (!query.text.is_empty()).then(|| query.text.clone())
+    let mut parts: Vec<String> = Vec::new();
+    if !query.text.is_empty() {
+        parts.push(query.text.clone());
+    }
+    if let Some(prefix) = &query.prefix {
+        parts.push(format!("{prefix}*"));
+    }
+    if let Some(suffix) = &query.suffix {
+        parts.push(format!("*{suffix}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn push_scope_prefix(scope: Scope, parts: &mut Vec<String>) {
@@ -296,6 +306,8 @@ mod tests {
             path_filter: path.map(str::to_string),
             drives_include: 0,
             drives_exclude: 0,
+            prefix: None,
+            suffix: None,
         }
     }
 

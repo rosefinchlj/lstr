@@ -86,6 +86,10 @@ pub struct Query {
     pub drives_include: u32,
     /// 排除盘符（bit i = 'A'+i）：`-c: 关键词`。0 = 不排除。
     pub drives_exclude: u32,
+    /// 通配前缀：`abc*` / `abc.*`（小写，匹配名字开头）。
+    pub prefix: Option<String>,
+    /// 通配后缀：`*abc`（小写，匹配名字结尾）。
+    pub suffix: Option<String>,
 }
 
 impl Query {
@@ -95,6 +99,8 @@ impl Query {
             && self.path_filter.is_none()
             && self.drives_include == 0
             && self.drives_exclude == 0
+            && self.prefix.is_none()
+            && self.suffix.is_none()
     }
 
     /// 盘符约束的最终卷掩码：None=不限制，Some(mask)=只查这些卷（可能为空）。
