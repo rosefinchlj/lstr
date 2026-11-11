@@ -3098,9 +3098,14 @@ impl LstrApp {
             let key_w = key_galley.size().x + 8.0;
             let total = key_w + 4.0 + label_galley.size().x;
             let x = right - total;
+            // 键帽框围着键文字的实际 galley 画（+2px 内边距）：↑↓ 箭头来自
+            // CJK 回退字体，行高 >16px，固定高度的框会被字形撑出错位。
+            // 框与键文字共享同一几何(bounds+padding)，从构造上对齐；
+            // 标签文字用 LEFT_CENTER 锚到同一中心线(footer_top+18)。
+            let key_h = key_galley.size().y;
             let key_rect = Rect::from_min_size(
-                egui::pos2(x, footer_top + 10.0),
-                egui::vec2(key_w, 16.0),
+                egui::pos2(x, footer_top + 18.0 - key_h * 0.5 - 2.0),
+                egui::vec2(key_w, key_h + 4.0),
             );
             painter.rect_stroke(
                 key_rect,
@@ -3108,14 +3113,9 @@ impl LstrApp {
                 Stroke::new(1.0, theme.hair),
                 StrokeKind::Inside,
             );
-            // 键帽框(footer_top+10 起,高 16 → 中心 +18)与两段文字的垂直对齐
-            // 用 egui 自己的 LEFT_CENTER 锚点：galley 手工算 y 会被行距/字体
-            // 度量坑（galley 高 ≠ 字形高），视觉中心总是偏。锚定框中心即可。
-            painter.text(
-                egui::pos2(x + 4.0, footer_top + 18.0),
-                Align2::LEFT_CENTER,
-                key.to_string(),
-                ui::mono_font(10.0),
+            painter.galley(
+                egui::pos2(x + 4.0, footer_top + 18.0 - key_h * 0.5),
+                key_galley,
                 theme.dim,
             );
             painter.text(
