@@ -130,6 +130,8 @@ const SEARCH_H: f32 = 53.0;
 const TABS_H: f32 = 30.0;
 /// 筛选条（位置/时间/类型按钮）高度。
 const FILTER_H: f32 = 28.0;
+/// 浏览模式的面包屑行（只在 Browse 下占用，紧贴筛选条下方）。
+const CRUMB_H: f32 = 22.0;
 const LIST_GAP: f32 = 4.0;
 const FOOTER_H: f32 = 36.0;
 const NEEDLE_H: f32 = 26.0;
@@ -985,6 +987,7 @@ impl LstrApp {
             let computed_h = (SEARCH_H
                 + TABS_H
                 + FILTER_H
+                + if self.browse_root.is_some() { CRUMB_H } else { 0.0 }
                 + LIST_GAP
                 + list_h
                 + LIST_GAP
@@ -1349,7 +1352,14 @@ impl LstrApp {
             self.toast(ctx, "正则模式只搜文件 / 文件夹 / 程序".to_string());
             return;
         }
-        strip_prefix(&mut self.input);
+        // 浏览模式只列文件系统条目，应用/命令页没有意义。
+        if self.in_browse() && matches!(scope, Scope::App | Scope::Command) {
+            self.toast(ctx, "浏览模式只支持文件夹 / 程序 / 文件".to_string());
+            return;
+        }
+        if !self.in_browse() {
+            strip_prefix(&mut self.input);
+        }
         self.scope = scope;
         self.trigger(ctx);
     }
@@ -1694,6 +1704,7 @@ impl LstrApp {
             (SEARCH_H
                 + TABS_H
                 + FILTER_H
+                + if self.browse_root.is_some() { CRUMB_H } else { 0.0 }
                 + LIST_GAP
                 + list_h
                 + LIST_GAP
@@ -1959,7 +1970,14 @@ impl LstrApp {
 
                 self.paint_tabs(ui, &painter, rect, &query);
                 self.paint_filters(ui, &painter, rect);
-                let list_top = rect.top() + SEARCH_H + TABS_H + FILTER_H + LIST_GAP;
+                let crumb_h = if let Some(root) = self.browse_root.clone() {
+                    self.paint_breadcrumb(ui, &painter, rect, &root);
+                    CRUMB_H
+                } else {
+                    0.0
+                };
+                let list_top =
+                    rect.top() + SEARCH_H + TABS_H + FILTER_H + crumb_h + LIST_GAP;
                 let list_rect = Rect::from_min_max(
                     rect.left_top(),
                     egui::pos2(rect.right() - PAD - preview_w, rect.bottom()),
@@ -2128,10 +2146,6 @@ impl LstrApp {
         rect: Rect,
         query: &crate::model::Query,
     ) {
-        if let Some(root) = self.browse_root.clone() {
-            self.paint_breadcrumb(ui, painter, rect, &root);
-            return;
-        }
         let theme = self.theme;
         let y = rect.top() + SEARCH_H + 6.0;
         let mut x = rect.left() + PAD;
@@ -2199,7 +2213,8 @@ impl LstrApp {
     ) {
         let theme = self.theme;
         let font = ui::text_font(12.5);
-        let y = rect.top() + SEARCH_H + 6.0;
+        // 面包屑在筛选条下方独占一行；TABS/FILTER 两行保留给主界面选项。
+        let y = rect.top() + SEARCH_H + TABS_H + FILTER_H + 1.0;
         let height = 20.0;
         let hint = "Ctrl+L 编辑 · Alt↑ 上级";
         let hint_galley = painter.layout_no_wrap(hint.to_string(), ui::mono_font(10.0), theme.dim);
@@ -2411,22 +2426,40 @@ impl LstrApp {
 
     /// 筛选条：位置 / 时间 / 类型三个按钮。用户点选即可，内部自动翻译成
     /// Everything 的 path:/dm:/ext: 查询段——不需要记语法。
+    /// 匹配 chip 的标签要能看出当前选了什么，而不是永远只写「匹配」。
+    fn match_chip_label(&self) -> String {
+        let matches = self.filters.matches;
+        let mut parts: Vec<&str> = Vec::new();
+        if matches.regex {
+            parts.push("正则");
+        } else if matches.whole_word {
+            parts.push("全词");
+        }
+        if matches.case_sensitive {
+            parts.push("大小写");
+        }
+        if parts.is_empty() {
+            "匹配".to_string()
+        } else {
+            format!("匹配 · {}", parts.join("+"))
+        }
+    }
+
+    fn clear_filter_kind(&mut self, kind: FilterMenuKind) {
+        match kind {
+            FilterMenuKind::Location => self.filters.location = None,
+            FilterMenuKind::Time => self.filters.time = None,
+            FilterMenuKind::Group => self.filters.group = None,
+            FilterMenuKind::Match => self.filters.matches = Default::default(),
+        }
+        self.filter_menu = None;
+    }
+
     fn paint_filters(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
         let theme = self.theme;
         let y = rect.top() + SEARCH_H + TABS_H + 2.0;
-        // 浏览模式下筛选条没有意义：整行改为操作提示，避免四个灰 chip 噪音。
-        if self.in_browse() {
-            painter.text(
-                egui::pos2(rect.left() + PAD, y + 11.0),
-                Align2::LEFT_CENTER,
-                "浏览模式 · 输入过滤当前目录（Ctrl+L 编辑路径）",
-                ui::mono_font(10.0),
-                theme.dim,
-            );
-            return;
-        }
-        // 路径模式本身就是位置筛选，按钮仅在普通搜索下生效。
-        let path_mode = self.path_mode();
+        // 路径/浏览模式本身就是位置筛选，按钮保留但置灰。
+        let path_mode = self.path_ui();
         let mut x = rect.left() + PAD;
 
         let chips: [(FilterMenuKind, String, bool); 4] = [
@@ -2466,7 +2499,7 @@ impl LstrApp {
             ),
             (
                 FilterMenuKind::Match,
-                "匹配".to_string(),
+                self.match_chip_label(),
                 !self.filters.matches.is_default(),
             ),
         ];
@@ -2481,7 +2514,9 @@ impl LstrApp {
                 theme.sub
             };
             let galley = painter.layout_no_wrap(label, ui::text_font(11.0), color);
-            let width = galley.size().x + 28.0;
+            // 激活的 chip 右侧留出单独的 × 命中区：只清这一项，不影响其它条件。
+            let clear_w = if active && !path_mode { 14.0 } else { 0.0 };
+            let width = galley.size().x + 28.0 + clear_w;
             let chip = Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, 22.0));
             let response = ui.interact(
                 chip,
@@ -2514,7 +2549,7 @@ impl LstrApp {
                 color,
             );
             // 下拉三角用绘制而非字符：▾ 这类符号在 SysFont 里可能缺字形（显示成方框）。
-            let cx = chip.right() - 10.0;
+            let cx = chip.right() - 10.0 - clear_w;
             let cy = chip.center().y + 1.0;
             painter.add(egui::Shape::convex_polygon(
                 vec![
@@ -2525,8 +2560,37 @@ impl LstrApp {
                 color,
                 Stroke::NONE,
             ));
+            let clear_rect = if active && !path_mode {
+                Some(Rect::from_min_size(
+                    egui::pos2(chip.right() - 15.0, chip.top() + 4.0),
+                    egui::vec2(12.0, 14.0),
+                ))
+            } else {
+                None
+            };
+            if let Some(clear_rect) = clear_rect {
+                painter.text(
+                    clear_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "×",
+                    ui::text_font(11.0),
+                    theme.amber,
+                );
+            }
             if response.clicked() && !path_mode {
-                clicked = Some(kind);
+                // 用指针位置区分「点 ×」和「点 chip 打开菜单」；两个独立
+                // interact 重叠时父级会吞掉子级的 click，这里手工命中测试。
+                let clicked_clear = clear_rect.is_some_and(|rect| {
+                    ui.ctx()
+                        .input(|i| i.pointer.interact_pos())
+                        .is_some_and(|pos| rect.contains(pos))
+                });
+                if clicked_clear {
+                    self.clear_filter_kind(kind);
+                    self.trigger(ui.ctx());
+                } else {
+                    clicked = Some(kind);
+                }
             }
             x += width + 8.0;
         }
@@ -2534,10 +2598,10 @@ impl LstrApp {
         // 有筛选或匹配选项时才出现清除入口。
         if (!self.filters.is_empty() || !self.filters.matches.is_default()) && !path_mode {
             // 窄窗口下四个 chip 已接近占满，清除退化为单字符 ×，避免压到 chip。
-            let label = if x + 64.0 > rect.right() - PAD {
+            let label = if x + 84.0 > rect.right() - PAD {
                 "×"
             } else {
-                "× 清除"
+                "× 清除全部"
             };
             let galley = painter.layout_no_wrap(label.to_string(), ui::text_font(10.5), theme.dim);
             let clear = Rect::from_min_size(
@@ -2562,7 +2626,11 @@ impl LstrApp {
             painter.text(
                 egui::pos2(x + 8.0, y + 11.0),
                 Align2::LEFT_CENTER,
-                "路径模式中筛选不生效",
+                if self.in_browse() {
+                    "浏览模式中筛选不生效"
+                } else {
+                    "路径模式中筛选不生效"
+                },
                 ui::mono_font(10.0),
                 theme.dim,
             );
@@ -2577,6 +2645,25 @@ impl LstrApp {
 
     fn filter_items(&self, kind: FilterMenuKind) -> Vec<FilterItem> {
         let mut items = Vec::new();
+        let active = match kind {
+            FilterMenuKind::Location => self.filters.location.is_some(),
+            FilterMenuKind::Time => self.filters.time.is_some(),
+            FilterMenuKind::Group => self.filters.group.is_some(),
+            FilterMenuKind::Match => !self.filters.matches.is_default(),
+        };
+        if active {
+            items.push(FilterItem {
+                label: match kind {
+                    FilterMenuKind::Location => "清除位置",
+                    FilterMenuKind::Time => "清除时间",
+                    FilterMenuKind::Group => "清除类型",
+                    FilterMenuKind::Match => "清除匹配选项",
+                }
+                .to_string(),
+                selected: false,
+                choice: FilterChoice::Clear(kind),
+            });
+        }
         match kind {
             FilterMenuKind::Location => {
                 items.push(FilterItem {
@@ -2731,6 +2818,12 @@ impl LstrApp {
                         {
                             self.scope = Scope::All;
                         }
+                        self.trigger(ui.ctx());
+                        return;
+                    }
+                    FilterChoice::Clear(clear_kind) => {
+                        let clear_kind = *clear_kind;
+                        self.clear_filter_kind(clear_kind);
                         self.trigger(ui.ctx());
                         return;
                     }
@@ -2904,7 +2997,15 @@ impl LstrApp {
                 ui::text_font(15.0),
                 theme.text,
             );
-            let empty_hint = if self.path_ui() {
+            let empty_hint = if self.in_browse() {
+                if query.scope != Scope::All {
+                    "当前类别没有匹配项"
+                } else if self.input.trim().is_empty() {
+                    "目录为空、不存在或无权限"
+                } else {
+                    "没有符合过滤词的文件"
+                }
+            } else if self.path_ui() {
                 "目录为空、不存在或无权限"
             } else if self.dialog.is_some() {
                 match query.scope {
@@ -3704,6 +3805,7 @@ impl LstrApp {
         self.filter_menu = None;
         Self::reset_input_cursor(ctx);
         self.move_caret_to_end(ctx);
+        self.apply_size(ctx);
         self.trigger(ctx);
         true
     }
@@ -3739,6 +3841,7 @@ impl LstrApp {
                 self.menu_open = false;
                 self.filter_menu = None;
                 Self::reset_input_cursor(ctx);
+                self.apply_size(ctx);
                 self.trigger(ctx);
             }
             _ => self.exit_browse(ctx),
@@ -3757,6 +3860,7 @@ impl LstrApp {
         self.menu_open = false;
         self.filter_menu = None;
         Self::reset_input_cursor(ctx);
+        self.apply_size(ctx);
         self.trigger(ctx);
     }
 
@@ -3775,6 +3879,7 @@ impl LstrApp {
         self.filter_menu = None;
         Self::reset_input_cursor(ctx);
         self.move_caret_to_end(ctx);
+        self.apply_size(ctx);
         self.trigger(ctx);
     }
 
@@ -3934,7 +4039,12 @@ impl LstrApp {
         let item_h = 30.0;
         let width = 236.0;
         let height = items.len() as f32 * item_h + 8.0;
-        let list_top = rect.top() + SEARCH_H + TABS_H + FILTER_H + LIST_GAP;
+        let list_top = rect.top()
+            + SEARCH_H
+            + TABS_H
+            + FILTER_H
+            + if self.browse_root.is_some() { CRUMB_H } else { 0.0 }
+            + LIST_GAP;
         let row_top = list_top + self.selected as f32 * theme.row_h;
         let mut top = row_top + theme.row_h + 2.0;
         if top + height > rect.bottom() - FOOTER_H - 4.0 {
@@ -5670,6 +5780,8 @@ enum FilterChoice {
     Group(Option<FileGroup>),
     /// 匹配选项是多选：点击后菜单保持打开。
     Match(MatchToggle),
+    /// 只清除当前这一项筛选（菜单顶部的「清除该项」）。
+    Clear(FilterMenuKind),
 }
 
 #[derive(Clone)]

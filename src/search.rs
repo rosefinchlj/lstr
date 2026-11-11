@@ -1092,9 +1092,17 @@ fn browse_response(
 ) -> Response {
     let started = Instant::now();
     let needle = filter.to_lowercase();
+    let scope = request.query.scope;
     let mut entries: Vec<Entry> = dir_cache
         .children(dir)
         .iter()
+        .filter(|entry| match scope {
+            Scope::All => true,
+            Scope::Folder => entry.kind == Kind::Folder,
+            Scope::Program => entry.kind == Kind::Program,
+            Scope::File => entry.kind == Kind::File,
+            Scope::App | Scope::Command => false,
+        })
         .filter(|entry| {
             needle.is_empty()
                 || entry.name.to_lowercase().contains(&needle)
