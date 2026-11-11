@@ -2555,6 +2555,16 @@ impl LstrApp {
             theme.sub,
             theme.amber,
         )));
+        // 下划线画在行盒底、比字形降部低 ~1px：量一个不带下划线的降部，
+        // 把这段溢出补偿一半（光学居中），否则字形本体看起来整体偏上。
+        let sub_plain = ui::LineInk::of(&painter.layout_job(ui::text_job(
+            "Wg",
+            "",
+            &ui::mono_font(11.5),
+            theme.sub,
+            theme.amber,
+        )));
+        let optical_bias = ((sub_ink.down - sub_plain.down) / 2.0).max(0.0);
         for (index, entry) in entries.iter().enumerate() {
             let row_top = list_top + index as f32 * theme.row_h - self.scroll_y;
             if row_top + theme.row_h <= list_top || row_top >= list_top + view_h {
@@ -2593,13 +2603,13 @@ impl LstrApp {
             let selected = index == self.selected;
             if selected {
                 painter.rect_filled(
-                    row_rect.shrink2(egui::vec2(0.0, 2.0)),
+                    row_rect.shrink2(egui::vec2(0.0, 1.0)),
                     CornerRadius::same(8),
                     theme.sel,
                 );
             } else if response.hovered() {
                 painter.rect_filled(
-                    row_rect.shrink2(egui::vec2(0.0, 2.0)),
+                    row_rect.shrink2(egui::vec2(0.0, 1.0)),
                     CornerRadius::same(8),
                     theme.hover,
                 );
@@ -2735,13 +2745,23 @@ impl LstrApp {
             let title_galley = painter.layout_job(title_job);
             let title_width = title_galley.size().x;
             // 两行内容按墨迹在高亮底内居中（见 ui::two_line_offsets）。高亮底是
-            // row_rect.shrink2(0, 2.0)，所以顶边 +2、可用高度 row_h-4。
-            let (y_title, y_sub) = ui::two_line_offsets(
-                row_rect.top() + 2.0,
-                theme.row_h - 4.0,
+            // row_rect.shrink2(0, 1.0)，所以顶边 +1、可用高度 row_h-2。
+            let (mut y_title, y_sub) = ui::two_line_offsets(
+                row_rect.top() + 1.0,
+                theme.row_h - 2.0,
                 &title_ink,
                 &sub_ink,
+                optical_bias,
             );
+            // 不同字体 ascent 不同（Segoe 19 / 微软雅黑 18），按 galley 顶放置会让
+            // 中文标题整体偏高 1px；这里按该行真实基线对齐，回到同一条网格线。
+            let title_base = title_galley
+                .rows
+                .first()
+                .and_then(|r| r.row.glyphs.first())
+                .map(|g| g.pos.y)
+                .unwrap_or(title_ink.base);
+            y_title += title_ink.base - title_base;
             painter.galley(
                 egui::pos2(row_rect.left() + 54.0, y_title),
                 title_galley,

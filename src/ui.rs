@@ -226,8 +226,15 @@ fn format(font: &FontId, color: Color32) -> TextFormat {
 
 /// 关键词高亮：加粗 + 强调色文字 + 2px 下划线（不用背景色，避免和选中行底色打架）。
 fn format_underlined(font: &FontId, _color: Color32, accent: Color32) -> TextFormat {
+    // 等宽行（路径/副标题）不换粗体族：粗体族是比例字体（Segoe UI Bold），
+    // 换过去会让关键词比同行路径文字低 2px、字宽也变（等宽预算失效）；
+    // 等宽行靠强调色 + 下划线区分命中即可。
+    let font_id = match font.family {
+        FontFamily::Monospace => font.clone(),
+        _ => bold_of(font),
+    };
     TextFormat {
-        font_id: bold_of(font),
+        font_id,
         color: accent,
         underline: Stroke::new(2.0, accent),
         ..Default::default()
@@ -351,12 +358,16 @@ impl LineInk {
 /// 按**墨迹**而不是 galley 盒子居中：盒子高度 = ascent−descent+line_gap，
 /// 上下空白不对称（顶部是升部留白、底部含行距），且下划线画在盒底之外，
 /// 按盒子居中会让末行降部/下划线探出高亮底边（用户报「背景没盖全」）。
-/// 返回 (标题 galley 顶 y, 副标题 galley 顶 y)。
+///
+/// `optical_bias` 向下微移整块：下划线画在行盒底、比字形降部还低 ~1px，
+/// 按含下划线的墨迹居中会让字形本体看起来偏高；补偿其中一半，让「字形块」
+/// 的上下视觉间隙相等。返回 (标题 galley 顶 y, 副标题 galley 顶 y)。
 pub fn two_line_offsets(
     highlight_top: f32,
     inner_h: f32,
     title: &LineInk,
     sub: &LineInk,
+    optical_bias: f32,
 ) -> (f32, f32) {
     let gap0 = 4.0;
     let mut gap = gap0;
@@ -365,7 +376,7 @@ pub fn two_line_offsets(
         gap = (gap0 - (ink_h - inner_h)).max(2.0);
         ink_h = title.up + title.down + gap + sub.up + sub.down;
     }
-    let air = ((inner_h - ink_h) / 2.0).max(0.0);
+    let air = ((inner_h - ink_h) / 2.0).max(0.0) + optical_bias.max(0.0);
     let title_dy = air + title.up - title.base;
     let sub_dy = air + title.up + title.down + gap + sub.up - sub.base;
     (highlight_top + title_dy, highlight_top + sub_dy)
@@ -644,23 +655,27 @@ mod tests {
 
     #[test]
     fn two_line_block_centers_on_ink_and_stays_inside_highlight() {
-        // 复现 44px 行（高亮内高 40）的两行布局：用真实系统字体量出墨迹几何，
-        // 断言墨迹块完整落在高亮底内且上下留白对称（此前按 galley 盒子居中，
-        // 盒子 23+18=41 > 40 且下划线画在盒底之外 → 末行探出高亮 4~5px）。
+        // 复现 44px 行（高亮内高 40）的两行布局：用真实系统字体量出墨迹几何。
+        // 断言 1) 含下划线的墨迹完整落在高亮底内；2) 字形本体的上下视觉间隙相等
+        // （下划线比降部低 ~1px，需补偿一半，否则用户看到「顶部比底部紧」）；
+        // 3) 未补偿时墨迹块本身错位（回归：盒子 23+18=41 > 40 必然溢出）。
         let ctx = egui::Context::default();
         install_fonts(&ctx);
         let _ = ctx.run(Default::default(), |_| {}); // egui 0.32: 首帧后才可取字体
         let accent = Color32::from_rgb(180, 120, 0);
         let title_font = text_font(14.5);
         let mono = mono_font(11.5);
-        let (title_ink, sub_ink) = ctx.fonts(|f| {
+        let (title_ink, sub_ink, sub_plain) = ctx.fonts(|f| {
             let t = f.layout_job(text_job("Wg", "Wg", &title_font, Color32::BLACK, accent));
             let s = f.layout_job(text_job("Wg", "Wg", &mono, Color32::DARK_GRAY, accent));
-            (LineInk::of(&t), LineInk::of(&s))
+            let p = f.layout_job(text_job("Wg", "", &mono, Color32::DARK_GRAY, accent));
+            (LineInk::of(&t), LineInk::of(&s), LineInk::of(&p))
         });
         let highlight_top = 10.0;
-        let inner_h = 40.0; // row_height 44 时高亮底的内高
-        let (y_title, y_sub) = two_line_offsets(highlight_top, inner_h, &title_ink, &sub_ink);
+        let inner_h = 42.0; // row_height 44、高亮底缩进 1px 时的内高
+        let bias = ((sub_ink.down - sub_plain.down) / 2.0).max(0.0);
+        let (y_title, y_sub) =
+            two_line_offsets(highlight_top, inner_h, &title_ink, &sub_ink, bias);
         let ink_top = y_title + title_ink.base - title_ink.up;
         let ink_bottom = y_sub + sub_ink.base + sub_ink.down;
         assert!(
@@ -672,11 +687,14 @@ mod tests {
             "墨迹下沿探出高亮: ink_bottom={ink_bottom}, highlight_bottom={}",
             highlight_top + inner_h
         );
-        let top_air = ink_top - highlight_top;
-        let bottom_air = highlight_top + inner_h - ink_bottom;
+        // 字形本体（标题字顶 ↔ 副标题降部）的上下视觉间隙应相等。
+        let cap_top = y_title + title_ink.base - title_ink.up;
+        let body_bottom = y_sub + sub_plain.base + sub_plain.down;
+        let top_gap = cap_top - highlight_top;
+        let bottom_gap = highlight_top + inner_h - body_bottom;
         assert!(
-            (top_air - bottom_air).abs() <= 0.6,
-            "墨迹上下留白不对称（未居中）: top={top_air}, bottom={bottom_air}"
+            (top_gap - bottom_gap).abs() <= 0.6,
+            "字形块上下间隙不对称（未光学居中）: top={top_gap}, bottom={bottom_gap}"
         );
     }
 
