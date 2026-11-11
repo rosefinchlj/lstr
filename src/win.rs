@@ -4,6 +4,7 @@ pub mod dialogwatch;
 pub mod dragdrop;
 pub mod explorer;
 pub mod hotkey;
+pub mod hotkey_relay;
 pub mod icons;
 pub mod shell;
 pub mod single_instance;

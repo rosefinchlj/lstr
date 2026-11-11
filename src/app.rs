@@ -6,6 +6,7 @@ use crate::search::filters::{FileGroup, LocationFilter, SearchFilters, TimeFilte
 use crate::search::{self, SearchService};
 use crate::ui::{self, Theme};
 use crate::win::hotkey::{HotkeyEvent, HotkeyService};
+use crate::win::hotkey_relay::HotkeyRelay;
 use crate::win::tray::{TrayAction, TrayState};
 use crate::win::dialog::{self, DialogInfo};
 use crate::win::{shell, window};
@@ -167,6 +168,9 @@ pub struct LstrApp {
     effects_applied: bool,
     acrylic_ok: bool,
     hotkey: Option<HotkeyService>,
+    /// 提权 worker 的热键中继：管理员窗口在前台时，普通权限的 LL 钩子
+    /// 收不到按键（UIPI），由子进程观察后 SetEvent 通知这里。
+    hotkey_relay: Option<HotkeyRelay>,
     dialog_watch: Option<crate::win::dialogwatch::DialogWatch>,
     suppressed_dialog: Option<isize>,
     tray: Option<TrayState>,
@@ -250,6 +254,8 @@ impl LstrApp {
         ui::apply_text_styles(&cc.egui_ctx);
 
         let preview_open = cfg.preview;
+        // 必须在 SearchService::new 之前创建：worker 启动后会立刻 OpenEvent。
+        let hotkey_relay = HotkeyRelay::create();
         let mut service = SearchService::new(cfg.clone(), Arc::clone(&history), cc.egui_ctx.clone());
         let pending_gen = service.search("", Scope::All, false, &SearchFilters::default(), &cfg.rank, cfg.show_history);
         let hotkey = match HotkeyService::start(cc.egui_ctx.clone(), &cfg.hotkey) {
@@ -310,6 +316,7 @@ impl LstrApp {
             effects_applied: false,
             acrylic_ok: false,
             hotkey,
+            hotkey_relay,
             dialog_watch,
             suppressed_dialog: None,
             tray,
@@ -431,6 +438,13 @@ impl LstrApp {
                 events.push(event);
             }
         }
+        // 管理员窗口在前台时，本进程的 LL 钩子被 UIPI 屏蔽；提权 worker
+        // 通过命名事件中继同一次双击。若两路同时到达（理论上不会），
+        // 只消费一次 toggle，避免开了又关。
+        let mut relay_pending = self
+            .hotkey_relay
+            .as_ref()
+            .is_some_and(|relay| relay.take());
         // 设置页录制唤起热键时忽略全局热键触发：否则录 double-ctrl 的瞬间
         // 现役热键会先把窗口收起，录制被打断（事件照常取走，只是不执行）。
         if self.hotkey_recording.is_some() {
@@ -439,7 +453,11 @@ impl LstrApp {
         for event in events {
             match event {
                 HotkeyEvent::Toggle => {
-                    self.toggle(ctx);
+                    if relay_pending {
+                        relay_pending = false;
+                    } else {
+                        self.toggle(ctx);
+                    }
                 }
                 HotkeyEvent::DialogSearch => {
                     if let Some(info) = dialog::active_dialog() {
@@ -463,6 +481,9 @@ impl LstrApp {
                     }
                 },
             }
+        }
+        if relay_pending {
+            self.toggle(ctx);
         }
     }
 
@@ -1275,7 +1296,7 @@ impl LstrApp {
                     // 焦点马上还给对话框：抑制它的自动唤出，不然会循环弹窗。
                     self.suppressed_dialog = Some(dialog.hwnd);
                     self.dialog = None;
-                    self.hide(ctx);
+                    self.hide_keep(ctx);
                     dialog::restore_focus(&dialog);
                 }
                 Err(err) => self.toast(ctx, err),
@@ -1300,7 +1321,7 @@ impl LstrApp {
                 if let Ok(mut history) = self.history.lock() {
                     history.record_query(&self.input, &entry);
                 }
-                self.hide(ctx);
+                self.hide_keep(ctx);
                 return;
             }
         }
@@ -1311,7 +1332,7 @@ impl LstrApp {
                 if let Ok(mut history) = self.history.lock() {
                     history.record_query(&self.input, &entry);
                 }
-                self.hide(ctx);
+                self.hide_keep(ctx);
             }
             Err(err) => self.toast(ctx, format!("打开失败: {err}")),
         }

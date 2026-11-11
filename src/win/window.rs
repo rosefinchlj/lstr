@@ -12,11 +12,13 @@ use windows::Win32::Graphics::Gdi::{
     RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
 };
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    keybd_event, SetActiveWindow, SetFocus, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
-    SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SW_SHOW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow, HWND_TOPMOST,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOW,
 };
 
 pub fn hwnd_of_frame(frame: &eframe::Frame) -> Option<isize> {
@@ -264,6 +266,20 @@ pub fn force_foreground(hwnd_value: isize) {
         let _ = SetFocus(Some(target));
         if attached {
             let _ = AttachThreadInput(current_thread, fg_thread, false);
+        }
+        // 前台是提权窗口（如「管理员: 终端」）时，UIPI 会静默拒绝
+        // SetForegroundWindow，普通用户态进程抢不到前台。合成一次裸 Alt
+        // 让系统把本进程视为「最后输入来源」，再抢一次；仍失败则走
+        // SwitchToThisWindow（shell 的切换入口，不受前台锁限制）。
+        if GetForegroundWindow().0 != target.0 {
+            keybd_event(VK_MENU.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
+            keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+            let _ = SetForegroundWindow(target);
+            let _ = SetActiveWindow(target);
+            let _ = SetFocus(Some(target));
+        }
+        if GetForegroundWindow().0 != target.0 {
+            SwitchToThisWindow(target, true);
         }
     }
 }

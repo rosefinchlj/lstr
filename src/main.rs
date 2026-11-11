@@ -43,6 +43,9 @@ fn main() -> eframe::Result<()> {
     install_panic_logger();
     // --index-worker:提权数据泵,不走单实例、不进 UI
     if std::env::args().any(|a| a == "--index-worker") {
+        // 提权进程的键盘钩子能看到发往管理员窗口的按键：用它中继唤起热键，
+        // 否则管理员终端在前台时主界面的双击 Ctrl 收不到（UIPI 限制）。
+        win::hotkey_relay::start_worker_relay();
         std::process::exit(lstr_index::worker::worker_main());
     }
     let single = match win::single_instance::acquire() {
