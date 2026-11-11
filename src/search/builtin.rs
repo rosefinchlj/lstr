@@ -760,10 +760,12 @@ fn pipe_alive(client: windows::Win32::Foundation::HANDLE) -> bool {
 /// 本机固定 NTFS 卷,新插盘也能自动纳入。
 pub fn worker_launch_args(index: &crate::config::IndexConfig, volume_mask: u32) -> String {
     let mut extra = String::new();
-    if index.backend == "usn" {
-        // USN 实时增量层(可选后端):dirscan 首扫 → journal 轮询(worker 侧带熔断/
-        // 游标校验/clean-exit 护栏)。固定 dir 首扫,与设置页文案一致;
-        // 这是唯一会下发 --index-journal 的自动路径。
+    // 实时层选择：incremental="usn"（默认）走 dir 首扫 + journal 轮询；
+    // "watch" 只目录监视、零 USN FSCTL。卷打不开时 worker 会按卷退回
+    // dir + watcher，所以 USN 不是单点故障。
+    if index.incremental == "usn" || index.backend == "usn" {
+        // 固定 dir 首扫（与设置页文案一致），这是唯一会下发 --index-journal
+        // 的自动路径。backend=="usn" 是旧配置兼容。
         extra.push_str(" --index-scan-mode dir --index-journal");
         extra.push_str(&format!(" --index-poll-ms {}", index.journal_poll_ms.max(100)));
     } else if index.scan_mode.eq_ignore_ascii_case("usn") {
@@ -1840,35 +1842,50 @@ mod tests {
         assert!(args.contains(" --index-volumes C,F"), "args={args}");
     }
 
-    /// backend="usn" 是唯一启用 USN 增量层的取值:固定 dir 首扫 + journal 轮询
-    /// + 轮询间隔;auto/builtin 默认不加任何 USN/节流开关(行为与旧版一致)。
+    /// incremental 决定内置索引的实时层:usn(默认)→ dir 首扫 + journal +
+    /// poll-ms;watch → 零 USN 开关;旧 backend="usn" 兼容仍启用 journal。
     #[test]
-    fn usn_backend_enables_journal_layer_only_for_usn() {
-        // 默认配置(auto):零 USN 开关
+    fn incremental_layer_selects_journal_or_watch() {
+        // 默认配置:USN 增量(目录首扫 + journal 轮询)
         let cfg = crate::config::IndexConfig::default();
-        let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
-        assert!(!args.contains("--index-journal"), "args={args}");
-        assert!(!args.contains("--index-poll-ms"), "args={args}");
-        assert!(!args.contains("--index-throttle-ms"), "args={args}");
-
-        // backend=usn:dir 首扫 + journal + poll-ms;即便 scan_mode 被旧配置
-        // 遗留成 usn,也强制 dir(与设置页「目录扫描+USN 实时增量」文案一致)。
-        let mut cfg = crate::config::IndexConfig { backend: "usn".into(), ..Default::default() };
         let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
         assert!(args.contains(" --index-scan-mode dir --index-journal"), "args={args}");
         assert!(args.contains(" --index-poll-ms 500"), "args={args}");
-        assert!(!args.contains("--index-scan-mode usn"), "args={args}");
-        cfg.scan_mode = "usn".into();
+        assert!(!args.contains("--index-throttle-ms"), "args={args}");
+
+        // watch:纯目录监视,零 USN 开关
+        let cfg = crate::config::IndexConfig {
+            incremental: "watch".into(),
+            ..Default::default()
+        };
         let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
-        assert!(args.contains("--index-scan-mode dir"), "usn 后端固定 dir 首扫: {args}");
+        assert!(!args.contains("--index-journal"), "args={args}");
+        assert!(!args.contains("--index-poll-ms"), "args={args}");
+        assert!(!args.contains("--index-scan-mode usn"), "args={args}");
+
+        // 旧 backend="usn" 配置兼容:即使 incremental 被写成 watch 也启用 journal
+        let cfg = crate::config::IndexConfig {
+            backend: "usn".into(),
+            incremental: "watch".into(),
+            ..Default::default()
+        };
+        let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
+        assert!(args.contains(" --index-scan-mode dir --index-journal"), "args={args}");
+
         // poll-ms 下限在参数侧同样兜底
-        cfg.journal_poll_ms = 10;
+        let cfg = crate::config::IndexConfig {
+            journal_poll_ms: 10,
+            ..Default::default()
+        };
         let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
         assert!(args.contains(" --index-poll-ms 100"), "args={args}");
 
-        // 旧 usn 首扫模式(手动配置):保持既有行为
-        let mut cfg = crate::config::IndexConfig::default();
-        cfg.scan_mode = "usn".into();
+        // 旧 scan_mode=usn 首扫模式(手动配置):保持既有行为
+        let mut cfg = crate::config::IndexConfig {
+            incremental: "watch".into(),
+            scan_mode: "usn".into(),
+            ..Default::default()
+        };
         let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
         assert!(args.contains(" --index-scan-mode usn"), "args={args}");
         assert!(!args.contains("--index-journal"), "journal_enabled 默认关: {args}");

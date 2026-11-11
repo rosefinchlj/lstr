@@ -1205,10 +1205,10 @@ fn finalize_entries_with_pending(
 }
 
 /// 内置索引能否自带时间筛选:目录枚举(dir 首扫)会把 mtime 写进快照;
-/// backend="usn" 增量后端固定走 dir 首扫(见 config 注释),同样有 mtime。
-/// 纯 USN 首扫(scan_mode="usn")没有 mtime,时间筛选仍需 Everything。
+/// incremental="usn"(默认)固定走 dir 首扫(见 config 注释),同样有 mtime。
+/// 纯 USN 首扫(旧 scan_mode="usn")没有 mtime,时间筛选仍需 Everything。
 fn builtin_index_has_mtime(index: &crate::config::IndexConfig) -> bool {
-    index.scan_mode == "dir" || index.backend == "usn"
+    index.scan_mode == "dir" || index.incremental == "usn" || index.backend == "usn"
 }
 
 /// 搜索 worker 的启动参数：字段多且都是「一次注入、全程只读」的句柄，
@@ -2387,16 +2387,26 @@ mod tests {
     /// 的第二代查询会让另一个测试的首代响应被 send_response 丢弃。
     static SERVICE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// 内置时间筛选的可用性:dir 首扫有 mtime;backend="usn" 固定走 dir
+    /// 内置时间筛选的可用性:dir 首扫有 mtime;incremental="usn" 固定走 dir
     /// 首扫(同样带 mtime);纯 USN 首扫没有 mtime。
     #[test]
     fn builtin_time_filter_availability() {
-        let mut index = crate::config::IndexConfig::default(); // backend=auto, scan_mode=dir
+        let index = crate::config::IndexConfig::default(); // auto + incremental=usn
+        assert!(builtin_index_has_mtime(&index), "USN 增量层固定 dir 首扫,有 mtime");
+
+        let mut index = crate::config::IndexConfig {
+            incremental: "watch".into(),
+            scan_mode: "dir".into(),
+            ..Default::default()
+        };
         assert!(builtin_index_has_mtime(&index), "dir 首扫写 mtime");
+
         index.scan_mode = "usn".to_string();
         assert!(!builtin_index_has_mtime(&index), "纯 USN 首扫无 mtime");
+
+        // 旧 backend=usn：同样固定 dir 首扫
         index.backend = "usn".to_string();
-        assert!(builtin_index_has_mtime(&index), "usn 后端固定 dir 首扫,有 mtime");
+        assert!(builtin_index_has_mtime(&index), "旧 usn 后端固定 dir 首扫,有 mtime");
     }
 
     /// 测试隔离:默认配置 backend=auto 会让服务线程真去探活/拉起 worker

@@ -69,8 +69,9 @@ fn normalize_max_load_results(value: usize) -> usize {
 }
 
 /// 自研索引引擎配置。backend:
-/// `auto` = worker 可用走内置,否则 Everything;`builtin`/`everything` 强制;
-/// `off` 关闭内置索引。
+/// `auto` = worker 可用走内置,否则 Everything;`builtin` 强制内置(不碰
+/// Everything);`everything` 只用 Everything。`off` 是历史值,load 时迁移为
+/// `everything`(两者搜索行为相同)。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IndexConfig {
@@ -79,13 +80,19 @@ pub struct IndexConfig {
     pub exclude_noise: bool,
     /// 单次查询候选收集上限(total 仍精确)。
     pub candidate_cap: usize,
-    /// 首扫模式:`dir`(默认,目录枚举,零 USN FSCTL)/ `usn`(原 ENUM+journal)。
-    /// 2026-11-09 本机 0x3B/Ntfs.sys 蓝屏后默认切到 `dir`。
-    /// 注:backend="usn" 增量后端固定走 dir 首扫 + journal 轮询,不读本字段。
+    /// 首扫模式(历史字段):`dir` 目录枚举。仅旧配置手动写 `usn` 时保留旧行为。
+    /// 新的实时层选择见 `incremental`。
     pub scan_mode: String,
-    /// `dir` 首扫完成后是否继续轮询 journal 做增量(阶段 2,默认关;
-    /// 旧 usn 首扫模式用。backend="usn" 不看此开关,自带 journal 轮询)。
+    /// 历史字段：`dir` 首扫后是否轮询 journal（旧的 usn 首扫模式用）。
+    /// 新配置请用 `incremental`。
     pub journal_enabled: bool,
+    /// 内置索引的实时更新方式：
+    /// - `usn`（默认）：目录首扫 + USN journal 轮询；快照游标可信时免扫直读。
+    ///   卷打不开 / journal 不可用时，worker 按卷自动退回目录监视。
+    /// - `watch`：只用 ReadDirectoryChangesW 目录监视，零 USN FSCTL。
+    /// 仅在 backend 使用内置索引时生效（everything/off 忽略）。
+    #[serde(default = "default_incremental")]
+    pub incremental: String,
     /// 只索引这些盘(如 `["F"]`);空 = 全部本机固定 NTFS 卷。
     pub volumes: Vec<String>,
     /// 负载整形:dirscan 批次间隔(毫秒)。>0 时每个批次枚举后 sleep 一下,
@@ -93,9 +100,13 @@ pub struct IndexConfig {
     /// × ntfs QueryOpen × minifilter;默认 0 = 不限,行为与旧版完全一致)。
     #[serde(default)]
     pub scan_throttle_ms: u64,
-    /// USN journal 轮询间隔(毫秒),最小 100,默认 500。仅 backend="usn" 使用。
+    /// USN journal 轮询间隔(毫秒),最小 100,默认 500。incremental="usn" 使用。
     #[serde(default = "default_journal_poll_ms")]
     pub journal_poll_ms: u64,
+}
+
+fn default_incremental() -> String {
+    "usn".to_string()
 }
 
 fn default_journal_poll_ms() -> u64 {
@@ -110,6 +121,7 @@ impl Default for IndexConfig {
             candidate_cap: 2000,
             scan_mode: "dir".into(),
             journal_enabled: false,
+            incremental: default_incremental(),
             volumes: Vec::new(),
             scan_throttle_ms: 0,
             journal_poll_ms: default_journal_poll_ms(),
@@ -129,6 +141,24 @@ impl IndexConfig {
     pub fn normalize(&mut self) {
         if self.journal_poll_ms < 100 {
             self.journal_poll_ms = 100;
+        }
+        // 未知值按默认走 USN（有按卷回退，不会丢索引能力）。
+        self.incremental = match self.incremental.trim().to_ascii_lowercase().as_str() {
+            "watch" => "watch".to_string(),
+            _ => "usn".to_string(),
+        };
+    }
+
+    /// 旧 `backend` 值迁移（Config::load 时调用）：
+    /// - `usn` → `auto` + `incremental = usn`（USN 现在只是内置索引的实时层，
+    ///   不再是一个“后端”）；
+    /// - `off` → `everything`（两者搜索行为相同，去掉重复选项）。
+    pub fn migrate_legacy_backend(&mut self) {
+        if self.backend == "usn" {
+            self.backend = "auto".to_string();
+            self.incremental = "usn".to_string();
+        } else if self.backend == "off" {
+            self.backend = "everything".to_string();
         }
     }
 
@@ -500,6 +530,7 @@ impl Config {
                 cfg.rank.backfill_missing_noise_rules();
                 cfg.max_load_results = normalize_max_load_results(cfg.max_load_results);
                 cfg.index.backend = normalize_backend(&cfg.index.backend);
+                cfg.index.migrate_legacy_backend();
                 cfg.index.normalize_volumes();
                 cfg.index.normalize();
                 // 唤起热键：手写 config.toml 的非法值（如裸字母）回退默认，
@@ -528,11 +559,9 @@ impl Config {
     }
 }
 
-/// 后端名归一化:只接受 auto/builtin/usn/everything/off,未知值一律回 auto,
+/// 后端名归一化:接受 auto/builtin/everything;`usn`/`off` 是旧值,
+/// 由 [`IndexConfig::migrate_legacy_backend`] 迁移。未知值一律回 auto,
 /// 避免手写 config.toml 里的错拼被静默当成「建内置引擎」。
-///
-/// `usn` = 增量后端:目录扫描首扫 + USN journal 实时增量(带熔断/游标校验护栏)。
-/// 它是唯一会启用 USN FSCTL 路径的取值;auto/builtin 保持零 USN FSCTL 不变。
 pub fn normalize_backend(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "auto" => "auto".into(),
@@ -642,6 +671,32 @@ mod tests {
         assert_eq!(cfg.backend, "builtin");
         assert_eq!(cfg.scan_throttle_ms, 0);
         assert_eq!(cfg.journal_poll_ms, 500);
+        assert_eq!(cfg.incremental, "usn", "缺 incremental 时默认走 USN");
+    }
+
+    /// 实时层默认 USN；旧 backend=usn 迁移为 auto+usn，off 迁移为 everything。
+    #[test]
+    fn incremental_defaults_and_legacy_backend_migrate() {
+        let cfg = IndexConfig::default();
+        assert_eq!(cfg.backend, "auto");
+        assert_eq!(cfg.incremental, "usn");
+
+        let mut cfg = IndexConfig { backend: "usn".into(), ..Default::default() };
+        cfg.migrate_legacy_backend();
+        assert_eq!(cfg.backend, "auto");
+        assert_eq!(cfg.incremental, "usn");
+
+        let mut cfg = IndexConfig { backend: "off".into(), ..Default::default() };
+        cfg.migrate_legacy_backend();
+        assert_eq!(cfg.backend, "everything");
+
+        // 手写值归一化：大小写/空白容忍，未知值回默认 USN。
+        let mut cfg = IndexConfig { incremental: " WATCH ".into(), ..Default::default() };
+        cfg.normalize();
+        assert_eq!(cfg.incremental, "watch");
+        let mut cfg = IndexConfig { incremental: "bogus".into(), ..Default::default() };
+        cfg.normalize();
+        assert_eq!(cfg.incremental, "usn");
     }
 
     /// 加载更多上限：默认 1000；手写越界值在 load 归一化时夹到 100..=3000；

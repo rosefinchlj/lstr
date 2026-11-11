@@ -1742,9 +1742,9 @@ impl LstrApp {
                     });
                 }
             } else if st.phase == lstr_index::Phase::Ready {
-                // usn 后端:USN 层异常状态要浮出来(退避/停用 = 实时增量不可靠,
+                // USN 增量层:异常状态要浮出来(退避/停用 = 实时增量不可靠,
                 // worker 正在自动对账或已停用该卷);正常 Watching 不打扰(安静原则)。
-                if self.cfg.index.backend == "usn" {
+                if self.cfg.index.incremental == "usn" || self.cfg.index.backend == "usn" {
                     let degraded: Vec<String> = st
                         .volumes
                         .iter()
@@ -5461,14 +5461,21 @@ impl LstrApp {
             }
         }
 
-        // —— 后端选择 ——
-        // 两列等宽网格:旧版写死 118px 宽/124px 步进,「仅内置索引(不碰 Everything)」
-        // 文字溢出按钮、第 4 个按钮又被窗口右边裁掉;这里按可见宽度均分。
-        Self::settings_label(painter, &theme, area.left(), y, "索引后端");
-        // usn = 增量后端:目录扫描首扫 + USN journal 实时增量(带熔断/对账护栏);
-        // 文案风格与其余四项一致(短句括注)。
-        let backends = [("auto", "自动(内置优先+兜底)"), ("builtin", "仅内置索引(不碰 Everything)"), ("usn", "目录扫描+USN 实时增量"), ("everything", "仅 Everything"), ("off", "关闭内置索引")];
-        let current = self.cfg_index_backend();
+        // —— 索引引擎 + 实时层 ——
+        // 两者正交：引擎决定「用谁搜」，实时层决定「内置索引怎么追变化」。
+        // 旧版把 USN 混在引擎列表里，看起来像第三个引擎，实际 USN 只是
+        // 内置索引的增量方式（同一套 dir 首扫 + 同一个 store）。
+        let current_engine = self.cfg_index_backend();
+        let current_incremental = self.cfg_index_incremental();
+        const ENGINES: [(&str, &str); 3] = [
+            ("auto", "自动(内置优先+Everything 兜底)"),
+            ("builtin", "仅内置索引(不碰 Everything)"),
+            ("everything", "仅 Everything"),
+        ];
+        const INCREMENTALS: [(&str, &str); 2] = [
+            ("usn", "USN journal(默认)"),
+            ("watch", "目录监视"),
+        ];
         const BACKEND_CHIP_H: f32 = 26.0;
         const BACKEND_CHIP_GAP: f32 = 8.0;
         const BACKEND_COLS: usize = 2;
@@ -5476,30 +5483,41 @@ impl LstrApp {
         let start_x = area.left() + 130.0;
         let avail = (area.right() - start_x).max(160.0);
         let chip_w = ((avail - BACKEND_CHIP_GAP * (BACKEND_COLS - 1) as f32) / BACKEND_COLS as f32).floor();
-        for (i, (key, label)) in backends.iter().enumerate() {
-            let col = i % BACKEND_COLS;
-            let row = i / BACKEND_COLS;
-            let rect = Rect::from_min_size(
-                egui::pos2(
-                    start_x + col as f32 * (chip_w + BACKEND_CHIP_GAP),
-                    y + row as f32 * (BACKEND_CHIP_H + BACKEND_CHIP_GAP),
-                ),
-                egui::vec2(chip_w, BACKEND_CHIP_H),
-            );
-            let accent = *key == current;
-            let response = ui.interact(rect, Id::new(("lstr-idx-backend", *key)), Sense::click());
-            if response.hovered() {
-                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        let groups: [(&str, bool, &[(&str, &str)], &str); 2] = [
+            ("索引引擎", false, &ENGINES, current_engine),
+            ("内置索引实时层", true, &INCREMENTALS, current_incremental),
+        ];
+        for (label, incremental_group, items, current) in groups {
+            Self::settings_label(painter, &theme, area.left(), y, label);
+            for (i, (key, text)) in items.iter().enumerate() {
+                let col = i % BACKEND_COLS;
+                let row = i / BACKEND_COLS;
+                let rect = Rect::from_min_size(
+                    egui::pos2(
+                        start_x + col as f32 * (chip_w + BACKEND_CHIP_GAP),
+                        y + row as f32 * (BACKEND_CHIP_H + BACKEND_CHIP_GAP),
+                    ),
+                    egui::vec2(chip_w, BACKEND_CHIP_H),
+                );
+                let accent = *key == current;
+                let response = ui.interact(rect, Id::new(("lstr-idx-backend", *key)), Sense::click());
+                if response.hovered() {
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                painter.rect_filled(rect, CornerRadius::same(6), if accent { theme.amber_soft } else { theme.hover });
+                painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0_f32, if accent { theme.amber } else { theme.hair }), StrokeKind::Inside);
+                painter.text(rect.center(), Align2::CENTER_CENTER, *text, font.clone(), if accent { theme.amber } else { theme.text });
+                if response.clicked() {
+                    if incremental_group {
+                        self.set_cfg_index_incremental(key);
+                    } else {
+                        self.set_cfg_index_backend(key);
+                    }
+                }
             }
-            painter.rect_filled(rect, CornerRadius::same(6), if accent { theme.amber_soft } else { theme.hover });
-            painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0_f32, if accent { theme.amber } else { theme.hair }), StrokeKind::Inside);
-            painter.text(rect.center(), Align2::CENTER_CENTER, *label, font.clone(), if accent { theme.amber } else { theme.text });
-            if response.clicked() {
-                self.set_cfg_index_backend(key);
-            }
+            let rows = (items.len() + BACKEND_COLS - 1) / BACKEND_COLS;
+            y += rows as f32 * BACKEND_CHIP_H + (rows.saturating_sub(1)) as f32 * BACKEND_CHIP_GAP + 10.0;
         }
-        let rows = (backends.len() + BACKEND_COLS - 1) / BACKEND_COLS;
-        y += rows as f32 * BACKEND_CHIP_H + (rows.saturating_sub(1)) as f32 * BACKEND_CHIP_GAP + 12.0;
 
         // —— 噪声排除开关 ——
         Self::settings_label(painter, &theme, area.left(), y, "噪声目录");
@@ -5517,9 +5535,9 @@ impl LstrApp {
         // 帮助:按实际生效时机分开写——切卷立即生效,后端/噪声要重启。
         // 这里用 layout+wrap 按 area 宽度自动折行:文案再长也不会跑出右边界
         // (painter.text 是 no-wrap,旧版单行长段落其实早就被窗口右侧裁掉了)。
-        let help = "自动:内置索引未就绪时用 Everything 兜底合并;仅内置:完全不读取 Everything;仅 Everything:只用 Everything 后端。\n\
-usn:目录扫描首扫 + USN journal 实时增量(快照完整且游标可信时免扫直读;带熔断/自动对账护栏;journal 重置或连续出错时该卷自动退回目录扫描对账)。\n\
-索引卷勾选立即生效(worker 自动起停该盘扫描);索引后端与噪声目录仍需重启 lstr 生效。\n\
+        let help = "索引引擎:自动=内置优先,内置未就绪时用 Everything 兜底;仅内置=完全不读取 Everything;仅 Everything=只用 Everything。\n\
+内置索引实时层:USN journal(默认)=目录首扫后按 journal 增量,快照完整且游标可信时免扫直读,卷不可用自动退回目录监视;目录监视=ReadDirectoryChangesW,零 USN FSCTL。\n\
+索引卷勾选立即生效(worker 自动起停该盘扫描);索引引擎/实时层与噪声目录仍需重启 lstr 生效。\n\
 时间筛选在内置索引(目录扫描)模式下可用。\n\
 内置索引只覆盖本机固定 NTFS 卷;网络盘/FAT32/exFAT 等需 Everything。";
         let galley = painter.layout(
@@ -5534,15 +5552,28 @@ usn:目录扫描首扫 + USN journal 实时增量(快照完整且游标可信时
     fn cfg_index_backend(&self) -> &'static str {
         match self.cfg.index.backend.as_str() {
             "builtin" => "builtin",
-            "usn" => "usn",
             "everything" => "everything",
-            "off" => "off",
+            // off 是历史值；Config::load 已迁移为 everything，这里兜底。
+            "off" => "everything",
             _ => "auto",
         }
     }
 
     fn set_cfg_index_backend(&mut self, key: &str) {
         self.cfg.index.backend = key.to_string();
+        let _ = self.cfg.save();
+    }
+
+    fn cfg_index_incremental(&self) -> &'static str {
+        if self.cfg.index.incremental == "watch" {
+            "watch"
+        } else {
+            "usn"
+        }
+    }
+
+    fn set_cfg_index_incremental(&mut self, key: &str) {
+        self.cfg.index.incremental = key.to_string();
         let _ = self.cfg.save();
     }
 
