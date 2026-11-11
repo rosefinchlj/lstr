@@ -44,6 +44,8 @@ pub struct Config {
     #[serde(default)]
     pub explorer_typing: bool,
     /// 文件对话框出现时自动跟随 Explorer 当前目录，默认关闭（会改动对话框路径）。
+    /// 仅对打开/保存对话框生效：文件夹选择器（VSCode 的「打开文件夹」）里
+    /// 填路径 + 确认 = 选中并关闭，不能自动跳。
     #[serde(default)]
     pub dialog_auto_follow: bool,
 

@@ -691,7 +691,8 @@ impl LstrApp {
         }
         self.suppressed_dialog = None;
         // P0-3：自动跟随 Explorer 当前目录（默认关闭，会改动对话框路径）。
-        if self.cfg.dialog_auto_follow {
+        // 文件夹选择器不跟随：那里「填路径 + 确认」= 选中并关闭。
+        if self.cfg.dialog_auto_follow && dialog::can_auto_follow(&info) {
             if let Some(folder) = crate::win::explorer::active_explorer_folder() {
                 if dialog::navigate_to_folder(&info, &folder.to_string_lossy()).is_ok() {
                     self.suppressed_dialog = Some(info.hwnd);
@@ -4896,7 +4897,7 @@ impl LstrApp {
         painter.text(
             egui::pos2(area.left(), area.bottom() - 40.0),
             Align2::LEFT_TOP,
-            "键入即搜：资源管理器内直接打字；自动跟随：对话框跳到刚浏览的目录",
+            "键入即搜：资源管理器内直接打字；自动跟随：打开/保存对话框跳到当前目录",
             ui::mono_font(10.0),
             theme.dim,
         );
