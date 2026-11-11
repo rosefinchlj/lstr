@@ -88,22 +88,65 @@ pub fn validate_regex(pattern: &str, case_sensitive: bool) -> Result<(), String>
 
 pub(crate) fn compiled_regex(spec: &QuerySpec) -> Option<Arc<Regex>> {
     let pattern = spec.regex.as_deref()?;
+    regex_for(pattern, spec.case_sensitive)
+}
+
+fn regex_for(pattern: &str, case_sensitive: bool) -> Option<Arc<Regex>> {
     if let Ok(mut cache) = regex_cache().lock() {
         if let Some((cached, case, regex)) = cache.as_ref() {
-            if cached == pattern && *case == spec.case_sensitive {
+            if cached == pattern && *case == case_sensitive {
                 return Some(Arc::clone(regex));
             }
         }
         let regex = Arc::new(
             RegexBuilder::new(pattern)
-                .case_insensitive(!spec.case_sensitive)
+                .case_insensitive(!case_sensitive)
                 .build()
                 .ok()?,
         );
-        *cache = Some((pattern.to_string(), spec.case_sensitive, Arc::clone(&regex)));
+        *cache = Some((pattern.to_string(), case_sensitive, Arc::clone(&regex)));
         return Some(regex);
     }
     None
+}
+
+/// 单个名字是否命中一个 token（与文件匹配同语义：ASCII 大小写/词边界）。
+/// 应用/命令行的严格匹配复用它，避免拼音/模糊在严格模式下绕过选项。
+pub fn name_matches(
+    name: &str,
+    token: &str,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+    if case_sensitive {
+        token_matches(name.as_bytes(), token.as_bytes(), whole_word)
+    } else {
+        token_matches(
+            &fold_ascii(name.as_bytes()),
+            &fold_ascii(token.as_bytes()),
+            whole_word,
+        )
+    }
+}
+
+/// 多 token AND（应用/命令行的严格匹配）。
+pub fn query_name_matches(
+    name: &str,
+    query: &str,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> bool {
+    query
+        .split_whitespace()
+        .all(|token| name_matches(name, token, case_sensitive, whole_word))
+}
+
+/// 应用/命令行正则匹配（缓存同一条 pattern）。
+pub fn regex_name_matches(name: &str, pattern: &str, case_sensitive: bool) -> bool {
+    regex_for(pattern, case_sensitive).is_some_and(|regex| regex.is_match(name.as_bytes()))
 }
 
 /// 从正则里抽一段最长的字面量（≥2 字节）做 n-gram 预筛；抽不到就全扫。

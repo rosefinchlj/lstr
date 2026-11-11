@@ -1513,7 +1513,13 @@ fn run_worker(args: WorkerArgs) {
             continue;
         }
 
-        let needs_uwp = !request.filters.matches.regex
+        // 目录/路径范围内只搜文件：应用、UWP、命令、关键字都不应该混进来。
+        let path_scoped = request.browse_root.is_some()
+            || request.base_folder.is_some()
+            || request.query.path_filter.is_some()
+            || browse::parse(&request.query.raw).is_some();
+        let needs_uwp = !path_scoped
+            && !request.filters.matches.regex
             && match request.query.scope {
                 Scope::App => true,
                 Scope::All => !request.query.is_empty() && !in_folder_context,
@@ -1577,6 +1583,9 @@ fn run_worker(args: WorkerArgs) {
             match request.query.scope {
                 Scope::App => {
                     entries = apps.search(&request.query.text, request.limit);
+                    entries.retain(|entry| {
+                        app_matches_options(&entry.name, &request.query.text, &request.filters)
+                    });
                     total = entries.len();
                 }
                 Scope::Command => {
@@ -1588,6 +1597,7 @@ fn run_worker(args: WorkerArgs) {
                     // 硬塞进来只会让人疑惑「选了 D 盘怎么还出现微信」。
                     if request.filters.is_empty()
                         && !in_folder_context
+                        && !path_scoped
                         && !request.filters.matches.regex
                     {
                         keyword_rows = keyword_entries(&request.keywords, &request.query.text);
@@ -1730,10 +1740,18 @@ fn run_worker(args: WorkerArgs) {
                     }
                     if request.filters.is_empty()
                         && !in_folder_context
+                        && !path_scoped
                         && !request.filters.matches.regex
                     {
                         let t_apps = Instant::now();
                         let mut app_hits = apps.search(&request.query.text, request.limit);
+                        app_hits.retain(|entry| {
+                            app_matches_options(
+                                &entry.name,
+                                &request.query.text,
+                                &request.filters,
+                            )
+                        });
                         diag_apps = t_apps.elapsed().as_secs_f32() * 1000.0;
                         total += app_hits.len();
                         entries.append(&mut app_hits);
@@ -1980,6 +1998,24 @@ fn fetch_count(query: &Query, limit: usize) -> usize {
         // 300→500 只多花约 8ms，却能给排序多 66% 的候选，值得保留。
         (limit * 50).min(500)
     }
+}
+
+/// 应用结果也要遵守匹配选项：严格模式下禁止拼音/模糊兜底，避免
+/// 「区分大小写 + 全词」搜 ai 仍被 AI合成 / 拼音命中带进来。
+fn app_matches_options(name: &str, query: &str, filters: &SearchFilters) -> bool {
+    let matches = filters.matches;
+    if matches.is_default() {
+        return true;
+    }
+    if matches.regex {
+        return lstr_index::query::regex_name_matches(name, query, matches.case_sensitive);
+    }
+    lstr_index::query::query_name_matches(
+        name,
+        query,
+        matches.case_sensitive,
+        matches.whole_word,
+    )
 }
 
 fn scope_matches(scope: Scope, entry: &Entry) -> bool {
@@ -2452,8 +2488,23 @@ mod tests {
     }
 
     #[test]
-    fn browse_root_empty_filter_lists_children() {
-        let _guard = SERVICE_TEST_LOCK.lock().unwrap();
+    fn app_results_respect_strict_match_options() {
+        let mut filters = SearchFilters::default();
+        assert!(app_matches_options("AI合成", "ai", &filters), "默认模式保留拼音/模糊");
+        filters.matches.case_sensitive = true;
+        filters.matches.whole_word = true;
+        assert!(
+            !app_matches_options("AI合成", "ai", &filters),
+            "区分大小写时 AI合成 不应命中小写 ai"
+        );
+        assert!(
+            app_matches_options("ai工具", "ai", &filters),
+            "原始名包含 ai 且词边界成立时应命中"
+        );
+    }
+
+    #[test]
+    fn browse_root_empty_filter_lists_children() {        let _guard = SERVICE_TEST_LOCK.lock().unwrap();
         fn wait(service: &SearchService, generation: u64) -> Response {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {

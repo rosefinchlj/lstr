@@ -1235,13 +1235,11 @@ impl LstrApp {
 
         let input_empty = self.input.is_empty();
         let mut scope_delta = 0;
-        if !self.in_browse() {
-            if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowLeft)) {
-                scope_delta = -1;
-            }
-            if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowRight)) {
-                scope_delta = 1;
-            }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowLeft)) {
+            scope_delta = -1;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowRight)) {
+            scope_delta = 1;
         }
         if scope_delta != 0 {
             self.step_scope(ctx, scope_delta);
@@ -1274,12 +1272,10 @@ impl LstrApp {
             self.move_selection(-6);
         }
 
-        if !self.in_browse() {
-            if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) {
-                self.step_scope(ctx, -1);
-            } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
-                self.step_scope(ctx, 1);
-            }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) {
+            self.step_scope(ctx, -1);
+        } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
+            self.step_scope(ctx, 1);
         }
 
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Enter)) {
@@ -3189,6 +3185,7 @@ impl LstrApp {
             }
 
             let pinyin_hit = entry.kind == Kind::App
+                && self.filters.matches.is_default()
                 && !q.is_empty()
                 && !entry.name.to_lowercase().contains(&q)
                 && entry
