@@ -1342,7 +1342,9 @@ impl LstrApp {
             return;
         }
         match shell::run_as_admin(&entry) {
-            Ok(()) => self.hide(ctx),
+            // 提权启动也是旁观操作（UAC 可能被取消），不消费搜索结果：
+            // 再次唤出仍保留本次输入与结果。
+            Ok(()) => self.hide_keep(ctx),
             Err(err) => self.toast(ctx, err),
         }
     }
