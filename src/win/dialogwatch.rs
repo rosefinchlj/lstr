@@ -1,7 +1,13 @@
-//! WinEvent hook：前台出现标准文件对话框（`#32770`）时通知主界面自动唤出。
+//! WinEvent hook：前台窗口变化、或有 `#32770` 显示时通知主界面，
+//! 由主循环判断是不是文件对话框。
+//!
+//! 前台事件不再按类名过滤：Win11 记事本等 XAML 宿主打开 `#32770` 后，
+//! 前台仍停在主窗口，事件里的 hwnd 不是对话框本身，提前过滤会把这类情况
+//! 全部丢掉。同时监听 `EVENT_OBJECT_SHOW`（只认 `#32770`）：前台没有变化
+//! 时，对话框显示本身也能触发探测。完整校验（进程/编辑框链/可见性）交给
+//! egui 主循环的 `dialog::foreground_dialog()`。
 //! `WINEVENT_OUTOFCONTEXT` 的回调在本线程泵消息时触发，线程只需一个裸
-//! `GetMessageW` 循环（不需要窗口）。回调里只做类名过滤这种最轻的判断，
-//! 完整校验（编辑框链、可见性）交给 egui 主循环的 `dialog::foreground_dialog()`。
+//! `GetMessageW` 循环（不需要窗口）。
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::OnceLock;
@@ -11,11 +17,13 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, GetClassNameW, MSG, WINEVENT_OUTOFCONTEXT,
+    DispatchMessageW, GetClassNameW, GetMessageW, MSG, WINEVENT_OUTOFCONTEXT,
 };
 
 const DIALOG_CLASS: &str = "#32770";
 const EVENT_SYSTEM_FOREGROUND: u32 = 3;
+/// EVENT_OBJECT_SHOW：对象显示。范围事件，回调里靠类名过滤。
+const EVENT_OBJECT_SHOW: u32 = 0x8002;
 const OBJID_WINDOW: i32 = 0;
 const CHILDID_SELF: i32 = 0;
 
@@ -83,7 +91,7 @@ impl Drop for DialogWatch {
 
 fn run(ready_tx: Sender<Result<u32, String>>) {
     unsafe {
-        let hook = SetWinEventHook(
+        let foreground = SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,
             EVENT_SYSTEM_FOREGROUND,
             None,
@@ -92,7 +100,22 @@ fn run(ready_tx: Sender<Result<u32, String>>) {
             0,
             WINEVENT_OUTOFCONTEXT,
         );
-        if hook.0.is_null() {
+        let shown = SetWinEventHook(
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_SHOW,
+            None,
+            Some(win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        if foreground.0.is_null() || shown.0.is_null() {
+            if !foreground.0.is_null() {
+                let _ = UnhookWinEvent(foreground);
+            }
+            if !shown.0.is_null() {
+                let _ = UnhookWinEvent(shown);
+            }
             let _ = ready_tx.send(Err("SetWinEventHook 失败".to_string()));
             return;
         }
@@ -103,7 +126,8 @@ fn run(ready_tx: Sender<Result<u32, String>>) {
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             let _ = DispatchMessageW(&message);
         }
-        let _ = UnhookWinEvent(hook);
+        let _ = UnhookWinEvent(foreground);
+        let _ = UnhookWinEvent(shown);
     }
 }
 
@@ -118,14 +142,16 @@ unsafe extern "system" fn win_event_proc(
 ) {
     // panic 穿过 FFI 边界会 fast-fail 整个进程，这里兜底。
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if event != EVENT_SYSTEM_FOREGROUND
-            || idobject != OBJID_WINDOW
-            || idchild != CHILDID_SELF
-            || hwnd.0.is_null()
-        {
+        if idobject != OBJID_WINDOW || idchild != CHILDID_SELF || hwnd.0.is_null() {
             return;
         }
-        if !class_is_dialog(hwnd) {
+        // 前台事件不带类名（可能是不抢前台的 XAML 宿主）；显示事件量大，
+        // 只认 `#32770`。类名查询不发消息，跨进程安全。
+        if event == EVENT_OBJECT_SHOW {
+            if !class_is_dialog(hwnd) {
+                return;
+            }
+        } else if event != EVENT_SYSTEM_FOREGROUND {
             return;
         }
         if let Some(tx) = EVENT_TX.get() {
@@ -153,8 +179,9 @@ fn class_is_dialog(hwnd: HWND) -> bool {
 mod tests {
     #[test]
     fn constants_match_win32_semantics() {
-        // EVENT_SYSTEM_FOREGROUND=3 / OBJID_WINDOW=0 / CHILDID_SELF=0。
+        // EVENT_SYSTEM_FOREGROUND=3 / EVENT_OBJECT_SHOW=0x8002。
         assert_eq!(super::EVENT_SYSTEM_FOREGROUND, 3);
+        assert_eq!(super::EVENT_OBJECT_SHOW, 0x8002);
         assert_eq!(super::DIALOG_CLASS, "#32770");
         assert_eq!(super::OBJID_WINDOW, 0);
         assert_eq!(super::CHILDID_SELF, 0);

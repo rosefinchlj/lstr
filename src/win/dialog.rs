@@ -49,15 +49,40 @@ pub fn active_dialog() -> Option<DialogInfo> {
     }
 }
 
-/// 严格版：只认当前前台窗口是不是文件对话框，不做枚举兜底。
-/// 自动唤出用这个——事件到达时前台若已切走就不该再弹。
+/// 自动唤出用：前台是文件对话框，或前台窗口所属进程有可见的文件对话框。
+///
+/// Win11 记事本（XAML 岛）Ctrl+O 的 `#32770` 显示后，前台仍停在主窗口
+/// （`GetForegroundWindow` 返回 `Notepad`），只认「前台 == #32770」会漏掉
+/// 这类宿主。此时按 pid 找同进程的可见 `#32770`；不同进程的后台对话框
+/// 不会被认领。
 pub fn foreground_dialog() -> Option<DialogInfo> {
     unsafe {
         let foreground = GetForegroundWindow();
         if foreground.0.is_null() {
             return None;
         }
-        dialog_info(foreground)
+        if let Some(info) = dialog_info(foreground) {
+            return Some(info);
+        }
+        let mut foreground_pid = 0u32;
+        GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
+        if foreground_pid == 0 {
+            return None;
+        }
+        let mut candidates: Vec<HWND> = Vec::new();
+        let _ = EnumWindows(
+            Some(enum_dialog_candidates),
+            LPARAM(&mut candidates as *mut _ as isize),
+        );
+        candidates.into_iter().find_map(|hwnd| {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == foreground_pid {
+                dialog_info(hwnd)
+            } else {
+                None
+            }
+        })
     }
 }
 
