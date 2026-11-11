@@ -1094,6 +1094,10 @@ impl Engine {
         // 代次变化即中止(旧查询如单字符 "a" 命中 200 万条要 600ms+,
         // 不中止会把后续击键堵在队列里)。
         let cancel_my = crate::query::CANCEL_GEN.load(std::sync::atomic::Ordering::Relaxed);
+        let path_matcher = spec
+            .path_prefix
+            .as_deref()
+            .and_then(crate::query::PathMatcher::new);
         for (i, v) in self.volumes.iter().enumerate() {
             if crate::query::CANCEL_GEN.load(std::sync::atomic::Ordering::Relaxed) != cancel_my {
                 out.aborted = true;
@@ -1151,6 +1155,9 @@ impl Engine {
                 for slot in self.pinyin[i].search(store, &tokens, self.cfg.candidate_cap) {
                     if !hits.iter().any(|h| h.slot == slot)
                         && crate::query::passes_filters(store, slot, spec)
+                        && path_matcher
+                            .as_ref()
+                            .is_none_or(|m| m.matches(store, slot))
                     {
                         out.total += 1;
                         hits.push(hit(slot));
@@ -1200,6 +1207,10 @@ impl Engine {
         debug_assert_eq!(spec.kind, KindFilter::All, "query_split 只接受 All-kind 查询");
         let mut out = SplitOutcome::default();
         let cancel_my = crate::query::CANCEL_GEN.load(std::sync::atomic::Ordering::Relaxed);
+        let path_matcher = spec
+            .path_prefix
+            .as_deref()
+            .and_then(crate::query::PathMatcher::new);
         // 与 Engine::query 相同的收集上限:仅过滤器查询(无 name token)放大 8 倍,
         // 否则 candidate_cap。两条前缀各用这个上限(旧双路各自也是这个上限)。
         let cap = if spec.tokens.is_empty() {
@@ -1287,6 +1298,12 @@ impl Engine {
                     folder_hits.iter().map(|h| h.slot).collect();
                 for slot in self.pinyin[i].search(store, &tokens, self.cfg.candidate_cap) {
                     if !crate::query::passes_filters(store, slot, spec) {
+                        continue;
+                    }
+                    if path_matcher
+                        .as_ref()
+                        .is_some_and(|m| !m.matches(store, slot))
+                    {
                         continue;
                     }
                     if all_set.insert(slot) {

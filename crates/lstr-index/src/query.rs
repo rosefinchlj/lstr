@@ -10,9 +10,75 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::store::{fold_ascii, VolumeStore, ATTR_INTERNAL};
+use crate::store::{fold_ascii, VolumeStore, ATTR_INTERNAL, NO_PARENT};
 
 pub const FILE_ATTRIBUTE_DIRECTORY_U16: u16 = 0x0010;
+
+/// 路径前缀的祖先段匹配器（无分配，避免为每个候选拼完整路径）。
+///
+/// 关键点：路径过滤必须在 **候选封顶之前** 生效。旧实现先收集前
+/// `candidate_cap` 条全局命中、再用 `path_in_prefix` 后滤；当查询词很常见
+/// （`api-` / `dll`）时，前 2000 条可能全在目标目录之外，结果 total 很大、
+/// hits 为 0。这里把前缀判断压进 emit，cap/总数都只统计目录内的命中。
+///
+/// 语义与 [`path_in_prefix`] 一致：候选必须是前缀目录的**后代**（目录自身
+/// 不算），路径从卷根开始逐段完全一致。
+pub(crate) struct PathMatcher {
+    /// 前缀去掉盘符后的段（小写 ASCII；中文按原字节比较）。
+    segments: Vec<Vec<u8>>,
+}
+
+impl PathMatcher {
+    /// 只接受本地盘符前缀（`d:\...`）；UNC/相对前缀返回 None，退回后置过滤。
+    pub(crate) fn new(prefix: &str) -> Option<Self> {
+        let bytes = prefix.trim_end_matches(['\\', '/']).as_bytes();
+        if bytes.len() < 2
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+        {
+            return None;
+        }
+        let rest = &prefix.trim_end_matches(['\\', '/'])[2..];
+        let segments: Vec<Vec<u8>> = rest
+            .split(['\\', '/'])
+            .filter(|s| !s.is_empty())
+            .map(|s| s.as_bytes().to_ascii_lowercase())
+            .collect();
+        Some(Self { segments })
+    }
+
+    /// slot 是否位于前缀目录之下。从父链向上按「最后一段→第一段」连续匹配，
+    /// 全部匹配后再确认前缀目录是卷根的直接子项（否则只是路径后缀碰巧相同）。
+    pub(crate) fn matches(&self, store: &VolumeStore, slot: u32) -> bool {
+        if self.segments.is_empty() {
+            return true; // 盘符根：卷内所有条目都在前缀下
+        }
+        let mut cur = store.parent[slot as usize];
+        let mut matched = 0usize;
+        let mut hops = 0u32;
+        while cur != NO_PARENT && hops < 64 {
+            let name = store.name(cur);
+            let last = self.segments[self.segments.len() - 1].as_slice();
+            if matched < self.segments.len()
+                && name.eq_ignore_ascii_case(&self.segments[self.segments.len() - 1 - matched])
+            {
+                matched += 1;
+                if matched == self.segments.len() {
+                    return store.parent[cur as usize] == NO_PARENT;
+                }
+            } else if matched > 0 {
+                // 断链：当前节点可能重新成为「最后一段」（避免 a\x\b 误配 a\b）。
+                matched = usize::from(name.eq_ignore_ascii_case(last));
+                if matched == self.segments.len() {
+                    return store.parent[cur as usize] == NO_PARENT;
+                }
+            }
+            cur = store.parent[cur as usize];
+            hops += 1;
+        }
+        false
+    }
+}
 
 /// 查询取消代次:UI 每次发出新搜索前写入最新 generation;查询线程在
 /// 热循环里每 [`CANCEL_CHECK_EVERY`] 个候选/命中读一次,发现代次变化即
@@ -241,6 +307,7 @@ pub(crate) fn query_volume_cancel(
     cancel: Option<u64>,
 ) -> (Vec<u32>, usize, bool, bool) {
     let tokens = query_tokens(spec);
+    let matcher = spec.path_prefix.as_deref().and_then(PathMatcher::new);
     // 精确模式沿用旧语义:收集与 total 都不受 cap/TOTAL_CAP 限制(名字完全
     // 一致的条目本来就少,旧实现直接返回全部;wfn 补齐依赖这个行为)。
     let unbounded = !tokens.is_empty() && spec.exact.is_some();
@@ -248,7 +315,7 @@ pub(crate) fn query_volume_cancel(
     let mut slots: Vec<u32> = Vec::with_capacity(256);
     let mut total = 0usize;
     let mut capped = false;
-    let aborted = walk_candidates(store, spec, &tokens, cancel, &mut |slot| {
+    let aborted = walk_candidates(store, spec, &tokens, matcher.as_ref(), cancel, &mut |slot| {
         total += 1;
         if !unbounded && total >= TOTAL_CAP {
             return false; // total 已到显示上限,停止扫描(收集也随之中止)
@@ -280,13 +347,14 @@ pub(crate) fn query_volume_split_cancel(
 ) -> (Vec<u32>, Vec<u32>, usize, usize, bool) {
     debug_assert!(spec.exact.is_none(), "split 查询不使用 exact 模式");
     let tokens = query_tokens(spec);
+    let matcher = spec.path_prefix.as_deref().and_then(PathMatcher::new);
     let mut all_slots: Vec<u32> = Vec::with_capacity(256);
     let mut folder_slots: Vec<u32> = Vec::with_capacity(256);
     let mut total_all = 0usize;
     let mut total_folders = 0usize;
     let mut all_done = false;
     let mut folder_done = false;
-    let aborted = walk_candidates(store, spec, &tokens, cancel, &mut |slot| {
+    let aborted = walk_candidates(store, spec, &tokens, matcher.as_ref(), cancel, &mut |slot| {
         if all_done && folder_done {
             return false;
         }
@@ -319,9 +387,19 @@ fn walk_candidates(
     store: &VolumeStore,
     spec: &QuerySpec,
     tokens: &[Vec<u8>],
+    matcher: Option<&PathMatcher>,
     cancel: Option<u64>,
-    emit: &mut impl FnMut(u32) -> bool,
+    emit_inner: &mut impl FnMut(u32) -> bool,
 ) -> bool {
+    // 路径前缀在 emit 前过滤：候选封顶与 total 都只统计目录内命中。
+    let mut emit_path = |slot: u32| {
+        if matcher.is_none_or(|m| m.matches(store, slot)) {
+            emit_inner(slot)
+        } else {
+            true
+        }
+    };
+    let emit = &mut emit_path;
     if tokens.is_empty() {
         // H5:空 token(单独 ext:rs / path:C:\dir 等过滤器查询)按过滤器全量列举,
         // 逐 slot 走 passes_filters(名字/类型/扩展名/组),收集封顶 candidate_cap,
@@ -553,6 +631,7 @@ pub(crate) fn query_volume_memmem_scan(
     let mut total = 0usize;
     let mut capped = false;
     let mut last_slot: Option<u32> = None; // 同一条目内多次命中只算一次
+    let matcher = spec.path_prefix.as_deref().and_then(PathMatcher::new);
 
     let finder = memchr::memmem::Finder::new(gen);
     let mut seen = 0usize;
@@ -584,6 +663,9 @@ pub(crate) fn query_volume_memmem_scan(
             continue;
         }
         if !passes_filters(store, slot, spec) {
+            continue;
+        }
+        if matcher.as_ref().is_some_and(|m| !m.matches(store, slot)) {
             continue;
         }
         total += 1;
@@ -632,6 +714,56 @@ mod tests {
         assert!(path_in_prefix(r"e:\anything", ""));
         // 完全不同的路径
         assert!(!path_in_prefix(r"e:\other\a.txt", prefix));
+    }
+
+    /// 回归（2026-11-11 `api-` 目录内搜索 0 结果）：路径前缀必须在候选封顶
+    /// **之前**过滤。旧实现先收前 2000 条全局命中再后滤路径，目标目录外的
+    /// 常见词命中把 cap 占满，目录内的条目一条都进不了 hits。
+    #[test]
+    fn path_prefix_filters_before_candidate_cap() {
+        let mut s = VolumeStore::new(false);
+        // 卷根的直接子目录（生产快照里顶层条目 parent 就是 NO_PARENT）
+        s.insert(10, 0, 0x10, b"target");
+        s.insert(11, 0, 0x10, b"other");
+        for i in 0..3000u64 {
+            s.insert(1000 + i, 11, 0, format!("api-{i}.dll").as_bytes());
+        }
+        s.insert(9000, 10, 0, b"api-target.dll");
+        s.compact();
+
+        let spec = QuerySpec {
+            tokens: vec!["api-".into()],
+            path_prefix: Some(r"d:\target".into()),
+            ..Default::default()
+        };
+        let (slots, total, _, _) = query_volume_cancel(&s, &spec, 2000, None);
+        assert_eq!(total, 1, "total 只应统计目标目录内的命中");
+        assert_eq!(slots.len(), 1, "目标目录内的条目不能被全局 cap 挤掉");
+        assert_eq!(s.name(slots[0]), b"api-target.dll");
+    }
+
+    /// 前缀必须从卷根开始逐段连续匹配：`b\a\b\file` 不能命中 `a\b`。
+    #[test]
+    fn path_matcher_anchors_at_volume_root() {
+        let mut s = VolumeStore::new(false);
+        s.insert(10, 0, 0x10, b"b");
+        s.insert(11, 10, 0x10, b"a");
+        s.insert(12, 11, 0x10, b"b");
+        s.insert(13, 12, 0, b"file.txt");
+        s.compact();
+
+        let matcher = PathMatcher::new(r"d:\a\b").expect("盘符前缀");
+        assert!(!matcher.matches(&s, s.find_slot(13).unwrap()), "后缀碰巧相同不算");
+
+        // 真正的 a\b\file 命中，目录自身不计。
+        let mut ok = VolumeStore::new(false);
+        ok.insert(20, 0, 0x10, b"a");
+        ok.insert(21, 20, 0x10, b"b");
+        ok.insert(22, 21, 0, b"file.txt");
+        ok.compact();
+        let matcher = PathMatcher::new(r"d:\a\b").expect("盘符前缀");
+        assert!(matcher.matches(&ok, ok.find_slot(22).unwrap()));
+        assert!(!matcher.matches(&ok, ok.find_slot(21).unwrap()), "前缀目录自身不算");
     }
 
     #[test]
@@ -805,7 +937,7 @@ mod tests {
         let mut emitted = 0usize;
         let mut cancel_at = 0usize;
         let t0 = std::time::Instant::now();
-        let aborted = walk_candidates(&s, &spec, &tokens, Some(my), &mut |_slot| {
+        let aborted = walk_candidates(&s, &spec, &tokens, None, Some(my), &mut |_slot| {
             emitted += 1;
             if emitted == 100_000 {
                 CANCEL_GEN.store(my + 1, Ordering::Relaxed);
