@@ -1611,9 +1611,16 @@ impl LstrApp {
                     return;
                 }
 
+                // 右侧图标组（清除 ×/历史/设置）从 right-PAD-72 排到 right-PAD，
+                // 文本区必须留出这段再加 8px 呼吸位，否则长输入会画到图标下面
+                // （TextEdit 只在控件矩形内裁剪，rect 给满宽就必然叠字）。
+                const ICON_AREA: f32 = 80.0;
                 let search_rect = Rect::from_min_size(
                     egui::pos2(rect.left() + PAD, rect.top() + 14.0),
-                    egui::vec2(rect.width() - 2.0 * PAD, 28.0),
+                    egui::vec2(
+                        (rect.width() - 2.0 * PAD - ICON_AREA).max(120.0),
+                        28.0,
+                    ),
                 );
                 let hint = if self.dialog.is_some() {
                     dialog_hint(query.scope).to_string()
