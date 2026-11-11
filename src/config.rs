@@ -6,6 +6,8 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub hotkey: String,
+    /// 一屏结果行数：决定窗口自动高度，也限制应用页/最近使用/Quick Switch
+    /// 的条数（这些列表没有「滚动加载」）；文件列表首屏固定 100 条。
     pub max_results: usize,
     /// 滚到列表底部「加载更多」的候选上限（100..=3000）。首屏仍固定 100 条，
     /// 上限只决定最多能翻到多少条；越大单次响应越慢（逐条 find_meta + 抓候选）。

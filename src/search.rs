@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 /// 重建成本是枚举开始菜单 + App Paths（本机 200+ 应用，几十 ms），放 worker 线程无感。
 const APPS_RELOAD_INTERVAL: Duration = Duration::from_secs(90);
 
-/// 首屏交付的候选上限。窗口只按「最大结果数」长高，其余靠滚轮查看。
+/// 首屏交付的候选上限。窗口只按「一屏结果数」长高，其余靠滚轮查看。
 pub(crate) const MIN_DELIVER: usize = 100;
 /// 「加载更多」时单次向索引/Everything 要的候选数上限。
 /// 3000 条交付上限按 2 倍留去重余量 → 6000。
@@ -70,7 +70,7 @@ struct Request {
     /// 诊断用：UI 发出时刻。worker 出队时用它区分「排队慢」还是「执行慢」。
     sent_at: Instant,
     query: Query,
-    /// 窗口「最大结果数」：决定窗口高度，也参与候选抓取/应用条数的预算。
+    /// 一屏结果行数：决定窗口高度，也参与候选抓取/应用条数的预算。
     limit: usize,
     /// 本次最多交付多少条候选：首屏 [`MIN_DELIVER`]，滚到底按设置上限翻倍。
     deliver: usize,
@@ -385,7 +385,7 @@ impl SearchService {
         self.generation
     }
 
-    /// 设置里的「最大结果数」改动后立即生效，无需重启。
+    /// 设置里的「一屏结果数」改动后立即生效，无需重启。
     pub fn set_limit(&mut self, limit: usize) {
         self.limit = limit.clamp(1, 50);
     }

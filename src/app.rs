@@ -1025,7 +1025,7 @@ impl LstrApp {
         let height = if self.settings_open {
             600.0
         } else {
-            // 窗口高度按「最大结果数」定：worker 会多送候选（可滚动），
+            // 窗口高度按「一屏结果数」定：worker 会多送候选（可滚动），
             // 窗口只长到设置的行数，不会因为候选多就撑满屏幕。
             let rows = self.entries.len().min(self.cfg.max_results);
             let mut list_h = if rows == 0 { 120.0 } else { rows as f32 * self.theme.row_h };
@@ -4772,7 +4772,7 @@ impl LstrApp {
         area: Rect,
     ) {
         let theme = self.theme;
-        Self::settings_heading(painter, &theme, area, "行为", "唤起热键、结果数量、对话框联动与开机启动");
+        Self::settings_heading(painter, &theme, area, "行为", "唤起热键、一屏行数/滚动加载、对话框联动与开机启动");
         let mut y = area.top() + 62.0;
         const ROW: f32 = 36.0;
         let ctrl_x = area.left() + 130.0;
@@ -4854,11 +4854,13 @@ impl LstrApp {
         }
         y += ROW;
 
-        Self::settings_label(painter, &theme, area.left(), y, "最大结果数");
+        Self::settings_label(painter, &theme, area.left(), y, "一屏结果数");
         let mut max_results = self.cfg.max_results as f32;
         let response = ui.put(
             Rect::from_min_size(egui::pos2(ctrl_x, y), egui::vec2(ctrl_w, 22.0)),
-            egui::Slider::new(&mut max_results, 4.0..=20.0).integer(),
+            egui::Slider::new(&mut max_results, 4.0..=20.0)
+                .integer()
+                .suffix(" 行"),
         );
         if response.changed() {
             self.cfg.max_results = max_results.round() as usize;
@@ -4866,9 +4868,21 @@ impl LstrApp {
             let _ = self.cfg.save();
             self.trigger(ctx);
         }
+        response.on_hover_text(
+            "窗口自动高度按这个行数算：一屏显示这么多行。\n\
+             应用页、最近使用、Quick Switch 也最多显示这么多条。\n\
+             手动拖高窗口可以显示更多行。",
+        );
+        painter.text(
+            egui::pos2(ctrl_x + ctrl_w + 10.0, y + 14.0),
+            Align2::LEFT_CENTER,
+            "窗口高度；应用/最近使用也受此限制",
+            ui::mono_font(10.5),
+            theme.dim,
+        );
         y += ROW;
 
-        Self::settings_label(painter, &theme, area.left(), y, "加载更多上限");
+        Self::settings_label(painter, &theme, area.left(), y, "滚动加载上限");
         let mut max_load = self.cfg.max_load_results as f32;
         let response = ui.put(
             Rect::from_min_size(egui::pos2(ctrl_x, y), egui::vec2(ctrl_w, 22.0)),
@@ -4885,10 +4899,15 @@ impl LstrApp {
             let _ = self.cfg.save();
             self.trigger(ctx);
         }
+        response.on_hover_text(
+            "普通搜索首屏固定 100 条（路径模式 200 条）。\n\
+             滚到列表底部会继续加载，每档翻倍，最多加载到这里设置的条数。\n\
+             调大后单次加载会变慢（候选更多）。",
+        );
         painter.text(
             egui::pos2(ctrl_x + ctrl_w + 10.0, y + 14.0),
             Align2::LEFT_CENTER,
-            "滚到底最多翻到多少条（越大越慢）",
+            "首屏 100 条，滚到底继续加载到此数",
             ui::mono_font(10.5),
             theme.dim,
         );
