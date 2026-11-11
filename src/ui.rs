@@ -249,26 +249,55 @@ pub fn text_job(
     accent: Color32,
 ) -> LayoutJob {
     let mut job = LayoutJob::default();
-    let needle = q.to_lowercase();
+    let needle = q.trim();
     if needle.is_empty() {
         job.append(text, 0.0, format(font, color));
         return job;
     }
+    // 多词查询（`api core`）按 token 分别标注：旧实现只找整串，整串在名字里
+    // 不连续时一个字都不标。每个 token 标首次出现，重叠区间合并。
     let lower = text.to_lowercase();
-    if let Some(pos) = lower.find(&needle) {
-        let end = pos + needle.len();
-        if text.is_char_boundary(pos) && text.is_char_boundary(end) {
-            job.append(&text[..pos], 0.0, format(font, color));
-            job.append(
-                &text[pos..end],
-                0.0,
-                format_underlined(font, color, accent),
-            );
-            job.append(&text[end..], 0.0, format(font, color));
-            return job;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for token in needle.split_whitespace() {
+        let token = token.to_lowercase();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(pos) = lower.find(&token) {
+            let end = pos + token.len();
+            if text.is_char_boundary(pos) && text.is_char_boundary(end) {
+                ranges.push((pos, end));
+            }
         }
     }
-    job.append(text, 0.0, format(font, color));
+    if ranges.is_empty() {
+        job.append(text, 0.0, format(font, color));
+        return job;
+    }
+    ranges.sort_unstable();
+    // 合并重叠/相邻区间，避免同一段文字被切成多个下划线分片。
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut cursor = 0usize;
+    for (start, end) in merged {
+        if start > cursor {
+            job.append(&text[cursor..start], 0.0, format(font, color));
+        }
+        job.append(
+            &text[start..end],
+            0.0,
+            format_underlined(font, color, accent),
+        );
+        cursor = end;
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, format(font, color));
+    }
     job
 }
 
@@ -759,5 +788,45 @@ mod tests {
             let y: i32 = parts[0].parse().expect("年份可解析");
             assert!((1970..=3000).contains(&y), "年份合理: {s}");
         }
+    }
+
+    #[test]
+    fn text_job_underlines_every_query_token() {
+        let font = egui::FontId::proportional(12.0);
+        let job = text_job(
+            "api-ms-win-core-file-l2-1-0.dll",
+            "api core",
+            &font,
+            Color32::BLACK,
+            Color32::RED,
+        );
+        let hits: Vec<&str> = job
+            .sections
+            .iter()
+            .filter(|section| section.format.underline.width > 0.0)
+            .map(|section| &job.text[section.byte_range.clone()])
+            .collect();
+        assert_eq!(hits, vec!["api", "core"], "多词查询应分别标注每个词");
+    }
+
+    #[test]
+    fn text_job_underlines_cjk_tokens_and_merges_overlap() {
+        let font = egui::FontId::proportional(12.0);
+        let job = text_job("微信资料备份", "微信 资料", &font, Color32::BLACK, Color32::RED);
+        let hits: Vec<&str> = job
+            .sections
+            .iter()
+            .filter(|section| section.format.underline.width > 0.0)
+            .map(|section| &job.text[section.byte_range.clone()])
+            .collect();
+        assert_eq!(hits, vec!["微信资料"], "相邻 token 合并成一段连续下划线即可");
+
+        let dup = text_job("api-api.txt", "api api", &font, Color32::BLACK, Color32::RED);
+        let count = dup
+            .sections
+            .iter()
+            .filter(|section| section.format.underline.width > 0.0)
+            .count();
+        assert_eq!(count, 1, "重复 token 不应叠加下划线分段");
     }
 }
