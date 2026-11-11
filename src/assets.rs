@@ -177,13 +177,13 @@ fn folder_entry(path: &Path) -> Entry {
     }
 }
 
-/// 收藏的显示类型按路径判定：真实目录才是文件夹；`.lnk`/`.exe`/`shell:`
-/// （UWP AppsFolder）按应用展示。硬编码成文件夹时，Quick Switch 会把
-/// 「终端」画成文件夹图标、右侧标「文件夹」。
+/// 收藏的显示类型按路径形态判定：`.lnk`/`.exe`/`shell:`（UWP AppsFolder）
+/// 按应用展示；带其它扩展名按文件；无扩展名按文件夹。硬编码成文件夹时，
+/// Quick Switch 会把「终端」画成文件夹图标。
+///
+/// 不查磁盘（`is_dir()`）：断开的 UNC/移动硬盘会让收藏列表阻塞数秒，
+/// 且收藏的目录暂时不可用也应该留在 Quick Switch 里。
 fn favorite_kind(path: &Path) -> Kind {
-    if path.is_dir() {
-        return Kind::Folder;
-    }
     if path
         .to_string_lossy()
         .to_ascii_lowercase()
@@ -191,13 +191,11 @@ fn favorite_kind(path: &Path) -> Kind {
     {
         return Kind::App;
     }
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("lnk" | "exe" | "url" | "bat" | "cmd" | "msi") => Kind::App,
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return Kind::Folder;
+    };
+    match ext.to_ascii_lowercase().as_str() {
+        "lnk" | "exe" | "url" | "bat" | "cmd" | "msi" => Kind::App,
         _ => Kind::File,
     }
 }
@@ -277,7 +275,14 @@ pub fn quick_switch_entries(
         push_unique(&mut out, &mut seen, folder_entry(&path));
     }
     for fav in favorites {
-        push_unique(&mut out, &mut seen, favorite_entry(fav));
+        let entry = favorite_entry(fav);
+        // Quick Switch 只做「跳到文件夹」：收藏的应用（终端/微信）在
+        // 文件对话框里没有可填入的路径，混进来只会显示成一个突兀的
+        // 「应用」。它们在「应用」标签的空查询里置顶。
+        if entry.kind != Kind::Folder {
+            continue;
+        }
+        push_unique(&mut out, &mut seen, entry);
     }
     for entry in recent_folders(history, 6) {
         push_unique(&mut out, &mut seen, entry);
@@ -319,12 +324,10 @@ mod tests {
     }
 
     #[test]
-    fn favorite_kind_follows_path_type() {
-        // 目录 → 文件夹；UWP AUMID / .lnk → 应用；普通文件 → 文件。
-        assert_eq!(
-            super::favorite_kind(&std::env::temp_dir()),
-            Kind::Folder
-        );
+    fn favorite_kind_follows_path_shape() {
+        // 无扩展名 → 文件夹（不查磁盘：断开的 UNC 也不阻塞）；UWP AUMID /
+        // .lnk → 应用；普通文件 → 文件。
+        assert_eq!(super::favorite_kind(Path::new(r"D:\work")), Kind::Folder);
         assert_eq!(
             super::favorite_kind(Path::new(
                 r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
@@ -378,6 +381,30 @@ mod tests {
         let paths: Vec<String> = entries.iter().map(|e| e.full_path()).collect();
         assert_eq!(paths.iter().filter(|p| *p == "D:\\work").count(), 1);
         assert!(paths.contains(&"E:\\tmp".to_string()));
+    }
+
+    #[test]
+    fn quick_switch_drops_non_folder_favorites() {
+        // 文件对话框的 Quick Switch 只做文件夹跳转：收藏的应用不该混进来。
+        let favorites = vec![
+            Favorite {
+                name: "work".to_string(),
+                path: r"D:\work".to_string(),
+            },
+            Favorite {
+                name: "终端".to_string(),
+                path: r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
+                    .to_string(),
+            },
+            Favorite {
+                name: "微信".to_string(),
+                path: r"C:\missing\微信.lnk".to_string(),
+            },
+        ];
+        let history = History::in_memory();
+        let entries = quick_switch_entries(&favorites, &history, Vec::new(), None);
+        let paths: Vec<String> = entries.iter().map(|e| e.full_path()).collect();
+        assert_eq!(paths, vec![r"D:\work".to_string()]);
     }
 
     #[test]

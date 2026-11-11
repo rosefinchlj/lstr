@@ -1585,6 +1585,21 @@ fn run_worker(args: WorkerArgs) {
             // （补位会让用户以为历史没清掉）；想看已安装应用去「应用」标签。
             if request.query.scope == Scope::App {
                 entries = apps.top(request.limit);
+                // 收藏的应用置顶：文件夹 Quick Switch 不再收应用，这里
+                // 是它们唯一的入口（空输入即见，Enter 启动）。
+                let mut pinned: Vec<Entry> = request
+                    .favorites
+                    .iter()
+                    .map(crate::assets::favorite_entry)
+                    .filter(|entry| entry.kind == Kind::App)
+                    .collect();
+                pinned.retain(|entry| !entries.iter().any(|e| e.id == entry.id));
+                if !pinned.is_empty() {
+                    let room = request.limit.saturating_sub(pinned.len());
+                    entries.truncate(room);
+                    pinned.append(&mut entries);
+                    entries = pinned;
+                }
             } else if request.query.scope == Scope::Command {
                 entries = commands("", &config.commands);
             }
