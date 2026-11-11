@@ -310,6 +310,67 @@ pub fn text_job_positions(
     job
 }
 
+/// 一行文字的墨迹几何（相对该行基线）：up = 墨迹上沿到基线的距离，
+/// down = 墨迹下沿到基线的距离。含下划线时 down 会明显大于字体降部——
+/// egui 的下划线画在行盒底部（logical_rect().bottom()），会超出 galley 盒。
+#[derive(Clone, Copy, Debug)]
+pub struct LineInk {
+    pub base: f32,
+    pub up: f32,
+    pub down: f32,
+}
+
+impl LineInk {
+    /// 从单行 galley 里取墨迹几何。galley 必须是单行；无字形时退回行盒。
+    pub fn of(galley: &egui::Galley) -> Self {
+        let row = &galley.rows[0];
+        let base = row
+            .row
+            .glyphs
+            .first()
+            .map(|g| g.pos.y)
+            .unwrap_or(row.rect().height() * 0.8);
+        let ink = row.row.visuals.mesh_bounds;
+        if !ink.is_finite() || row.row.glyphs.is_empty() {
+            return Self {
+                base,
+                up: base,
+                down: (row.rect().height() - base).max(0.0),
+            };
+        }
+        Self {
+            base,
+            up: (base - ink.top()).max(0.0),
+            down: (ink.bottom() - base).max(0.0),
+        }
+    }
+}
+
+/// 两行内容（标题 + 副标题）在高亮底内的垂直偏移（相对 row_top）。
+///
+/// 按**墨迹**而不是 galley 盒子居中：盒子高度 = ascent−descent+line_gap，
+/// 上下空白不对称（顶部是升部留白、底部含行距），且下划线画在盒底之外，
+/// 按盒子居中会让末行降部/下划线探出高亮底边（用户报「背景没盖全」）。
+/// 返回 (标题 galley 顶 y, 副标题 galley 顶 y)。
+pub fn two_line_offsets(
+    highlight_top: f32,
+    inner_h: f32,
+    title: &LineInk,
+    sub: &LineInk,
+) -> (f32, f32) {
+    let gap0 = 4.0;
+    let mut gap = gap0;
+    let mut ink_h = title.up + title.down + gap + sub.up + sub.down;
+    if ink_h > inner_h {
+        gap = (gap0 - (ink_h - inner_h)).max(2.0);
+        ink_h = title.up + title.down + gap + sub.up + sub.down;
+    }
+    let air = ((inner_h - ink_h) / 2.0).max(0.0);
+    let title_dy = air + title.up - title.base;
+    let sub_dy = air + title.up + title.down + gap + sub.up - sub.base;
+    (highlight_top + title_dy, highlight_top + sub_dy)
+}
+
 /// 从 URL 里取出 host 用于副标题展示；取不到就原样返回。
 pub fn url_host(url: &str) -> &str {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
@@ -579,6 +640,44 @@ mod tests {
             initial: name.chars().next().unwrap_or('?').to_string(),
             tone: 0,
         }
+    }
+
+    #[test]
+    fn two_line_block_centers_on_ink_and_stays_inside_highlight() {
+        // 复现 44px 行（高亮内高 40）的两行布局：用真实系统字体量出墨迹几何，
+        // 断言墨迹块完整落在高亮底内且上下留白对称（此前按 galley 盒子居中，
+        // 盒子 23+18=41 > 40 且下划线画在盒底之外 → 末行探出高亮 4~5px）。
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let _ = ctx.run(Default::default(), |_| {}); // egui 0.32: 首帧后才可取字体
+        let accent = Color32::from_rgb(180, 120, 0);
+        let title_font = text_font(14.5);
+        let mono = mono_font(11.5);
+        let (title_ink, sub_ink) = ctx.fonts(|f| {
+            let t = f.layout_job(text_job("Wg", "Wg", &title_font, Color32::BLACK, accent));
+            let s = f.layout_job(text_job("Wg", "Wg", &mono, Color32::DARK_GRAY, accent));
+            (LineInk::of(&t), LineInk::of(&s))
+        });
+        let highlight_top = 10.0;
+        let inner_h = 40.0; // row_height 44 时高亮底的内高
+        let (y_title, y_sub) = two_line_offsets(highlight_top, inner_h, &title_ink, &sub_ink);
+        let ink_top = y_title + title_ink.base - title_ink.up;
+        let ink_bottom = y_sub + sub_ink.base + sub_ink.down;
+        assert!(
+            ink_top >= highlight_top - 0.25,
+            "墨迹上沿探出高亮: ink_top={ink_top}, highlight_top={highlight_top}"
+        );
+        assert!(
+            ink_bottom <= highlight_top + inner_h + 0.25,
+            "墨迹下沿探出高亮: ink_bottom={ink_bottom}, highlight_bottom={}",
+            highlight_top + inner_h
+        );
+        let top_air = ink_top - highlight_top;
+        let bottom_air = highlight_top + inner_h - ink_bottom;
+        assert!(
+            (top_air - bottom_air).abs() <= 0.6,
+            "墨迹上下留白不对称（未居中）: top={top_air}, bottom={bottom_air}"
+        );
     }
 
     #[test]

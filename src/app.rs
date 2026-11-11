@@ -2537,6 +2537,24 @@ impl LstrApp {
             .x
             .max(1.0);
         let sub_budget = (((rect.width() - 16.0 - 64.0) / char_w).floor() as usize).max(16);
+        // 两行内容（标题 + 副标题）的墨迹几何（含关键词下划线）。每帧量一次，
+        // 所有行共用同一组基线：按墨迹而不是 galley 盒居中——盒子上下留白
+        // 不对称、下划线还画在盒底之外，按盒居中会让降部探出高亮底边。
+        // 代表串带大写 + 降部，覆盖最高的上沿和最低的下沿。
+        let title_ink = ui::LineInk::of(&painter.layout_job(ui::text_job(
+            "Wg",
+            "Wg",
+            &ui::text_font(14.5),
+            theme.text,
+            theme.amber,
+        )));
+        let sub_ink = ui::LineInk::of(&painter.layout_job(ui::text_job(
+            "Wg",
+            "Wg",
+            &ui::mono_font(11.5),
+            theme.sub,
+            theme.amber,
+        )));
         for (index, entry) in entries.iter().enumerate() {
             let row_top = list_top + index as f32 * theme.row_h - self.scroll_y;
             if row_top + theme.row_h <= list_top || row_top >= list_top + view_h {
@@ -2716,20 +2734,14 @@ impl LstrApp {
             title_job.wrap.break_anywhere = true;
             let title_galley = painter.layout_job(title_job);
             let title_width = title_galley.size().x;
-            let title_height = title_galley.size().y;
-            // 两行内容垂直布局：标题 + 行距 + 副标题(路径)，整块在**高亮底**内
-            // 居中。高亮底是 row_rect.shrink2(0, 2.0)（上下各缩 2px），所以容器
-            // 高度取 row_h-4；内容超高时先把行距压到 2px，绝不越出高亮。
-            const SUB_LINE_H: f32 = 16.0; // mono 11.5 × TEXT_SCALE 的近似行高
-            let inner_h = theme.row_h - 4.0;
-            let mut line_gap = 4.0;
-            let mut content_h = title_height + line_gap + SUB_LINE_H;
-            if content_h > inner_h {
-                line_gap = (inner_h - title_height - SUB_LINE_H).max(2.0);
-                content_h = title_height + line_gap + SUB_LINE_H;
-            }
-            let y_title = row_rect.top() + 2.0 + ((inner_h - content_h) / 2.0).max(0.0);
-            let y_sub = y_title + title_height + line_gap;
+            // 两行内容按墨迹在高亮底内居中（见 ui::two_line_offsets）。高亮底是
+            // row_rect.shrink2(0, 2.0)，所以顶边 +2、可用高度 row_h-4。
+            let (y_title, y_sub) = ui::two_line_offsets(
+                row_rect.top() + 2.0,
+                theme.row_h - 4.0,
+                &title_ink,
+                &sub_ink,
+            );
             painter.galley(
                 egui::pos2(row_rect.left() + 54.0, y_title),
                 title_galley,
@@ -2776,7 +2788,9 @@ impl LstrApp {
                     head_job.wrap.max_rows = 1;
                     head_job.wrap.break_anywhere = true;
                     let head_galley = painter.layout_job(head_job);
-                    let y = y_title + (title_height - head_galley.size().y).max(0.0);
+                    // 首行接排的路径片段按基线对齐标题（此前按盒子对齐，
+                    // 等宽与标题升部不同会差 1~2px）。
+                    let y = y_title + (title_ink.base - sub_ink.base).max(0.0);
                     painter.galley(
                         egui::pos2(row_rect.left() + 54.0 + title_width + gap, y),
                         head_galley,
