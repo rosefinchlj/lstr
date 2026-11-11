@@ -4,11 +4,66 @@
 
 use std::path::PathBuf;
 
+/// 文件名匹配选项（与位置/时间/类型不同，不参与 `is_empty` 判断）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MatchOptions {
+    /// 区分 ASCII 大小写（非 ASCII 本来就是字节精确）。
+    pub case_sensitive: bool,
+    /// 全词匹配：token 前后必须是词边界。
+    pub whole_word: bool,
+    /// 正则模式：整个输入作为正则表达式。
+    pub regex: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchToggle {
+    CaseSensitive,
+    WholeWord,
+    Regex,
+}
+
+impl MatchOptions {
+    pub fn is_default(self) -> bool {
+        !self.case_sensitive && !self.whole_word && !self.regex
+    }
+
+    pub fn get(self, toggle: MatchToggle) -> bool {
+        match toggle {
+            MatchToggle::CaseSensitive => self.case_sensitive,
+            MatchToggle::WholeWord => self.whole_word,
+            MatchToggle::Regex => self.regex,
+        }
+    }
+
+    pub fn set(&mut self, toggle: MatchToggle, value: bool) {
+        match toggle {
+            MatchToggle::CaseSensitive => self.case_sensitive = value,
+            MatchToggle::WholeWord => {
+                self.whole_word = value;
+                if value {
+                    // 全词与正则互斥（正则有自己的边界语法）。
+                    self.regex = false;
+                }
+            }
+            MatchToggle::Regex => {
+                self.regex = value;
+                if value {
+                    // 正则与全词互斥；区分大小写仍可与正则组合。
+                    self.whole_word = false;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SearchFilters {
     pub location: Option<LocationFilter>,
     pub time: Option<TimeFilter>,
     pub group: Option<FileGroup>,
+    /// 文件名匹配选项。`is_empty` 刻意忽略它：开启匹配选项不应让
+    /// 应用/命令/关键字结果被当成“有筛选”而消失。
+    pub matches: MatchOptions,
 }
 
 impl SearchFilters {
@@ -32,6 +87,13 @@ impl SearchFilters {
         }
         if let Some(time) = &self.time {
             parts.push(time.query().to_string());
+        }
+        // Everything 的内联修饰符；内置后端走 build_spec，不看这里。
+        if self.matches.case_sensitive {
+            parts.push("case:".to_string());
+        }
+        if self.matches.whole_word {
+            parts.push("whole-words:".to_string());
         }
         parts
     }
@@ -209,6 +271,7 @@ mod tests {
             location: Some(LocationFilter::Drive('D')),
             time: Some(TimeFilter::Week),
             group: Some(FileGroup::Images),
+            ..Default::default()
         };
         let parts = filters.query_parts(false, false);
         assert_eq!(parts[0], r"path:D:\");
@@ -222,6 +285,7 @@ mod tests {
             location: Some(LocationFilter::Drive('D')),
             time: None,
             group: Some(FileGroup::Code),
+            ..Default::default()
         };
         // 用户手输了 ext: 和 path: 时，按钮选择让位，避免自相矛盾的交集。
         let parts = filters.query_parts(true, true);
@@ -247,5 +311,29 @@ mod tests {
             assert!(location.path().is_dir());
             assert!(!location.label().is_empty());
         }
+    }
+
+    /// 匹配选项不能算“文件筛选”：否则只开区分大小写时，应用/命令/关键字
+    /// 会因 `is_empty() == false` 被整段跳过。
+    #[test]
+    fn match_options_do_not_make_filters_non_empty() {
+        let mut filters = SearchFilters::default();
+        filters.matches.case_sensitive = true;
+        assert!(filters.is_empty(), "匹配选项不应改变 is_empty 语义");
+        // Everything 后端仍需要收到修饰符。
+        assert_eq!(filters.query_parts(false, false), vec!["case:".to_string()]);
+    }
+
+    #[test]
+    fn whole_word_and_regex_are_mutually_exclusive() {
+        let mut matches = MatchOptions::default();
+        matches.set(MatchToggle::Regex, true);
+        matches.set(MatchToggle::WholeWord, true);
+        assert!(matches.whole_word);
+        assert!(!matches.regex, "开全词应关闭正则");
+        matches.set(MatchToggle::Regex, true);
+        assert!(matches.regex);
+        assert!(!matches.whole_word, "开正则应关闭全词");
+        assert!(!matches.is_default());
     }
 }

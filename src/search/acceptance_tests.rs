@@ -438,6 +438,7 @@ fn acceptance_g_time_filter_and_relative_time() {
         location: None,
         time: Some(TimeFilter::Today),
         group: None,
+        ..Default::default()
     };
     let (_, total) = search(&fx, "LstrAcc", Scope::All, &filters);
     assert_eq!(total, 11, "G30 时间=今天不应过滤掉刚创建的夹具");

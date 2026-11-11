@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::history::History;
 use crate::hotkey::{display_hotkey, TapKey, WakeHotkey, DOUBLE_TAP_WINDOW};
 use crate::model::{Entry, Kind, Scope};
-use crate::search::filters::{FileGroup, LocationFilter, SearchFilters, TimeFilter};
+use crate::search::filters::{FileGroup, LocationFilter, MatchToggle, SearchFilters, TimeFilter};
 use crate::search::{self, SearchService};
 use crate::ui::{self, Theme};
 use crate::win::hotkey::{HotkeyEvent, HotkeyService};
@@ -2067,7 +2067,7 @@ impl LstrApp {
         let y = rect.top() + SEARCH_H + TABS_H + 2.0;
         let mut x = rect.left() + PAD;
 
-        let chips: [(FilterMenuKind, String, bool); 3] = [
+        let chips: [(FilterMenuKind, String, bool); 4] = [
             (
                 FilterMenuKind::Location,
                 format!(
@@ -2101,6 +2101,11 @@ impl LstrApp {
                         .unwrap_or("全部")
                 ),
                 self.filters.group.is_some(),
+            ),
+            (
+                FilterMenuKind::Match,
+                "匹配".to_string(),
+                !self.filters.matches.is_default(),
             ),
         ];
 
@@ -2164,10 +2169,15 @@ impl LstrApp {
             x += width + 8.0;
         }
 
-        // 有筛选时才出现清除入口。
-        if !self.filters.is_empty() && !path_mode {
-            // ×（U+00D7）在 Segoe UI 里一定有字形，比 ✕ 安全。
-            let galley = painter.layout_no_wrap("× 清除".to_string(), ui::text_font(10.5), theme.dim);
+        // 有筛选或匹配选项时才出现清除入口。
+        if (!self.filters.is_empty() || !self.filters.matches.is_default()) && !path_mode {
+            // 窄窗口下四个 chip 已接近占满，清除退化为单字符 ×，避免压到 chip。
+            let label = if x + 64.0 > rect.right() - PAD {
+                "×"
+            } else {
+                "× 清除"
+            };
+            let galley = painter.layout_no_wrap(label.to_string(), ui::text_font(10.5), theme.dim);
             let clear = Rect::from_min_size(
                 egui::pos2(x + 4.0, y + 3.0),
                 egui::vec2(galley.size().x + 8.0, 16.0),
@@ -2261,6 +2271,19 @@ impl LstrApp {
                     });
                 }
             }
+            FilterMenuKind::Match => {
+                for (label, toggle) in [
+                    ("区分大小写", MatchToggle::CaseSensitive),
+                    ("全词匹配", MatchToggle::WholeWord),
+                    ("正则表达式", MatchToggle::Regex),
+                ] {
+                    items.push(FilterItem {
+                        label: label.to_string(),
+                        selected: self.filters.matches.get(toggle),
+                        choice: FilterChoice::Match(toggle),
+                    });
+                }
+            }
         }
         items
     }
@@ -2337,6 +2360,13 @@ impl LstrApp {
         if let Some(index) = clicked {
             if let Some(item) = items.get(index) {
                 match &item.choice {
+                    // 匹配选项是多选：点一下切换，菜单保持打开，方便连续勾选。
+                    FilterChoice::Match(toggle) => {
+                        let next = !self.filters.matches.get(*toggle);
+                        self.filters.matches.set(*toggle, next);
+                        self.trigger(ui.ctx());
+                        return;
+                    }
                     FilterChoice::Location(value) => self.filters.location = value.clone(),
                     FilterChoice::Time(value) => self.filters.time = *value,
                     FilterChoice::Group(value) => self.filters.group = *value,
@@ -2770,12 +2800,13 @@ impl LstrApp {
                     theme.text,
                     theme.amber,
                 ),
-                None => ui::text_job(
+                None => ui::text_job_case(
                     &entry.name,
                     title_q,
                     &ui::text_font(14.5),
                     theme.text,
                     theme.amber,
+                    self.filters.matches.case_sensitive,
                 ),
             };
             title_job.wrap.max_width = (row_rect.width() - 54.0 - meta_w - 6.0).max(24.0);
@@ -2845,7 +2876,14 @@ impl LstrApp {
                 let (head, tail) = split_at_chars(&path_text, cut);
 
                 if !head.is_empty() {
-                    let mut head_job = ui::text_job(&head, needle, &mono, theme.sub, theme.amber);
+                    let mut head_job = ui::text_job_case(
+                        &head,
+                        needle,
+                        &mono,
+                        theme.sub,
+                        theme.amber,
+                        self.filters.matches.case_sensitive,
+                    );
                     // 切分按纯文本测量，高亮分段可能带来极小宽度差，留几像素防裁字。
                     head_job.wrap.max_width = head_max + 6.0;
                     head_job.wrap.max_rows = 1;
@@ -2861,7 +2899,14 @@ impl LstrApp {
                     );
                 }
                 if !tail.is_empty() {
-                    let mut tail_job = ui::text_job(&tail, needle, &mono, theme.sub, theme.amber);
+                    let mut tail_job = ui::text_job_case(
+                        &tail,
+                        needle,
+                        &mono,
+                        theme.sub,
+                        theme.amber,
+                        self.filters.matches.case_sensitive,
+                    );
                     tail_job.wrap.max_width = (row_rect.width() - 54.0 - meta_w - 10.0).max(24.0);
                     tail_job.wrap.max_rows = 1;
                     tail_job.wrap.break_anywhere = true;
@@ -2909,12 +2954,13 @@ impl LstrApp {
                         }
                     }
                 };
-                let mut sub_job = ui::text_job(
+                let mut sub_job = ui::text_job_case(
                     &subtitle,
                     if path_mode { "" } else { &query.text },
                     &ui::mono_font(11.5),
                     theme.sub,
                     theme.amber,
+                    self.filters.matches.case_sensitive,
                 );
                 sub_job.wrap.max_width = (row_rect.width() - 54.0 - meta_w - 10.0).max(24.0);
                 sub_job.wrap.max_rows = 1;
@@ -3557,12 +3603,13 @@ impl LstrApp {
             Kind::App => "应用",
             Kind::Command => "命令",
         };
-        let mut name_job = ui::text_job(
+        let mut name_job = ui::text_job_case(
             &entry.name,
             q,
             &ui::text_font(14.5),
             theme.text,
             theme.amber,
+            self.filters.matches.case_sensitive,
         );
         name_job.wrap.max_width = pane.width() - 16.0;
         name_job.wrap.max_rows = 2;
@@ -3586,12 +3633,13 @@ impl LstrApp {
         y += 18.0;
 
         let full = ui::display_path(entry);
-        let mut path_job = ui::text_job(
+        let mut path_job = ui::text_job_case(
             &full,
             q,
             &ui::mono_font(11.0),
             theme.sub,
             theme.amber,
+            self.filters.matches.case_sensitive,
         );
         path_job.wrap.max_width = pane.width() - 16.0;
         path_job.wrap.break_anywhere = true;
@@ -5135,12 +5183,13 @@ fn primary_key_from_egui(key: egui::Key) -> Option<crate::hotkey::PrimaryKey> {
     })
 }
 
-/// 筛选条上的三个按钮。
+/// 筛选条上的四个按钮。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FilterMenuKind {
     Location,
     Time,
     Group,
+    Match,
 }
 
 impl FilterMenuKind {
@@ -5149,6 +5198,7 @@ impl FilterMenuKind {
             FilterMenuKind::Location => 0,
             FilterMenuKind::Time => 1,
             FilterMenuKind::Group => 2,
+            FilterMenuKind::Match => 3,
         }
     }
 }
@@ -5164,6 +5214,8 @@ enum FilterChoice {
     Location(Option<LocationFilter>),
     Time(Option<TimeFilter>),
     Group(Option<FileGroup>),
+    /// 匹配选项是多选：点击后菜单保持打开。
+    Match(MatchToggle),
 }
 
 #[derive(Clone)]

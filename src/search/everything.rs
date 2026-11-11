@@ -519,6 +519,7 @@ mod filter_integration {
             }),
             time: None,
             group: None,
+            ..Default::default()
         };
         let (entries, _) = provider.search(&q, &filters, 20).expect("查询失败");
         assert!(!entries.is_empty(), "位置筛选不应返回空集");
@@ -532,6 +533,7 @@ mod filter_integration {
             location: None,
             time: None,
             group: Some(FileGroup::Code),
+            ..Default::default()
         };
         let (entries, _) = provider.search(&q, &filters, 20).expect("查询失败");
         assert!(!entries.is_empty(), "类型筛选不应返回空集");
@@ -552,6 +554,7 @@ mod filter_integration {
             location: None,
             time: Some(TimeFilter::Today),
             group: None,
+            ..Default::default()
         };
         let (entries, _) = provider.search(&q, &filters, 5).expect("查询失败");
         for entry in &entries {

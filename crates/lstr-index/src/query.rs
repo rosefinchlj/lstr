@@ -14,6 +14,82 @@ use crate::store::{fold_ascii, VolumeStore, ATTR_INTERNAL, NO_PARENT};
 
 pub const FILE_ATTRIBUTE_DIRECTORY_U16: u16 = 0x0010;
 
+/// 文件名严格匹配谓词（区分大小写 / 全词）。
+///
+/// 现有 ngram / char_mask / memmem 仍作为大小写不敏感的子串超集预筛；
+/// 这里在 emit 前再做一次严格校验，保证 cap/total 只统计真正命中的条目。
+pub(crate) struct MatchMatcher {
+    tokens: Vec<Vec<u8>>,
+    whole_word: bool,
+    case_sensitive: bool,
+}
+
+impl MatchMatcher {
+    pub(crate) fn new(spec: &QuerySpec) -> Option<Self> {
+        if !spec.case_sensitive && !spec.whole_word {
+            return None;
+        }
+        let tokens: Vec<Vec<u8>> = spec
+            .tokens
+            .iter()
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                if spec.case_sensitive {
+                    token.as_bytes().to_vec()
+                } else {
+                    fold_ascii(token.as_bytes())
+                }
+            })
+            .collect();
+        Some(Self {
+            tokens,
+            whole_word: spec.whole_word,
+            case_sensitive: spec.case_sensitive,
+        })
+    }
+
+    pub(crate) fn matches(&self, store: &VolumeStore, slot: u32) -> bool {
+        let name = if self.case_sensitive {
+            store.name(slot)
+        } else {
+            store.name_lc(slot)
+        };
+        self.tokens
+            .iter()
+            .all(|token| token_matches(name, token, self.whole_word))
+    }
+}
+
+/// ASCII 字母数字算“词字符”；其余（标点/空白/非 ASCII 字节）都算边界。
+#[inline]
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+}
+
+fn token_matches(name: &[u8], token: &[u8], whole_word: bool) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+    if !whole_word {
+        return memchr::memmem::find(name, token).is_some();
+    }
+    let mut from = 0usize;
+    while from + token.len() <= name.len() {
+        let Some(rel) = memchr::memmem::find(&name[from..], token) else {
+            return false;
+        };
+        let start = from + rel;
+        let end = start + token.len();
+        let start_ok = start == 0 || !is_word_byte(name[start - 1]);
+        let end_ok = end == name.len() || !is_word_byte(name[end]);
+        if start_ok && end_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 /// 路径前缀的祖先段匹配器（无分配，避免为每个候选拼完整路径）。
 ///
 /// 关键点：路径过滤必须在 **候选封顶之前** 生效。旧实现先收集前
@@ -134,6 +210,10 @@ pub struct QuerySpec {
     /// 卷掩码(bit i='A'+i):None=不限制,Some(mask)=只在这些卷查询
     /// (mask 为 0 表示排除掉了所有卷,查询结果为空)。
     pub vol_mask: Option<u32>,
+    /// 区分 ASCII 大小写（默认 false = 现有大小写不敏感语义）。
+    pub case_sensitive: bool,
+    /// 全词匹配：每个 token 前后必须是词边界（ASCII 字母数字为词字符）。
+    pub whole_word: bool,
 }
 
 /// 盘符字母 → 卷掩码位(bit i = 'A'+i)。非字母返回 0。
@@ -278,20 +358,32 @@ fn query_tokens(spec: &QuerySpec) -> Vec<Vec<u8>> {
 /// 限制,这里同样收集全部同名槽位,供 `query_split_with_exact` 并趟复用。
 pub(crate) fn exact_slots(store: &VolumeStore, spec: &QuerySpec, ex: &[u8]) -> Vec<u32> {
     let mut slots = Vec::new();
+    // offs 按小写名排序；大小写敏感时先用折叠名定位区间，再按原始名判等。
+    let folded = if spec.case_sensitive {
+        fold_ascii(ex)
+    } else {
+        ex.to_vec()
+    };
     if !store.offs.is_empty() {
-        let lo = store.offs.partition_point(|&s| store.name_lc(s) < ex);
+        let lo = store.offs.partition_point(|&s| store.name_lc(s) < &folded[..]);
         for &slot in &store.offs[lo..] {
-            if store.name_lc(slot) != ex {
+            if store.name_lc(slot) != folded {
                 break;
             }
-            if passes_filters(store, slot, spec) {
+            let exact_ok = !spec.case_sensitive || store.name(slot) == ex;
+            if exact_ok && passes_filters(store, slot, spec) {
                 slots.push(slot);
             }
         }
         return slots;
     }
     for slot in 0..store.name_off.len() as u32 {
-        if store.name_lc(slot) == ex && passes_filters(store, slot, spec) {
+        let exact_ok = if spec.case_sensitive {
+            store.name(slot) == ex
+        } else {
+            store.name_lc(slot) == ex
+        };
+        if exact_ok && passes_filters(store, slot, spec) {
             slots.push(slot);
         }
     }
@@ -308,6 +400,7 @@ pub(crate) fn query_volume_cancel(
 ) -> (Vec<u32>, usize, bool, bool) {
     let tokens = query_tokens(spec);
     let matcher = spec.path_prefix.as_deref().and_then(PathMatcher::new);
+    let match_matcher = MatchMatcher::new(spec);
     // 精确模式沿用旧语义:收集与 total 都不受 cap/TOTAL_CAP 限制(名字完全
     // 一致的条目本来就少,旧实现直接返回全部;wfn 补齐依赖这个行为)。
     let unbounded = !tokens.is_empty() && spec.exact.is_some();
@@ -315,7 +408,14 @@ pub(crate) fn query_volume_cancel(
     let mut slots: Vec<u32> = Vec::with_capacity(256);
     let mut total = 0usize;
     let mut capped = false;
-    let aborted = walk_candidates(store, spec, &tokens, matcher.as_ref(), cancel, &mut |slot| {
+    let aborted = walk_candidates(
+        store,
+        spec,
+        &tokens,
+        matcher.as_ref(),
+        match_matcher.as_ref(),
+        cancel,
+        &mut |slot| {
         total += 1;
         if !unbounded && total >= TOTAL_CAP {
             return false; // total 已到显示上限,停止扫描(收集也随之中止)
@@ -348,13 +448,21 @@ pub(crate) fn query_volume_split_cancel(
     debug_assert!(spec.exact.is_none(), "split 查询不使用 exact 模式");
     let tokens = query_tokens(spec);
     let matcher = spec.path_prefix.as_deref().and_then(PathMatcher::new);
+    let match_matcher = MatchMatcher::new(spec);
     let mut all_slots: Vec<u32> = Vec::with_capacity(256);
     let mut folder_slots: Vec<u32> = Vec::with_capacity(256);
     let mut total_all = 0usize;
     let mut total_folders = 0usize;
     let mut all_done = false;
     let mut folder_done = false;
-    let aborted = walk_candidates(store, spec, &tokens, matcher.as_ref(), cancel, &mut |slot| {
+    let aborted = walk_candidates(
+        store,
+        spec,
+        &tokens,
+        matcher.as_ref(),
+        match_matcher.as_ref(),
+        cancel,
+        &mut |slot| {
         if all_done && folder_done {
             return false;
         }
@@ -388,16 +496,20 @@ fn walk_candidates(
     spec: &QuerySpec,
     tokens: &[Vec<u8>],
     matcher: Option<&PathMatcher>,
+    match_matcher: Option<&MatchMatcher>,
     cancel: Option<u64>,
     emit_inner: &mut impl FnMut(u32) -> bool,
 ) -> bool {
-    // 路径前缀在 emit 前过滤：候选封顶与 total 都只统计目录内命中。
+    // 路径前缀 + 严格匹配在 emit 前过滤：候选封顶与 total 都只统计
+    // 目录内、且满足大小写/全词语义的命中。
     let mut emit_path = |slot: u32| {
-        if matcher.is_none_or(|m| m.matches(store, slot)) {
-            emit_inner(slot)
-        } else {
-            true
+        if matcher.is_some_and(|m| !m.matches(store, slot)) {
+            return true;
         }
+        if match_matcher.is_some_and(|m| !m.matches(store, slot)) {
+            return true;
+        }
+        emit_inner(slot)
     };
     let emit = &mut emit_path;
     if tokens.is_empty() {
@@ -426,20 +538,32 @@ fn walk_candidates(
     }
     if let Some(ex) = &spec.exact {
         let exb = ex.as_bytes();
+        // offs 按小写名排序；大小写敏感时先用折叠名定位区间，再用原始名判等。
+        let folded = if spec.case_sensitive {
+            fold_ascii(exb)
+        } else {
+            exb.to_vec()
+        };
         if !store.offs.is_empty() {
-            let lo = store.offs.partition_point(|&s| store.name_lc(s) < exb);
+            let lo = store.offs.partition_point(|&s| store.name_lc(s) < &folded[..]);
             for &slot in &store.offs[lo..] {
-                if store.name_lc(slot) != exb {
+                if store.name_lc(slot) != folded {
                     break;
                 }
-                if passes_filters(store, slot, spec) && !emit(slot) {
+                let exact_ok = !spec.case_sensitive || store.name(slot) == exb;
+                if exact_ok && passes_filters(store, slot, spec) && !emit(slot) {
                     return false;
                 }
             }
             return false;
         }
         for slot in 0..store.name_off.len() as u32 {
-            if store.name_lc(slot) == exb && passes_filters(store, slot, spec) && !emit(slot) {
+            let exact_ok = if spec.case_sensitive {
+                store.name(slot) == exb
+            } else {
+                store.name_lc(slot) == exb
+            };
+            if exact_ok && passes_filters(store, slot, spec) && !emit(slot) {
                 return false;
             }
         }
@@ -937,7 +1061,7 @@ mod tests {
         let mut emitted = 0usize;
         let mut cancel_at = 0usize;
         let t0 = std::time::Instant::now();
-        let aborted = walk_candidates(&s, &spec, &tokens, None, Some(my), &mut |_slot| {
+        let aborted = walk_candidates(&s, &spec, &tokens, None, None, Some(my), &mut |_slot| {
             emitted += 1;
             if emitted == 100_000 {
                 CANCEL_GEN.store(my + 1, Ordering::Relaxed);
@@ -1199,6 +1323,142 @@ mod tests {
     }
 
     // ---------- n-gram 快路径等价性:与 memmem 路径同序同分 ----------
+
+    /// 区分大小写：只命中原始字节一致的名字；默认模式保持大小写不敏感。
+    #[test]
+    fn case_sensitive_matches_raw_names_only() {
+        let mut s = VolumeStore::new(false);
+        for (i, name) in ["README", "readme", "ReadMe", "report.txt", "ÄI", "äi"]
+            .iter()
+            .enumerate()
+        {
+            s.insert(100 + i as u64, 0, 0, name.as_bytes());
+        }
+        s.compact();
+        let run = |token: &str, case_sensitive: bool| {
+            let spec = QuerySpec {
+                tokens: vec![token.to_string()],
+                case_sensitive,
+                ..Default::default()
+            };
+            let (_, total, _) = query_volume(&s, &spec, 100);
+            total
+        };
+        assert_eq!(run("README", true), 1);
+        assert_eq!(run("readme", true), 1);
+        assert_eq!(run("ReadMe", true), 1);
+        assert_eq!(run("read", true), 1, "只应命中全小写的 readme");
+        assert_eq!(run("read", false), 3, "默认大小写不敏感仍命中三例");
+        // 非 ASCII 本来就是字节精确；fold_ascii 不折叠 Ä/ä。
+        assert_eq!(run("ÄI", true), 1);
+        assert_eq!(run("äi", true), 1);
+    }
+
+    fn whole_word_store() -> VolumeStore {
+        let mut s = VolumeStore::new(false);
+        for (i, name) in [
+            "foo",
+            "foo.txt",
+            "my-foo-bar",
+            "foobar",
+            "xfoo",
+            "(foo)",
+            "foo_bar",
+            "FOO",
+        ]
+        .iter()
+        .enumerate()
+        {
+            s.insert(100 + i as u64, 0, 0, name.as_bytes());
+        }
+        s.compact();
+        s
+    }
+
+    #[test]
+    fn whole_word_requires_boundaries() {
+        let s = whole_word_store();
+        let spec = QuerySpec {
+            tokens: vec!["foo".into()],
+            whole_word: true,
+            ..Default::default()
+        };
+        let (slots, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 6);
+        let names: Vec<&[u8]> = slots.iter().map(|&x| s.name(x)).collect();
+        for expected in [&b"foo"[..], b"foo.txt", b"my-foo-bar", b"(foo)", b"foo_bar", b"FOO"] {
+            assert!(names.contains(&expected), "缺少 {:?}: {names:?}", expected);
+        }
+        for unexpected in [&b"foobar"[..], b"xfoo"] {
+            assert!(!names.contains(&unexpected), "不应命中 {:?}", unexpected);
+        }
+
+        // 区分大小写 + 全词：FOO 不再命中。
+        let spec = QuerySpec {
+            tokens: vec!["foo".into()],
+            whole_word: true,
+            case_sensitive: true,
+            ..Default::default()
+        };
+        let (_, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn whole_word_multi_token_is_and() {
+        let mut s = VolumeStore::new(false);
+        for (i, name) in ["foo-bar", "bar-foo", "foo bar baz", "foobar bar"]
+            .iter()
+            .enumerate()
+        {
+            s.insert(100 + i as u64, 0, 0, name.as_bytes());
+        }
+        s.compact();
+        let spec = QuerySpec {
+            tokens: vec!["foo".into(), "bar".into()],
+            whole_word: true,
+            ..Default::default()
+        };
+        let (slots, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 3, "foobar 里的 foo 不是整词，应被排除");
+        let names: Vec<&[u8]> = slots.iter().map(|&x| s.name(x)).collect();
+        assert!(!names.contains(&&b"foobar bar"[..]));
+    }
+
+    /// 严格匹配必须前置到 cap 之前：全盘大量非整词命中不能把整词命中挤掉。
+    #[test]
+    fn whole_word_filters_before_candidate_cap() {
+        let mut s = VolumeStore::new(false);
+        for i in 0..3000u64 {
+            s.insert(1000 + i, 0, 0, format!("foobar{i}.txt").as_bytes());
+        }
+        s.insert(9000, 0, 0, b"foo");
+        s.compact();
+        let spec = QuerySpec {
+            tokens: vec!["foo".into()],
+            whole_word: true,
+            ..Default::default()
+        };
+        let (slots, total, _) = query_volume(&s, &spec, 10);
+        assert_eq!(total, 1);
+        assert_eq!(s.name(slots[0]), b"foo");
+    }
+
+    #[test]
+    fn case_sensitive_works_in_scan_mode() {
+        // 未 compact：ngram 不可用，走 memmem 全扫。
+        let mut s = VolumeStore::new(false);
+        s.insert(10, 0, 0, b"README");
+        s.insert(11, 0, 0, b"readme");
+        assert!(s.is_scanning());
+        let spec = QuerySpec {
+            tokens: vec!["README".into()],
+            case_sensitive: true,
+            ..Default::default()
+        };
+        let (_, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 1);
+    }
 
     struct Lcg(u64);
     impl Lcg {

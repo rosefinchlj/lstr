@@ -1146,7 +1146,11 @@ impl Engine {
             };
             let mut hits: Vec<Hit> = slots.into_iter().map(|slot| hit(slot)).collect();
             // 拼音候选(仅 ASCII 查询;名字里不含查询词时靠拼音命中)
-            if !spec.tokens.is_empty() && spec.tokens.iter().all(|t| t.is_ascii()) {
+            if !spec.case_sensitive
+                && !spec.whole_word
+                && !spec.tokens.is_empty()
+                && spec.tokens.iter().all(|t| t.is_ascii())
+            {
                 let tokens: Vec<Vec<u8>> = spec
                     .tokens
                     .iter()
@@ -1286,7 +1290,11 @@ impl Engine {
             // 旧双路各自调一次 pinyin.search(同一序列),这里只扫一次,再按
             // 「是否已在各自 hits 里」独立补进两条前缀并各自计数 —— 与旧实现
             // 的两个 total 口径完全一致。
-            if !spec.tokens.is_empty() && spec.tokens.iter().all(|t| t.is_ascii()) {
+            if !spec.case_sensitive
+                && !spec.whole_word
+                && !spec.tokens.is_empty()
+                && spec.tokens.iter().all(|t| t.is_ascii())
+            {
                 let tokens: Vec<Vec<u8>> = spec
                     .tokens
                     .iter()

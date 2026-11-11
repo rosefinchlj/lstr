@@ -264,6 +264,18 @@ pub fn text_job(
     color: Color32,
     accent: Color32,
 ) -> LayoutJob {
+    text_job_case(text, q, font, color, accent, false)
+}
+
+/// 同 [`text_job`]，但可指定是否区分大小写（与搜索的匹配选项一致）。
+pub fn text_job_case(
+    text: &str,
+    q: &str,
+    font: &FontId,
+    color: Color32,
+    accent: Color32,
+    case_sensitive: bool,
+) -> LayoutJob {
     let mut job = LayoutJob::default();
     let needle = q.trim();
     if needle.is_empty() {
@@ -272,14 +284,24 @@ pub fn text_job(
     }
     // 多词查询（`api core`）按 token 分别标注：旧实现只找整串，整串在名字里
     // 不连续时一个字都不标。每个 token 标首次出现，重叠区间合并。
-    let lower = text.to_lowercase();
+    let lower;
+    let hay = if case_sensitive {
+        text
+    } else {
+        lower = text.to_lowercase();
+        lower.as_str()
+    };
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for token in needle.split_whitespace() {
-        let token = token.to_lowercase();
+    for raw in needle.split_whitespace() {
+        let token = if case_sensitive {
+            raw.to_string()
+        } else {
+            raw.to_lowercase()
+        };
         if token.is_empty() {
             continue;
         }
-        if let Some(pos) = lower.find(&token) {
+        if let Some(pos) = hay.find(&token) {
             let end = pos + token.len();
             if text.is_char_boundary(pos) && text.is_char_boundary(end) {
                 ranges.push((pos, end));
@@ -844,5 +866,36 @@ mod tests {
             .filter(|section| section.format.underline.width > 0.0)
             .count();
         assert_eq!(count, 1, "重复 token 不应叠加下划线分段");
+    }
+
+    #[test]
+    fn text_job_case_sensitive_respects_case() {
+        let font = egui::FontId::proportional(12.0);
+        let job = text_job_case(
+            "README",
+            "readme",
+            &font,
+            Color32::BLACK,
+            Color32::RED,
+            true,
+        );
+        assert!(
+            job.sections
+                .iter()
+                .all(|section| section.format.underline.width == 0.0),
+            "区分大小写时 README 不应被 readme 标注"
+        );
+        let job = text_job_case(
+            "README",
+            "readme",
+            &font,
+            Color32::BLACK,
+            Color32::RED,
+            false,
+        );
+        assert!(job
+            .sections
+            .iter()
+            .any(|section| section.format.underline.width > 0.0));
     }
 }

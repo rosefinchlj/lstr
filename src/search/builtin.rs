@@ -184,7 +184,13 @@ impl BuiltinProvider {
         let mut spec = build_spec(query, filters);
         spec.kind = KindFilter::All;
         // 时间筛选时 mod.rs 不会补 exact(Everything 分支才支持),这里不做无用功。
-        let exact_needle = filters.time.is_none().then(|| query.text.to_lowercase());
+        let exact_needle = filters.time.is_none().then(|| {
+            if filters.matches.case_sensitive {
+                query.text.clone()
+            } else {
+                query.text.to_lowercase()
+            }
+        });
         // 分项剖析:引擎评估与候选 Entry 构造(路径拼接/过滤)分开计时。
         let t_engine = std::time::Instant::now();
         let outcome = self.query_split_exact_spec(&spec, exact_needle.as_deref());
@@ -259,7 +265,11 @@ impl BuiltinProvider {
         limit: usize,
     ) -> Result<(Vec<Entry>, usize), String> {
         let mut spec = build_spec(query, filters);
-        spec.exact = Some(query.text.to_lowercase());
+        spec.exact = Some(if filters.matches.case_sensitive {
+            query.text.clone()
+        } else {
+            query.text.to_lowercase()
+        });
         let outcome = self.query_spec(&spec);
         let mut entries = Vec::with_capacity(outcome.hits.len().min(limit));
         self.collect_exact_entries(&outcome.hits, query, limit, &mut entries);
@@ -482,6 +492,8 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
         // 盘符过滤（c:/d: 限定、-c: 排除）：交给引擎在卷循环直接跳过，
         // 省掉整卷扫描；0 掩码（全排除）→ 查询结果为空。
         vol_mask: query.drive_mask(),
+        case_sensitive: filters.matches.case_sensitive,
+        whole_word: filters.matches.whole_word,
     };
     if let Some(location) = &filters.location {
         let p = location.path().display().to_string().to_lowercase();

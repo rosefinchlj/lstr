@@ -324,20 +324,29 @@ impl SearchService {
 /// 用户打「设置」时期望的是设置命令，而不是同名的 app/文件。只按 name 置顶会让
 /// 同名 app 靠历史分把命令顶下去（见 rank 的
 /// `settings_alias_outranks_frequently_used_app_named_settings`）。
-fn pin_exact_name_matches(entries: &mut Vec<Entry>, needle: &str) {
+fn pin_exact_name_matches(entries: &mut Vec<Entry>, needle: &str, case_sensitive: bool) {
     if needle.is_empty() {
         return;
     }
-    // needle 由调用方统一 to_lowercase 过，这里也用 to_lowercase 比较，
-    // 与去重/rank 的归一化保持一致（eq_ignore_ascii_case 只覆盖 ASCII）。
+    // 默认沿用 Unicode lowercase（与去重/rank 归一化一致）；区分大小写时
+    // 必须按原始字节判等，否则 `API` 会把 `api` 也置顶。
     let is_exact = |entry: &Entry| {
-        if entry.name.to_lowercase() == needle {
+        let name_eq = if case_sensitive {
+            entry.name == needle
+        } else {
+            entry.name.to_lowercase() == needle
+        };
+        if name_eq {
             return true;
         }
         entry.kind == Kind::Command
-            && command_aliases(&entry.id)
-                .iter()
-                .any(|alias| alias.to_lowercase() == needle)
+            && command_aliases(&entry.id).iter().any(|alias| {
+                if case_sensitive {
+                    *alias == needle
+                } else {
+                    alias.to_lowercase() == needle
+                }
+            })
     };
     // 一遍分桶：命中项进 exact（其余进 rest），没有命中时 exact 为空，
     // 顺序与旧实现完全相同。旧实现先 any 扫一遍再 drain 扫一遍，
@@ -386,7 +395,7 @@ mod pin_tests {
             item("other", "trailer"),
             item("exact2", "AI"),
         ];
-        pin_exact_name_matches(&mut entries, "ai");
+        pin_exact_name_matches(&mut entries, "ai", false);
         assert_eq!(
             entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
             vec!["exact1", "exact2", "sub", "other"]
@@ -396,7 +405,7 @@ mod pin_tests {
     #[test]
     fn empty_needle_keeps_the_original_order() {
         let mut entries = vec![item("a", "a"), item("b", "b")];
-        pin_exact_name_matches(&mut entries, "");
+        pin_exact_name_matches(&mut entries, "", false);
         assert_eq!(entries[0].id, "a");
     }
 
@@ -404,7 +413,7 @@ mod pin_tests {
     fn pin_uses_unicode_lowercase_not_ascii_only() {
         // L2：去重/rank 都按 to_lowercase 归一化，置顶也必须一致。
         let mut entries = vec![item("sub", "x"), item("exact", "ÄI")];
-        pin_exact_name_matches(&mut entries, "äi");
+        pin_exact_name_matches(&mut entries, "äi", false);
         assert_eq!(entries[0].id, "exact");
     }
 
@@ -825,7 +834,12 @@ fn finalize_entries_with_pending(
     }
     let t_rank = t_mark.elapsed().as_secs_f64() * 1000.0;
     t_mark = Instant::now();
-    let needle_lower = request.query.text.to_lowercase();
+    let case_sensitive = request.filters.matches.case_sensitive;
+    let needle_lower = if case_sensitive {
+        request.query.text.clone()
+    } else {
+        request.query.text.to_lowercase()
+    };
     let deliver = request.limit.max(100);
     let mut meta_ms = 0.0;
     let (t_ids, t_names);
@@ -842,7 +856,12 @@ fn finalize_entries_with_pending(
         let mut pending_uses: HashMap<String, usize> = HashMap::new();
         for entry in entries {
             let name_lower = entry.name.to_lowercase();
-            let is_exact = !needle_lower.is_empty() && name_lower == needle_lower;
+            let is_exact = !needle_lower.is_empty()
+                && if case_sensitive {
+                    entry.name == needle_lower
+                } else {
+                    name_lower == needle_lower
+                };
             // 普通条目只需要前 deliver 个有效候选;精确同名要扫到每种
             // (kind,name) 的 6 条上限,因为它们会被 pin 到最前面。
             // 预算外/已满额/同名重复的候选直接跳过,不再做 id 归一化与
@@ -922,7 +941,7 @@ fn finalize_entries_with_pending(
     }
     t_mark = Instant::now();
     // 名称完全一致的结果硬置顶：档位权重可能被用户调整，或被历史/位置加权翻过。
-    pin_exact_name_matches(&mut entries, &needle_lower);
+    pin_exact_name_matches(&mut entries, &needle_lower, case_sensitive);
     let t_pin = t_mark.elapsed().as_secs_f64() * 1000.0;
     t_mark = Instant::now();
     // 列表可滚动：多送一些候选（最多 100 条），UI 只按窗口高度展示前几条，
