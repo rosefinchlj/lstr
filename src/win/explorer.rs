@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 /// 记住「最近一次前台 Explorer 窗口正在浏览的目录」。
 /// 文件对话框/启动器拿到前台后，前台窗口已不是 Explorer，只能靠这份缓存做
-/// Ctrl+G 一键跳 / 自动跟随 / {current_folder} 命令。
+/// Ctrl+G 一键跳 / {current_folder} 命令。
 static LAST_FOLDER: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static LAST_SEEN: OnceLock<Mutex<(isize, String)>> = OnceLock::new();
 /// 同一个窗口的 HWND：结果要跳回「原来那个」资源管理器，而不是新开一个。
@@ -82,7 +82,7 @@ pub fn foreground_explorer_folder() -> Option<PathBuf> {
     // 「此电脑」/回收站/控制面板等虚拟位置以及桌面都没有真实目录。
     // 这里绝不能回退到 LAST_FOLDER 缓存：那会把上一次浏览的路径冒充当前路径，
     // 让键入即搜显示错误的目录提示、还按旧目录过滤结果。缓存只服务于
-    // 对话框模式（前台已不是 Explorer 时的 Ctrl+G / 自动跟随）。
+    // 对话框模式（前台已不是 Explorer 时的 Ctrl+G / Quick Switch）。
     log_explorer(&format!(
         "no match (hwnd={hwnd}, title={title}) -> global search"
     ));

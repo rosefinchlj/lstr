@@ -28,10 +28,6 @@ pub struct DialogInfo {
     pub is_save: bool,
     /// Vista+ IFileDialog（现代打开/保存对话框）：确认走按钮点击而非 IDOK。
     pub vista: bool,
-    /// 文件夹选择器（`IFileOpenDialog` + `FOS_PICKFOLDERS`，VSCode/Electron 的
-    /// 「打开文件夹」）。这类对话框里「填路径 + 确认」等于**选中并关闭**，
-    /// 而不是跳转，自动跟随必须绕开它。
-    pub folder_picker: bool,
 }
 
 pub fn active_dialog() -> Option<DialogInfo> {
@@ -114,17 +110,11 @@ unsafe fn dialog_info(hwnd: HWND) -> Option<DialogInfo> {
         return None;
     };
 
-    // 文件夹选择器与打开/保存对话框的模板差异：文件名编辑框总在 ComboBox(Ex32)
-    // 里（打开与保存实测皆是），而「文件夹」编辑框直接挂在 #32770 下。
-    // 这个差异决定「填路径 + 确认」是跳转还是选中并关闭，必须准确识别。
-    let folder_picker = vista && !has_ancestor_class(edit, hwnd, COMBO_CLASS);
-
     Some(DialogInfo {
         hwnd: hwnd.0 as isize,
         edit: edit.0 as isize,
         is_save,
         vista,
-        folder_picker,
     })
 }
 
@@ -142,18 +132,10 @@ pub fn fill_path(dialog: &DialogInfo, path: &str) -> Result<(), String> {
     set_edit_text(dialog.edit, path)
 }
 
-/// 自动跟随（设置项 `dialog_auto_follow`）能否处理这个对话框。
-///
-/// 文件夹选择器必须排除：它没有「只跳转不确认」的原生行为，
-/// 填路径 + 确认会被当成「选中并关闭」，把用户还没选定的目录直接交出去。
-pub fn can_auto_follow(dialog: &DialogInfo) -> bool {
-    !dialog.folder_picker
-}
-
 /// 把对话框切到某个文件夹：**供用户显式动作**（Quick Switch / Ctrl+G /
-/// 选中文件夹结果）使用。填路径后确认：打开对话框进入该目录并保持打开，
-/// 文件夹选择器则接受该目录并关闭——后者正是「用户选定这个文件夹」的结果。
-/// 自动跟随不能走这里：选择器会因此被静默关掉（见 [`DialogInfo::folder_picker`]）。
+/// 选中文件夹结果）使用。填路径后确认：打开/保存对话框进入该目录并保持打开；
+/// 文件夹选择器（`FOS_PICKFOLDERS`）则接受该目录并关闭——后者正是
+/// 「用户选定这个文件夹」的结果，勿用于任何自动行为。
 pub fn navigate_to_folder(dialog: &DialogInfo, path: &str) -> Result<(), String> {
     if dialog.hwnd == 0 {
         return Err("对话框句柄无效".to_string());
@@ -588,17 +570,17 @@ mod vista_dialog_tests {
     }
 }
 
+
 #[cfg(test)]
-mod picker_detection_tests {
-    //! 文件夹选择器（FOS_PICKFOLDERS）与打开/保存对话框的识别。
-    //!
-    //! 三类对话框的「文件名编辑框」祖先链不同（实测 Win11 26H2 中文）：
-    //! - 打开：Edit → ComboBox → ComboBoxEx32 → #32770
-    //! - 保存：Edit → ComboBox → FloatNotifySink → DirectUIHWND → … → #32770
-    //! - 选择文件夹：Edit → #32770（编辑框直接挂在对话框下）
-    //! 选择器里「填路径 + 确认」= 选中并关闭，识别错了就会把用户没选的目录交出去。
+mod navigation_tests {
+    //! `navigate_to_folder` 的真实对话框回归：显式跳转（Quick Switch / Ctrl+G /
+    //! 选中文件夹结果）依赖「填路径 + 确认」的两种原生语义：
+    //! - 打开/保存对话框：进入目录并**保持打开**；
+    //! - 文件夹选择器（`FOS_PICKFOLDERS`，VSCode/Electron 的「打开文件夹」）：
+    //!   **选中并关闭**，即「用户选定了这个目录」——只用于显式动作，不得自动触发。
 
     use super::*;
+    use std::sync::mpsc::{self, Receiver};
     use std::time::{Duration, Instant};
     use windows::core::{Interface, HSTRING, PCWSTR};
     use windows::Win32::System::Com::{
@@ -608,7 +590,7 @@ mod picker_detection_tests {
     use windows::Win32::UI::Shell::{
         FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, IShellItem,
         FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS,
-        SHCreateItemFromParsingName,
+        SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumChildWindows, FindWindowW, GetDlgCtrlID, PostMessageW, WM_GETTEXT, WM_GETTEXTLENGTH,
@@ -625,10 +607,14 @@ mod picker_detection_tests {
         text.encode_utf16().chain([0u16]).collect()
     }
 
-    /// 在后台线程弹一个真正的 IFileOpenDialog/IFileSaveDialog，
-    /// 直到测试线程点「取消」为止。
-    fn spawn_dialog(title: &'static str, kind: Kind) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || unsafe {
+    /// 在后台线程弹一个真正的 IFileOpenDialog/IFileSaveDialog，直到被取消
+    /// 或确认；返回「用户选中的路径」（取消/失败为 None）。
+    fn spawn_dialog(
+        title: &'static str,
+        kind: Kind,
+    ) -> (std::thread::JoinHandle<()>, Receiver<Option<String>>) {
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             let dialog: IFileDialog = match kind {
                 Kind::Save => CoCreateInstance::<_, IFileSaveDialog>(
@@ -662,9 +648,20 @@ mod picker_detection_tests {
                 let _ = dialog.SetFolder(&folder);
             }
             let _ = dialog.SetTitle(&HSTRING::from(title));
-            let _ = dialog.Show(None);
+            let shown = dialog.Show(None);
+            let chosen = if shown.is_ok() {
+                dialog
+                    .GetResult()
+                    .ok()
+                    .and_then(|item| item.GetDisplayName(SIGDN_FILESYSPATH).ok())
+                    .and_then(|path| path.to_string().ok())
+            } else {
+                None
+            };
+            let _ = tx.send(chosen);
             CoUninitialize();
-        })
+        });
+        (handle, rx)
     }
 
     fn wait_for_dialog(title: &str) -> Option<HWND> {
@@ -681,6 +678,18 @@ mod picker_detection_tests {
         None
     }
 
+    /// 子控件是逐步构建的：拿到对话框后还要等文件名编辑框出现。
+    fn wait_for_info(hwnd: HWND) -> Option<DialogInfo> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(info) = unsafe { dialog_info(hwnd) } {
+                return Some(info);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
     fn cancel_dialog(hwnd: HWND) {
         unsafe {
             if let Ok(cancel) = GetDlgItem(Some(hwnd), 2) {
@@ -689,87 +698,11 @@ mod picker_detection_tests {
         }
     }
 
-    #[test]
-    #[ignore = "requires an interactive desktop session"]
-    fn classifies_picker_open_and_save_dialogs() {
-        for (title, kind, picker, save) in [
-            ("lstr-test-picker", Kind::PickFolder, true, false),
-            ("lstr-test-open", Kind::Open, false, false),
-            ("lstr-test-save", Kind::Save, false, true),
-        ] {
-            let thread = spawn_dialog(title, kind);
-            let hwnd = wait_for_dialog(title).expect("对话框应在 10s 内出现");
-            // 子控件是逐步构建的：拿到对话框后还要等文件名编辑框出现。
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut info = None;
-            while Instant::now() < deadline {
-                info = unsafe { dialog_info(hwnd) };
-                if info.is_some() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            cancel_dialog(hwnd);
-            let _ = thread.join();
-            let info = info.expect("应识别到文件对话框");
-            println!(
-                "{title}: vista={} picker={} is_save={}",
-                info.vista, info.folder_picker, info.is_save
-            );
-            assert!(info.vista, "{title} 应识别为 Vista 对话框");
-            assert_eq!(info.folder_picker, picker, "{title} 的选择器识别不符合预期");
-            assert_eq!(info.is_save, save, "{title} 的保存识别不符合预期");
-        }
-    }
-
-    /// 自动跟随的真实链路：打开对话框「填路径 + 确认」= 跳转且对话框保持打开；
-    /// 文件夹选择器则被 can_auto_follow 拦下——不填、不点，对话框原地不动。
-    #[test]
-    #[ignore = "requires an interactive desktop session"]
-    fn auto_follow_navigates_open_dialog_but_skips_picker() {
-        let target = std::env::temp_dir().join("lstr-auto-follow-test");
-        std::fs::create_dir_all(&target).expect("创建测试目录");
-        let target_text = target.to_string_lossy().to_string();
-        let wanted = "lstr-auto-follow-test";
-
-        // 打开对话框：允许自动跟随，且跟随确实生效（对话框仍活着、目录已切换）。
-        {
-            let thread = spawn_dialog("lstr-test-follow", Kind::Open);
-            let hwnd = wait_for_dialog("lstr-test-follow").expect("打开对话框应出现");
-            let info = unsafe { dialog_info(hwnd) }.expect("应识别到打开对话框");
-            assert!(can_auto_follow(&info), "打开对话框应允许自动跟随");
-            navigate_to_folder(&info, &target_text).expect("填路径并确认");
-            std::thread::sleep(Duration::from_millis(900));
-            assert!(is_alive(&info), "打开对话框跳转后应保持打开");
-            let crumb = breadcrumb_text(hwnd);
-            println!("open crumb={crumb:?}");
-            assert!(
-                crumb.contains(wanted),
-                "打开对话框应已跳到目标目录，实际 {crumb:?}"
-            );
-            cancel_dialog(hwnd);
-            let _ = thread.join();
-        }
-
-        // 文件夹选择器：不允许自动跟随；模拟 app 的行为（不调用跳转），
-        // 对话框必须仍停在原目录，且不会被关掉。
-        {
-            let thread = spawn_dialog("lstr-test-skip", Kind::PickFolder);
-            let hwnd = wait_for_dialog("lstr-test-skip").expect("选择器应出现");
-            let info = unsafe { dialog_info(hwnd) }.expect("应识别到选择器");
-            assert!(!can_auto_follow(&info), "文件夹选择器不应自动跟随");
-            std::thread::sleep(Duration::from_millis(600));
-            assert!(is_alive(&info), "选择器不应被自动关闭");
-            let crumb = breadcrumb_text(hwnd);
-            println!("picker crumb={crumb:?}");
-            assert!(
-                crumb.contains(r"C:\Windows"),
-                "选择器应停在初始目录，实际 {crumb:?}"
-            );
-            cancel_dialog(hwnd);
-            let _ = thread.join();
-        }
-        let _ = std::fs::remove_dir_all(&target);
+    fn test_target(name: &str) -> (std::path::PathBuf, String) {
+        let path = std::env::temp_dir().join(name);
+        std::fs::create_dir_all(&path).expect("创建测试目录");
+        let text = path.to_string_lossy().to_string();
+        (path, text)
     }
 
     /// 地址栏面包屑的窗口文本（形如 `地址: C:\Windows`）；读不到返回空串。
@@ -805,5 +738,52 @@ mod picker_detection_tests {
             }
         }
         String::new()
+    }
+
+    #[test]
+    #[ignore = "requires an interactive desktop session"]
+    fn navigate_open_and_save_dialogs_stays_open_at_target() {
+        for (title, kind, wanted) in [
+            ("lstr-test-open", Kind::Open, "lstr-nav-test-open"),
+            ("lstr-test-save", Kind::Save, "lstr-nav-test-save"),
+        ] {
+            let (target, target_text) = test_target(wanted);
+            let (thread, _rx) = spawn_dialog(title, kind);
+            let hwnd = wait_for_dialog(title).expect("对话框应在 10s 内出现");
+            let info = wait_for_info(hwnd).expect("应识别到文件对话框");
+            navigate_to_folder(&info, &target_text).expect("填路径并确认");
+            std::thread::sleep(Duration::from_millis(900));
+            assert!(is_alive(&info), "{title}: 跳转后应保持打开");
+            let crumb = breadcrumb_text(hwnd);
+            println!("{title}: crumb={crumb:?}");
+            assert!(
+                crumb.contains(wanted),
+                "{title}: 应已跳到目标目录，实际 {crumb:?}"
+            );
+            cancel_dialog(hwnd);
+            let _ = thread.join();
+            let _ = std::fs::remove_dir_all(&target);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an interactive desktop session"]
+    fn navigate_folder_picker_selects_and_closes() {
+        let (target, target_text) = test_target("lstr-nav-test-picker");
+        let (thread, rx) = spawn_dialog("lstr-test-picker", Kind::PickFolder);
+        let hwnd = wait_for_dialog("lstr-test-picker").expect("选择器应在 10s 内出现");
+        let info = wait_for_info(hwnd).expect("应识别到选择器");
+        navigate_to_folder(&info, &target_text).expect("填路径并确认");
+        let chosen = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("选择器应被确认并关闭");
+        let _ = thread.join();
+        println!("picker chosen={chosen:?}");
+        let chosen = chosen.expect("应拿到选中的目录");
+        assert!(
+            chosen.eq_ignore_ascii_case(&target_text),
+            "选择器应返回目标目录，实际 {chosen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&target);
     }
 }

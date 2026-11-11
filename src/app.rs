@@ -690,16 +690,6 @@ impl LstrApp {
             return;
         }
         self.suppressed_dialog = None;
-        // P0-3：自动跟随 Explorer 当前目录（默认关闭，会改动对话框路径）。
-        // 文件夹选择器不跟随：那里「填路径 + 确认」= 选中并关闭。
-        if self.cfg.dialog_auto_follow && dialog::can_auto_follow(&info) {
-            if let Some(folder) = crate::win::explorer::active_explorer_folder() {
-                if dialog::navigate_to_folder(&info, &folder.to_string_lossy()).is_ok() {
-                    self.suppressed_dialog = Some(info.hwnd);
-                    return;
-                }
-            }
-        }
         self.open_dialog_mode(ctx, info);
     }
 
@@ -4878,26 +4868,11 @@ impl LstrApp {
             ui::mono_font(10.5),
             if self.typing.is_some() { theme.sub } else { theme.dim },
         );
-        y += ROW;
-
-        Self::settings_label(painter, &theme, area.left(), y, "对话框自动跟随目录");
-        let mut dialog_auto_follow = self.cfg.dialog_auto_follow;
-        if Self::settings_checkbox(
-            ui,
-            painter,
-            &theme,
-            Id::new("lstr-follow-check"),
-            Rect::from_min_size(egui::pos2(ctrl_x, y), egui::vec2(60.0, 22.0)),
-            &mut dialog_auto_follow,
-        ) {
-            self.cfg.dialog_auto_follow = dialog_auto_follow;
-            let _ = self.cfg.save();
-        }
 
         painter.text(
             egui::pos2(area.left(), area.bottom() - 40.0),
             Align2::LEFT_TOP,
-            "键入即搜：资源管理器内直接打字；自动跟随：打开/保存对话框跳到当前目录",
+            "键入即搜：资源管理器内直接打字，无需先唤出 lstr",
             ui::mono_font(10.0),
             theme.dim,
         );

@@ -43,11 +43,6 @@ pub struct Config {
     /// 判定严格：仅 Explorer 前台 + 非编辑框 + 无修饰键/IME；设置页可随时关闭。
     #[serde(default)]
     pub explorer_typing: bool,
-    /// 文件对话框出现时自动跟随 Explorer 当前目录，默认关闭（会改动对话框路径）。
-    /// 仅对打开/保存对话框生效：文件夹选择器（VSCode 的「打开文件夹」）里
-    /// 填路径 + 确认 = 选中并关闭，不能自动跳。
-    #[serde(default)]
-    pub dialog_auto_follow: bool,
 
     /// 自研索引引擎（设置面板「搜索」页）。
     #[serde(default)]
@@ -433,7 +428,6 @@ impl Default for Config {
             actions: Vec::new(),
             commands: Vec::new(),
             explorer_typing: true,
-            dialog_auto_follow: false,
             index: IndexConfig::default(),
         }
     }
