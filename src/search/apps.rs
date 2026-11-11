@@ -186,12 +186,9 @@ impl AppIndex {
         &self.apps
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.apps.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.apps.is_empty()
     }
 }
 

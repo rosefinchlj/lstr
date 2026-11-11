@@ -50,7 +50,6 @@ const G_VKEY: u16 = 0x47;
 pub enum HotkeyEvent {
     Toggle,
     DialogSearch,
-    Quit,
 }
 
 /// LL 钩子回调里用的事件接收端：发事件 + 唤醒 UI 线程。

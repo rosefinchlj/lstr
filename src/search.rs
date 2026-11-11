@@ -47,9 +47,11 @@ fn profile_queries() -> bool {
 
 /// 出队了一个请求:等待计数 -1(saturating,防 debug 断言下溢)。
 fn query_inflight_dec() {
-    let _ = QUERY_INFLIGHT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-        Some(v.saturating_sub(1))
-    });
+    let prev = QUERY_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+    if prev == 0 {
+        // 只有诊断用途;计数不该为负,恢复 0。
+        QUERY_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 struct Request {
@@ -781,6 +783,7 @@ fn fill_one_meta(entry: Entry, correct_kind: bool) -> Option<Entry> {
     Some(entry)
 }
 
+#[cfg(test)]
 fn finalize_entries(
     entries: Vec<Entry>,
     request: &Request,
@@ -1938,26 +1941,6 @@ fn keyword_entry(id: String, name: String, target: String) -> Entry {
         pinyin: None,
         initial: ">".to_string(),
         tone: 0xE0A040,
-    }
-}
-
-/// Quick Switch 行：Explorer 已打开的文件夹。
-fn quick_switch_entry(path: PathBuf) -> Entry {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| path.display().to_string());
-    Entry {
-        id: format!("qs:{}", path.display()),
-        kind: Kind::Folder,
-        name,
-        path: Some(path),
-        size: None,
-        modified: None,
-        pinyin: None,
-        initial: String::new(),
-        tone: 0x6C9BFF,
     }
 }
 

@@ -154,7 +154,7 @@ pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let dir = PathBuf::from(r"C:\Windows\Fonts");
 
-    let mut add = |fonts: &mut egui::FontDefinitions, name: &str, file: &str, index: u32| -> bool {
+    let add = |fonts: &mut egui::FontDefinitions, name: &str, file: &str, index: u32| -> bool {
         let path = dir.join(file);
         let Ok(bytes) = std::fs::read(&path) else {
             return false;
@@ -236,7 +236,7 @@ fn format_underlined(font: &FontId, _color: Color32, accent: Color32) -> TextFor
     TextFormat {
         font_id,
         color: accent,
-        underline: Stroke::new(2.0, accent),
+        underline: Stroke::new(2.0_f32, accent),
         ..Default::default()
     }
 }
@@ -557,7 +557,7 @@ pub fn paint_app_tile(painter: &egui::Painter, rect: egui::Rect, entry: &Entry) 
 }
 
 pub fn paint_file_icon(painter: &egui::Painter, rect: egui::Rect, kind: Kind, color: Color32) {
-    let stroke = Stroke::new(1.2, color);
+    let stroke = Stroke::new(1.2_f32, color);
     match kind {
         Kind::Folder => {
             let tab = egui::Rect::from_min_size(rect.min + egui::vec2(1.0, 3.0), egui::vec2(6.0, 3.0));
@@ -609,29 +609,11 @@ pub fn paint_file_icon(painter: &egui::Painter, rect: egui::Rect, kind: Kind, co
                         egui::pos2(body.left() + 3.0, body.top() + y),
                         egui::pos2(body.right() - 3.0, body.top() + y),
                     ],
-                    Stroke::new(1.0, color.gamma_multiply(0.65)),
+                    Stroke::new(1.0_f32, color.gamma_multiply(0.65)),
                 );
             }
         }
     }
-}
-
-pub fn keycap(painter: &egui::Painter, pos: egui::Pos2, label: &str, theme: &Theme) -> egui::Rect {
-    let font = mono_font(9.5);
-    let galley = painter.layout_no_wrap(label.to_string(), font, theme.dim);
-    let rect = egui::Rect::from_min_size(pos, galley.size() + egui::vec2(8.0, 3.0));
-    painter.rect_stroke(
-        rect,
-        egui::CornerRadius::same(4),
-        Stroke::new(1.0, theme.hair),
-        egui::StrokeKind::Inside,
-    );
-    painter.galley(
-        pos + egui::vec2(4.0, 1.5),
-        galley,
-        theme.dim,
-    );
-    rect
 }
 
 #[cfg(test)]

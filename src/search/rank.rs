@@ -113,7 +113,8 @@ pub fn score_entry(entry: &Entry, q: &str, history: &History, app_boost: i32) ->
     score_entry_with(entry, q, history, app_boost, &RankConfig::default())
 }
 
-/// 单个条目的排序分。查询为空时按历史、应用加权和类型偏好排序（最近使用优先）。
+/// 单个条目的排序分（默认权重，测试用）。
+#[cfg(test)]
 pub fn score_entry_with(
     entry: &Entry,
     q: &str,
@@ -272,8 +273,9 @@ fn is_build_dir_pattern(pattern: &str) -> bool {
     )
 }
 
-/// 噪声惩罚：遍历用户可编辑的规则表，取命中的最重一档，再乘全局强度。
-/// 规则统一按正斜杠匹配（先把路径里的 `\` 换成 `/`）。
+/// 噪声惩罚（测试用：验证规则命中的回归口径）。生产热路径走
+/// [`noise_penalty_prepared`]。
+#[cfg(test)]
 fn noise_penalty(path: &str, needle: &str, kind: Kind, cfg: &RankConfig) -> i32 {
     // 规则表按小写正斜杠保存，路径也统一归一化（含大小写）后再匹配。
     let normalized_path = path.replace('\\', "/").to_lowercase();

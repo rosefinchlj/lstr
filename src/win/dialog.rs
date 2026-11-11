@@ -9,7 +9,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BM_CLICK, BringWindowToTop, EnumChildWindows, EnumWindows, FindWindowExW, GetClassNameW,
-    GetDlgItem, GetForegroundWindow, WM_GETTEXT, WM_GETTEXTLENGTH, WM_KEYDOWN, WM_KEYUP,
+    GetDlgItem, GetForegroundWindow, WM_KEYDOWN, WM_KEYUP,
     GetParent, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
     PostMessageW, SetForegroundWindow, SendMessageW, IDOK, WM_COMMAND, WM_SETTEXT,
 };
@@ -25,12 +25,9 @@ const SEARCH_BOX_CLASS: &str = "SearchEditBoxWrapperClass";
 pub struct DialogInfo {
     pub hwnd: isize,
     pub edit: isize,
-    pub pid: u32,
-    pub title: String,
     pub is_save: bool,
     /// Vista+ IFileDialog（现代打开/保存对话框）：确认走按钮点击而非 IDOK。
     pub vista: bool,
-    pub rect: RECT,
 }
 
 pub fn active_dialog() -> Option<DialogInfo> {
@@ -73,10 +70,6 @@ unsafe fn dialog_info(hwnd: HWND) -> Option<DialogInfo> {
     }
     let title = window_text(hwnd);
     let is_save = is_save_title(&title);
-    let mut pid = 0u32;
-    let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
-    let mut rect = RECT::default();
-    GetWindowRect(hwnd, &mut rect).ok()?;
 
     // 两代对话框，Vista 优先判断：
     // - Vista+ IFileDialog：DirectUIHWND 子窗口 + 普通 Edit 文件名框
@@ -95,11 +88,8 @@ unsafe fn dialog_info(hwnd: HWND) -> Option<DialogInfo> {
     Some(DialogInfo {
         hwnd: hwnd.0 as isize,
         edit: edit.0 as isize,
-        pid,
-        title,
         is_save,
         vista,
-        rect,
     })
 }
 
@@ -421,7 +411,7 @@ mod vista_dialog_tests {
     keybd_event, KEYEVENTF_KEYUP, KEYBD_EVENT_FLAGS,
 };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, WM_GETTEXT, WM_GETTEXTLENGTH,
     };
 
     static FOUND_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -479,8 +469,8 @@ mod vista_dialog_tests {
         while Instant::now() < deadline {
             if let Some(found) = active_dialog() {
                 println!(
-                    "poll: title={} vista={} edit={}",
-                    found.title, found.vista, found.edit
+                    "poll: vista={} edit={}",
+                    found.vista, found.edit
                 );
                 if found.vista {
                     info = Some(found);
@@ -492,7 +482,7 @@ mod vista_dialog_tests {
         // 先探测失败也可能有对话框——打印子控件清单用于诊断
         if info.is_none() {
             if let Some(found) = active_dialog() {
-                println!("fallback detection: title={} vista={} edit={}", found.title, found.vista, found.edit);
+                println!("fallback detection: vista={} edit={}", found.vista, found.edit);
                 let mut children: Vec<HWND> = Vec::new();
                 unsafe {
                     let _ = EnumChildWindows(
@@ -521,8 +511,8 @@ mod vista_dialog_tests {
         }
         let info = info.expect("应探测到 Vista 文件对话框（vista=true）");
         println!(
-            "detected: title={} vista={} edit={}",
-            info.title, info.vista, info.edit
+            "detected: vista={} edit={}",
+            info.vista, info.edit
         );
 
         fill_path(&info, r"C:\Windows").expect("填入路径");

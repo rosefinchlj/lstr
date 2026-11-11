@@ -3,11 +3,11 @@
 //! `GetMessageW` 循环（不需要窗口）。回调里只做类名过滤这种最轻的判断，
 //! 完整校验（编辑框链、可见性）交给 egui 主循环的 `dialog::foreground_dialog()`。
 
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{

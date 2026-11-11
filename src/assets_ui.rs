@@ -162,7 +162,7 @@ fn action_button(
     painter.rect_stroke(
         rect,
         CornerRadius::same(6),
-        Stroke::new(1.0, theme.hair),
+        Stroke::new(1.0_f32, theme.hair),
         StrokeKind::Inside,
     );
     painter.text(
@@ -302,7 +302,7 @@ pub fn paint(
                             egui::pos2(rect.left() + 4.0, rect.bottom()),
                             egui::pos2(rect.right() - 4.0, rect.bottom()),
                         ],
-                        Stroke::new(1.0, theme.hair),
+                        Stroke::new(1.0_f32, theme.hair),
                     );
                     p.text(
                         egui::pos2(rect.left() + 10.0, rect.center().y),
@@ -354,7 +354,7 @@ pub fn paint(
             egui::pos2(area.left(), editor_top),
             egui::pos2(area.right(), editor_top),
         ],
-        Stroke::new(1.0, theme.hair),
+        Stroke::new(1.0_f32, theme.hair),
     );
     let editing = state.selected.is_some();
     painter.text(

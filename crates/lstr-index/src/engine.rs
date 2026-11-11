@@ -2671,7 +2671,6 @@ mod tests {
     /// 一致)。旧实现 save 内部 compact,这里改为「保存视图 + 延迟 compact」。
     #[test]
     fn save_view_keeps_slots_and_drops_dead_entries() {
-        const DIR: u32 = 0x0010;
         let dir = temp_index_dir("pinyin-save-view");
         let guid = 0x4444u128;
         let mut engine = engine_with(&dir);

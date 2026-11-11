@@ -10,12 +10,6 @@ pub enum Kind {
     Command,
 }
 
-impl Kind {
-    pub fn is_file_like(self) -> bool {
-        matches!(self, Kind::File | Kind::Folder | Kind::Program)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     All,
@@ -45,17 +39,6 @@ impl Scope {
             Scope::File => "文件",
             Scope::App => "应用",
             Scope::Command => "命令",
-        }
-    }
-
-    pub fn from_key(key: &str) -> Self {
-        match key {
-            "folder" => Scope::Folder,
-            "program" => Scope::Program,
-            "file" => Scope::File,
-            "app" => Scope::App,
-            "command" => Scope::Command,
-            _ => Scope::All,
         }
     }
 
@@ -89,10 +72,6 @@ impl Entry {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| self.name.clone())
-    }
-
-    pub fn is_executable(&self) -> bool {
-        self.kind == Kind::Program
     }
 }
 

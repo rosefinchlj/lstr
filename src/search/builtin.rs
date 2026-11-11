@@ -22,8 +22,6 @@ use crate::search::pinyin;
 pub enum BackendKind {
     /// 自研索引(worker 管道在线)。
     Builtin,
-    /// Everything IPC。
-    Everything,
 }
 
 /// UI 聚合状态:索引构建进度 + 当前实际后端。
@@ -31,7 +29,6 @@ pub enum BackendKind {
 pub struct IndexUiStatus {
     pub phase: lstr_index::Phase,
     pub volumes: Vec<lstr_index::VolumeProgress>,
-    pub phase_since: std::time::Instant,
     pub backend: BackendKind,
     /// Everything IPC 是否可用(时间筛选的降级依据)。
     pub everything_ok: bool,
@@ -96,7 +93,6 @@ impl BuiltinProvider {
         IndexUiStatus {
             phase: st.phase,
             volumes: st.volumes,
-            phase_since: st.since,
             backend: BackendKind::Builtin,
             everything_ok: false,
         }
@@ -878,7 +874,7 @@ mod tests {
         // 文件分散到各 ai_dir 子目录(每条父目录 2-4 个候选),模拟真实查询
         // 候选来自几十个父目录的形态;第三个元素 = 父目录在 dir_names 的序号。
         let mut names: Vec<(String, bool, Option<usize>)> = Vec::new();
-        for (i, name) in dir_names.iter().enumerate() {
+        for name in &dir_names {
             names.push((name.clone(), true, None));
         }
         for i in 0..files {

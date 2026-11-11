@@ -236,10 +236,6 @@ pub fn hide(hwnd_value: isize) {
     }
 }
 
-pub fn is_foreground(hwnd_value: isize) -> bool {
-    unsafe { GetForegroundWindow().0 == hwnd(hwnd_value).0 }
-}
-
 pub fn force_foreground(hwnd_value: isize) {
     if hwnd_value == 0 {
         return;

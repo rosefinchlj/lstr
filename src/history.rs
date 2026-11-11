@@ -330,7 +330,8 @@ impl History {
         let _ = self.db.execute("DELETE FROM query_hits", []);
     }
 
-    /// 清空查询词学习数据，保留打开历史。
+    /// 清空查询词学习数据，保留打开历史（测试用）。
+    #[cfg(test)]
     pub fn clear_queries(&mut self) {
         let _ = self.db.execute("DELETE FROM query_hits", []);
     }

@@ -293,7 +293,7 @@ pub fn note_foreground_explorer() {
             seen.1 = title.clone();
         }
         if let Some((matched, folder)) =
-            with_com(|| unsafe { resolve_foreground(key, &title) }).flatten()
+            with_com(|| resolve_foreground(key, &title)).flatten()
         {
             remember(matched, &folder);
         }

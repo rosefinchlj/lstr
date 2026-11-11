@@ -6,9 +6,6 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SAM_FLAGS, REG_SZ,
 };
 
-const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-const VALUE_NAME: &str = "lstr";
-
 fn open_run_key(access: REG_SAM_FLAGS) -> Result<HKEY, String> {
     let mut key = HKEY::default();
     let err = unsafe {

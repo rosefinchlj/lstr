@@ -539,6 +539,7 @@ fn walk_memmem(
 /// 语义:按 names_lc 偏移序枚举 gen 的全部命中 → slot 解析(丢弃陈项)→
 /// 同条目去重 → 其余 token AND → 过滤 → total 精确计数(TOTAL_CAP 封顶)、
 /// 收集封顶 cap。
+#[cfg(test)]
 pub(crate) fn query_volume_memmem_scan(
     store: &VolumeStore,
     spec: &QuerySpec,

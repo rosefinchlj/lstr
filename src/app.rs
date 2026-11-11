@@ -462,7 +462,6 @@ impl LstrApp {
                         self.toast(ctx, "请先打开「打开/保存」对话框，再按 Ctrl+G".to_string());
                     }
                 },
-                HotkeyEvent::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
     }
@@ -1591,7 +1590,7 @@ impl LstrApp {
                 painter.rect_stroke(
                     rect.shrink(0.5),
                     CornerRadius::same(theme.radius),
-                    Stroke::new(1.0, theme.hair2),
+                    Stroke::new(1.0_f32, theme.hair2),
                     StrokeKind::Inside,
                 );
                 if !theme.light {
@@ -1601,7 +1600,7 @@ impl LstrApp {
                             egui::pos2(rect.left() + theme.radius as f32 + 2.0, y),
                             egui::pos2(rect.right() - theme.radius as f32 - 2.0, y),
                         ],
-                        Stroke::new(1.0, Color32::from_white_alpha(16)),
+                        Stroke::new(1.0_f32, Color32::from_white_alpha(16)),
                     );
                 }
 
@@ -1662,7 +1661,7 @@ impl LstrApp {
                         egui::pos2(rect.left() + PAD, rect.top() + SEARCH_H),
                         egui::pos2(rect.right() - PAD, rect.top() + SEARCH_H),
                     ],
-                    Stroke::new(1.0, focus_color),
+                    Stroke::new(1.0_f32, focus_color),
                 );
 
                 // 右侧图标统一垂直居中于搜索文本行（文本区 top+14 高 28 → 中线 top+28）。
@@ -1681,7 +1680,7 @@ impl LstrApp {
                     painter.rect_stroke(
                         gear_rect.shrink(1.0),
                         CornerRadius::same(6),
-                        Stroke::new(1.0, theme.hair2),
+                        Stroke::new(1.0_f32, theme.hair2),
                         StrokeKind::Inside,
                     );
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1714,7 +1713,7 @@ impl LstrApp {
                     painter.rect_stroke(
                         history_rect.shrink(1.0),
                         CornerRadius::same(6),
-                        Stroke::new(1.0, theme.hair2),
+                        Stroke::new(1.0_f32, theme.hair2),
                         StrokeKind::Inside,
                     );
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1728,7 +1727,7 @@ impl LstrApp {
                 };
                 // 画一个时钟图标（字体缺 U+23F2 之类的 glyph）。
                 let center = history_rect.center();
-                let clock = Stroke::new(1.3, history_color);
+                let clock = Stroke::new(1.3_f32, history_color);
                 painter.circle_stroke(center, 7.0, clock);
                 painter.line_segment(
                     [center, center + egui::vec2(0.0, -4.0)],
@@ -1745,7 +1744,7 @@ impl LstrApp {
                             center + egui::vec2(-6.5, 6.5),
                             center + egui::vec2(6.5, -6.5),
                         ],
-                        Stroke::new(1.6, history_color),
+                        Stroke::new(1.6_f32, history_color),
                     );
                 }
                 if history.hovered() {
@@ -1787,7 +1786,7 @@ impl LstrApp {
                         painter.rect_stroke(
                             clear_rect.shrink(1.0),
                             CornerRadius::same(6),
-                            Stroke::new(1.0, theme.hair2),
+                            Stroke::new(1.0_f32, theme.hair2),
                             StrokeKind::Inside,
                         );
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1866,7 +1865,7 @@ impl LstrApp {
                         banner,
                         CornerRadius::same(7),
                         Stroke::new(
-                            1.0,
+                            1.0_f32,
                             if response.hovered() {
                                 theme.amber.gamma_multiply(0.6)
                             } else {
@@ -1906,7 +1905,7 @@ impl LstrApp {
                             egui::pos2(list_rect.right() + 3.0, rect.top() + SEARCH_H),
                             egui::pos2(list_rect.right() + 3.0, footer_top),
                         ],
-                        Stroke::new(1.0, theme.hair),
+                        Stroke::new(1.0_f32, theme.hair),
                     );
                     let pane = Rect::from_min_max(
                         egui::pos2(list_rect.right() + 9.0, list_top),
@@ -1925,7 +1924,7 @@ impl LstrApp {
                     painter.rect_stroke(
                         strip,
                         CornerRadius::same(7),
-                        Stroke::new(1.0, theme.amber.gamma_multiply(0.35)),
+                        Stroke::new(1.0_f32, theme.amber.gamma_multiply(0.35)),
                         StrokeKind::Inside,
                     );
                     painter.circle_filled(
@@ -2089,7 +2088,7 @@ impl LstrApp {
                     chip,
                     CornerRadius::same(6),
                     Stroke::new(
-                        1.0,
+                        1.0_f32,
                         if active {
                             theme.amber.gamma_multiply(0.6)
                         } else {
@@ -2241,7 +2240,7 @@ impl LstrApp {
             .show(ui.ctx(), |ui| {
                 let frame = egui::Frame {
                     fill: theme.menu,
-                    stroke: Stroke::new(1.0, theme.hair2),
+                    stroke: Stroke::new(1.0_f32, theme.hair2),
                     corner_radius: CornerRadius::same(10),
                     inner_margin: egui::Margin::same(4),
                     shadow: egui::epaint::Shadow {
@@ -2275,7 +2274,7 @@ impl LstrApp {
                         if item.selected {
                             // ✓ 同样可能缺字形，用两段线画一个对勾。
                             let tip = egui::pos2(row.right() - 14.0, row.center().y + 1.0);
-                            let stroke = Stroke::new(1.6, theme.amber);
+                            let stroke = Stroke::new(1.6_f32, theme.amber);
                             ui.painter().line_segment(
                                 [tip + egui::vec2(-5.0, 0.0), tip + egui::vec2(-1.5, 3.5)],
                                 stroke,
@@ -3038,7 +3037,7 @@ impl LstrApp {
                 egui::pos2(rect.left() + PAD, footer_top),
                 egui::pos2(rect.right() - PAD, footer_top),
             ],
-            Stroke::new(1.0, theme.hair),
+            Stroke::new(1.0_f32, theme.hair),
         );
 
         let mut default_text = if query.is_empty() {
@@ -3144,7 +3143,7 @@ impl LstrApp {
             painter.rect_stroke(
                 key_rect,
                 CornerRadius::same(4),
-                Stroke::new(1.0, theme.hair),
+                Stroke::new(1.0_f32, theme.hair),
                 StrokeKind::Inside,
             );
             painter.galley(
@@ -3400,7 +3399,7 @@ impl LstrApp {
             .show(ctx, |ui| {
                 let frame = egui::Frame {
                     fill: theme.menu,
-                    stroke: Stroke::new(1.0, theme.hair2),
+                    stroke: Stroke::new(1.0_f32, theme.hair2),
                     corner_radius: CornerRadius::same(10),
                     inner_margin: egui::Margin::same(4),
                     shadow: egui::epaint::Shadow {
@@ -3462,7 +3461,7 @@ impl LstrApp {
 
     fn paint_preview(
         &mut self,
-        ui: &mut egui::Ui,
+        _ui: &mut egui::Ui,
         painter: &egui::Painter,
         pane: Rect,
         entry: &Entry,
@@ -3566,7 +3565,6 @@ impl LstrApp {
                 ui::mono_font(11.0),
                 theme.sub,
             );
-            y += 16.0;
         }
     }
 
@@ -3597,7 +3595,7 @@ impl LstrApp {
             box_rect,
             CornerRadius::same(4),
             Stroke::new(
-                1.0,
+                1.0_f32,
                 if *checked {
                     theme.amber
                 } else if response.hovered() {
@@ -3610,7 +3608,7 @@ impl LstrApp {
         );
         if *checked {
             let tip = egui::pos2(box_rect.center().x, box_rect.center().y + 1.0);
-            let mark = Stroke::new(1.8, Color32::WHITE);
+            let mark = Stroke::new(1.8_f32, Color32::WHITE);
             painter.line_segment(
                 [tip + egui::vec2(-4.0, 0.0), tip + egui::vec2(-1.0, 3.0)],
                 mark,
@@ -3756,7 +3754,7 @@ impl LstrApp {
                 egui::pos2(rect.left() + SIDEBAR_W, rect.top() + 56.0),
                 egui::pos2(rect.left() + SIDEBAR_W, rect.bottom() - 16.0),
             ],
-            Stroke::new(1.0, theme.hair),
+            Stroke::new(1.0_f32, theme.hair),
         );
 
         let area = Rect::from_min_max(
@@ -3810,7 +3808,7 @@ impl LstrApp {
             painter.rect_stroke(
                 button,
                 CornerRadius::same(6),
-                Stroke::new(1.0, if selected { theme.amber } else { theme.hair }),
+                Stroke::new(1.0_f32, if selected { theme.amber } else { theme.hair }),
                 StrokeKind::Inside,
             );
             painter.text(
@@ -3857,9 +3855,9 @@ impl LstrApp {
                 Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
             );
             if selected {
-                painter.circle_stroke(swatch.center(), 10.0, Stroke::new(2.0, theme.text));
+                painter.circle_stroke(swatch.center(), 10.0, Stroke::new(2.0_f32, theme.text));
             } else if response.hovered() {
-                painter.circle_stroke(swatch.center(), 10.0, Stroke::new(1.5, theme.sub));
+                painter.circle_stroke(swatch.center(), 10.0, Stroke::new(1.5_f32, theme.sub));
             }
             if response.hovered() {
                 response.clone().on_hover_text(*name);
@@ -4272,7 +4270,7 @@ impl LstrApp {
         painter.rect_stroke(
             reset,
             CornerRadius::same(6),
-            Stroke::new(1.0, theme.hair),
+            Stroke::new(1.0_f32, theme.hair),
             StrokeKind::Inside,
         );
         painter.text(
@@ -4375,7 +4373,7 @@ impl LstrApp {
         painter.rect_stroke(
             add,
             CornerRadius::same(6),
-            Stroke::new(1.0, theme.hair),
+            Stroke::new(1.0_f32, theme.hair),
             StrokeKind::Inside,
         );
         painter.text(
@@ -4406,7 +4404,7 @@ impl LstrApp {
         painter.rect_stroke(
             reset,
             CornerRadius::same(6),
-            Stroke::new(1.0, theme.hair),
+            Stroke::new(1.0_f32, theme.hair),
             StrokeKind::Inside,
         );
         painter.text(
@@ -4466,7 +4464,6 @@ impl LstrApp {
                     "{base} · 后端:{} · Everything:{}",
                     match st.backend {
                         crate::search::builtin::BackendKind::Builtin => "内置索引",
-                        crate::search::builtin::BackendKind::Everything => "Everything",
                     },
                     if st.everything_ok { "在线" } else { "离线" }
                 )
@@ -4550,7 +4547,7 @@ impl LstrApp {
             painter.rect_stroke(
                 rect,
                 CornerRadius::same(6),
-                Stroke::new(1.0, if on { theme.amber } else { theme.hair }),
+                Stroke::new(1.0_f32, if on { theme.amber } else { theme.hair }),
                 StrokeKind::Inside,
             );
             painter.text(
@@ -4631,7 +4628,7 @@ impl LstrApp {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             painter.rect_filled(rect, CornerRadius::same(6), if accent { theme.amber_soft } else { theme.hover });
-            painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, if accent { theme.amber } else { theme.hair }), StrokeKind::Inside);
+            painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0_f32, if accent { theme.amber } else { theme.hair }), StrokeKind::Inside);
             painter.text(rect.center(), Align2::CENTER_CENTER, *label, font.clone(), if accent { theme.amber } else { theme.text });
             if response.clicked() {
                 self.set_cfg_index_backend(key);
@@ -4646,7 +4643,7 @@ impl LstrApp {
         let rect = Rect::from_min_size(egui::pos2(area.left() + 130.0, y), egui::vec2(180.0, 26.0));
         let response = ui.interact(rect, Id::new("lstr-idx-noise"), Sense::click());
         painter.rect_filled(rect, CornerRadius::same(6), if noise_on { theme.amber_soft } else { theme.hover });
-        painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, if noise_on { theme.amber } else { theme.hair }), StrokeKind::Inside);
+        painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0_f32, if noise_on { theme.amber } else { theme.hair }), StrokeKind::Inside);
         painter.text(rect.center(), Align2::CENTER_CENTER, if noise_on { "已排除(node_modules 等)" } else { "不过滤(内存占用更高)" }, ui::text_font(10.5), if noise_on { theme.amber } else { theme.text });
         if response.clicked() {
             self.set_cfg_index_noise(!noise_on);
@@ -4773,7 +4770,7 @@ impl LstrApp {
             painter.rect_stroke(
                 rect,
                 CornerRadius::same(6),
-                Stroke::new(1.0, if accent { theme.amber } else { theme.hair }),
+                Stroke::new(1.0_f32, if accent { theme.amber } else { theme.hair }),
                 StrokeKind::Inside,
             );
             painter.text(
