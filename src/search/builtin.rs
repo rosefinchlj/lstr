@@ -1329,6 +1329,7 @@ mod tests {
             show_history: false,
             favorites: Vec::new(),
             base_folder: None,
+            browse_root: None,
         };
         let old_final = super::super::finalize_entries(
             old_entries,
@@ -1410,6 +1411,7 @@ mod tests {
             show_history: false,
             favorites: Vec::new(),
             base_folder: None,
+            browse_root: None,
         };
         let old_final = super::super::finalize_entries(
             old_entries,
@@ -1495,6 +1497,7 @@ mod tests {
             show_history: false,
             favorites: Vec::new(),
             base_folder: None,
+            browse_root: None,
         };
         let old_final = super::super::finalize_entries(
             old_entries,
@@ -1580,6 +1583,7 @@ mod tests {
             show_history: false,
             favorites: Vec::new(),
             base_folder: None,
+            browse_root: None,
         };
         let old_final = super::super::finalize_entries(
             vec![old_entry],
@@ -1683,6 +1687,7 @@ mod tests {
             show_history: false,
             favorites: Vec::new(),
             base_folder: None,
+            browse_root: None,
         };
         // 旧完整路径:候选阶段对全部候选逐条 find_meta(folder 120 / file 480)
         // → finalize。

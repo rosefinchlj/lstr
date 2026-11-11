@@ -230,6 +230,10 @@ pub struct LstrApp {
     typing_folder: Option<std::path::PathBuf>,
     /// 目录上下文里临时切到全局搜索（Ctrl+Shift+G）。
     typing_global: bool,
+    /// 深路径浏览模式的当前目录：输入框只放过滤词，面包屑占 TABS 行。
+    browse_root: Option<std::path::PathBuf>,
+    /// 面包屑中间省略号展开的祖先弹层。
+    crumb_more: bool,
     /// 设置页「唤起热键」录制状态（None = 未在录制）。
     hotkey_recording: Option<HotkeyRecording>,
 }
@@ -358,6 +362,8 @@ impl LstrApp {
             typing,
             assets_ui: crate::assets_ui::AssetUiState::default(),
             typing_folder: None,
+            browse_root: None,
+            crumb_more: false,
             typing_global: false,
             hotkey_recording: None,
         }
@@ -723,15 +729,27 @@ impl LstrApp {
                 } else {
                     self.typing_folder.clone()
                 };
-                self.pending_gen = self.service.search_in(
-                    &self.input,
-                    self.scope,
-                    self.dialog.is_some(),
-                    &self.filters,
-                    &self.cfg.rank,
-                    self.cfg.show_history,
-                    base_folder,
-                );
+                self.pending_gen = if let Some(root) = self.browse_root.clone() {
+                    self.service.search_browse(
+                        &self.input,
+                        self.scope,
+                        self.dialog.is_some(),
+                        &self.filters,
+                        &self.cfg.rank,
+                        self.cfg.show_history,
+                        root,
+                    )
+                } else {
+                    self.service.search_in(
+                        &self.input,
+                        self.scope,
+                        self.dialog.is_some(),
+                        &self.filters,
+                        &self.cfg.rank,
+                        self.cfg.show_history,
+                        base_folder,
+                    )
+                };
                 self.search_sent_at = Some(Instant::now());
                 self.ui_total_ms = None;
                 self.waiting = true;
@@ -831,6 +849,7 @@ impl LstrApp {
             self.scroll_y = 0.0;
             self.scroll_to_selection = false;
             self.filters = SearchFilters::default();
+            self.browse_root = None;
         }
         Self::reset_input_cursor(ctx);
         self.filter_menu = None;
@@ -851,6 +870,7 @@ impl LstrApp {
         self.dialog = Some(info.clone());
         self.typing_folder = None;
         self.typing_global = false;
+        self.browse_root = None;
         self.menu_open = false;
         self.center_frames = 0;
         self.pending_show = true;
@@ -953,7 +973,10 @@ impl LstrApp {
             let mut list_h = if rows == 0 { 120.0 } else { rows as f32 * self.theme.row_h };
             // 空态技巧面板（分类两列约 280px）：仅空输入+空结果时撑高窗口，
             // 一旦有结果或开始输入即恢复按行数计算。
-            let tips_active = rows == 0 && self.input.trim().is_empty() && !self.settings_open;
+            let tips_active = rows == 0
+                && self.input.trim().is_empty()
+                && !self.settings_open
+                && self.browse_root.is_none();
             if tips_active {
                 list_h = list_h.max(300.0);
             }
@@ -1016,6 +1039,10 @@ impl LstrApp {
         // 设置面板 先各自收起，全部收完后再按一次才隐藏窗口。
         // 窗口不会因为失焦自动关闭。
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            if self.crumb_more {
+                self.crumb_more = false;
+                return;
+            }
             if self.menu_open {
                 self.menu_open = false;
                 return;
@@ -1031,6 +1058,17 @@ impl LstrApp {
             self.menu_open = false;
             self.filter_menu = None;
             self.settings_open = false;
+            if self.in_browse() {
+                // Esc 分层：先清过滤词，再退出浏览（不直接收窗）。
+                if !self.input.is_empty() {
+                    self.input.clear();
+                    Self::reset_input_cursor(ctx);
+                    self.trigger(ctx);
+                } else {
+                    self.exit_browse(ctx);
+                }
+                return;
+            }
             if let Some(dialog) = self.dialog.take() {
                 // 交还焦点：抑制这个对话框的自动唤出。
                 self.suppressed_dialog = Some(dialog.hwnd);
@@ -1069,6 +1107,12 @@ impl LstrApp {
             self.preview_open = !self.preview_open;
             self.cfg.preview = self.preview_open;
             let _ = self.cfg.save();
+            return;
+        }
+
+        // Ctrl+L：浏览模式下把当前目录放回输入框，切回可编辑完整路径。
+        if self.in_browse() && ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::L)) {
+            self.edit_browse_path(ctx);
             return;
         }
 
@@ -1143,22 +1187,32 @@ impl LstrApp {
             }
         }
 
-        // 路径模式回退：Alt+↑ 或（筛选为空时）Backspace 一次退一整级。
-        if self.path_mode() {
+        // 路径/浏览模式回退：Alt+↑ 或（过滤词为空时）Backspace 一次退一整级。
+        let has_selection = {
+            let id = egui::Id::new("lstr-search-input");
+            egui::widgets::text_edit::TextEditState::load(ctx, id)
+                .and_then(|state| state.cursor.char_range())
+                .map(|range| range.primary.index != range.secondary.index)
+                .unwrap_or(false)
+        };
+        if self.in_browse() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowUp)) {
+                self.browse_up(ctx);
+                return;
+            }
+            if self.input.is_empty()
+                && !has_selection
+                && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace))
+            {
+                self.browse_up(ctx);
+                return;
+            }
+        } else if self.path_mode() {
             if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowUp)) {
                 self.path_up(ctx);
                 return;
             }
-            let filter_empty = self.input.ends_with(std::path::is_separator);
-            // 有选中文本（如 Ctrl+A 全选）时让 TextEdit 正常删除，不触发整级回退。
-            let has_selection = {
-                let id = egui::Id::new("lstr-search-input");
-                egui::widgets::text_edit::TextEditState::load(ctx, id)
-                    .and_then(|state| state.cursor.char_range())
-                    .map(|range| range.primary.index != range.secondary.index)
-                    .unwrap_or(false)
-            };
-            if filter_empty
+            if self.input.ends_with(std::path::is_separator)
                 && !has_selection
                 && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace))
             {
@@ -1178,11 +1232,13 @@ impl LstrApp {
 
         let input_empty = self.input.is_empty();
         let mut scope_delta = 0;
-        if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowLeft)) {
-            scope_delta = -1;
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowRight)) {
-            scope_delta = 1;
+        if !self.in_browse() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowLeft)) {
+                scope_delta = -1;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowRight)) {
+                scope_delta = 1;
+            }
         }
         if scope_delta != 0 {
             self.step_scope(ctx, scope_delta);
@@ -1215,10 +1271,12 @@ impl LstrApp {
             self.move_selection(-6);
         }
 
-        if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) {
-            self.step_scope(ctx, -1);
-        } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
-            self.step_scope(ctx, 1);
+        if !self.in_browse() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) {
+                self.step_scope(ctx, -1);
+            } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
+                self.step_scope(ctx, 1);
+            }
         }
 
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Enter)) {
@@ -1338,7 +1396,7 @@ impl LstrApp {
         }
         // 路径模式：Enter 文件夹 = 继续深入；想在资源管理器打开用 Ctrl+Enter。
         // 普通模式下 Enter 文件夹仍保持打开行为，只有 → 下钻。
-        if entry.kind == Kind::Folder && self.path_mode() {
+        if entry.kind == Kind::Folder && self.path_ui() {
             self.descend_index(ctx, index);
             return;
         }
@@ -1352,7 +1410,10 @@ impl LstrApp {
             if crate::win::explorer::navigate_active_to(&entry.full_path()).is_ok() {
                 self.service.record_open(&entry);
                 if let Ok(mut history) = self.history.lock() {
-                    history.record_query(&self.input, &entry);
+                    // 浏览模式下输入框只是过滤词，不能当成完整查询记录。
+                    if self.browse_root.is_none() {
+                        history.record_query(&self.input, &entry);
+                    }
                 }
                 self.hide_keep(ctx);
                 return;
@@ -1363,7 +1424,10 @@ impl LstrApp {
                 self.service.record_open(&entry);
                 // P1-1：记住「搜这个词时选了它」。
                 if let Ok(mut history) = self.history.lock() {
-                    history.record_query(&self.input, &entry);
+                    // 浏览模式下输入框只是过滤词，不能当成完整查询记录。
+                    if self.browse_root.is_none() {
+                        history.record_query(&self.input, &entry);
+                    }
                 }
                 self.hide_keep(ctx);
             }
@@ -1689,7 +1753,9 @@ impl LstrApp {
                         28.0,
                     ),
                 );
-                let hint = if self.filters.matches.regex {
+                let hint = if self.in_browse() {
+                    "在当前目录过滤…".to_string()
+                } else if self.filters.matches.regex {
                     "输入正则表达式…".to_string()
                 } else if self.dialog.is_some() {
                     dialog_hint(query.scope).to_string()
@@ -1878,11 +1944,16 @@ impl LstrApp {
                     );
                     if clear.clicked() {
                         lstr_index::snapshot::debug_log("ui: clear_button");
-                        self.input.clear();
-                        self.selected = 0;
-                        self.menu_open = false;
-                        self.focus_requested = true;
-                        self.trigger(ctx);
+                        if self.in_browse() && self.input.is_empty() {
+                            // 浏览模式过滤词已空：× 退出浏览。
+                            self.exit_browse(ctx);
+                        } else {
+                            self.input.clear();
+                            self.selected = 0;
+                            self.menu_open = false;
+                            self.focus_requested = true;
+                            self.trigger(ctx);
+                        }
                     }
                 }
 
@@ -2057,6 +2128,10 @@ impl LstrApp {
         rect: Rect,
         query: &crate::model::Query,
     ) {
+        if let Some(root) = self.browse_root.clone() {
+            self.paint_breadcrumb(ui, painter, rect, &root);
+            return;
+        }
         let theme = self.theme;
         let y = rect.top() + SEARCH_H + 6.0;
         let mut x = rect.left() + PAD;
@@ -2113,13 +2188,245 @@ impl LstrApp {
         }
     }
 
+    /// 浏览模式的面包屑：占用原类别 Tab 那一行（高 20px），窗口高度不变。
+    /// 祖先可点击跳转；中间放不下时折叠成 …，点开列出隐藏的祖先。
+    fn paint_breadcrumb(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        root: &std::path::Path,
+    ) {
+        let theme = self.theme;
+        let font = ui::text_font(12.5);
+        let y = rect.top() + SEARCH_H + 6.0;
+        let height = 20.0;
+        let hint = "Ctrl+L 编辑 · Alt↑ 上级";
+        let hint_galley = painter.layout_no_wrap(hint.to_string(), ui::mono_font(10.0), theme.dim);
+        let hint_w = hint_galley.size().x + 16.0;
+        let max_right = rect.right() - PAD - hint_w;
+        let items = breadcrumb_items(root);
+        let widths: Vec<f32> = items
+            .iter()
+            .map(|(label, _)| {
+                painter
+                    .layout_no_wrap(label.clone(), font.clone(), theme.sub)
+                    .size()
+                    .x
+            })
+            .collect();
+        let sep_w = 14.0;
+        let total: f32 = widths.iter().sum::<f32>()
+            + sep_w * items.len().saturating_sub(1) as f32;
+        let avail = max_right - (rect.left() + PAD);
+
+        // 可见项：全放不下时保留“此电脑”+ 末尾若干项，中间用 … 折叠。
+        let mut visible: Vec<usize> = (0..items.len()).collect();
+        let mut hidden: Vec<usize> = Vec::new();
+        if total > avail && items.len() > 2 {
+            let ell_w = 18.0;
+            let mut used = widths[0];
+            let mut tail: Vec<usize> = Vec::new();
+            for idx in (1..items.len()).rev() {
+                let cost = sep_w + widths[idx];
+                if used + ell_w + sep_w + cost > avail {
+                    break;
+                }
+                tail.push(idx);
+                used += cost;
+            }
+            if !tail.is_empty() {
+                tail.reverse();
+                hidden = (1..items.len()).filter(|i| !tail.contains(i)).collect();
+                visible = std::iter::once(0).chain(tail).collect();
+            }
+        }
+
+        enum Part {
+            Item(usize),
+            Ellipsis,
+        }
+        let mut parts: Vec<Part> = Vec::new();
+        if hidden.is_empty() {
+            parts.extend(visible.iter().copied().map(Part::Item));
+        } else {
+            parts.push(Part::Item(visible[0]));
+            parts.push(Part::Ellipsis);
+            parts.extend(visible[1..].iter().copied().map(Part::Item));
+        }
+
+        let mut x = rect.left() + PAD;
+        let mut clicked: Option<usize> = None;
+        let mut more_clicked = false;
+        for (n, part) in parts.iter().enumerate() {
+            if n > 0 {
+                painter.text(
+                    egui::pos2(x, y + height * 0.5),
+                    Align2::LEFT_CENTER,
+                    "›",
+                    ui::text_font(11.0),
+                    theme.dim,
+                );
+                x += sep_w;
+            }
+            match part {
+                Part::Item(idx) => {
+                    let (label, path) = &items[*idx];
+                    let w = widths[*idx];
+                    let crumb = Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, height));
+                    let response =
+                        ui.interact(crumb, Id::new(("lstr-crumb", *idx)), Sense::click());
+                    let active = *idx == items.len() - 1;
+                    let color = if active {
+                        theme.text
+                    } else if response.hovered() {
+                        theme.amber
+                    } else {
+                        theme.sub
+                    };
+                    painter.galley(
+                        egui::pos2(x, y),
+                        painter.layout_no_wrap(label.clone(), font.clone(), color),
+                        color,
+                    );
+                    if response.hovered() {
+                        response.clone().on_hover_text(path.display().to_string());
+                    }
+                    if response.clicked() {
+                        clicked = Some(*idx);
+                    }
+                    x += w;
+                }
+                Part::Ellipsis => {
+                    let r = Rect::from_min_size(egui::pos2(x, y), egui::vec2(18.0, height));
+                    let response = ui.interact(r, Id::new("lstr-crumb-more"), Sense::click());
+                    let color = if response.hovered() {
+                        theme.amber
+                    } else {
+                        theme.dim
+                    };
+                    painter.galley(
+                        egui::pos2(x + 2.0, y),
+                        painter.layout_no_wrap("…".to_string(), font.clone(), color),
+                        color,
+                    );
+                    if response.clicked() {
+                        more_clicked = true;
+                    }
+                    x += 18.0;
+                }
+            }
+        }
+        painter.galley(
+            egui::pos2(rect.right() - PAD - hint_galley.size().x, y),
+            hint_galley,
+            theme.dim,
+        );
+
+        if more_clicked {
+            self.crumb_more = true;
+        }
+        if let Some(idx) = clicked {
+            self.crumb_more = false;
+            let path = items[idx].1.clone();
+            if path.as_os_str().is_empty() {
+                self.exit_browse(ui.ctx());
+            } else {
+                self.browse_root = Some(path);
+                self.input.clear();
+                self.selected = 0;
+                self.scroll_y = 0.0;
+                self.menu_open = false;
+                self.filter_menu = None;
+                Self::reset_input_cursor(ui.ctx());
+                self.focus_requested = true;
+                self.trigger(ui.ctx());
+            }
+            return;
+        }
+
+        if self.crumb_more && !hidden.is_empty() {
+            let mut more_clicked_item: Option<usize> = None;
+            let area = egui::Area::new(Id::new("lstr-crumb-more-menu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(rect.left() + PAD, y + 24.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame {
+                        fill: theme.menu,
+                        stroke: Stroke::new(1.0_f32, theme.hair2),
+                        corner_radius: CornerRadius::same(10),
+                        inner_margin: egui::Margin::same(4),
+                        ..Default::default()
+                    }
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        for idx in &hidden {
+                            let (row, response) = ui.allocate_exact_size(
+                                egui::vec2(260.0, 26.0),
+                                Sense::click(),
+                            );
+                            if response.hovered() {
+                                ui.painter().rect_filled(
+                                    row.shrink(2.0),
+                                    CornerRadius::same(6),
+                                    theme.surface_hi,
+                                );
+                            }
+                            ui.painter().text(
+                                egui::pos2(row.left() + 8.0, row.center().y),
+                                Align2::LEFT_CENTER,
+                                &items[*idx].0,
+                                ui::text_font(12.0),
+                                theme.text,
+                            );
+                            if response.clicked() {
+                                more_clicked_item = Some(*idx);
+                            }
+                        }
+                    });
+                });
+            if let Some(idx) = more_clicked_item {
+                self.crumb_more = false;
+                let path = items[idx].1.clone();
+                if path.as_os_str().is_empty() {
+                    self.exit_browse(ui.ctx());
+                } else {
+                    self.browse_root = Some(path);
+                    self.input.clear();
+                    self.selected = 0;
+                    self.scroll_y = 0.0;
+                    Self::reset_input_cursor(ui.ctx());
+                    self.focus_requested = true;
+                    self.trigger(ui.ctx());
+                }
+            } else if ui.ctx().input(|i| i.pointer.any_click()) {
+                if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                    if !area.response.rect.contains(pos) {
+                        self.crumb_more = false;
+                    }
+                }
+            }
+        }
+    }
+
     /// 筛选条：位置 / 时间 / 类型三个按钮。用户点选即可，内部自动翻译成
     /// Everything 的 path:/dm:/ext: 查询段——不需要记语法。
     fn paint_filters(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
         let theme = self.theme;
+        let y = rect.top() + SEARCH_H + TABS_H + 2.0;
+        // 浏览模式下筛选条没有意义：整行改为操作提示，避免四个灰 chip 噪音。
+        if self.in_browse() {
+            painter.text(
+                egui::pos2(rect.left() + PAD, y + 11.0),
+                Align2::LEFT_CENTER,
+                "浏览模式 · 输入过滤当前目录（Ctrl+L 编辑路径）",
+                ui::mono_font(10.0),
+                theme.dim,
+            );
+            return;
+        }
         // 路径模式本身就是位置筛选，按钮仅在普通搜索下生效。
         let path_mode = self.path_mode();
-        let y = rect.top() + SEARCH_H + TABS_H + 2.0;
         let mut x = rect.left() + PAD;
 
         let chips: [(FilterMenuKind, String, bool); 4] = [
@@ -2468,7 +2775,7 @@ impl LstrApp {
         let theme = self.theme;
         if entries.is_empty() {
             // 空查询（还没开始搜索）：分类两列的搜索技巧面板。
-            if query.is_empty() {
+            if query.is_empty() && self.browse_root.is_none() {
                 self.needle_target = 0.0;
                 self.scrollable = false;
                 // 左列「搜索语法」：位置 / 筛选 / 范围；右列「输入与快捷键」。
@@ -2485,7 +2792,11 @@ impl LstrApp {
                     ),
                     (
                         "筛选",
-                        &[("ext:rs", "按扩展名"), ("时间 · 类型", "用下方筛选条切换")],
+                        &[
+                            ("ext:rs", "按扩展名"),
+                            ("时间 · 类型", "用下方筛选条切换"),
+                            ("匹配", "大小写 / 全词 / 正则"),
+                        ],
                     ),
                     (
                         "范围",
@@ -2593,7 +2904,7 @@ impl LstrApp {
                 ui::text_font(15.0),
                 theme.text,
             );
-            let empty_hint = if self.path_mode() {
+            let empty_hint = if self.path_ui() {
                 "目录为空、不存在或无权限"
             } else if self.dialog.is_some() {
                 match query.scope {
@@ -2661,7 +2972,7 @@ impl LstrApp {
         let mut clicked = None;
         let mut drag_started = None;
         let q = query.text.to_lowercase();
-        let path_mode = self.path_mode();
+        let path_mode = self.path_ui();
         // 副标题（等宽字体）的字符预算：用实际字符宽度换算，尽量把行宽用满。
         let mono_char_w = ui::mono_font(11.5);
         let char_w = painter
@@ -3215,6 +3526,13 @@ impl LstrApp {
                 if self.scrollable { " · 滚轮查看更多" } else { "" }
             )
         };
+        if let Some(root) = &self.browse_root {
+            let name = root
+                .file_name()
+                .map(|part| part.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.to_string_lossy().into_owned());
+            default_text = format!("{} 项 · 目录: {name}", entries.len());
+        }
         if let Some(folder) = &self.typing_folder {
             if self.typing_global {
                 default_text.push_str(" · 全局");
@@ -3238,13 +3556,20 @@ impl LstrApp {
             theme.dim
         };
 
-        let path_mode = self.path_mode();
+        let path_mode = self.path_ui();
         let selected_is_folder = self
             .entries
             .get(self.selected)
             .map(|entry| entry.kind == Kind::Folder)
             .unwrap_or(false);
-        let hints: [(&str, &str); 4] = if path_mode {
+        let hints: [(&str, &str); 4] = if self.in_browse() {
+            [
+                ("↑↓", "选择"),
+                ("↵", "进入"),
+                ("Alt↑", "上一级"),
+                ("Esc", "返回"),
+            ]
+        } else if path_mode {
             [
                 ("↑↓", "选择"),
                 ("→", "进入"),
@@ -3346,14 +3671,23 @@ impl LstrApp {
         true
     }
 
-    /// 是否处于路径模式（PathTyping）。正则模式下输入 `D:\...` 也按正则处理，
-    /// 不能误进目录浏览。
+    /// 是否处于 PathTyping（手输完整路径）。正则模式下 `D:\...` 也按正则处理。
     fn path_mode(&self) -> bool {
         !self.filters.matches.regex && crate::search::browse::parse(&self.input).is_some()
     }
 
-    /// 文件夹结果：就地展开（Listary 式下钻）。输入框替换为 `路径\` 进入路径模式，
-    /// 返回 false 表示选中项不是文件夹，调用方退回原行为（动作菜单/打开）。
+    /// 深路径浏览：输入框只放过滤词，当前目录由 browse_root 承担。
+    fn in_browse(&self) -> bool {
+        self.browse_root.is_some()
+    }
+
+    /// 路径 UI（PathTyping 或 Browse）：筛选条/高亮/footer 用。
+    fn path_ui(&self) -> bool {
+        self.in_browse() || self.path_mode()
+    }
+
+    /// 文件夹结果：进入深路径浏览模式。输入框清空为过滤词，当前目录写进
+    /// browse_root（不再把整条路径塞进输入框）。返回 false 表示不是文件夹。
     fn descend_index(&mut self, ctx: &egui::Context, index: usize) -> bool {
         let Some(entry) = self.entries.get(index) else {
             return false;
@@ -3361,13 +3695,14 @@ impl LstrApp {
         if entry.kind != Kind::Folder {
             return false;
         }
-        let mut path = entry.full_path();
-        if !path.ends_with(['\\', '/']) {
-            path.push('\\');
-        }
-        self.input = path;
+        self.browse_root = Some(std::path::PathBuf::from(entry.full_path()));
+        self.input.clear();
         self.selected = 0;
+        self.scroll_y = 0.0;
+        self.scroll_to_selection = false;
         self.menu_open = false;
+        self.filter_menu = None;
+        Self::reset_input_cursor(ctx);
         self.move_caret_to_end(ctx);
         self.trigger(ctx);
         true
@@ -3386,6 +3721,59 @@ impl LstrApp {
         self.input = next;
         self.selected = 0;
         self.menu_open = false;
+        self.move_caret_to_end(ctx);
+        self.trigger(ctx);
+    }
+
+    /// 浏览模式回退一级；盘符根/UNC 根再回退就退出浏览。
+    fn browse_up(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.browse_root.clone() else {
+            return;
+        };
+        match root.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                self.browse_root = Some(parent.to_path_buf());
+                self.input.clear();
+                self.selected = 0;
+                self.scroll_y = 0.0;
+                self.menu_open = false;
+                self.filter_menu = None;
+                Self::reset_input_cursor(ctx);
+                self.trigger(ctx);
+            }
+            _ => self.exit_browse(ctx),
+        }
+    }
+
+    /// 退出浏览模式，回到全局搜索（输入与结果清空）。
+    fn exit_browse(&mut self, ctx: &egui::Context) {
+        if self.browse_root.take().is_none() {
+            return;
+        }
+        self.input.clear();
+        self.entries.clear();
+        self.selected = 0;
+        self.scroll_y = 0.0;
+        self.menu_open = false;
+        self.filter_menu = None;
+        Self::reset_input_cursor(ctx);
+        self.trigger(ctx);
+    }
+
+    /// Ctrl+L：把当前浏览目录放回输入框，切回可编辑完整路径的 PathTyping。
+    fn edit_browse_path(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.browse_root.take() else {
+            return;
+        };
+        let mut path = root.to_string_lossy().into_owned();
+        if !path.ends_with(['\\', '/']) {
+            path.push('\\');
+        }
+        self.input = path;
+        self.selected = 0;
+        self.menu_open = false;
+        self.filter_menu = None;
+        Self::reset_input_cursor(ctx);
         self.move_caret_to_end(ctx);
         self.trigger(ctx);
     }
@@ -5506,6 +5894,36 @@ fn split_path_head(
     lo
 }
 
+/// 面包屑分段：首项「此电脑」（空路径 = 退出浏览），随后盘符/UNC 根与各级目录。
+fn breadcrumb_items(root: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
+    use std::path::Component;
+    let mut items: Vec<(String, std::path::PathBuf)> =
+        vec![("此电脑".to_string(), std::path::PathBuf::new())];
+    let mut current = std::path::PathBuf::new();
+    for component in root.components() {
+        current.push(component.as_os_str());
+        match component {
+            Component::Prefix(prefix) => {
+                let mut label = prefix.as_os_str().to_string_lossy().into_owned();
+                while label.ends_with(['\\', '/']) {
+                    label.pop();
+                }
+                // Prefix 的 as_os_str 是 "D:"（不含根分隔符）；这里补回根，
+                // 后续 Normal 组件才能真正拼成 "D:\a" 而不是盘符相对路径 "D:a"。
+                let root = std::path::PathBuf::from(format!("{label}\\"));
+                current = root.clone();
+                items.push((label, root));
+            }
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                items.push((name.to_string_lossy().into_owned(), current.clone()));
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
 /// 按字符数把完整路径切成「第一行接排段」与「第二行续段」。
 fn split_at_chars(text: &str, count: usize) -> (String, String) {
     let mut chars = text.chars();
@@ -5757,5 +6175,15 @@ mod path_layout_tests {
             let items = menu_items(&menu_entry(kind, path), &[]);
             assert!(!item(&items, MenuAction::OpenTerminal).enabled, "{kind:?} 不应终端打开");
         }
+    }
+
+    #[test]
+    fn breadcrumb_items_split_drive_and_segments() {
+        let items = breadcrumb_items(std::path::Path::new(r"D:\a\b"));
+        let labels: Vec<&str> = items.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, vec!["此电脑", "D:", "a", "b"]);
+        assert_eq!(items[0].1, std::path::PathBuf::new(), "首项用于退出浏览");
+        assert_eq!(items[1].1, std::path::PathBuf::from(r"D:\"));
+        assert_eq!(items[3].1, std::path::PathBuf::from(r"D:\a\b"));
     }
 }

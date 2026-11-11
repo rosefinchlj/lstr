@@ -73,6 +73,8 @@ struct Request {
     favorites: Vec<crate::assets::Favorite>,
     /// P0-2：「Explorer 内键入即搜」锁定的当前目录（None = 全局搜索）。
     base_folder: Option<PathBuf>,
+    /// 深路径浏览模式的当前目录：输入框只放过滤词，worker 直接列这个目录。
+    browse_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -245,6 +247,52 @@ impl SearchService {
         show_history: bool,
         base_folder: Option<PathBuf>,
     ) -> u64 {
+        self.search_with_context(
+            raw,
+            scope,
+            dialog_quick,
+            filters,
+            rank,
+            show_history,
+            base_folder,
+            None,
+        )
+    }
+
+    /// 深路径浏览：输入框只放过滤词，worker 直接列 `browse_root` 的子项。
+    pub fn search_browse(
+        &mut self,
+        raw: &str,
+        scope: Scope,
+        dialog_quick: bool,
+        filters: &SearchFilters,
+        rank: &RankConfig,
+        show_history: bool,
+        browse_root: PathBuf,
+    ) -> u64 {
+        self.search_with_context(
+            raw,
+            scope,
+            dialog_quick,
+            filters,
+            rank,
+            show_history,
+            None,
+            Some(browse_root),
+        )
+    }
+
+    fn search_with_context(
+        &mut self,
+        raw: &str,
+        scope: Scope,
+        dialog_quick: bool,
+        filters: &SearchFilters,
+        rank: &RankConfig,
+        show_history: bool,
+        base_folder: Option<PathBuf>,
+        browse_root: Option<PathBuf>,
+    ) -> u64 {
         self.generation += 1;
         // 通知查询线程:更旧的查询可以立即放弃(打字时 "a"→"ai" 不再排队 600ms)。
         lstr_index::query::CANCEL_GEN
@@ -271,6 +319,7 @@ impl SearchService {
                 show_history,
                 favorites: self.favorites.clone(),
                 base_folder,
+                browse_root,
             })
             .is_err()
         {
@@ -455,6 +504,7 @@ mod pin_tests {
             show_history: true,
             favorites: Vec::new(),
             base_folder: None,
+            browse_root: None,
         }
     }
 
@@ -1031,6 +1081,52 @@ struct WorkerArgs {
     client_done: Arc<AtomicBool>,
 }
 
+/// 列目录响应：路径模式与深路径浏览共用（不碰 Everything/内置引擎）。
+fn browse_response(
+    dir: &str,
+    filter: &str,
+    request: &Request,
+    dir_cache: &mut browse::DirCache,
+    history: &Arc<Mutex<History>>,
+    config: &Config,
+) -> Response {
+    let started = Instant::now();
+    let needle = filter.to_lowercase();
+    let mut entries: Vec<Entry> = dir_cache
+        .children(dir)
+        .iter()
+        .filter(|entry| {
+            needle.is_empty()
+                || entry.name.to_lowercase().contains(&needle)
+                || entry
+                    .pinyin
+                    .as_deref()
+                    .map(|pinyin| pinyin.to_lowercase().contains(&needle))
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    let total = entries.len();
+    if let Ok(history) = history.lock() {
+        rank::rank_with(
+            &mut entries,
+            filter,
+            &history,
+            config.app_boost,
+            &request.rank,
+        );
+    }
+    // 浏览目录不是「搜索前 N 条」：放宽上限，列表靠 UI 滚动查看。
+    entries.truncate(request.limit.max(200));
+    Response {
+        generation: request.generation,
+        entries,
+        total,
+        elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
+        error: None,
+    }
+}
+
 fn run_worker(args: WorkerArgs) {
     let WorkerArgs {
         rx,
@@ -1305,6 +1401,28 @@ fn run_worker(args: WorkerArgs) {
             }
         }
 
+        // P0-2：深路径浏览模式：UI 已经拆出 root，输入框只放过滤词。
+        // 必须优先于 base_folder/path 解析，且不能走 resolve_exact（否则过滤词
+        // 恰好是已存在目录时会自动闯进去，面包屑和结果根不一致）。
+        if let Some(root) = request.browse_root.clone() {
+            let mut dir = root.to_string_lossy().into_owned();
+            if !dir.ends_with(['\\', '/']) {
+                dir.push('\\');
+            }
+            let filter = request.query.raw.trim();
+            let response = browse_response(
+                &dir,
+                filter,
+                &request,
+                &mut dir_cache,
+                &history,
+                &config,
+            );
+            send_response(&tx, &request, response);
+            ctx.request_repaint();
+            continue;
+        }
+
         // 路径模式（D:\foo\bar、\\server\share）：直接列目录，
         // 不碰 Everything，也不必为它懒启动 PowerShell 枚举 UWP。
         if let Some(path_query) = if request.filters.matches.regex {
@@ -1313,41 +1431,16 @@ fn run_worker(args: WorkerArgs) {
             browse::parse(&request.query.raw)
         } {
             let path_query = browse::resolve_exact(path_query);
-            let started = Instant::now();
-            let filter = path_query.filter.to_lowercase();
-            let mut entries: Vec<Entry> = dir_cache
-                .children(&path_query.dir)
-                .iter()
-                .filter(|entry| {
-                    filter.is_empty()
-                        || entry.name.to_lowercase().contains(&filter)
-                        || entry
-                            .pinyin
-                            .as_deref()
-                            .map(|pinyin| pinyin.to_lowercase().contains(&filter))
-                            .unwrap_or(false)
-                })
-                .cloned()
-                .collect();
-            let total = entries.len();
-            if let Ok(history) = history.lock() {
-                rank::rank_with(
-                    &mut entries,
-                    &path_query.filter,
-                    &history,
-                    config.app_boost,
-                    &request.rank,
-                );
-            }
-            // 浏览目录不是「搜索前 N 条」：放宽上限，列表靠 UI 滚动查看。
-            entries.truncate(request.limit.max(200));
-            send_response(&tx, &request, Response {
-                generation: request.generation,
-                entries,
-                total,
-                elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
-                error: None,
-            });            ctx.request_repaint();
+            let response = browse_response(
+                &path_query.dir,
+                &path_query.filter,
+                &request,
+                &mut dir_cache,
+                &history,
+                &config,
+            );
+            send_response(&tx, &request, response);
+            ctx.request_repaint();
             continue;
         }
 
@@ -2018,6 +2111,10 @@ fn url_encode(input: &str) -> String {
 mod tests {
     use super::*;
 
+    /// SearchService 端到端测试串行化：`CANCEL_GEN` 是进程级全局，并行测试
+    /// 的第二代查询会让另一个测试的首代响应被 send_response 丢弃。
+    static SERVICE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// 内置时间筛选的可用性:dir 首扫有 mtime;backend="usn" 固定走 dir
     /// 首扫(同样带 mtime);纯 USN 首扫没有 mtime。
     #[test]
@@ -2076,6 +2173,7 @@ mod tests {
             show_history: false,
             favorites: Vec::new(),
             base_folder: None,
+            browse_root: None,
         };
         let history = std::sync::Arc::new(std::sync::Mutex::new(
             crate::history::History::in_memory(),
@@ -2255,6 +2353,7 @@ mod tests {
 
     #[test]
     fn browse_mode_flows_through_service() {
+        let _guard = SERVICE_TEST_LOCK.lock().unwrap();
         // 路径模式只依赖 read_dir，无需 Everything，可做端到端回归。
         fn wait(service: &SearchService, generation: u64) -> Response {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2298,6 +2397,77 @@ mod tests {
                 && response.entries.iter().any(|e| e.name == "src" && e.kind == Kind::Folder),
             "完整目录路径应列出子项（Cargo.toml/src），实际: {names:?}"
         );
+    }
+
+    #[test]
+    fn browse_root_lists_children_and_skips_resolve_exact() {
+        let _guard = SERVICE_TEST_LOCK.lock().unwrap();
+        fn wait(service: &SearchService, generation: u64) -> Response {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(response) = service.poll() {
+                    if response.generation == generation {
+                        return response;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "等待浏览响应超时");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "lstr-browse-root-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("alpha")).unwrap();
+        std::fs::write(root.join("alpha").join("inner.txt"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("gamma")).unwrap();
+        std::fs::write(root.join("beta.txt"), b"x").unwrap();
+
+        let config = test_config();
+        let history = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::history::History::in_memory(),
+        ));
+        let ctx = eframe::egui::Context::default();
+        let mut service = SearchService::new(config, history, ctx);
+
+        // 空过滤词：列出 browse_root 的直接子项（3 项）。
+        let generation = service.search_browse(
+            "",
+            crate::model::Scope::All,
+            false,
+            &Default::default(),
+            &Default::default(),
+            false,
+            root.clone(),
+        );
+        let response = wait(&service, generation);
+        let mut names: Vec<String> = response.entries.iter().map(|e| e.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["alpha", "beta.txt", "gamma"]);
+
+        // 过滤词恰好是已存在目录名：只过滤出这一项，不能触发 resolve_exact
+        // 自动闯进 alpha（否则会列出 inner.txt）。
+        let generation = service.search_browse(
+            "alpha",
+            crate::model::Scope::All,
+            false,
+            &Default::default(),
+            &Default::default(),
+            false,
+            root.clone(),
+        );
+        let response = wait(&service, generation);
+        assert_eq!(response.entries.len(), 1, "应只过滤出 alpha 本身");
+        assert_eq!(response.entries[0].name, "alpha");
+        assert!(
+            response.entries.iter().all(|e| e.name != "inner.txt"),
+            "browse_root 不能让 resolve_exact 自动进入子目录"
+        );
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
