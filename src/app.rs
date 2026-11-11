@@ -234,6 +234,8 @@ pub struct LstrApp {
     typing_global: bool,
     /// 深路径浏览模式的当前目录：输入框只放过滤词，面包屑占 TABS 行。
     browse_root: Option<std::path::PathBuf>,
+    /// Alt+↑ 回退时记住离开的子目录，Alt+↓ 可以再回去（后进先出）。
+    browse_forward: Vec<std::path::PathBuf>,
     /// 面包屑中间省略号展开的祖先弹层。
     crumb_more: bool,
     /// 设置页「唤起热键」录制状态（None = 未在录制）。
@@ -365,6 +367,7 @@ impl LstrApp {
             assets_ui: crate::assets_ui::AssetUiState::default(),
             typing_folder: None,
             browse_root: None,
+            browse_forward: Vec::new(),
             crumb_more: false,
             typing_global: false,
             hotkey_recording: None,
@@ -852,6 +855,7 @@ impl LstrApp {
             self.scroll_to_selection = false;
             self.filters = SearchFilters::default();
             self.browse_root = None;
+            self.browse_forward.clear();
         }
         Self::reset_input_cursor(ctx);
         self.filter_menu = None;
@@ -873,6 +877,7 @@ impl LstrApp {
         self.typing_folder = None;
         self.typing_global = false;
         self.browse_root = None;
+        self.browse_forward.clear();
         self.menu_open = false;
         self.center_frames = 0;
         self.pending_show = true;
@@ -1201,6 +1206,10 @@ impl LstrApp {
         if self.in_browse() {
             if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowUp)) {
                 self.browse_up(ctx);
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowDown)) {
+                self.browse_down(ctx);
                 return;
             }
             if self.input.is_empty()
@@ -2344,6 +2353,7 @@ impl LstrApp {
                 self.exit_browse(ui.ctx());
             } else {
                 self.browse_root = Some(path);
+                self.browse_forward.clear();
                 self.input.clear();
                 self.selected = 0;
                 self.scroll_y = 0.0;
@@ -2403,6 +2413,7 @@ impl LstrApp {
                     self.exit_browse(ui.ctx());
                 } else {
                     self.browse_root = Some(path);
+                self.browse_forward.clear();
                     self.input.clear();
                     self.selected = 0;
                     self.scroll_y = 0.0;
@@ -3668,7 +3679,7 @@ impl LstrApp {
             [
                 ("↑↓", "选择"),
                 ("↵", "进入"),
-                ("Alt↑", "上一级"),
+                ("Alt↑↓", "上/下级"),
                 ("Esc", "返回"),
             ]
         } else if path_mode {
@@ -3798,6 +3809,7 @@ impl LstrApp {
             return false;
         }
         self.browse_root = Some(std::path::PathBuf::from(entry.full_path()));
+        self.browse_forward.clear();
         // 位置由面包屑决定；其它筛选（时间/类型/匹配）保留并继续生效。
         self.filters.location = None;
         self.input.clear();
@@ -3835,6 +3847,8 @@ impl LstrApp {
         let Some(root) = self.browse_root.clone() else {
             return;
         };
+        // 记住当前目录：Alt+↓ 可以再回到下一级。
+        self.browse_forward.push(root.clone());
         match root.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => {
                 self.browse_root = Some(parent.to_path_buf());
@@ -3851,11 +3865,29 @@ impl LstrApp {
         }
     }
 
+    /// Alt+↓：回到 Alt+↑ 之前离开的子目录（后进先出）。
+    fn browse_down(&mut self, ctx: &egui::Context) {
+        let Some(next) = self.browse_forward.pop() else {
+            return;
+        };
+        self.browse_root = Some(next);
+        self.input.clear();
+        self.selected = 0;
+        self.scroll_y = 0.0;
+        self.scroll_to_selection = false;
+        self.menu_open = false;
+        self.filter_menu = None;
+        Self::reset_input_cursor(ctx);
+        self.apply_size(ctx);
+        self.trigger(ctx);
+    }
+
     /// 退出浏览模式，回到全局搜索（输入与结果清空）。
     fn exit_browse(&mut self, ctx: &egui::Context) {
         if self.browse_root.take().is_none() {
             return;
         }
+        self.browse_forward.clear();
         self.input.clear();
         self.entries.clear();
         self.selected = 0;
@@ -3872,6 +3904,7 @@ impl LstrApp {
         let Some(root) = self.browse_root.take() else {
             return;
         };
+        self.browse_forward.clear();
         let mut path = root.to_string_lossy().into_owned();
         if !path.ends_with(['\\', '/']) {
             path.push('\\');

@@ -1513,12 +1513,18 @@ fn run_worker(args: WorkerArgs) {
             continue;
         }
 
-        // 目录/路径范围内只搜文件：应用、UWP、命令、关键字都不应该混进来。
+        // 目录/路径范围或纯文件过滤（ext:/path:/时间/类型/盘符）只搜文件：
+        // 应用、UWP、命令、关键字都不应该混进来。
         let path_scoped = request.browse_root.is_some()
             || request.base_folder.is_some()
             || request.query.path_filter.is_some()
             || browse::parse(&request.query.raw).is_some();
-        let needs_uwp = !path_scoped
+        let file_filter_active = path_scoped
+            || request.query.ext.is_some()
+            || request.query.path_filter.is_some()
+            || request.query.drive_mask().is_some()
+            || !request.filters.is_empty();
+        let needs_uwp = !file_filter_active
             && !request.filters.matches.regex
             && match request.query.scope {
                 Scope::App => true,
@@ -1597,7 +1603,7 @@ fn run_worker(args: WorkerArgs) {
                     // 硬塞进来只会让人疑惑「选了 D 盘怎么还出现微信」。
                     if request.filters.is_empty()
                         && !in_folder_context
-                        && !path_scoped
+                        && !file_filter_active
                         && !request.filters.matches.regex
                     {
                         keyword_rows = keyword_entries(&request.keywords, &request.query.text);
@@ -1740,7 +1746,7 @@ fn run_worker(args: WorkerArgs) {
                     }
                     if request.filters.is_empty()
                         && !in_folder_context
-                        && !path_scoped
+                        && !file_filter_active
                         && !request.filters.matches.regex
                     {
                         let t_apps = Instant::now();

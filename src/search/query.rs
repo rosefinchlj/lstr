@@ -48,7 +48,15 @@ pub fn parse(raw: &str, scope: Scope) -> Query {
     let mut words = Vec::new();
 
     for token in text.split_whitespace() {
-        if let Some(value) = strip_prefix_ci(token, "ext:") {
+        if let Some(value) = token.strip_prefix("*.") {
+            // `*.html` 等价 ext:html（Everything 习惯）；多级后缀/其它通配
+            // 暂按普通词处理，避免把 `*.tar.gz` 误当 ext:gz。
+            if !value.is_empty() && !value.contains(['*', '?', '.', '\\', '/']) {
+                ext = Some(value.to_ascii_lowercase());
+            } else {
+                words.push(token);
+            }
+        } else if let Some(value) = strip_prefix_ci(token, "ext:") {
             ext = Some(value.to_string());
         } else if let Some(value) = strip_prefix_ci(token, "path:") {
             path_filter = Some(value.to_string());
@@ -190,6 +198,22 @@ mod tests {
         let query = parse("apple", Scope::All);
         assert_eq!(query.scope, Scope::All);
         assert_eq!(query.text, "apple");
+    }
+
+    #[test]
+    fn star_dot_ext_is_extension_filter() {
+        let query = parse("*.html", Scope::All);
+        assert_eq!(query.ext.as_deref(), Some("html"));
+        assert_eq!(query.text, "");
+        assert!(!query.is_empty(), "只有后缀过滤也是有效查询");
+
+        let upper = parse("*.HTML", Scope::All);
+        assert_eq!(upper.ext.as_deref(), Some("html"));
+
+        // 多级后缀不擅自降级成最后一段 ext，按普通词保留。
+        let multi = parse("*.tar.gz", Scope::All);
+        assert_eq!(multi.ext, None);
+        assert_eq!(multi.text, "*.tar.gz");
     }
 
     #[test]
