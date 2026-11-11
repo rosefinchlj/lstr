@@ -11,7 +11,7 @@ pub mod query;
 pub mod rank;
 pub mod uwp;
 
-use crate::config::{Config, KeywordConfig, RankConfig};
+use crate::config::{Config, KeywordConfig, RankConfig, MAX_LOAD_RESULTS, MIN_LOAD_RESULTS};
 use crate::history::History;
 use lstr_index::{ClientCommand, EngineMsg};
 use crate::model::{Entry, Kind, Query, Scope};
@@ -30,15 +30,13 @@ const APPS_RELOAD_INTERVAL: Duration = Duration::from_secs(90);
 
 /// 首屏交付的候选上限。窗口只按「最大结果数」长高，其余靠滚轮查看。
 pub(crate) const MIN_DELIVER: usize = 100;
-/// 滚到列表底部自动「加载更多」的上限（100→200→400→800→1000）。
-/// 内置引擎 candidate_cap 默认 2000，1000 条足够大面积扫视，单次响应也不至于过大。
-pub(crate) const MAX_DELIVER: usize = 1000;
 /// 「加载更多」时单次向索引/Everything 要的候选数上限。
-const MAX_FETCH: usize = 2000;
+/// 3000 条交付上限按 2 倍留去重余量 → 6000。
+const MAX_FETCH: usize = 6000;
 
-/// 下一档交付上限；已到顶返回 None（UI 不再发加载更多请求）。
-fn next_deliver(current: usize) -> Option<usize> {
-    (current < MAX_DELIVER).then(|| (current * 2).min(MAX_DELIVER))
+/// 下一档交付上限；已到设置里的上限（`max`）返回 None（UI 不再发请求）。
+fn next_deliver(current: usize, max: usize) -> Option<usize> {
+    (current < max).then(|| (current * 2).min(max))
 }
 
 /// 等待中的查询请求数:UI 线程发送前 +1,搜索线程出队后 -1。
@@ -74,7 +72,7 @@ struct Request {
     query: Query,
     /// 窗口「最大结果数」：决定窗口高度，也参与候选抓取/应用条数的预算。
     limit: usize,
-    /// 本次最多交付多少条候选：首屏 [`MIN_DELIVER`]，滚到底翻倍到 [`MAX_DELIVER`]。
+    /// 本次最多交付多少条候选：首屏 [`MIN_DELIVER`]，滚到底按设置上限翻倍。
     deliver: usize,
     keywords: Vec<KeywordConfig>,
     /// 对话框模式（Quick Switch）：空查询时把 Explorer 已打开的文件夹置顶。
@@ -140,8 +138,10 @@ pub struct SearchService {
     generation: u64,
     history: Arc<Mutex<History>>,
     limit: usize,
-    /// 当前「加载更多」的交付上限（100 → 200 → … → [`MAX_DELIVER`]）。
+    /// 当前「加载更多」的交付上限（100 → 200 → … → `max_deliver`）。
     deliver: usize,
+    /// 设置页「加载更多上限」；来自 config，运行期可改。
+    max_deliver: usize,
     /// 上一次查询参数；`more()` 用它重发同一个查询。
     last: Option<LastQuery>,
     keywords: Vec<KeywordConfig>,
@@ -217,6 +217,9 @@ impl SearchService {
             history,
             limit: config.max_results,
             deliver: MIN_DELIVER,
+            max_deliver: config
+                .max_load_results
+                .clamp(MIN_LOAD_RESULTS, MAX_LOAD_RESULTS),
             last: None,
             keywords: config.keywords,
             favorites: config.favorites,
@@ -387,11 +390,16 @@ impl SearchService {
         self.limit = limit.clamp(1, 50);
     }
 
+    /// 设置页「加载更多上限」改动后立即生效（下一次续拉/新查询按新值）。
+    pub fn set_max_load(&mut self, limit: usize) {
+        self.max_deliver = limit.clamp(MIN_LOAD_RESULTS, MAX_LOAD_RESULTS);
+    }
+
     /// 滚到列表底部：把交付上限翻倍并原样重发上一次查询。
-    /// 返回新 generation；已到 [`MAX_DELIVER`] 或还没发过查询时返回 None。
+    /// 返回新 generation；已到设置上限或还没发过查询时返回 None。
     pub fn more(&mut self) -> Option<u64> {
         let last = self.last.clone()?;
-        self.deliver = next_deliver(self.deliver)?;
+        self.deliver = next_deliver(self.deliver, self.max_deliver)?;
         let generation = self.search_with_context(
             &last.raw,
             last.scope,
@@ -888,11 +896,18 @@ mod pin_tests {
 
     #[test]
     fn load_more_deliver_doubles_and_stops_at_cap() {
-        assert_eq!(next_deliver(MIN_DELIVER), Some(200));
-        assert_eq!(next_deliver(200), Some(400));
-        assert_eq!(next_deliver(400), Some(800));
-        assert_eq!(next_deliver(800), Some(MAX_DELIVER));
-        assert_eq!(next_deliver(MAX_DELIVER), None);
+        // 默认上限 1000：100→200→400→800→1000，然后停。
+        assert_eq!(next_deliver(MIN_DELIVER, 1000), Some(200));
+        assert_eq!(next_deliver(200, 1000), Some(400));
+        assert_eq!(next_deliver(400, 1000), Some(800));
+        assert_eq!(next_deliver(800, 1000), Some(1000));
+        assert_eq!(next_deliver(1000, 1000), None);
+        // 设置调到 3000 时继续翻倍，最后一档夹到 3000。
+        assert_eq!(next_deliver(1000, MAX_LOAD_RESULTS), Some(2000));
+        assert_eq!(next_deliver(2000, MAX_LOAD_RESULTS), Some(3000));
+        assert_eq!(next_deliver(3000, MAX_LOAD_RESULTS), None);
+        // 上限设为 100（等于首屏）时不再加载更多。
+        assert_eq!(next_deliver(MIN_DELIVER, MIN_DELIVER), None);
     }
 
     #[test]
@@ -904,8 +919,8 @@ mod pin_tests {
         assert_eq!(fetch_count(&q, 8, 200), 400);
         // 800 条时按交付量的 2 倍抓候选（同名去重会吃掉一部分）→ 1600。
         assert_eq!(fetch_count(&q, 8, 800), 1600);
-        // 到交付上限时抓 2000（MAX_FETCH），不再继续放大。
-        assert_eq!(fetch_count(&q, 8, MAX_DELIVER), MAX_FETCH);
+        // 到设置上限 3000 时抓 6000（MAX_FETCH），不再继续放大。
+        assert_eq!(fetch_count(&q, 8, MAX_LOAD_RESULTS), MAX_FETCH);
     }
 }
 /// 「候选阶段零 FS」的标记:内置索引产出的 Entry 只带索引内信息
@@ -2755,8 +2770,16 @@ mod tests {
         assert!(service.more().is_some());
         assert_eq!(service.deliver, 800);
         assert!(service.more().is_some());
-        assert_eq!(service.deliver, MAX_DELIVER);
+        assert_eq!(service.deliver, service.max_deliver);
         assert!(service.more().is_none(), "到上限后应停止");
+
+        // 设置页把上限调到 3000：同一查询可以继续续拉。
+        service.set_max_load(MAX_LOAD_RESULTS);
+        assert!(service.more().is_some());
+        assert_eq!(service.deliver, 2000);
+        assert!(service.more().is_some());
+        assert_eq!(service.deliver, MAX_LOAD_RESULTS);
+        assert!(service.more().is_none(), "到新上限后应停止");
 
         // 新查询（输入/筛选变化）必须回到首屏 100，不能继承上一轮的上限。
         let _ = service.search(

@@ -4868,6 +4868,32 @@ impl LstrApp {
         }
         y += ROW;
 
+        Self::settings_label(painter, &theme, area.left(), y, "加载更多上限");
+        let mut max_load = self.cfg.max_load_results as f32;
+        let response = ui.put(
+            Rect::from_min_size(egui::pos2(ctrl_x, y), egui::vec2(ctrl_w, 22.0)),
+            egui::Slider::new(
+                &mut max_load,
+                crate::config::MIN_LOAD_RESULTS as f32..=crate::config::MAX_LOAD_RESULTS as f32,
+            )
+            .integer()
+            .suffix(" 条"),
+        );
+        if response.changed() {
+            self.cfg.max_load_results = max_load.round() as usize;
+            self.service.set_max_load(self.cfg.max_load_results);
+            let _ = self.cfg.save();
+            self.trigger(ctx);
+        }
+        painter.text(
+            egui::pos2(ctrl_x + ctrl_w + 10.0, y + 14.0),
+            Align2::LEFT_CENTER,
+            "滚到底最多翻到多少条（越大越慢）",
+            ui::mono_font(10.5),
+            theme.dim,
+        );
+        y += ROW;
+
         Self::settings_label(painter, &theme, area.left(), y, "对话框自动唤出");
         let mut dialog_assist = self.cfg.dialog_assist;
         if Self::settings_checkbox(

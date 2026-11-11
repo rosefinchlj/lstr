@@ -7,6 +7,10 @@ use std::path::PathBuf;
 pub struct Config {
     pub hotkey: String,
     pub max_results: usize,
+    /// 滚到列表底部「加载更多」的候选上限（100..=3000）。首屏仍固定 100 条，
+    /// 上限只决定最多能翻到多少条；越大单次响应越慢（逐条 find_meta + 抓候选）。
+    #[serde(default = "default_max_load_results")]
+    pub max_load_results: usize,
     pub width: f32,
     /// 用户拖拽后的窗口高度；None 表示按结果数量自动计算。
     #[serde(default)]
@@ -47,6 +51,19 @@ pub struct Config {
     /// 自研索引引擎（设置面板「搜索」页）。
     #[serde(default)]
     pub index: IndexConfig,
+}
+
+/// 滚到列表底部时「加载更多」的上限范围。首屏固定 100 条，这里只限制最多能翻到多少。
+pub const MIN_LOAD_RESULTS: usize = 100;
+pub const MAX_LOAD_RESULTS: usize = 3000;
+
+fn default_max_load_results() -> usize {
+    1000
+}
+
+/// 手写 config.toml 的越界值在 load 时夹到合法区间。
+fn normalize_max_load_results(value: usize) -> usize {
+    value.clamp(MIN_LOAD_RESULTS, MAX_LOAD_RESULTS)
 }
 
 /// 自研索引引擎配置。backend:
@@ -414,6 +431,7 @@ impl Default for Config {
             // 默认唤起热键：双击 Ctrl（Listary 式）；double-space 仍是合法选项。
             hotkey: crate::hotkey::DEFAULT_HOTKEY.to_string(),
             max_results: 8,
+            max_load_results: default_max_load_results(),
             width: 640.0,
             height: None,
             app_boost: 3,
@@ -478,6 +496,7 @@ impl Config {
             // 补齐旧配置缺少的内置噪声规则（新增规则不靠用户手动「恢复默认」）。
             Ok(mut cfg) => {
                 cfg.rank.backfill_missing_noise_rules();
+                cfg.max_load_results = normalize_max_load_results(cfg.max_load_results);
                 cfg.index.backend = normalize_backend(&cfg.index.backend);
                 cfg.index.normalize_volumes();
                 cfg.index.normalize();
@@ -621,6 +640,25 @@ mod tests {
         assert_eq!(cfg.backend, "builtin");
         assert_eq!(cfg.scan_throttle_ms, 0);
         assert_eq!(cfg.journal_poll_ms, 500);
+    }
+
+    /// 加载更多上限：默认 1000；手写越界值在 load 归一化时夹到 100..=3000；
+    /// 旧配置缺少该键时用 serde default 补齐，不会整份回落默认值。
+    #[test]
+    fn max_load_results_defaults_and_clamps() {
+        assert_eq!(Config::default().max_load_results, 1000);
+        assert_eq!(normalize_max_load_results(10), MIN_LOAD_RESULTS);
+        assert_eq!(normalize_max_load_results(10_000), MAX_LOAD_RESULTS);
+        assert_eq!(normalize_max_load_results(1500), 1500);
+
+        let text = toml::to_string(&Config::default()).expect("serialize config");
+        let legacy: String = text
+            .lines()
+            .filter(|line| !line.starts_with("max_load_results"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: Config = toml::from_str(&legacy).expect("legacy config without new key");
+        assert_eq!(parsed.max_load_results, 1000);
     }
 
     /// journal_poll_ms 下限 100:配置里手写更小的值在 load 归一化时被抬到 100。
