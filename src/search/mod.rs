@@ -1,5 +1,7 @@
 pub mod apps;
 pub mod browse;
+#[cfg(test)]
+mod acceptance_tests;
 pub mod builtin;
 pub mod everything;
 pub mod filters;
@@ -1259,6 +1261,7 @@ fn run_worker(
         // 路径模式（D:\foo\bar、\\server\share）：直接列目录，
         // 不碰 Everything，也不必为它懒启动 PowerShell 枚举 UWP。
         if let Some(path_query) = browse::parse(&request.query.raw) {
+            let path_query = browse::resolve_exact(path_query);
             let started = Instant::now();
             let filter = path_query.filter.to_lowercase();
             let mut entries: Vec<Entry> = dir_cache
@@ -2214,6 +2217,19 @@ mod tests {
     #[test]
     fn browse_mode_flows_through_service() {
         // 路径模式只依赖 read_dir，无需 Everything，可做端到端回归。
+        fn wait(service: &SearchService, generation: u64) -> Response {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(response) = service.poll() {
+                    if response.generation == generation {
+                        return response;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "等待路径模式响应超时");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
         let config = test_config();
         let history = std::sync::Arc::new(std::sync::Mutex::new(
             crate::history::History::in_memory(),
@@ -2221,24 +2237,28 @@ mod tests {
         let ctx = eframe::egui::Context::default();
         let mut service = SearchService::new(config, history, ctx);
         let cwd = std::env::current_dir().expect("cwd");
+
         // 过滤词「carg」应命中 crate 根的 Cargo.toml。
         let query = format!("{}\\carg", cwd.display());
         let generation = service.search(&query, crate::model::Scope::All, false, &Default::default(), &Default::default(), true);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if let Some(response) = service.poll() {
-                if response.generation == generation {
-                    assert!(
-                        response.entries.iter().any(|e| e.name == "Cargo.toml"),
-                        "路径模式应列出 Cargo.toml，实际: {:?}",
-                        response.entries.iter().map(|e| &e.name).collect::<Vec<_>>()
-                    );
-                    return;
-                }
-            }
-            assert!(std::time::Instant::now() < deadline, "等待路径模式响应超时");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        let response = wait(&service, generation);
+        assert!(
+            response.entries.iter().any(|e| e.name == "Cargo.toml"),
+            "路径模式应列出 Cargo.toml，实际: {:?}",
+            response.entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+
+        // 完整目录路径（末尾无分隔符）应列出该目录内容，而不是把最后一段
+        // 当成父目录的过滤词（那样只会显示这个目录自己）。
+        let exact = cwd.display().to_string();
+        let generation = service.search(&exact, crate::model::Scope::All, false, &Default::default(), &Default::default(), true);
+        let response = wait(&service, generation);
+        let names: Vec<&String> = response.entries.iter().map(|e| &e.name).collect();
+        assert!(
+            response.entries.iter().any(|e| e.name == "Cargo.toml")
+                && response.entries.iter().any(|e| e.name == "src" && e.kind == Kind::Folder),
+            "完整目录路径应列出子项（Cargo.toml/src），实际: {names:?}"
+        );
     }
 
     #[test]

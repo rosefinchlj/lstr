@@ -99,6 +99,27 @@ pub fn list_children(dir: &str) -> Vec<Entry> {
     entries
 }
 
+/// 完整路径消歧：`E:\foo\bar`（末尾无分隔符）若**本身就是已存在的目录**，
+/// 按「列出 bar 的内容」处理；否则沿用 `parse` 的「父目录 + 过滤词」行为
+/// （打字过程中的 `D:\proj\li` 仍按前缀过滤）。
+///
+/// 只对本地盘符路径做存在性检查：UNC 的 `is_dir` 是网络请求，不能每次击键都发。
+pub fn resolve_exact(pq: PathQuery) -> PathQuery {
+    if pq.filter.is_empty() {
+        return pq;
+    }
+    let candidate = format!("{}{}", pq.dir, pq.filter);
+    let is_local = candidate.len() >= 2 && candidate.as_bytes()[1] == b':';
+    if is_local && std::path::Path::new(&candidate).is_dir() {
+        PathQuery {
+            dir: format!("{}\\", candidate.trim_end_matches(['\\', '/'])),
+            filter: String::new(),
+        }
+    } else {
+        pq
+    }
+}
+
 /// 目录内容缓存：以目录自身 mtime 为失效依据。
 /// 大目录（如 System32 约四千项）每个击键都重读会掉帧，mtime 未变就复用。
 pub struct DirCache {
@@ -187,6 +208,35 @@ mod tests {
         assert!(parse(r"> D:\foo").is_none());
         assert!(parse(r"a D:\foo").is_none());
         assert!(parse("").is_none());
+    }
+
+    #[test]
+    fn exact_existing_dir_lists_its_children() {
+        // 验收表 F23：输入完整目录路径（末尾无分隔符）应列出该目录内容，
+        // 而不是把最后一段当成父目录的过滤词（那样只会显示目录自身）。
+        let tag = format!("lstr-browse-acc-{}", std::process::id());
+        let base = std::env::temp_dir().join(&tag);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("child")).unwrap();
+        std::fs::write(base.join("child").join("a.txt"), b"x").unwrap();
+
+        let raw = base.display().to_string();
+        let pq = resolve_exact(parse(&raw).expect("完整目录路径"));
+        assert_eq!(pq.filter, "", "已是完整目录时应清空过滤词");
+        assert!(pq.dir.ends_with('\\'), "目录应以分隔符结尾: {}", pq.dir);
+        let children = list_children(&pq.dir);
+        assert!(
+            children.iter().any(|e| e.name == "child"),
+            "应列出子目录: {:?}",
+            children.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+
+        // 尾段不存在时保持旧行为：父目录 + 过滤词。
+        let missing = format!("{}\\no-such-dir", base.display());
+        let pq = resolve_exact(parse(&missing).expect("路径模式"));
+        assert_eq!(pq.filter, "no-such-dir");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
