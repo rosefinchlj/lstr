@@ -1733,7 +1733,7 @@ mod tests {
         }
         // 末尾至少留 delta/改名的视图态
         store.insert(next_frn, 5, 0, b"tail-delta.txt");
-        let mut h = view_header(0x7a7);
+        let h = view_header(0x7a7);
         let dir = tmpdir("seg-random");
         let _ = std::fs::remove_dir_all(&dir);
         save_view_sync(&dir, &h, &store).unwrap();
