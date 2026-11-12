@@ -404,6 +404,10 @@ pub struct QuerySpec {
     pub mtime_after: Option<i64>,
     /// 修改时间上界(unix 秒,含)。
     pub mtime_before: Option<i64>,
+    /// 文件大小下界/上界(字节,含边界)。目录不参与大小过滤；大小未知
+    /// (`u64::MAX`)的条目在大小条件下不通过。
+    pub size_after: Option<u64>,
+    pub size_before: Option<u64>,
     /// 卷掩码(bit i='A'+i):None=不限制,Some(mask)=只在这些卷查询
     /// (mask 为 0 表示排除掉了所有卷,查询结果为空)。
     pub vol_mask: Option<u32>,
@@ -495,6 +499,27 @@ pub fn passes_filters(store: &VolumeStore, slot: u32, spec: &QuerySpec) -> bool 
         }
     }
     let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY_U16 != 0;
+    if spec.size_after.is_some() || spec.size_before.is_some() {
+        // 目录没有有意义的大小；大小未知（USN 增量尚未回填）一律不通过，
+        // 与 mtime=0 在时间条件下被排除的口径一致。
+        if is_dir {
+            return false;
+        }
+        let size = store.size[slot as usize];
+        if size == u64::MAX {
+            return false;
+        }
+        if let Some(after) = spec.size_after {
+            if size < after {
+                return false;
+            }
+        }
+        if let Some(before) = spec.size_before {
+            if size > before {
+                return false;
+            }
+        }
+    }
     // 快路径:All 且无 ext/组过滤时无需看名字;Folders 同理(目录判定只看
     // attrs)。单字符 "a" 要扫 290 万 slot,旧实现每条都做 name_lc + 后缀
     // 比较,是 folders 路 39ms 的主因;这里让绝大多数候选只读 attrs。
@@ -1312,9 +1337,9 @@ mod tests {
     #[test]
     fn mtime_filter_excludes_unknown_and_old_entries() {
         let mut s = VolumeStore::new(Default::default(), 'C');
-        s.insert_meta(5, 0, 0x10, b"root", 1_600_000_000);
-        s.insert_meta(10, 5, 0, b"new.txt", 1_800_000_000);
-        s.insert_meta(11, 5, 0, b"old.txt", 1_500_000_000);
+        s.insert_meta(5, 0, 0x10, b"root", 1_600_000_000, u64::MAX);
+        s.insert_meta(10, 5, 0, b"new.txt", 1_800_000_000, u64::MAX);
+        s.insert_meta(11, 5, 0, b"old.txt", 1_500_000_000, u64::MAX);
         s.insert(12, 5, 0, b"unknown.txt");
         s.compact();
         let spec = QuerySpec {
@@ -1327,10 +1352,39 @@ mod tests {
         assert_eq!(s.name(slots[0]), b"new.txt");
     }
 
+    #[test]
+    fn size_filter_excludes_dirs_unknown_and_out_of_range() {
+        let mut s = VolumeStore::new(Default::default(), 'C');
+        s.insert_meta(5, 0, 0x10, b"root", 0, 0); // 目录：不参与大小
+        s.insert_meta(10, 5, 0, b"small.txt", 0, 500);
+        s.insert_meta(11, 5, 0, b"mid.txt", 0, 10 * 1024 * 1024);
+        s.insert_meta(12, 5, 0, b"big.txt", 0, 3 * 1024 * 1024 * 1024);
+        s.insert_meta(13, 5, 0, b"unknown.txt", 0, u64::MAX);
+        s.compact();
+
+        let spec = QuerySpec {
+            size_after: Some(1024),
+            ..Default::default()
+        };
+        let (slots, total, _) = query_volume(&s, &spec, 100);
+        let mut names: Vec<&[u8]> = slots.iter().map(|&x| s.name(x)).collect();
+        names.sort_unstable();
+        assert_eq!(total, 2, "目录/未知大小/过小文件都应被排除");
+        assert_eq!(names, vec![&b"big.txt"[..], &b"mid.txt"[..]]);
+
+        let range = QuerySpec {
+            size_after: Some(10 * 1024 * 1024),
+            size_before: Some(2 * 1024 * 1024 * 1024),
+            ..Default::default()
+        };
+        let (slots, total, _) = query_volume(&s, &range, 100);
+        assert_eq!(total, 1, "只有 mid 落在区间内（边界含等号）");
+        assert_eq!(s.name(slots[0]), b"mid.txt");
+    }
+
     /// E:单字符走字母位图快路径,结果应与名字里含该字母的条目一致。
     #[test]
-    fn single_char_uses_char_mask_and_matches_names() {
-        let s = setup();
+    fn single_char_uses_char_mask_and_matches_names() {        let s = setup();
         let spec = QuerySpec { tokens: vec!["a".into()], ..Default::default() };
         let (slots, total, _) = query_volume(&s, &spec, 100);
         assert_eq!(total, 3, "alpha/Program Files/xabcxabc 含 a");
@@ -1563,6 +1617,7 @@ mod tests {
                 attrs,
                 name.as_bytes(),
                 1_600_000_000 + (i % 1000) as i64,
+                u64::MAX,
             );
         }
         s.compact();

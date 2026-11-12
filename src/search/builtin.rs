@@ -490,6 +490,8 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
         exact: None,
         mtime_after: None,
         mtime_before: None,
+        size_after: None,
+        size_before: None,
         // 盘符过滤（c:/d: 限定、-c: 排除）：交给引擎在卷循环直接跳过，
         // 省掉整卷扫描；0 掩码（全排除）→ 查询结果为空。
         vol_mask: query.drive_mask(),
@@ -517,6 +519,10 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
         if let Some(before) = range.before {
             spec.mtime_before = Some(spec.mtime_before.map_or(before, |old| old.min(before)));
         }
+    }
+    if let Some(range) = &filters.size {
+        spec.size_after = range.after;
+        spec.size_before = range.before;
     }
     if spec.ext.is_none() {
         if let Some(group) = &filters.group {
@@ -883,6 +889,10 @@ mod tests {
             .unwrap_or(0)
     }
 
+    fn disk_size(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
     /// 真实临时索引 fixture:从盘符到 cwd 的目录链 + 测试目录,全部作为引擎
     /// 记录的父链,子项落到真实文件系统(files 个文件 / dirs 个目录 + 特殊项)。
     /// 让 find_meta、kind_of、拼音、类型漂移都走生产路径。
@@ -1022,6 +1032,7 @@ mod tests {
                 op: Op::Upsert,
                 name: name.clone(),
                 mtime: disk_mtime(&chain_disk),
+                size: 0,
             });
             parent = frn;
         }
@@ -1033,6 +1044,7 @@ mod tests {
             op: Op::Upsert,
             name: tag.clone(),
             mtime: disk_mtime(&test_dir),
+            size: 0,
         });
         for (i, (name, is_dir, parent_idx)) in names.iter().enumerate() {
             let parent_frn = parent_idx
@@ -1049,6 +1061,11 @@ mod tests {
                 op: Op::Upsert,
                 name: name.clone(),
                 mtime: disk_mtime(&disk_parent.join(name)),
+                size: if *is_dir {
+                    0
+                } else {
+                    disk_size(&disk_parent.join(name))
+                },
             });
         }
         // 无权限目录 + 其中的文件(挂在测试目录下,父链真实存在;目录 ACL
@@ -1060,6 +1077,7 @@ mod tests {
             op: Op::Upsert,
             name: denied_dir.to_string(),
             mtime: 0,
+            size: 0,
         });
         recs.push(Rec {
             frn: 6001,
@@ -1068,6 +1086,7 @@ mod tests {
             op: Op::Upsert,
             name: "ai_denied_file.txt".to_string(),
             mtime: 0,
+            size: u64::MAX,
         });
         recs.push(Rec {
             frn: 5000,
@@ -1076,6 +1095,7 @@ mod tests {
             op: Op::Upsert,
             name: missing.to_string(),
             mtime: 0,
+            size: u64::MAX,
         });
         let count = recs.len() as u32;
         engine.handle(lstr_index::EngineMsg::Records { guid, recs, next_usn: 100 });

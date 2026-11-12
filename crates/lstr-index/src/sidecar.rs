@@ -36,7 +36,9 @@ use crate::proto::{decode_recs, encode_recs};
 use crate::usn::Rec;
 
 pub const MAGIC: &[u8; 4] = b"LCUR";
-pub const VERSION: u32 = 1;
+/// v2:Rec 增加 size 字段(与 proto/IPC 布局同步);旧旁车版本不兼容,
+/// 加载时丢弃并从快照游标走 journal 回放(不会丢数据)。
+pub const VERSION: u32 = 2;
 
 const TAG_JOURNAL: u8 = 1;
 const TAG_CHILDREN: u8 = 2;
@@ -212,8 +214,8 @@ fn parse(data: &[u8], guid: u128) -> Option<SidecarFile> {
 }
 
 /// 一个 rec 块(4 字节计数 + 逐条 rec)的总字节数;逐条走一遍长度校验。
-/// 布局:op(1) + attrs(4) + frn(8) + parent(8) + mtime(8) + name_len(2) + name。
-/// 返回 None = 声称的条数与剩余字节矛盾(损坏)。
+/// 布局:op(1) + attrs(4) + frn(8) + parent(8) + mtime(8) + size(8) +
+/// name_len(2) + name。返回 None = 声称的条数与剩余字节矛盾(损坏)。
 fn recs_block_len(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < 4 {
         return None;
@@ -222,15 +224,15 @@ fn recs_block_len(bytes: &[u8]) -> Option<usize> {
     let mut rest = &bytes[4..];
     let mut total = 4usize;
     for _ in 0..n {
-        if rest.len() < 31 {
+        if rest.len() < 39 {
             return None;
         }
-        let name_len = u16::from_le_bytes(rest[29..31].try_into().ok()?) as usize;
-        if rest.len() < 31 + name_len {
+        let name_len = u16::from_le_bytes(rest[37..39].try_into().ok()?) as usize;
+        if rest.len() < 39 + name_len {
             return None;
         }
-        rest = &rest[31 + name_len..];
-        total += 31 + name_len;
+        rest = &rest[39 + name_len..];
+        total += 39 + name_len;
     }
     Some(total)
 }
@@ -258,6 +260,7 @@ mod tests {
             op,
             name: name.trim_end_matches('/').to_string(),
             mtime: 1_700_000_000,
+            size: u64::MAX,
         }
     }
 
@@ -266,7 +269,7 @@ mod tests {
             SidecarOp::Journal {
                 recs: vec![
                     rec(11, 10, "alpha.txt", Op::Upsert),
-                    Rec { frn: 12, parent_frn: 10, attrs: 0, op: Op::Remove, name: String::new(), mtime: 0 },
+                    Rec { frn: 12, parent_frn: 10, attrs: 0, op: Op::Remove, name: String::new(), mtime: 0, size: u64::MAX },
                 ],
             },
             SidecarOp::Children { parent_frn: crate::store::ROOT_FRN, recs: vec![rec(20, 5, "root-new.txt", Op::Upsert)] },

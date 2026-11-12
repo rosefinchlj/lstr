@@ -22,7 +22,7 @@ use lstr_index::{Engine, EngineConfig, EngineMsg, Op, Phase, Rec};
 
 use crate::model::{Entry, Kind, Scope};
 use crate::search::builtin::BuiltinProvider;
-use crate::search::filters::{DateRange, SearchFilters, TimeFilter};
+use crate::search::filters::{DateRange, SearchFilters, SizeRange, TimeFilter};
 use crate::search::{browse, query};
 
 const DIR_ATTR: u32 = 0x10;
@@ -57,6 +57,10 @@ fn disk_mtime(path: &Path) -> i64 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn disk_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 /// 建与验收表同构的夹具并建立真实索引。
@@ -118,6 +122,18 @@ fn fixture() -> Option<Fixture> {
         };
         std::fs::write(&path, b"x").ok()?;
     }
+    // 大小条件夹具：三个文件分别 1KB / 5MB / 20MB（set_len 只改长度，
+    // 不写数据；NTFS 上按稀疏/延迟分配处理，测试开销可忽略）。
+    for (index, size) in [(0usize, 1024u64), (1, 5 * 1024 * 1024), (6, 20 * 1024 * 1024)] {
+        let (parent, name) = &files[index];
+        let path = if *parent == "." {
+            root.join(name)
+        } else {
+            root.join(parent).join(name)
+        };
+        let file = std::fs::OpenOptions::new().write(true).open(&path).ok()?;
+        file.set_len(size).ok()?;
+    }
 
     let snap = std::env::temp_dir().join(format!("lstr-acc-snap-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&snap);
@@ -160,6 +176,7 @@ fn fixture() -> Option<Fixture> {
             op: Op::Upsert,
             name: name.clone(),
             mtime: disk_mtime(&chain_disk),
+            size: 0,
         });
         parent = frn;
     }
@@ -171,6 +188,7 @@ fn fixture() -> Option<Fixture> {
         op: Op::Upsert,
         name: tag.clone(),
         mtime: disk_mtime(&root),
+        size: 0,
     });
     for (i, dir) in dirs.iter().enumerate() {
         recs.push(Rec {
@@ -180,6 +198,7 @@ fn fixture() -> Option<Fixture> {
             op: Op::Upsert,
             name: dir.clone(),
             mtime: disk_mtime(&root.join(dir)),
+            size: 0,
         });
     }
     for (i, (parent_name, name)) in files.iter().enumerate() {
@@ -195,6 +214,7 @@ fn fixture() -> Option<Fixture> {
             op: Op::Upsert,
             name: name.to_string(),
             mtime: disk_mtime(&root.join(parent_name).join(name)),
+            size: disk_size(&root.join(parent_name).join(name)),
         });
     }
     let count = recs.len() as u32;
@@ -477,6 +497,7 @@ fn acceptance_h_date_condition_filters_by_index_mtime() {
         op: Op::Upsert,
         name: name.to_string(),
         mtime,
+        size: u64::MAX,
     };
     fx.provider.engine.handle(EngineMsg::Records {
         guid: 0xACC5,
@@ -549,5 +570,94 @@ fn acceptance_h_date_condition_filters_by_index_mtime() {
             .iter()
             .map(|e| (e.name.clone(), e.modified))
             .collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// I. 输入框大小条件
+// ---------------------------------------------------------------------------
+
+/// 真实文件（1KB / 5MB / 20MB）+ 真实引擎：size 条件在候选过滤阶段生效，
+/// 目录被排除，total 与返回条数同口径。
+#[test]
+fn acceptance_i_size_condition_filters_by_index_size() {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    let Some(fx) = fixture() else { return };
+
+    let size_filters = |after: Option<u64>, before: Option<u64>| SearchFilters {
+        size: Some(SizeRange {
+            after,
+            before,
+            after_text: after.map(|_| "条件".to_string()),
+            before_text: before.map(|_| "条件".to_string()),
+        }),
+        ..Default::default()
+    };
+    let names = |input: &str, filters: &SearchFilters| {
+        let (entries, total) = search(&fx, input, Scope::All, filters);
+        assert_eq!(entries.len(), total, "I1 total 与返回条数必须一致");
+        entries.into_iter().map(|e| e.name).collect::<Vec<_>>()
+    };
+
+    // 下界：1KB 文件被排除，5MB / 20MB 通过。
+    assert_eq!(
+        names("LstrAcc-全匹配", &size_filters(Some(2 * KB), None)),
+        Vec::<String>::new(),
+        "I2 小于下界的文件应被排除"
+    );
+    assert_eq!(
+        names("LstrAcc-扩展名测试", &size_filters(Some(2 * KB), None)),
+        vec!["LstrAcc-扩展名测试.RS".to_string()],
+        "I3 5MB 文件应通过下界"
+    );
+    assert_eq!(
+        names("LstrAcc-根文件", &size_filters(Some(2 * KB), None)),
+        vec!["LstrAcc-根文件.log".to_string()],
+        "I4 20MB 文件应通过下界"
+    );
+
+    // 上界：1KB 通过，5MB / 20MB 被排除。
+    assert_eq!(
+        names("LstrAcc-全匹配", &size_filters(None, Some(2 * KB))),
+        vec!["LstrAcc-全匹配.md".to_string()],
+        "I5 1KB 文件应通过上界"
+    );
+    assert_eq!(
+        names("LstrAcc-扩展名测试", &size_filters(None, Some(2 * KB))),
+        Vec::<String>::new(),
+        "I6 5MB 文件应被上界排除"
+    );
+
+    // 区间：只有 5MB 文件；目录即使名字匹配也不参与大小过滤。
+    assert_eq!(
+        names("LstrAcc-", &size_filters(Some(2 * KB), Some(10 * MB))),
+        vec!["LstrAcc-扩展名测试.RS".to_string()],
+        "I7 区间应同时收窄上下界，且排除目录"
+    );
+    assert_eq!(
+        names("LstrAcc-文档", &size_filters(Some(0), None)),
+        Vec::<String>::new(),
+        "I8 文件夹没有大小，size 条件下必须排除"
+    );
+
+    // 空输入 + 只有大小条件：走引擎全表过滤，返回条目不含目录（候选阶段
+    // size 不填 Entry，展示大小由 finalize 从 FS 补；这里断言过滤结果本身）。
+    let (entries, total) = search(&fx, "", Scope::All, &size_filters(Some(2 * KB), None));
+    assert!(total >= 2, "I9 条件单独查询应有结果，实际 total={total}");
+    assert!(
+        entries.iter().all(|e| e.kind != Kind::Folder),
+        "I9 大小条件必须排除目录: {:?}",
+        entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>()
+    );
+    let mut names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "LstrAcc-扩展名测试.RS".to_string(),
+            "LstrAcc-根文件.log".to_string()
+        ],
+        "I9 只有 >=2KB 的两个文件通过"
     );
 }

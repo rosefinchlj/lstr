@@ -11,6 +11,7 @@
 //! parent : u64 len + u32×
 //! attrs  : u64 len + u16×
 //! mtime  : u64 len + u32×  (unix 秒;0=未知,USN 路径为 0)
+//! size   : u64 len + u64×  (字节;u64::MAX=未知)
 //! unres  : u64 len + (u32 slot, u64 parent_frn)×
 //! ```
 //! 列必须一致有序。就绪卷由 [`SaveTask`] 构造只读快照视图(不 compact store,
@@ -27,7 +28,8 @@ pub const MAGIC: &[u8; 4] = b"LIDX";
 /// v3:未消解父链接 (slot, parent_frn) 也落盘(v2 没有,重启后这些条目永久退化)。
 /// v4:增加 mtime 列(unix 秒),内置时间筛选/结果元数据使用。
 /// v5:排除表从布尔开关改为内容哈希(noise_hash),排除规则任意变更即失配重扫。
-pub const VERSION: u32 = 5;
+/// v6:增加 size 列(u64 字节,`u64::MAX`=未知),内置大小筛选使用。
+pub const VERSION: u32 = 6;
 
 /// 覆盖日志目录的环境变量(集成测试/诊断隔离用)。
 const LOG_DIR_ENV: &str = "LSTR_INDEX_LOG_DIR";
@@ -179,6 +181,7 @@ pub fn save_report(
     write_col_u32(&mut w, &store.parent)?;
     write_col_u16(&mut w, &store.attrs)?;
     write_col_u32(&mut w, &store.mtime)?;
+    write_col_u64(&mut w, &store.size)?;
     // 未消解父链接:compact 会把 slot 重映射到最终编号,此时写入可直接恢复
     let pairs = store.unresolved_pairs();
     w.write_all(&(pairs.len() as u64).to_le_bytes())?;
@@ -283,6 +286,7 @@ enum SavePhase {
     Parent,
     Attrs,
     Mtime,
+    Size,
     UnresolvedWrite,
     Finish,
     SyncWait,
@@ -802,6 +806,28 @@ impl SaveTask {
                     self.flush_out()?;
                     self.cursor = end;
                     if self.cursor >= self.order.len() {
+                        self.phase = SavePhase::Size;
+                        self.cursor = 0;
+                    }
+                    if self.pause(step_started, budget, yield_now) {
+                        return Ok(None);
+                    }
+                }
+                SavePhase::Size => {
+                    let end = (self.cursor + SAVE_CHUNK_ELEMS).min(self.order.len());
+                    if self.cursor == 0 {
+                        let n = self.order.len() as u64 * 8;
+                        self.file_mut()?.write_all(&n.to_le_bytes())?;
+                    }
+                    self.out.clear();
+                    for k in self.cursor..end {
+                        let old = self.order[k];
+                        self.out
+                            .extend_from_slice(&store.size[old as usize].to_le_bytes());
+                    }
+                    self.flush_out()?;
+                    self.cursor = end;
+                    if self.cursor >= self.order.len() {
                         self.phase = SavePhase::UnresolvedWrite;
                         self.cursor = 0;
                     }
@@ -1059,6 +1085,7 @@ pub fn load(dir: &Path, guid: u128, noise_hash: u64, exclude: &crate::noise::Exc
     let parent = read_col_u32(&mut cur)?;
     let attrs = read_col_u16(&mut cur)?;
     let mtime = read_col_u32(&mut cur)?;
+    let size = read_col_u64(&mut cur)?;
     let n_unresolved = u64::from_le_array(&mut cur)? as usize;
     let mut unresolved: Vec<(u32, u64)> = Vec::with_capacity(n_unresolved.min(1 << 20));
     for _ in 0..n_unresolved {
@@ -1069,10 +1096,16 @@ pub fn load(dir: &Path, guid: u128, noise_hash: u64, exclude: &crate::noise::Exc
     if !cur.is_empty() {
         return None;
     }
-    if offs.len() != count || frn.len() != count || parent.len() != count || attrs.len() != count || mtime.len() != count {
+    if offs.len() != count
+        || frn.len() != count
+        || parent.len() != count
+        || attrs.len() != count
+        || mtime.len() != count
+        || size.len() != count
+    {
         debug_log(&format!(
-            "load {guid:032x}: column len mismatch offs={} frn={} parent={} attrs={} count={count}",
-            offs.len(), frn.len(), parent.len(), attrs.len()
+            "load {guid:032x}: column len mismatch offs={} frn={} parent={} attrs={} mtime={} size={} count={count}",
+            offs.len(), frn.len(), parent.len(), attrs.len(), mtime.len(), size.len()
         ));
         return None;
     }
@@ -1124,6 +1157,7 @@ pub fn load(dir: &Path, guid: u128, noise_hash: u64, exclude: &crate::noise::Exc
         parent,
         attrs,
         mtime,
+        size,
         name_off,
         unresolved,
         exclude.clone(),
@@ -1280,7 +1314,7 @@ mod tests {
         'C',
     );
         s.insert(5, 0, 0x10, b"root");
-        s.insert_meta(10, 5, 0, b"alpha.txt", 1_700_000_123);
+        s.insert_meta(10, 5, 0, b"alpha.txt", 1_700_000_123, 12_345);
         s.insert(11, 5, 0, "报告.docx".as_bytes());
         s.insert(12, 5, 0x10, b"node_modules");
         s.insert(13, 12, 0, b"dep.txt");
@@ -1310,14 +1344,18 @@ mod tests {
         assert!(ls.find_slot(10).is_some());
         let slot = ls.find_slot(10).unwrap();
         assert_eq!(ls.name(slot), b"alpha.txt");
-        // v4:mtime 列落盘/读回(0=未知)。
+        // v4:mtime 列落盘/读回(0=未知)。v6:size 列落盘/读回(MAX=未知)。
         assert_eq!(ls.mtime[slot as usize], 1_700_000_123);
+        assert_eq!(ls.size[slot as usize], 12_345);
         let unknown = ls.find_slot(11).unwrap();
         assert_eq!(ls.mtime[unknown as usize], 0);
-        // 加载(from_parts)必须按 mtime 列重建待回填队列,否则重启后
-        // USN 增量条目仍永久过不了时间筛选。
+        assert_eq!(ls.size[unknown as usize], u64::MAX);
+        // 加载(from_parts)必须按 mtime/size 列重建待回填队列,否则重启后
+        // USN 增量条目仍永久过不了时间/大小筛选。
         assert!(ls.mtime_pending.contains(&unknown), "mtime=0 条目应待回填");
         assert!(!ls.mtime_pending.contains(&slot), "已知 mtime 不登记");
+        assert!(ls.size_pending.contains(&unknown), "size=MAX 条目应待回填");
+        assert!(!ls.size_pending.contains(&slot), "已知 size 不登记");
         assert_eq!(ls.char_mask.len(), ls.name_off.len());
         assert_eq!(ls.offs.len(), ls.name_off.len());
         // 有序性保持

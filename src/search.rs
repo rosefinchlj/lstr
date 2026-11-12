@@ -1503,6 +1503,9 @@ fn browse_response(
     let modified = local_filters
         .then_some(request.filters.modified.as_ref())
         .flatten();
+    let size_range = local_filters
+        .then_some(request.filters.size.as_ref())
+        .flatten();
     let mut entries: Vec<Entry> = dir_cache
         .children(dir)
         .iter()
@@ -1521,6 +1524,15 @@ fn browse_response(
                 entry.modified.is_some_and(|mtime| {
                     range.after.is_none_or(|after| mtime >= after)
                         && range.before.is_none_or(|before| mtime <= before)
+                })
+            })
+        })
+        .filter(|entry| {
+            // 大小只对文件有意义；文件夹的 size 为 None，条件下一律排除。
+            size_range.is_none_or(|range| {
+                entry.size.is_some_and(|size| {
+                    range.after.is_none_or(|after| size >= after)
+                        && range.before.is_none_or(|before| size <= before)
                 })
             })
         })

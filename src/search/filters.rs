@@ -1,4 +1,4 @@
-//! 界面筛选条的数据模型：位置 / 时间 / 类型，以及输入框提交的日期条件。
+//! 界面筛选条的数据模型：位置 / 时间 / 类型，以及输入框提交的日期/大小条件。
 //! 用户只点按钮/输入条件，不直接写引擎查询语法；这些枚举由
 //! `builtin::build_spec` 翻译成引擎查询规格。
 
@@ -64,6 +64,8 @@ pub struct SearchFilters {
     /// 输入框里提交的日期条件（修改时间，unix 秒，含边界）。
     /// 与 `time` 预设是交集语义：两者都设置时取更紧的上下界。
     pub modified: Option<DateRange>,
+    /// 输入框里提交的大小条件（字节，含边界）。目录不参与大小过滤。
+    pub size: Option<SizeRange>,
     /// 文件名匹配选项。`is_empty` 刻意忽略它：开启匹配选项不应让
     /// 应用/命令/关键字结果被当成“有筛选”而消失。
     pub matches: MatchOptions,
@@ -75,6 +77,7 @@ impl SearchFilters {
             && self.time.is_none()
             && self.group.is_none()
             && self.modified.is_none()
+            && self.size.is_none()
     }
 }
 
@@ -184,6 +187,61 @@ impl DateRange {
         if let (Some(a), Some(b)) = (after, before) {
             if a > b {
                 return Err("日期条件互相冲突，区间为空".to_string());
+            }
+        }
+        if other.after.is_some_and(|b| self.after.is_none_or(|a| b > a)) {
+            self.after_text = other.after_text;
+        }
+        if other
+            .before
+            .is_some_and(|b| self.before.is_none_or(|a| b < a))
+        {
+            self.before_text = other.before_text;
+        }
+        self.after = after;
+        self.before = before;
+        Ok(())
+    }
+}
+
+/// 输入框提交的文件大小区间（字节，含边界）。目录不参与大小过滤；
+/// 大小未知的条目（索引里 `u64::MAX`）在条件下一律不通过。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SizeRange {
+    pub after: Option<u64>,
+    pub before: Option<u64>,
+    pub after_text: Option<String>,
+    pub before_text: Option<String>,
+}
+
+impl SizeRange {
+    pub fn is_empty(&self) -> bool {
+        self.after.is_none() && self.before.is_none()
+    }
+
+    pub fn label(&self) -> String {
+        match (&self.after_text, &self.before_text) {
+            (Some(after), Some(before)) => format!("{after} · {before}"),
+            (Some(after), None) => after.clone(),
+            (None, Some(before)) => before.clone(),
+            (None, None) => String::new(),
+        }
+    }
+
+    /// 合并一条新条件：上下界取更紧的一侧，文案跟着被收紧的那一侧更新。
+    /// 合并后为空区间（after > before）返回错误，调用方保留原状态。
+    pub fn merge(&mut self, other: SizeRange) -> Result<(), String> {
+        let after = match (self.after, other.after) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let before = match (self.before, other.before) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let (Some(a), Some(b)) = (after, before) {
+            if a > b {
+                return Err("大小条件互相冲突，区间为空".to_string());
             }
         }
         if other.after.is_some_and(|b| self.after.is_none_or(|a| b > a)) {
@@ -356,6 +414,69 @@ mod tests {
         for drive in available_drives() {
             assert!(drive.is_ascii_uppercase());
         }
+    }
+
+    #[test]
+    fn size_range_merges_tighter_bounds() {
+        let mut range = SizeRange {
+            after: Some(1024),
+            before: Some(10 * 1024 * 1024),
+            after_text: Some("≥ 1 KB".into()),
+            before_text: Some("≤ 10 MB".into()),
+        };
+        range
+            .merge(SizeRange {
+                after: Some(2 * 1024 * 1024),
+                before: None,
+                after_text: Some("≥ 2 MB".into()),
+                before_text: None,
+            })
+            .expect("tighter lower bound");
+        assert_eq!(range.after, Some(2 * 1024 * 1024));
+        assert_eq!(range.before, Some(10 * 1024 * 1024));
+        assert_eq!(range.label(), "≥ 2 MB · ≤ 10 MB");
+
+        // 更松的边界不改动既有区间。
+        range
+            .merge(SizeRange {
+                after: Some(1),
+                before: None,
+                after_text: Some("> 1 B".into()),
+                before_text: None,
+            })
+            .expect("looser lower bound is ignored");
+        assert_eq!(range.after, Some(2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn conflicting_size_range_is_rejected() {
+        let mut range = SizeRange {
+            after: Some(10 * 1024 * 1024),
+            before: None,
+            after_text: Some("≥ 10 MB".into()),
+            before_text: None,
+        };
+        let before = range.clone();
+        let err = range
+            .merge(SizeRange {
+                after: None,
+                before: Some(1024),
+                after_text: None,
+                before_text: Some("< 1 KB".into()),
+            })
+            .expect_err("empty interval must be rejected");
+        assert!(err.contains("冲突"));
+        assert_eq!(range, before, "失败时不得改动原区间");
+    }
+
+    #[test]
+    fn size_condition_makes_filters_non_empty() {
+        let mut filters = SearchFilters::default();
+        filters.size = Some(SizeRange {
+            after: Some(1024),
+            ..Default::default()
+        });
+        assert!(!filters.is_empty());
     }
 
     #[test]

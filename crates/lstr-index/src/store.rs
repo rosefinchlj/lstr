@@ -351,10 +351,15 @@ pub struct VolumeStore {
     /// slot → 最后修改时间(unix 秒;0=未知)。目录枚举(首扫/watcher 刷新)写入,
     /// USN journal 路径没有时间信息(保持 0)。内置时间筛选依赖这一列。
     pub mtime: Vec<u32>,
+    /// slot → 文件大小(字节;`u64::MAX` = 未知)。目录枚举写入真实大小,
+    /// USN 记录没有大小(保持未知)。内置大小筛选依赖这一列。
+    pub size: Vec<u64>,
     /// mtime 仍为 0 的 slot 队列(USN 增量插入/恢复名时登记)。引擎空闲时
     /// 限量探测真实 mtime 回填(见 `Engine::maintain`),查询路径不做 FS IO。
     /// compact/快照加载后由 [`Self::rebuild_mtime_pending`] 重建。
     pub mtime_pending: Vec<u32>,
+    /// size 仍为未知（`u64::MAX`）的 slot 队列，回填机制与 mtime 相同。
+    pub size_pending: Vec<u32>,
     /// slot → 小写名里出现的 ASCII 字母位图(bit0=a .. bit25=z)。
     /// 单字符查询用它把 memmem 全量扫描降为按位快速筛(短串是打字延迟的主因)。
     pub char_mask: Vec<u32>,
@@ -473,7 +478,9 @@ impl VolumeStore {
             parent: Vec::new(),
             attrs: Vec::new(),
             mtime: Vec::new(),
+            size: Vec::new(),
             mtime_pending: Vec::new(),
+            size_pending: Vec::new(),
             char_mask: Vec::new(),
             base_len: 0,
             scan_mode: true,
@@ -511,6 +518,7 @@ impl VolumeStore {
         parent: Vec<u32>,
         attrs: Vec<u16>,
         mtime: Vec<u32>,
+        size: Vec<u64>,
         name_off: Vec<u32>,
         unresolved: Vec<(u32, u64)>,
         exclude: crate::noise::ExcludeRules,
@@ -534,7 +542,9 @@ impl VolumeStore {
             parent,
             attrs,
             mtime,
+            size,
             mtime_pending: Vec::new(),
+            size_pending: Vec::new(),
             char_mask,
             base_len,
             scan_mode: false,
@@ -568,6 +578,7 @@ impl VolumeStore {
         // 快照里的 mtime=0 条目(USN 增量写入的)同样需要回填:重建待探测
         // 队列,否则重启后这些条目仍永久过不了时间筛选。
         s.rebuild_mtime_pending();
+        s.rebuild_size_pending();
         s
     }
 
@@ -604,6 +615,31 @@ impl VolumeStore {
         self.mtime_pending.split_off(self.mtime_pending.len() - n)
     }
 
+    /// 登记「size 未知」的 slot（USN 插入/恢复名/修改后大小可能已变）。
+    #[inline]
+    fn note_size_pending(&mut self, slot: u32, size: u64, name: &[u8]) {
+        if size == u64::MAX && !name.is_empty() {
+            self.size_pending.push(slot);
+        }
+    }
+
+    /// 按当前列重建 size 待回填队列（compact 重排/快照加载后）。
+    pub fn rebuild_size_pending(&mut self) {
+        let pending: Vec<u32> = (0..self.name_off.len() as u32)
+            .filter(|&slot| self.size[slot as usize] == u64::MAX && !self.name(slot).is_empty())
+            .collect();
+        self.size_pending = pending;
+    }
+
+    /// 取走最多 `max` 个待回填 size slot。
+    pub fn take_size_pending(&mut self, max: usize) -> Vec<u32> {
+        let n = max.min(self.size_pending.len());
+        if n == 0 {
+            return Vec::new();
+        }
+        self.size_pending.split_off(self.size_pending.len() - n)
+    }
+
     /// compact 后已归并的 slot 数。快照按「base(FRN 序)+ delta(FRN 排序后归并)」
     /// 流式重建列,保存期间不 compact(见 snapshot 的分段保存)。
     pub fn base_len(&self) -> u32 {
@@ -633,7 +669,9 @@ impl VolumeStore {
             + self.parent.len() * 4
             + self.attrs.len() * 2
             + self.mtime.len() * 4
+            + self.size.len() * 8
             + self.mtime_pending.len() * 4
+            + self.size_pending.len() * 4
             + self.char_mask.len() * 4
             + self.ngram_heap_bytes()
     }
@@ -643,7 +681,7 @@ impl VolumeStore {
     pub fn memory_breakdown_mb(&self) -> String {
         let mb = |n: usize| n as f64 / (1024.0 * 1024.0);
         format!(
-            "names={:.1} names_lc={:.1} name_off={:.1} off_index={:.1} offs={:.1} frn={:.1} parent={:.1} attrs={:.1} mtime={:.1} char_mask={:.1} mtime_pending={:.1} ngram={:.1}",
+            "names={:.1} names_lc={:.1} name_off={:.1} off_index={:.1} offs={:.1} frn={:.1} parent={:.1} attrs={:.1} mtime={:.1} size={:.1} char_mask={:.1} mtime_pending={:.1} size_pending={:.1} ngram={:.1}",
             mb(self.names.len()),
             mb(self.names_lc.len()),
             mb(self.name_off.len() * 4),
@@ -653,8 +691,10 @@ impl VolumeStore {
             mb(self.parent.len() * 4),
             mb(self.attrs.len() * 2),
             mb(self.mtime.len() * 4),
+            mb(self.size.len() * 8),
             mb(self.char_mask.len() * 4),
             mb(self.mtime_pending.len() * 4),
+            mb(self.size_pending.len() * 4),
             mb(self.ngram_heap_bytes()),
         )
     }
@@ -896,7 +936,7 @@ impl VolumeStore {
             self.clear_seen();
             let mut added = 0usize;
             for r in recs {
-                if self.insert_meta(r.frn, r.parent_frn, r.attrs, r.name.as_bytes(), r.mtime) {
+                if self.insert_meta(r.frn, r.parent_frn, r.attrs, r.name.as_bytes(), r.mtime, r.size) {
                     added += 1;
                 }
                 if let Some(slot) = self.find_slot(r.frn) {
@@ -920,7 +960,7 @@ impl VolumeStore {
         }
         let mut added = 0usize;
         for r in recs {
-            if self.insert_meta(r.frn, r.parent_frn, r.attrs, r.name.as_bytes(), r.mtime) {
+            if self.insert_meta(r.frn, r.parent_frn, r.attrs, r.name.as_bytes(), r.mtime, r.size) {
                 added += 1;
             }
             if let Some(slot) = self.find_slot(r.frn) {
@@ -957,7 +997,7 @@ impl VolumeStore {
         }
         let mut added = 0usize;
         for r in recs {
-            if self.insert_meta(r.frn, r.parent_frn, r.attrs, r.name.as_bytes(), r.mtime) {
+            if self.insert_meta(r.frn, r.parent_frn, r.attrs, r.name.as_bytes(), r.mtime, r.size) {
                 added += 1;
             }
             if let Some(slot) = self.find_slot(r.frn) {
@@ -1013,7 +1053,7 @@ impl VolumeStore {
         attrs: u32,
         name: &[u8],
     ) -> bool {
-        self.insert_meta(frn, parent_frn, attrs, name, 0)
+        self.insert_meta(frn, parent_frn, attrs, name, 0, u64::MAX)
     }
 
     pub fn insert_meta(
@@ -1023,6 +1063,7 @@ impl VolumeStore {
         attrs: u32,
         name: &[u8],
         mtime: i64,
+        size: u64,
     ) -> bool {
         let mtime = mtime.clamp(0, u32::MAX as i64) as u32;
         let scanning = self.is_scanning();
@@ -1054,6 +1095,8 @@ impl VolumeStore {
                         | if parent_frn == ROOT_FRN { ATTR_ROOT_CHILD } else { 0 };
                     self.mtime[old as usize] = mtime;
                     self.note_mtime_pending(old, mtime, name);
+                    self.size[old as usize] = size;
+                    self.note_size_pending(old, size, name);
                     return false;
                 }
                 // 就地更新:slot 身份不变 —— 目录改名后子项的父指针仍然有效
@@ -1099,6 +1142,8 @@ impl VolumeStore {
                     | if parent_frn == ROOT_FRN { ATTR_ROOT_CHILD } else { 0 };
                 self.mtime[old as usize] = mtime;
                 self.note_mtime_pending(old, mtime, name);
+                self.size[old as usize] = size;
+                self.note_size_pending(old, size, name);
                 if !self.exclude.is_empty() {
                     // 父/名变了,重新判噪(结果可能解除或加深)
                     self.attrs[old as usize] &= !ATTR_NOISE;
@@ -1134,6 +1179,8 @@ impl VolumeStore {
         self.attrs.push(a);
         self.mtime.push(mtime);
         self.note_mtime_pending(slot, mtime, name);
+        self.size.push(size);
+        self.note_size_pending(slot, size, name);
         self.char_mask.push(mask_of_bytes(name));
         self.delta.push(slot);
         // 倒排 overlay:索引构建后的新增槽不进倒排(重建留给 compact),
@@ -1420,14 +1467,16 @@ impl VolumeStore {
             let p = self.parent[old as usize];
             parent.push(if p == NO_PARENT { NO_PARENT } else { remap[p as usize] });
         }
-        // 7. attrs/mtime/frn
+        // 7. attrs/mtime/size/frn
         let mut attrs = Vec::with_capacity(by_frn.len());
         let mut mtime = Vec::with_capacity(by_frn.len());
+        let mut size = Vec::with_capacity(by_frn.len());
         let mut mask = Vec::with_capacity(by_frn.len());
         let mut frn = Vec::with_capacity(by_frn.len());
         for &(_, old) in &by_frn {
             attrs.push(self.attrs[old as usize] & !ATTR_INTERNAL);
             mtime.push(self.mtime[old as usize]);
+            size.push(self.size[old as usize]);
             mask.push(mask_of_bytes(slice_at(&self.names, self.name_off[old as usize] as usize)));
             frn.push(self.frn[old as usize]);
         }
@@ -1504,6 +1553,7 @@ impl VolumeStore {
         self.parent = parent;
         self.attrs = attrs;
         self.mtime = mtime;
+        self.size = size;
         self.char_mask = mask;
         self.delta.clear();
         self.delta.shrink_to_fit();
@@ -1529,6 +1579,7 @@ impl VolumeStore {
         self.scan_mode = false;
         // slot 已整体重排,旧的待回填编号全部失效;按新列重建一次。
         self.rebuild_mtime_pending();
+        self.rebuild_size_pending();
         // children 索引若已构建(watch 模式),slot 重排后按新 parent 列重建。
         if self.children_built {
             self.rebuild_children();
@@ -1588,13 +1639,13 @@ mod tests {
         let mut s = VolumeStore::new(Default::default(), 'C');
         insert(&mut s, 100, 5, 0x10, "dir");
         s.compact(); // ready:后续 insert 走增量更新/追加路径
-        s.insert_meta(101, 100, 0, b"unknown.txt", 0);
-        s.insert_meta(102, 100, 0, b"known.txt", 1_700_000_000);
+        s.insert_meta(101, 100, 0, b"unknown.txt", 0, u64::MAX);
+        s.insert_meta(102, 100, 0, b"known.txt", 1_700_000_000, u64::MAX);
         assert_eq!(s.mtime_pending.len(), 2, "dir + unknown.txt");
 
         // 后续 USN 记录带来真实 mtime:就地更新(不再登记新 pending),
         // 旧 pending 项由引擎 drain 按 mtime != 0 丢弃。
-        s.insert_meta(101, 100, 0, b"unknown.txt", 1_700_000_001);
+        s.insert_meta(101, 100, 0, b"unknown.txt", 1_700_000_001, u64::MAX);
         assert_eq!(s.mtime_pending.len(), 2);
         s.compact();
         assert_eq!(s.mtime_pending.len(), 1, "compact 重建后只剩 mtime=0 的 dir");
@@ -1603,7 +1654,7 @@ mod tests {
         assert_eq!(s.name(slot), b"dir");
 
         // 新插入的未知 mtime 条目继续登记。
-        s.insert_meta(103, 100, 0, b"new.txt", 0);
+        s.insert_meta(103, 100, 0, b"new.txt", 0, u64::MAX);
         assert_eq!(s.mtime_pending.len(), 2);
     }
 
@@ -1666,8 +1717,8 @@ mod tests {
         s.compact();
         assert!(s.attrs[s.find_slot(100).unwrap() as usize] & ATTR_ROOT_CHILD != 0);
         let recs = vec![
-            Rec { frn: 101, parent_frn: 5, attrs: 0, op: crate::usn::Op::Upsert, name: "keep.txt".into(), mtime: 0 },
-            Rec { frn: 102, parent_frn: 5, attrs: 0, op: crate::usn::Op::Upsert, name: "new.txt".into(), mtime: 0 },
+            Rec { frn: 101, parent_frn: 5, attrs: 0, op: crate::usn::Op::Upsert, name: "keep.txt".into(), mtime: 0, size: u64::MAX },
+            Rec { frn: 102, parent_frn: 5, attrs: 0, op: crate::usn::Op::Upsert, name: "new.txt".into(), mtime: 0, size: u64::MAX },
         ];
         let (added, removed) = s.apply_root_children(&recs);
         assert_eq!(removed, 1);
@@ -1944,6 +1995,7 @@ mod tests {
             op: Op::Upsert,
             name: name.to_string(),
             mtime: 0,
+            size: u64::MAX,
         };
         let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
@@ -1969,7 +2021,7 @@ mod tests {
         assert!(s.find_slot(101).is_none());
         assert!(s.find_slot(100).is_some());
         // 把 c1 移到 dirB(insert_meta 就地改父),索引应同步移动
-        s.insert_meta(100, 20, 0, b"c1.txt", 0);
+        s.insert_meta(100, 20, 0, b"c1.txt", 0, u64::MAX);
         assert_eq!(s.parent[c1 as usize], b);
         // 刷新 dirA 为空:不应误删已移走的 c1
         let (_, removed) = s.apply_children(a, &[]);

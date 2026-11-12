@@ -232,11 +232,94 @@ const HELP_GROUP_HEAD_H: f32 = 21.0;
 const HELP_ROW_H: f32 = 19.0;
 const HELP_GROUP_GAP: f32 = 8.0;
 
+/// 搜索框左侧条件 chip 的宽度（不绘制）。`label` 为空 = 紧凑模式（只画值）。
+fn condition_chip_width(painter: &egui::Painter, label: &str, value: &str) -> f32 {
+    let label_w = if label.is_empty() {
+        0.0
+    } else {
+        painter
+            .layout_no_wrap(label.to_string(), ui::text_font(11.0), Color32::WHITE)
+            .size()
+            .x
+            + 6.0
+    };
+    let value_w = painter
+        .layout_no_wrap(value.to_string(), ui::mono_font(10.5), Color32::WHITE)
+        .size()
+        .x;
+    8.0 + label_w + value_w + 6.0 + 14.0
+}
+
+/// 画一个条件 chip（标签比例字体 + 值等宽字体 + × 命中区），返回
+/// `(宽度, 是否点了 ×)`。日期/大小共用；颜色由调用方按类型传。
+fn paint_condition_chip(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    left: f32,
+    top: f32,
+    label: &str,
+    value: &str,
+    color: Color32,
+    bg: Color32,
+    id: &str,
+    tooltip: &str,
+) -> (f32, bool) {
+    let label_galley = (!label.is_empty())
+        .then(|| painter.layout_no_wrap(label.to_string(), ui::text_font(11.0), color));
+    let value_galley = painter.layout_no_wrap(value.to_string(), ui::mono_font(10.5), color);
+    let clear_w = 14.0;
+    let label_w = label_galley
+        .as_ref()
+        .map(|g| g.size().x + 6.0)
+        .unwrap_or(0.0);
+    let chip_w = 8.0 + label_w + value_galley.size().x + 6.0 + clear_w;
+    let chip_h = 20.0;
+    let chip = Rect::from_min_size(egui::pos2(left, top), egui::vec2(chip_w, chip_h));
+    painter.rect_filled(chip, CornerRadius::same(6), bg);
+    painter.rect_stroke(
+        chip,
+        CornerRadius::same(6),
+        Stroke::new(1.0_f32, color.gamma_multiply(0.45)),
+        StrokeKind::Inside,
+    );
+    if let Some(galley) = &label_galley {
+        painter.galley(
+            egui::pos2(chip.left() + 8.0, chip.center().y - galley.size().y / 2.0),
+            galley.clone(),
+            color,
+        );
+    }
+    painter.galley(
+        egui::pos2(
+            chip.left() + 8.0 + label_w,
+            chip.center().y - value_galley.size().y / 2.0,
+        ),
+        value_galley.clone(),
+        color,
+    );
+    let clear = Rect::from_min_size(
+        egui::pos2(chip.right() - clear_w - 2.0, chip.top() + 3.0),
+        egui::vec2(clear_w, chip_h - 6.0),
+    );
+    painter.text(
+        clear.center(),
+        Align2::CENTER_CENTER,
+        "×",
+        ui::mono_font(11.0),
+        color,
+    );
+    let response = ui
+        .interact(clear, Id::new(("lstr-cond-chip-clear", id)), Sense::click())
+        .on_hover_text(tooltip.to_string());
+    (chip_w, response.clicked())
+}
+
 /// 空查询帮助面板的内容高度（相对列表顶部）：宽窗口两列，以较高的左列
 /// 为准；窄窗口退化为单列顺排，两列内容相加。
 fn help_panel_height(width: f32) -> f32 {
     let group = |rows: f32| HELP_GROUP_HEAD_H + rows * HELP_ROW_H + HELP_GROUP_GAP;
-    let left = group(3.0) * 3.0;
+    // 左列：位置 3 行 / 筛选 4 行（含日期、大小）/ 范围 3 行。
+    let left = group(3.0) + group(4.0) + group(3.0);
     let head = HELP_TOP_PAD + HELP_TITLE_H;
     if width >= 560.0 {
         head + left
@@ -262,7 +345,7 @@ pub struct LstrApp {
     error: Option<String>,
     /// 正则模式下的编译错误（不触发搜索，单独提示）。
     regex_error: Option<String>,
-    /// 输入框日期条件解析错误（非法日期/空区间等，保留原文不提交）。
+    /// 输入框日期/大小条件解析错误（非法日期/单位/空区间等，保留原文不提交）。
     condition_error: Option<String>,
     /// 自研索引状态行(渐进启动:构建中/未启用提示;错误条优先)。
     index_note: Option<String>,
@@ -962,7 +1045,7 @@ impl LstrApp {
         }
     }
 
-    /// 日期条件是否在当前上下文生效：正则、PathTyping、应用/命令页不解析；
+    /// 日期/大小条件是否在当前上下文生效：正则、PathTyping、应用/命令页不解析；
     /// 浏览模式生效（与时间/类型筛选一致）。
     fn conditions_apply(&self, scope: Scope) -> bool {
         !self.filters.matches.regex
@@ -970,7 +1053,7 @@ impl LstrApp {
             && !matches!(scope, Scope::App | Scope::Command)
     }
 
-    /// 扫描输入框里的日期条件：成功的片段从文本删除并合并进 filters，
+    /// 扫描输入框里的日期/大小条件：成功的片段从文本删除并合并进 filters，
     /// 非法条件保留原文、只记录错误。返回是否改动了输入。
     ///
     /// 只在 TextEdit changed 后调用；IME 组合期不调用（避免把预编辑当条件）。
@@ -980,23 +1063,31 @@ impl LstrApp {
         }
         let extracted = crate::search::conditions::extract(&self.input);
         self.condition_error = extracted.errors.first().cloned();
-        if extracted.conditions.is_empty() {
+        if extracted.is_empty() {
             return false;
         }
-        let mut merged = self.filters.modified.clone().unwrap_or_default();
-        for condition in extracted.conditions {
-            if let Err(err) = merged.merge(condition) {
+        let mut dates = self.filters.modified.clone().unwrap_or_default();
+        for range in extracted.dates {
+            if let Err(err) = dates.merge(range) {
+                self.condition_error = Some(err);
+                return false;
+            }
+        }
+        let mut sizes = self.filters.size.clone().unwrap_or_default();
+        for range in extracted.sizes {
+            if let Err(err) = sizes.merge(range) {
                 self.condition_error = Some(err);
                 return false;
             }
         }
         self.input = extracted.cleaned;
-        self.filters.modified = (!merged.is_empty()).then_some(merged);
+        self.filters.modified = (!dates.is_empty()).then_some(dates);
+        self.filters.size = (!sizes.is_empty()).then_some(sizes);
         self.move_caret_to_end(ctx);
         true
     }
 
-    /// 程序化清空输入（不清筛选）：同时清掉日期条件错误，避免错误态
+    /// 程序化清空输入（不清筛选）：同时清掉条件错误，避免错误态
     /// 一直挡住后续查询。
     fn clear_input_text(&mut self) {
         self.input.clear();
@@ -2092,73 +2183,88 @@ impl LstrApp {
                 } else {
                     hint_for(query.scope).to_string()
                 };
-                // 日期条件 chip：固定在输入框左侧，文本区整体右移。
-                // 标签用比例字体、值用等宽字体 + 琥珀色，和普通输入文字区分。
-                let cond_label = self
-                    .filters
-                    .modified
-                    .as_ref()
-                    .filter(|range| !range.is_empty())
-                    .map(|range| range.label());
+                // 条件 chip：固定在输入框左侧，文本区整体右移。
+                // 标签用比例字体、值用等宽字体；日期=琥珀色，大小=冷色。
+                let disabled = !self.conditions_apply(query.scope);
+                let size_color = if theme.light {
+                    Color32::from_rgb(46, 112, 142)
+                } else {
+                    Color32::from_rgb(118, 188, 210)
+                };
+                let size_bg = Color32::from_rgba_unmultiplied(
+                    size_color.r(),
+                    size_color.g(),
+                    size_color.b(),
+                    26,
+                );
+                let mut chips: Vec<(String, String, Color32, Color32, &'static str, &'static str)> =
+                    Vec::new();
+                if let Some(range) = self.filters.modified.as_ref().filter(|r| !r.is_empty()) {
+                    chips.push((
+                        "时间".into(),
+                        range.label(),
+                        theme.amber,
+                        theme.amber_soft,
+                        "date",
+                        "修改时间条件（本地时间）；点 × 移除",
+                    ));
+                }
+                if let Some(range) = self.filters.size.as_ref().filter(|r| !r.is_empty()) {
+                    chips.push((
+                        "大小".into(),
+                        range.label(),
+                        size_color,
+                        size_bg,
+                        "size",
+                        "文件大小条件；点 × 移除",
+                    ));
+                }
                 let mut text_rect = search_rect;
-                if let Some(label) = &cond_label {
-                    let disabled = !self.conditions_apply(query.scope);
-                    let color = if disabled { theme.dim } else { theme.amber };
-                    let bg = if disabled { theme.hover } else { theme.amber_soft };
-                    let label_galley = painter.layout_no_wrap("时间".to_string(), ui::text_font(11.0), color);
-                    let value_galley = painter.layout_no_wrap(label.clone(), ui::mono_font(10.5), color);
-                    let clear_w = 14.0;
-                    let chip_w = 8.0 + label_galley.size().x + 6.0 + value_galley.size().x
-                        + 6.0 + clear_w;
-                    let chip_h = 20.0;
-                    let chip = Rect::from_min_size(
-                        egui::pos2(search_rect.left(), search_rect.top() + 4.0),
-                        egui::vec2(chip_w, chip_h),
-                    );
-                    painter.rect_filled(chip, CornerRadius::same(6), bg);
-                    painter.rect_stroke(
-                        chip,
-                        CornerRadius::same(6),
-                        Stroke::new(1.0_f32, color.gamma_multiply(0.45)),
-                        StrokeKind::Inside,
-                    );
-                    painter.galley(
-                        egui::pos2(chip.left() + 8.0, chip.center().y - label_galley.size().y / 2.0),
-                        label_galley.clone(),
-                        color,
-                    );
-                    painter.galley(
-                        egui::pos2(
-                            chip.left() + 8.0 + label_galley.size().x + 6.0,
-                            chip.center().y - value_galley.size().y / 2.0,
-                        ),
-                        value_galley.clone(),
-                        color,
-                    );
-                    let clear = Rect::from_min_size(
-                        egui::pos2(chip.right() - clear_w - 2.0, chip.top() + 3.0),
-                        egui::vec2(clear_w, chip_h - 6.0),
-                    );
-                    painter.text(
-                        clear.center(),
-                        Align2::CENTER_CENTER,
-                        "×",
-                        ui::mono_font(11.0),
-                        color,
-                    );
-                    let response = ui
-                        .interact(clear, Id::new("lstr-date-chip-clear"), Sense::click())
-                        .on_hover_text(if disabled {
-                            "日期条件只作用于文件搜索；此处不生效（点 × 移除）"
-                        } else {
-                            "修改时间条件（本地时间）；点 × 移除"
-                        });
-                    if response.clicked() {
-                        self.filters.modified = None;
+                if !chips.is_empty() {
+                    // 窄窗口下先去掉标签（只留值），保证文本区至少留出 80px。
+                    let with_labels: f32 = chips
+                        .iter()
+                        .map(|c| condition_chip_width(&painter, &c.0, &c.1))
+                        .sum::<f32>()
+                        + 6.0 * chips.len().saturating_sub(1) as f32;
+                    let compact = search_rect.width() - with_labels < 90.0;
+                    let suffix = if disabled {
+                        "；当前上下文不生效"
+                    } else {
+                        ""
+                    };
+                    let mut x = search_rect.left();
+                    let mut removed: Option<&'static str> = None;
+                    for (label, value, color, bg, id, tip) in &chips {
+                        let label = if compact { "" } else { label.as_str() };
+                        let (w, clicked) = paint_condition_chip(
+                            ui,
+                            &painter,
+                            x,
+                            search_rect.top() + 4.0,
+                            label,
+                            value,
+                            if disabled { theme.dim } else { *color },
+                            if disabled { theme.hover } else { *bg },
+                            id,
+                            &format!("{tip}{suffix}"),
+                        );
+                        if clicked {
+                            removed = Some(*id);
+                        }
+                        x += w + 6.0;
+                    }
+                    if let Some(id) = removed {
+                        match id {
+                            "date" => self.filters.modified = None,
+                            "size" => self.filters.size = None,
+                            _ => {}
+                        }
                         self.trigger(ctx);
                     }
-                    text_rect.min.x = (chip.right() + 8.0)
-                        .min((search_rect.right() - 80.0).max(chip.right() + 4.0));
+                    text_rect.min.x = (x + 2.0)
+                        .min(search_rect.right() - 40.0)
+                        .max(search_rect.left());
                 }
                 let response = ui.put(
                     text_rect,
@@ -3274,6 +3380,7 @@ impl LstrApp {
                         &[
                             ("ext:rs", "按扩展名"),
                             ("日期", "date>2026-11-10: 冒号提交"),
+                            ("大小", "size>10M: 按文件大小"),
                             ("匹配", "大小写 / 全词 / 正则"),
                         ],
                     ),
@@ -3369,14 +3476,14 @@ impl LstrApp {
                 painter.text(
                     egui::pos2(rect.center().x, list_top + 44.0),
                     Align2::CENTER_CENTER,
-                    "正在输入日期条件",
+                    "正在输入日期/大小条件",
                     ui::text_font(15.0),
                     theme.text,
                 );
                 painter.text(
                     egui::pos2(rect.center().x, list_top + 68.0),
                     Align2::CENTER_CENTER,
-                    "冒号提交后生效，例如 date>2026-11-10:",
+                    "冒号提交后生效，例如 date>2026-11-10: / size>10M:",
                     ui::mono_font(11.5),
                     theme.dim,
                 );
@@ -3424,7 +3531,7 @@ impl LstrApp {
             } else if self.typing_folder.is_some() && !self.typing_global {
                 "当前目录内无匹配 · Ctrl+Shift+G 全局搜索"
             } else {
-                "试试 ext:rs、date>2026-11-10: 或 a 微信"
+                "试试 ext:rs、date>2026-11-10: 或 size>10M:"
             };
             painter.text(
                 egui::pos2(rect.center().x, list_top + 68.0),
@@ -4058,7 +4165,7 @@ impl LstrApp {
         let mut default_text = if self.conditions_apply(query.scope)
             && crate::search::conditions::is_composing(&self.input)
         {
-            "正在输入日期条件 · 冒号提交后生效".to_string()
+            "正在输入日期/大小条件 · 冒号提交后生效".to_string()
         } else if query.is_empty() && self.filters.is_empty() {
             format!(
                 "{} 项{}",

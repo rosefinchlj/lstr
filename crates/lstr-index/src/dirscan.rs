@@ -223,6 +223,9 @@ pub fn enumerate_dir(
                         let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
                         let is_reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
                         let mtime = unix_from_filetime(i64_at(&buf, off + 24).unwrap_or(0));
+                        // FILE_ID_BOTH_DIR_INFORMATION.EndOfFile（LARGE_INTEGER，
+                        // off+40）：与 mtime 同一条记录，读大小零额外 IO。
+                        let size = i64_at(&buf, off + 40).unwrap_or(0).max(0) as u64;
                         pending.push(Rec {
                             frn: file_id,
                             parent_frn: dir_frn,
@@ -230,6 +233,7 @@ pub fn enumerate_dir(
                             op: Op::Upsert,
                             name: name.clone(),
                             mtime,
+                            size,
                         });
                         total += 1;
                         if pending.len() >= BATCH_RECS {
@@ -320,6 +324,7 @@ pub fn enumerate_children(
                 let is_meta = mfrn < 0x100 && name.starts_with('$');
                 if !is_meta {
                     let mtime = unix_from_filetime(i64_at(&buf, off + 24).unwrap_or(0));
+                    let size = i64_at(&buf, off + 40).unwrap_or(0).max(0) as u64;
                     out.push(Rec {
                         frn: file_id,
                         parent_frn: dir_frn,
@@ -327,6 +332,7 @@ pub fn enumerate_children(
                         op: Op::Upsert,
                         name,
                         mtime,
+                        size,
                     });
                 }
             }

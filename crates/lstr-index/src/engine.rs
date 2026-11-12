@@ -324,9 +324,9 @@ pub struct Engine {
     /// 剩余块由宿主稍后继续消化。宿主(search worker)注入,复用 0294602
     /// 「打字时查询优先于索引维护」的判定,把优先级检查扩展到 apply 中段。
     query_yield: Option<Box<dyn Fn() -> bool + Send>>,
-    /// mtime 回填探针:路径 → unix 秒(None = 文件已删/无权限)。None 时用
-    /// 生产实现 `win::find_meta`;测试注入假探针,避免依赖真实磁盘。
-    mtime_probe: Option<Box<dyn Fn(&str) -> Option<i64> + Send>>,
+    /// 元数据回填探针:路径 → (size, mtime)（None = 文件已删/无权限）。
+    /// None 时用生产实现 `win::find_meta`;测试注入假探针，避免依赖真实磁盘。
+    meta_probe: Option<Box<dyn Fn(&str) -> Option<(u64, i64)> + Send>>,
     /// 让路发生次数(诊断/基准断言:批间让路必须真的发生过)。
     apply_yields: u64,
     /// 正在进行的可中断全量保存(一次一个卷)。保存期间 store 冻结:
@@ -362,7 +362,7 @@ impl Engine {
             pending_applies: Vec::new(),
             apply_chunk_records: DEFAULT_APPLY_CHUNK,
             query_yield: None,
-            mtime_probe: None,
+            meta_probe: None,
             apply_yields: 0,
             save_task: None,
             deferred_msgs: std::collections::VecDeque::new(),
@@ -1092,10 +1092,13 @@ impl Engine {
         self.query_yield = hook;
     }
 
-    /// 注入 mtime 回填探针(路径 → unix 秒;None = 已删/无权限,丢弃不重试)。
+    /// 注入元数据回填探针(路径 → (size, mtime);None = 已删/无权限,丢弃不重试)。
     /// 生产不注入(None)时走 `win::find_meta`;测试注入假探针即可离线验证。
-    pub fn set_mtime_probe(&mut self, probe: Option<Box<dyn Fn(&str) -> Option<i64> + Send>>) {
-        self.mtime_probe = probe;
+    pub fn set_meta_probe(
+        &mut self,
+        probe: Option<Box<dyn Fn(&str) -> Option<(u64, i64)> + Send>>,
+    ) {
+        self.meta_probe = probe;
     }
 
     /// 调整分批块大小(条);0 = 关闭分批(一次性 apply)。测试/基准用;
@@ -1133,7 +1136,14 @@ impl Engine {
     fn apply_rec(store: &mut VolumeStore, rec: &Rec, syncing: bool) {
         match rec.op {
             Op::Upsert => {
-                store.insert_meta(rec.frn, rec.parent_frn, rec.attrs, rec.name.as_bytes(), rec.mtime);
+                store.insert_meta(
+                    rec.frn,
+                    rec.parent_frn,
+                    rec.attrs,
+                    rec.name.as_bytes(),
+                    rec.mtime,
+                    rec.size,
+                );
                 if syncing {
                     store.mark_seen(rec.frn);
                 }
@@ -1684,11 +1694,11 @@ impl Engine {
         self.pinyin.get(hit.vol as usize)?.get(hit.slot)
     }
 
-    /// 取一条真实 mtime:测试注入的探针优先,生产回落 `win::find_meta`。
-    fn probe_mtime(&self, path: &str) -> Option<i64> {
-        match &self.mtime_probe {
+    /// 取一条真实元数据:测试注入的探针优先,生产回落 `win::find_meta`。
+    fn probe_meta(&self, path: &str) -> Option<(u64, i64)> {
+        match &self.meta_probe {
             Some(probe) => probe(path),
-            None => crate::win::find_meta(path).map(|(_, mtime, _)| mtime),
+            None => crate::win::find_meta(path).map(|(size, mtime, _)| (size, mtime)),
         }
     }
 
@@ -1766,16 +1776,16 @@ impl Engine {
         }
     }
 
-    /// 限量回填 USN 增量条目的真实 mtime(查询路径不做 FS IO 的配套)。
+    /// 限量回填 USN 增量条目的真实 mtime / size(查询路径不做 FS IO 的配套)。
     ///
-    /// 每卷每轮最多 [`MTIME_BACKFILL_PER_ROUND`] 个 slot;`mtime != 0`
-    /// (已被其它记录/上一轮填过)直接丢弃。probe 返回 None(文件已删/无权限)
-    /// 也丢弃 —— 不再重试,避免对死路径每轮反复 stat。首扫/对账窗口跳过:
-    /// 首扫的 mtime 由目录枚举写入,store 尚未定型。
+    /// 每卷每轮最多 [`MTIME_BACKFILL_PER_ROUND`] 个 slot(两个待回填队列合计);
+    /// 已经填过的字段直接丢弃。probe 返回 None(文件已删/无权限)也丢弃 ——
+    /// 不再重试,避免对死路径每轮反复 stat。首扫/对账窗口跳过:首扫的元数据
+    /// 由目录枚举写入,store 尚未定型。
     ///
-    /// 返回是否真的写入了 mtime。这是 maintain 的「有事可做」信号,不影响
-    /// 落盘语义(dirty 由这里置位,保存循环照常按节流处理)。
-    fn backfill_mtime(&mut self) -> bool {
+    /// 一次 `find_meta` 同时返回 size 与 mtime,所以两个队列合并去重后只 stat
+    /// 一次。返回是否真的写入了字段(maintain 的「有事可做」信号)。
+    fn backfill_meta(&mut self) -> bool {
         let mut wrote = false;
         for i in 0..self.volumes.len() {
             if self.volumes[i].syncing {
@@ -1785,33 +1795,41 @@ impl Engine {
             let batch = {
                 let Some(store) = self.volumes[i].store.as_mut() else { continue };
                 if store.is_scanning() {
-                    continue; // 首扫 mtime 来自目录枚举,等 VolumeReady 后再看
+                    continue; // 首扫元数据来自目录枚举,等 VolumeReady 后再看
                 }
-                store.take_mtime_pending(MTIME_BACKFILL_PER_ROUND)
+                let mut slots = store.take_mtime_pending(MTIME_BACKFILL_PER_ROUND);
+                let remaining = MTIME_BACKFILL_PER_ROUND.saturating_sub(slots.len());
+                if remaining > 0 {
+                    slots.extend(store.take_size_pending(remaining));
+                }
+                slots
             };
             if batch.is_empty() {
                 continue;
             }
             // 同一 slot 可能因多条 USN 记录重复登记:批内先去重,避免同一
-            // 路径重复 stat。批间重复由「mtime 已非 0」检查兜底。
+            // 路径重复 stat。批间重复由「字段已填」检查兜底。
             let mut slots = batch;
             slots.sort_unstable();
             slots.dedup();
-            let mut found: Vec<(u32, i64)> = Vec::with_capacity(slots.len());
+            // (slot, size, mtime, fill_mtime, fill_size)
+            let mut found: Vec<(u32, u64, i64, bool, bool)> = Vec::with_capacity(slots.len());
             for slot in slots {
                 let Some(store) = self.volumes[i].store.as_ref() else { break };
-                if slot as usize >= store.len()
-                    || store.mtime[slot as usize] != 0
-                    || store.name(slot).is_empty()
-                {
+                if slot as usize >= store.len() || store.name(slot).is_empty() {
+                    continue;
+                }
+                let fill_mtime = store.mtime[slot as usize] == 0;
+                let fill_size = store.size[slot as usize] == u64::MAX;
+                if !fill_mtime && !fill_size {
                     continue;
                 }
                 let hit = Hit { vol: i as u32, slot, generation, mtime: 0 };
                 // 父链断裂/祖先已删(path_of None):无法定位真实文件,丢弃。
                 let Some(path) = self.path_of(&hit) else { continue };
-                if let Some(mtime) = self.probe_mtime(&path) {
-                    if mtime > 0 {
-                        found.push((slot, mtime));
+                if let Some((size, mtime)) = self.probe_meta(&path) {
+                    if (fill_mtime && mtime > 0) || fill_size {
+                        found.push((slot, size, mtime, fill_mtime, fill_size));
                     }
                 }
             }
@@ -1821,10 +1839,17 @@ impl Engine {
             let changed = {
                 let Some(store) = self.volumes[i].store.as_mut() else { continue };
                 let mut changed = false;
-                for (slot, mtime) in found {
-                    if (slot as usize) < store.len() && store.mtime[slot as usize] == 0 {
+                for (slot, size, mtime, fill_mtime, fill_size) in found {
+                    if (slot as usize) >= store.len() {
+                        continue;
+                    }
+                    if fill_mtime && store.mtime[slot as usize] == 0 && mtime > 0 {
                         store.mtime[slot as usize] =
                             mtime.clamp(0, u32::MAX as i64) as u32;
+                        changed = true;
+                    }
+                    if fill_size && store.size[slot as usize] == u64::MAX {
+                        store.size[slot as usize] = size;
                         changed = true;
                     }
                 }
@@ -1901,7 +1926,7 @@ impl Engine {
         }
         // USN 增量条目的 mtime 回填:compact 已重建 pending,这里拿到的 slot
         // 与当前 store 一致。限量(每卷 128/轮),避免长时间占住引擎线程。
-        if self.backfill_mtime() {
+        if self.backfill_meta() {
             did = true;
         }
         let now = Instant::now();
@@ -2333,7 +2358,7 @@ mod tests {
     }
 
     fn rec(frn: u64, parent: u64, attrs: u32, name: &str) -> Rec {
-        Rec { frn, parent_frn: parent, attrs, op: Op::Upsert, name: name.to_string(), mtime: 0 }
+        Rec { frn, parent_frn: parent, attrs, op: Op::Upsert, name: name.to_string(), mtime: 0, size: u64::MAX }
     }
 
     /// attrs=0 的便捷版(旁车测试用)。
@@ -2528,16 +2553,24 @@ mod tests {
         };
         assert_eq!(engine.query(&gamma).total, 0);
 
+        // 回填前:size 全未知 → 大小筛选命中不到。
+        let alpha_size = QuerySpec {
+            tokens: vec!["alpha".into()],
+            size_after: Some(1000),
+            ..Default::default()
+        };
+        assert_eq!(engine.query(&alpha_size).total, 0, "size=MAX 不得通过大小筛选");
+
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let probe_calls = calls.clone();
-        engine.set_mtime_probe(Some(Box::new(move |_path| {
+        engine.set_meta_probe(Some(Box::new(move |_path| {
             probe_calls.fetch_add(1, Ordering::Relaxed);
-            Some(MTIME)
+            Some((4096, MTIME))
         })));
         assert!(engine.maintain(), "回填写入后 maintain 应报告做了事");
         assert_eq!(calls.load(Ordering::Relaxed), 5, "两条卷的 5 个条目都应探测");
 
-        // 两个卷的 slot 都回填到索引 mtime。
+        // 两个卷的 slot 都回填到索引 mtime / size。
         for (vol, frn) in [(0usize, 11u64), (1usize, 21u64)] {
             let store = engine.volumes[vol].store.as_ref().unwrap();
             let slot = store.find_slot(frn).expect("entry");
@@ -2545,10 +2578,17 @@ mod tests {
                 store.mtime[slot as usize] as i64, MTIME,
                 "vol {vol} frn {frn} 的 mtime 应已回填"
             );
+            assert_eq!(store.size[slot as usize], 4096, "size 应同时回填");
             assert!(store.mtime_pending.is_empty(), "回填后 pending 应清空");
+            assert!(store.size_pending.is_empty(), "回填后 size pending 应清空");
         }
         assert_eq!(engine.query(&alpha).total, 1, "回填后时间筛选必须命中 C 卷");
         assert_eq!(engine.query(&gamma).total, 1, "回填后时间筛选必须命中 E 卷");
+        assert_eq!(
+            engine.query(&alpha_size).total,
+            1,
+            "回填后大小筛选必须命中 C 卷"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2571,14 +2611,14 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let (probe_calls, probe_seen) = (calls.clone(), seen.clone());
-        engine.set_mtime_probe(Some(Box::new(move |path| {
+        engine.set_meta_probe(Some(Box::new(move |path| {
             probe_calls.fetch_add(1, Ordering::Relaxed);
             probe_seen.lock().unwrap().push(path.to_string());
             // 只让 gone.txt 探测失败;kept.txt 正常回填。
             if path.ends_with("gone.txt") {
                 None
             } else {
-                Some(1_750_000_000)
+                Some((8192, 1_750_000_000))
             }
         })));
 
@@ -2623,9 +2663,9 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let probe_calls = calls.clone();
-        engine.set_mtime_probe(Some(Box::new(move |_| {
+        engine.set_meta_probe(Some(Box::new(move |_| {
             probe_calls.fetch_add(1, Ordering::Relaxed);
-            Some(1_750_000_000)
+            Some((2048, 1_750_000_000))
         })));
 
         assert_eq!(MTIME_BACKFILL_PER_ROUND, 128);
@@ -3050,6 +3090,7 @@ mod tests {
                 op: Op::Remove,
                 name: String::new(),
                 mtime: 0,
+                size: u64::MAX,
             }],
             next_usn: 150,
         });
@@ -3788,9 +3829,9 @@ mod tests {
         // 完整对账流:alpha 更新(mtime)、gamma 新增、beta 删除、alpha 改名
         let sync_recs = vec![
             rec(10, 0, 0x0010, "docs"),
-            Rec { frn: 11, parent_frn: 10, attrs: 0, op: Op::Upsert, name: "alpha.txt".into(), mtime: 1_700_000_000 },
+            Rec { frn: 11, parent_frn: 10, attrs: 0, op: Op::Upsert, name: "alpha.txt".into(), mtime: 1_700_000_000, size: u64::MAX },
             rec(13, 10, 0, "gamma.txt"),
-            Rec { frn: 12, parent_frn: 10, attrs: 0, op: Op::Remove, name: String::new(), mtime: 0 },
+            Rec { frn: 12, parent_frn: 10, attrs: 0, op: Op::Remove, name: String::new(), mtime: 0, size: u64::MAX },
             rec(11, 10, 0, "zeta.txt"),
         ];
         // a:一次性 apply
@@ -4075,7 +4116,7 @@ mod tests {
     const BENCH_FILES: u64 = 2_498_000;
 
     fn bench_rec(frn: u64, parent: u64, name: String, attrs: u32, mtime: i64) -> Rec {
-        Rec { frn, parent_frn: parent, attrs, op: Op::Upsert, name, mtime }
+        Rec { frn, parent_frn: parent, attrs, op: Op::Upsert, name, mtime, size: u64::MAX }
     }
 
     /// 首扫构建流(目录先行 + 文件;名字 1/5 含 'a',单字符查询撞 cap 的痛点形态)。
@@ -4766,7 +4807,14 @@ mod tests {
         for f in 0..PROFILE_FILES {
             let frn = 10 + PROFILE_DIRS + f;
             let parent = if f % 10 == 9 { 10 + (f / 10 % PROFILE_DIRS) } else { crate::store::ROOT_FRN };
-            s.insert_meta(frn, parent, 0, profile_name(f).as_bytes(), 1_600_000_000 + (f % 1_000_000) as i64);
+            s.insert_meta(
+                frn,
+                parent,
+                0,
+                profile_name(f).as_bytes(),
+                1_600_000_000 + (f % 1_000_000) as i64,
+                u64::MAX,
+            );
         }
         s.compact();
         let pinyin = PinyinCache::rebuild(&s);
@@ -5180,6 +5228,7 @@ mod tests {
                 op: Op::Remove,
                 name: String::new(),
                 mtime: 0,
+                size: u64::MAX,
             })
             .collect();
         engine.handle(EngineMsg::Records { guid, recs: removes, next_usn: 120 });
@@ -5252,6 +5301,7 @@ mod tests {
                 op: Op::Remove,
                 name: String::new(),
                 mtime: 0,
+                size: u64::MAX,
             })
             .collect();
         engine.handle(EngineMsg::Records { guid, recs: removes, next_usn: 120 });
@@ -5326,6 +5376,7 @@ mod tests {
                 op: Op::Remove,
                 name: String::new(),
                 mtime: 0,
+                size: u64::MAX,
             })
             .collect();
         engine.handle(EngineMsg::Records { guid, recs: removes, next_usn: 120 });

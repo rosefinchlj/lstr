@@ -63,6 +63,9 @@ pub struct Rec {
     /// 最后修改时间(unix 秒;0 = 未知)。只有目录枚举(dir scan)能拿到,
     /// USN 记录本身不含时间 —— 内置时间筛选依赖它。
     pub mtime: i64,
+    /// 文件大小(字节;`u64::MAX` = 未知)。目录枚举能直接拿到,
+    /// USN 记录不含大小 —— 内置大小筛选依赖它。
+    pub size: u64,
 }
 
 /// 解析一段 USN_RECORD_V2 缓冲(ENUM 输出从 offset 8 起,journal 输出同构)。
@@ -145,6 +148,7 @@ impl RawRecord {
             op,
             name: self.name.clone(),
             mtime: 0,
+            size: u64::MAX,
         })
     }
 }
@@ -166,6 +170,7 @@ pub fn scan_records(buf: &[u8]) -> (Vec<Rec>, usize) {
             op: Op::Upsert,
             name: r.name,
             mtime: 0,
+            size: u64::MAX,
         })
         .collect();
     (recs, consumed)
