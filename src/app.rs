@@ -251,7 +251,8 @@ fn condition_chip_width(painter: &egui::Painter, label: &str, value: &str) -> f3
 }
 
 /// 画一个条件 chip（标签比例字体 + 值等宽字体 + × 命中区），返回
-/// `(宽度, 是否点了 ×)`。日期/大小共用；颜色由调用方按类型传。
+/// `(宽度, 是否点了 ×, 是否点了本体, 是否双击本体)`。日期/大小/盘符共用；
+/// 单击定位虚拟光标，双击进入编辑。
 fn paint_condition_chip(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
@@ -263,7 +264,7 @@ fn paint_condition_chip(
     bg: Color32,
     id: &str,
     tooltip: &str,
-) -> (f32, bool, bool) {
+) -> (f32, bool, bool, bool) {
     let label_galley = (!label.is_empty())
         .then(|| painter.layout_no_wrap(label.to_string(), ui::text_font(13.0), color));
     let value_galley = painter.layout_no_wrap(value.to_string(), ui::mono_font(12.0), color);
@@ -319,7 +320,12 @@ fn paint_condition_chip(
     let response = ui
         .interact(clear, Id::new(("lstr-cond-chip-clear", id)), Sense::click())
         .on_hover_text(tooltip.to_string());
-    (chip_w, response.clicked(), body.clicked())
+    (
+        chip_w,
+        response.clicked(),
+        body.clicked(),
+        body.double_clicked(),
+    )
 }
 
 /// 条件 chip 的数据源（按键编辑/删除时用来定位 `filters` 里的数据）。
@@ -1237,6 +1243,12 @@ impl LstrApp {
         };
         let mut chips = Vec::new();
         if let Some(range) = self.filters.modified.as_ref().filter(|r| !r.is_empty()) {
+            // tooltip 附带换算后的绝对日期：别名条件（今天/本周/近7天）
+            // 能直接看到真实区间。
+            let tooltip = match crate::search::conditions::date_range_text(range) {
+                Some(text) => format!("修改时间 {text}（本地时间）；双击编辑，点 × 移除"),
+                None => "修改时间条件（本地时间）；双击编辑，点 × 移除".into(),
+            };
             chips.push(ConditionChipInfo {
                 kind: ConditionChipKind::Date,
                 label: "时间",
@@ -1244,7 +1256,7 @@ impl LstrApp {
                 color: theme.amber,
                 bg: theme.amber_soft,
                 id: "date".into(),
-                tooltip: "修改时间条件（本地时间）；Shift+Ctrl+Bksp 编辑，点 × 移除".into(),
+                tooltip,
                 edit_text: crate::search::conditions::date_edit_text(range)
                     .map(|text| strip_condition_terminator(&text).to_string()),
                 hold_after_edit: false,
@@ -1258,7 +1270,7 @@ impl LstrApp {
                 color: size_color,
                 bg: Color32::from_rgba_unmultiplied(size_color.r(), size_color.g(), size_color.b(), 26),
                 id: "size".into(),
-                tooltip: "文件大小条件；Shift+Ctrl+Bksp 编辑，点 × 移除".into(),
+                tooltip: "文件大小条件；双击编辑，点 × 移除".into(),
                 edit_text: crate::search::conditions::size_edit_text(range)
                     .map(|text| strip_condition_terminator(&text).to_string()),
                 hold_after_edit: false,
@@ -1278,9 +1290,9 @@ impl LstrApp {
                 ),
                 id: format!("drive-{index}"),
                 tooltip: if drive.exclude {
-                    format!("排除 {} 盘；Shift+Ctrl+Bksp 编辑，点 × 移除", drive.letter)
+                    format!("排除 {} 盘；双击编辑，点 × 移除", drive.letter)
                 } else {
-                    format!("只搜 {} 盘；Shift+Ctrl+Bksp 编辑，点 × 移除", drive.letter)
+                    format!("只搜 {} 盘；双击编辑，点 × 移除", drive.letter)
                 },
                 edit_text: Some(drive.source()),
                 hold_after_edit: true,
@@ -2056,6 +2068,28 @@ impl LstrApp {
             if let Some(index) = self.condition_delete_target(ctx) {
                 self.record_condition_undo();
                 if self.remove_chip(index) {
+                    self.condition_error = None;
+                    self.menu_open = false;
+                    self.filter_menu = None;
+                    self.condition_edit_backup = None;
+                    self.trigger(ctx);
+                }
+            }
+            return;
+        }
+
+        // 输入框为空且不在浏览/路径模式：普通 Backspace 也从右往左删 chip
+        //（标签输入的通用习惯；浏览模式下 Backspace 仍是回上一级）。
+        if self.input.is_empty()
+            && self.filters.has_input_conditions()
+            && !self.in_browse()
+            && !self.path_mode()
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace))
+        {
+            let count = self.condition_chips().len();
+            if count > 0 {
+                self.record_condition_undo();
+                if self.remove_chip(count - 1) {
                     self.condition_error = None;
                     self.menu_open = false;
                     self.filter_menu = None;
@@ -2876,10 +2910,11 @@ impl LstrApp {
                     let mut chip_lefts = Vec::with_capacity(chips.len());
                     let mut removed: Option<usize> = None;
                     let mut caret_target: Option<usize> = None;
+                    let mut edit_target: Option<usize> = None;
                     for (index, chip) in chips.iter().enumerate() {
                         chip_lefts.push(x);
                         let label = if compact { "" } else { chip.label };
-                        let (w, clear_clicked, body_clicked) = paint_condition_chip(
+                        let (w, clear_clicked, body_clicked, body_double) = paint_condition_chip(
                             ui,
                             &painter,
                             x,
@@ -2894,7 +2929,9 @@ impl LstrApp {
                         if clear_clicked {
                             removed = Some(index);
                         }
-                        if body_clicked {
+                        if body_double {
+                            edit_target = Some(index);
+                        } else if body_clicked {
                             caret_target = Some(index);
                         }
                         x += w + 6.0;
@@ -2919,6 +2956,8 @@ impl LstrApp {
                             self.condition_edit_backup = None;
                             self.trigger(ctx);
                         }
+                    } else if let Some(index) = edit_target {
+                        self.edit_chip(index, ctx);
                     } else if let Some(index) = caret_target {
                         self.chip_caret = Some(index);
                     }
@@ -4173,7 +4212,7 @@ impl LstrApp {
                         "筛选",
                         &[
                             ("ext:rs", "按扩展名"),
-                            ("日期", "date>2026-11-10: 冒号/回车"),
+                            ("日期", "date>2026-11-10: 今天/本周/近7天"),
                             ("大小", "size>10M: 按文件大小"),
                             ("Ctrl+Bksp", "删条件；加 Shift 编辑"),
                             ("Ctrl+Z/Y", "撤回 / 取消撤回条件"),
@@ -4279,7 +4318,7 @@ impl LstrApp {
                 painter.text(
                     egui::pos2(rect.center().x, list_top + 68.0),
                     Align2::CENTER_CENTER,
-                    "冒号或回车提交，例如 date>2026-11-10: / size>10M: / C:",
+                    crate::search::conditions::composing_hint(&self.input),
                     ui::mono_font(11.5),
                     theme.dim,
                 );

@@ -229,29 +229,21 @@ pub fn is_composing(raw: &str) -> bool {
     if parse_from(raw, pos, field_len, compact, kind).is_ok() {
         return false;
     }
-    let rest = &raw[pos + field_len..];
     if compact {
         // `dm:` / `dm:>…` 都还在输入；空格后会由 extract 提交。
         return true;
     }
-    let rest = rest.trim_start();
+    let rest = raw[pos + field_len..].trim_start();
     if rest.is_empty() {
         // 只打了 `date`：仍允许当普通文件名搜（否则搜 "date" 永远出不来）。
         return false;
     }
-    // 比较符之后必须是空白/数字/日期分隔符，才认为在输入日期；
-    // `date>report.txt` 这类普通词不能把查询永久暂停。
-    if let Some((_, op_len)) = parse_op(rest) {
-        let after_pos = skip_ws(rest, op_len);
-        let after = &rest[after_pos..];
-        return after.is_empty()
-            || after
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit() || matches!(c, '-' | '.' | '/'));
-    }
-    // 闭区间：`date 2026-11-01..` 以数字开头。
-    rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+    // 比较符之后的值，或裸值（没有比较符）：只要还可能成为日期值就暂停。
+    let after = match parse_op(rest) {
+        Some((_, op_len)) => &rest[skip_ws(rest, op_len)..],
+        None => rest,
+    };
+    is_date_value_input(after)
 }
 
 /// 输入里最后一个字段起点（条件通常打在末尾，也比全局扫描便宜）。
@@ -320,6 +312,29 @@ pub fn date_edit_text(range: &DateRange) -> Option<String> {
         (Some(after), None) => Some(format!("date >= {}:", local_date_text(after)?)),
         (None, Some(before)) => Some(format!("date <= {}:", local_date_text(before)?)),
         (None, None) => None,
+    }
+}
+
+/// 日期条件的绝对区间文案（tooltip 用）：别名条件显示换算后的真实日期。
+pub fn date_range_text(range: &DateRange) -> Option<String> {
+    let after = range.after.and_then(local_date_text);
+    let before = range.before.and_then(local_date_text);
+    match (after, before) {
+        (Some(a), Some(b)) => Some(format!("{a} ~ {b}")),
+        (Some(a), None) => Some(format!("≥ {a}")),
+        (None, Some(b)) => Some(format!("≤ {b}")),
+        (None, None) => None,
+    }
+}
+
+/// 输入条件时的字段感知提示（空态面板第二行）。
+pub fn composing_hint(raw: &str) -> &'static str {
+    match last_field(raw) {
+        Some((_, _, _, FieldKind::Date)) => {
+            "冒号或回车提交；日期可用 今天/昨天/本周/上周/本月/上月/近N天"
+        }
+        Some((_, _, _, FieldKind::Size)) => "冒号或回车提交；单位 B/KB/MB/GB/TB，如 10M、1.5GB",
+        None => "冒号或回车提交，例如 date>2026-11-10: / size>10M: / C:",
     }
 }
 
@@ -430,10 +445,12 @@ fn parse_date_from(
 
 /// 解析 `<op> date` 或 `date..date`。
 /// `prose=true` 时日期后允许空白（后面还要找冒号）。
+/// 值支持显式 `YYYY-MM-DD` 与相对别名（今天/昨天/本周/上周/本月/上月/近N天）；
+/// 裸值（没有比较符）默认「等于」该天/该区间。
 fn parse_date_expr(
     raw: &str,
     start: usize,
-    prose: bool,
+    _prose: bool,
 ) -> Result<(usize, DateRange), Option<String>> {
     let mut i = skip_ws(raw, start);
     let rest = &raw[i..];
@@ -472,54 +489,65 @@ fn parse_date_expr(
             ));
         }
     }
-    // 再尝试比较符。
-    let (op, op_len) = parse_op(&raw[i..]).ok_or(None)?;
-    i += op_len;
-    i = skip_ws(raw, i);
-    let Some(value_len) = date_len(&raw[i..]) else {
-        return Err(Some(format!(
-            "日期无效：{}（格式 YYYY-MM-DD）",
-            token_at(raw, i)
-        )));
+    // 比较符可省略：`date 2026-11-10:` / `date 本周:` 默认「等于」该天/该区间。
+    let (op, has_op) = match parse_op(&raw[i..]) {
+        Some((op, len)) => {
+            i += len;
+            i = skip_ws(raw, i);
+            (op, true)
+        }
+        None => (Op::Eq, false),
     };
-    let text = &raw[i..i + value_len];
-    let date = parse_ymd(text).ok_or_else(|| Some(format!("日期无效：{text}（格式 YYYY-MM-DD）")))?;
-    let end = i + value_len;
-    if !prose && raw[end..].starts_with(':') {
-        // compact 后直接跟冒号也可以（date:>2026-11-10:），由调用方消费。
-    }
-    let midnight = local_midnight_unix(date)
+    let value_start = i;
+    let token = token_at(raw, value_start);
+    let (value_len, first, second) = if token.len() == 10 && date_len(token).is_some() {
+        let ymd = parse_ymd(token)
+            .ok_or_else(|| Some(format!("日期无效：{token}（格式 YYYY-MM-DD）")))?;
+        (token.len(), ymd, ymd)
+    } else if let Some((a, b)) = resolve_date_value(token) {
+        (token.len(), a, b)
+    } else if has_op {
+        return Err(Some(format!(
+            "日期无效：{token}（YYYY-MM-DD 或 今天/本周/近N天）"
+        )));
+    } else {
+        // 裸值不是日期也不是别名：这里不是条件，继续扫描。
+        return Err(None);
+    };
+    let end = value_start + value_len;
+    let text = token;
+    let start_midnight = local_midnight_unix(first)
         .ok_or_else(|| Some("无法换算本地时间（时区设置异常）".into()))?;
-    let next_midnight = local_midnight_unix(next_day(date))
+    let end_exclusive = local_midnight_unix(next_day(second))
         .ok_or_else(|| Some("无法换算本地时间（时区设置异常）".into()))?;
     let condition = match op {
         Op::Gt => DateRange {
-            after: Some(next_midnight),
+            after: Some(end_exclusive),
             before: None,
             after_text: Some(format!("> {text}")),
             before_text: None,
         },
         Op::Ge => DateRange {
-            after: Some(midnight),
+            after: Some(start_midnight),
             before: None,
             after_text: Some(format!("≥ {text}")),
             before_text: None,
         },
         Op::Lt => DateRange {
             after: None,
-            before: midnight.checked_sub(1),
+            before: start_midnight.checked_sub(1),
             after_text: None,
             before_text: Some(format!("< {text}")),
         },
         Op::Le => DateRange {
             after: None,
-            before: next_midnight.checked_sub(1),
+            before: end_exclusive.checked_sub(1),
             after_text: None,
             before_text: Some(format!("≤ {text}")),
         },
         Op::Eq => DateRange {
-            after: Some(midnight),
-            before: next_midnight.checked_sub(1),
+            after: Some(start_midnight),
+            before: end_exclusive.checked_sub(1),
             after_text: Some(format!("= {text}")),
             before_text: None,
         },
@@ -764,6 +792,184 @@ fn token_at(raw: &str, pos: usize) -> &str {
         .map(|offset| pos + offset)
         .unwrap_or(raw.len());
     &raw[pos..end]
+}
+
+// ---------------------------------------------------------------------------
+// 相对日期别名：今天 / 昨天 / 本周 / 上周 / 本月 / 上月 / 近N天
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AliasKind {
+    Today,
+    Yesterday,
+    ThisWeek,
+    LastWeek,
+    ThisMonth,
+    LastMonth,
+}
+
+const DATE_ALIASES: &[(&str, AliasKind)] = &[
+    ("今天", AliasKind::Today),
+    ("today", AliasKind::Today),
+    ("昨天", AliasKind::Yesterday),
+    ("yesterday", AliasKind::Yesterday),
+    ("本周", AliasKind::ThisWeek),
+    ("这周", AliasKind::ThisWeek),
+    ("thisweek", AliasKind::ThisWeek),
+    ("上周", AliasKind::LastWeek),
+    ("lastweek", AliasKind::LastWeek),
+    ("本月", AliasKind::ThisMonth),
+    ("这个月", AliasKind::ThisMonth),
+    ("thismonth", AliasKind::ThisMonth),
+    ("上月", AliasKind::LastMonth),
+    ("上个月", AliasKind::LastMonth),
+    ("lastmonth", AliasKind::LastMonth),
+];
+
+/// 把日期值 token 解析成闭区间 `(首日, 末日)`。
+/// 显式日期 → 单天；别名/近N天 → 按本地今天换算的区间。
+fn resolve_date_value(token: &str) -> Option<((i32, u32, u32), (i32, u32, u32))> {
+    let today = local_today();
+    for (name, kind) in DATE_ALIASES {
+        if name.eq_ignore_ascii_case(token) {
+            return Some(alias_range(*kind, today));
+        }
+    }
+    relative_days_range(token, today)
+}
+
+fn alias_range(kind: AliasKind, today: (i32, u32, u32)) -> ((i32, u32, u32), (i32, u32, u32)) {
+    match kind {
+        AliasKind::Today => (today, today),
+        AliasKind::Yesterday => {
+            let y = add_days(today, -1);
+            (y, y)
+        }
+        AliasKind::ThisWeek => {
+            let monday = add_days(today, -(weekday(today) as i64));
+            (monday, add_days(monday, 6))
+        }
+        AliasKind::LastWeek => {
+            let monday = add_days(today, -(weekday(today) as i64) - 7);
+            (monday, add_days(monday, 6))
+        }
+        AliasKind::ThisMonth => (
+            (today.0, today.1, 1),
+            (today.0, today.1, days_in_month(today.0, today.1)),
+        ),
+        AliasKind::LastMonth => {
+            let (year, month) = if today.1 == 1 {
+                (today.0 - 1, 12)
+            } else {
+                (today.0, today.1 - 1)
+            };
+            ((year, month, 1), (year, month, days_in_month(year, month)))
+        }
+    }
+}
+
+/// `近7天` / `最近30天` / `7天内` → 含今天的近 N 天区间。
+/// 与别名不同，这里的形态不合法时返回 None（不当作输入中）。
+fn relative_days_range(token: &str, today: (i32, u32, u32)) -> Option<((i32, u32, u32), (i32, u32, u32))> {
+    const MAX_DAYS: i64 = 36_500;
+    let n: i64 = if let Some(rest) = token
+        .strip_prefix("最近")
+        .or_else(|| token.strip_prefix("近"))
+    {
+        rest.strip_suffix('天')?.parse().ok()?
+    } else {
+        token.strip_suffix("天内")?.parse().ok()?
+    };
+    if n == 0 || n > MAX_DAYS {
+        return None;
+    }
+    Some((add_days(today, -(n - 1)), today))
+}
+
+/// token 是否可能成为日期值（别名或近N天的前缀）：`date>今`、`date 近7` 期间
+/// 要暂停查询，而不是把半截串当文件名搜。
+fn is_date_value_input(after: &str) -> bool {
+    if after.is_empty() {
+        return true;
+    }
+    let token = token_at(after, 0);
+    if token.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    if DATE_ALIASES
+        .iter()
+        .any(|(name, _)| name.starts_with(token) || name.to_ascii_lowercase().starts_with(&token.to_ascii_lowercase()))
+    {
+        return true;
+    }
+    is_relative_days_prefix(token)
+}
+
+/// `近` / `近7` / `7天` / `7天内` 这类还在打一半的形态。
+fn is_relative_days_prefix(token: &str) -> bool {
+    let had_prefix = token.starts_with("最近") || token.starts_with("近");
+    let rest = if had_prefix {
+        token
+            .strip_prefix("最近")
+            .or_else(|| token.strip_prefix("近"))
+            .unwrap_or(token)
+    } else {
+        token
+    };
+    let bytes = rest.as_bytes();
+    let mut digits = 0usize;
+    while digits < bytes.len() && bytes[digits].is_ascii_digit() {
+        digits += 1;
+    }
+    let tail = &rest[digits..];
+    match tail {
+        "" => digits > 0 || had_prefix,
+        "天" | "天内" => digits > 0,
+        _ => false,
+    }
+}
+
+/// 当前本地日期（今天），供相对别名换算。
+fn local_today() -> (i32, u32, u32) {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let st = unsafe { GetLocalTime() };
+    (st.wYear as i32, st.wMonth as u32, st.wDay as u32)
+}
+
+/// 平锐算法：civil 日期 → 自 1970-01-01 的天数（无时区/DST 参与，加减天安全）。
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as i64;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era as i64 * 146_097 + doe - 719_468
+}
+
+/// `days_from_civil` 的逆变换。
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
+}
+
+/// 日期 ± N 天。
+fn add_days(date: (i32, u32, u32), delta: i64) -> (i32, u32, u32) {
+    civil_from_days(days_from_civil(date.0, date.1, date.2) + delta)
+}
+
+/// 星期一 = 0 … 星期日 = 6。
+fn weekday(date: (i32, u32, u32)) -> u32 {
+    (days_from_civil(date.0, date.1, date.2) + 3).rem_euclid(7) as u32
 }
 
 fn colon_len(raw: &str, pos: usize) -> Option<usize> {    if raw[pos..].starts_with(':') {
@@ -1284,5 +1490,172 @@ mod tests {
         let again = extract(&text).sizes.remove(0);
         assert_eq!(again.after, merged.after, "{text:?}");
         assert_eq!(again.before, merged.before, "{text:?}");
+    }
+
+    #[test]
+    fn civil_date_helpers_match_known_anchors() {
+        // 1970-01-01 周四、2024-01-01 周一（真实历法锚点）。
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(weekday((1970, 1, 1)), 3);
+        assert_eq!(weekday((2024, 1, 1)), 0);
+        // 往返与跨月加减。
+        assert_eq!(add_days((2026, 3, 1), -1), (2026, 2, 28));
+        assert_eq!(add_days((2024, 2, 28), 1), (2024, 2, 29), "闰年");
+        assert_eq!(add_days((2026, 12, 31), 1), (2027, 1, 1));
+        for day in [(2026, 1, 1), (2024, 2, 29), (2026, 11, 13)] {
+            assert_eq!(civil_from_days(days_from_civil(day.0, day.1, day.2)), day);
+        }
+    }
+
+    #[test]
+    fn relative_date_aliases_expand_to_day_ranges() {
+        let today = local_today();
+        assert_eq!(resolve_date_value("今天"), Some((today, today)));
+        assert_eq!(resolve_date_value("today"), Some((today, today)));
+        let yesterday = add_days(today, -1);
+        assert_eq!(resolve_date_value("昨天"), Some((yesterday, yesterday)));
+
+        let monday = add_days(today, -(weekday(today) as i64));
+        assert_eq!(resolve_date_value("本周"), Some((monday, add_days(monday, 6))));
+        assert_eq!(
+            resolve_date_value("上周"),
+            Some((add_days(monday, -7), add_days(monday, -1)))
+        );
+
+        let first = (today.0, today.1, 1);
+        assert_eq!(
+            resolve_date_value("本月"),
+            Some((first, (today.0, today.1, days_in_month(today.0, today.1))))
+        );
+        let (py, pm) = if today.1 == 1 {
+            (today.0 - 1, 12)
+        } else {
+            (today.0, today.1 - 1)
+        };
+        assert_eq!(
+            resolve_date_value("上月"),
+            Some(((py, pm, 1), (py, pm, days_in_month(py, pm))))
+        );
+
+        assert_eq!(
+            resolve_date_value("近7天"),
+            Some((add_days(today, -6), today))
+        );
+        assert_eq!(
+            resolve_date_value("14天内"),
+            Some((add_days(today, -13), today))
+        );
+        assert_eq!(resolve_date_value("近1天"), Some((today, today)));
+        assert_eq!(resolve_date_value("最近30天"), Some((add_days(today, -29), today)));
+        assert!(resolve_date_value("近0天").is_none());
+        assert!(resolve_date_value("近x天").is_none());
+        assert!(resolve_date_value("7天").is_none(), "裸数字+天 不是完整形态（要 天内）");
+    }
+
+    #[test]
+    fn alias_conditions_parse_with_labels() {
+        let today = local_today();
+        let out = extract("date>今天: a.log");
+        assert_eq!(out.cleaned, "a.log");
+        assert_eq!(out.dates.len(), 1);
+        assert_eq!(
+            out.dates[0].after,
+            Some(local_midnight_unix(add_days(today, 1)).unwrap()),
+            "> 今天 = 明天零点起"
+        );
+        assert_eq!(out.dates[0].label(), "> 今天");
+
+        let week = extract("date 本周:").dates.remove(0);
+        let monday = add_days(today, -(weekday(today) as i64));
+        assert_eq!(week.after, Some(local_midnight_unix(monday).unwrap()));
+        assert_eq!(
+            week.before,
+            Some(local_midnight_unix(add_days(monday, 7)).unwrap() - 1)
+        );
+        assert_eq!(week.label(), "= 本周");
+
+        let recent = extract("date>=近7天:").dates.remove(0);
+        assert_eq!(
+            recent.after,
+            Some(local_midnight_unix(add_days(today, -6)).unwrap())
+        );
+        assert_eq!(recent.label(), "≥ 近7天");
+
+        // 别名与显式日期可合并（谁紧用谁）。
+        let mut merged = extract("date>今天:").dates.remove(0);
+        merged
+            .merge(extract("date<2099-01-01:").dates.remove(0))
+            .expect("merge");
+        assert_eq!(
+            merged.after,
+            Some(local_midnight_unix(add_days(today, 1)).unwrap())
+        );
+    }
+
+    #[test]
+    fn bare_date_defaults_to_that_day() {
+        let bare = extract("date 2026-11-10:").dates.remove(0);
+        let eq = extract("date=2026-11-10:").dates.remove(0);
+        assert_eq!(bare.after, eq.after);
+        assert_eq!(bare.before, eq.before);
+        assert_eq!(bare.label(), "= 2026-11-10");
+        // 裸值不是日期也不是别名：仍不算条件。
+        let out = extract("date foo:");
+        assert!(out.dates.is_empty());
+        assert!(out.errors.is_empty());
+        assert_eq!(out.cleaned, "date foo:");
+    }
+
+    #[test]
+    fn composing_covers_alias_and_relative_prefixes() {
+        for input in [
+            "date>今",
+            "date>今天",
+            "date 本",
+            "date 本周",
+            "date 近",
+            "date 近7",
+            "date 7",
+            "date 7天",
+            "date 7天内",
+            "date>t",
+            "date>最近",
+            "a.log date>今",
+        ] {
+            assert!(is_composing(input), "{input:?} 应视为条件输入中");
+        }
+        for input in [
+            "date>今天foo",
+            "date foo",
+            "date>report.txt",
+            "date>2026-11-10:",
+        ] {
+            assert!(!is_composing(input), "{input:?} 不应暂停查询");
+        }
+    }
+
+    #[test]
+    fn composing_hint_is_field_aware() {
+        assert!(composing_hint("date>今").contains("今天"));
+        assert!(composing_hint("size>10").contains("B/KB"));
+        assert!(composing_hint("C").contains("C:"));
+        assert!(composing_hint("").contains("date"));
+    }
+
+    #[test]
+    fn date_range_text_resolves_absolute_dates() {
+        let range = extract("date 本周:").dates.remove(0);
+        let text = date_range_text(&range).expect("absolute text");
+        // 两个端点都是合法 YYYY-MM-DD 且逐日递增。
+        let parts: Vec<&str> = text.split(" ~ ").collect();
+        assert_eq!(parts.len(), 2);
+        for part in parts {
+            assert_eq!(part.len(), 10);
+            assert!(parse_ymd(part).is_some(), "{part:?}");
+        }
+
+        let single = extract("date>今天:").dates.remove(0);
+        assert!(date_range_text(&single).unwrap().starts_with("≥ "));
+        assert!(date_range_text(&DateRange::default()).is_none());
     }
 }
