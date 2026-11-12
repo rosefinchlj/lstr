@@ -1731,8 +1731,11 @@ fn run_worker(args: WorkerArgs) {
                     }
                     b.engine.maintain();
                     *handshake_slot.lock().unwrap() = b.engine.handshake_state();
-                    maintenance_busy =
-                        b.engine.save_in_progress() || b.engine.has_deferred_msgs();
+                    // 分片 compact 也要持续推进:maintenance_busy 让主循环立刻
+                    // 回来再给下一片,否则会阻塞在 recv_timeout(150ms) 上。
+                    maintenance_busy = b.engine.save_in_progress()
+                        || b.engine.has_deferred_msgs()
+                        || b.engine.compact_in_progress();
                 }
             }
             // —— 排除规则表变化检测(「立即重建」)——

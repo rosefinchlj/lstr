@@ -10,7 +10,7 @@ use crate::pinyin::PinyinCache;
 use crate::query::{Hit, KindFilter, QueryOutcome, QuerySpec};
 use crate::sidecar::{self, SidecarOp};
 use crate::snapshot::{self, SnapshotHeader};
-use crate::store::{VolumeStore, NO_PARENT, ROOT_FRN};
+use crate::store::{CompactTask, VolumeStore, NO_PARENT, ROOT_FRN};
 use crate::usn::{Op, Rec};
 use crate::usnwatch::UsnWatchState;
 
@@ -161,6 +161,10 @@ const DEFAULT_APPLY_CHUNK: usize = 512;
 /// 条 3.3s),期间同一线程的查询只能排队;用户打字时(每 40ms 一个请求)
 /// 绝不能撞上它。留 800ms 覆盖「停顿一下继续打」的常见节奏。
 const COMPACT_IDLE_GAP: Duration = Duration::from_millis(800);
+
+/// 分片 compact 每次 maintain 的时间预算。查询在片间优先出队,单次等待
+/// 从整卷 0.5-3s 降到 ~4ms(判噪/列构建/ngram 都按这个预算切)。
+const COMPACT_STEP_BUDGET: Duration = Duration::from_millis(4);
 
 /// 每轮 maintain 每卷最多回填的 mtime 条数。USN 记录不带 mtime,增量条目
 /// 插入后为 0;`FindFirstFileW` 实测约 22µs/条,128 条 ≈ 3ms/轮,宿主空闲
@@ -336,6 +340,14 @@ pub struct Engine {
     last_query_at: std::cell::Cell<Instant>,
     /// 允许 compact 前需要连续空闲多久;测试可调到 0。
     compact_idle_gap: Duration,
+    /// 运行中的分片 compact(同一时刻至多一卷;期间修改类消息进 deferred)。
+    running_compact: Option<RunningCompact>,
+}
+
+struct RunningCompact {
+    guid: u128,
+    vol_index: usize,
+    task: CompactTask,
 }
 
 impl Engine {
@@ -360,6 +372,7 @@ impl Engine {
                 Instant::now() - std::time::Duration::from_secs(60),
             ),
             compact_idle_gap: COMPACT_IDLE_GAP,
+            running_compact: None,
         };
         let t_load = Instant::now();
         engine.load_snapshots();
@@ -672,6 +685,25 @@ impl Engine {
                     if *guid == saved_guid =>
                 {
                     self.abort_save("control message superseded frozen store");
+                    self.flush_deferred();
+                }
+                _ => {
+                    self.deferred_msgs.push_back(msg);
+                    return;
+                }
+            }
+        }
+        // 分片 compact 期间同样冻结修改类消息(与保存一致):任务可能正持有
+        // 旧列构建新列,任何写入都会破坏视图。控制帧重建/清空同卷时中止任务。
+        if let Some(compact_guid) = self.compact_guid() {
+            match &msg {
+                EngineMsg::UsnWatch { .. } | EngineMsg::WorkerLost => {}
+                EngineMsg::ScanBegin { guid, .. }
+                | EngineMsg::JournalReset { guid }
+                | EngineMsg::VolumeGone { guid }
+                    if *guid == compact_guid =>
+                {
+                    self.abort_compact("control message superseded paged compact");
                     self.flush_deferred();
                 }
                 _ => {
@@ -1660,6 +1692,80 @@ impl Engine {
         }
     }
 
+    /// 运行中的分片 compact(宿主据此在空闲循环里持续推进)。
+    pub fn compact_in_progress(&self) -> bool {
+        self.running_compact.is_some()
+    }
+
+    fn compact_guid(&self) -> Option<u128> {
+        self.running_compact.as_ref().map(|rc| rc.guid)
+    }
+
+    /// 推进分片 compact 一个时间预算。返回 true = 已完成(或任务已失效)。
+    fn advance_compact(&mut self, budget: Duration) -> bool {
+        let Some(mut rc) = self.running_compact.take() else { return true };
+        let done = {
+            let Some(store) = self
+                .volumes
+                .get_mut(rc.vol_index)
+                .and_then(|v| v.store.as_mut())
+            else {
+                // 卷已被移除:任务作废。
+                return true;
+            };
+            rc.task.advance(store, budget)
+        };
+        // 换血后旧 Hit/拼音缓存必须立刻失效(与同步 compact 的收尾一致)。
+        if rc.task.take_installed() {
+            let i = rc.vol_index;
+            self.bump_generation(i);
+            if let Some(store) = &self.volumes[i].store {
+                self.pinyin[i] = PinyinCache::rebuild(store);
+            }
+            self.volumes[i].dirty = true;
+        }
+        if done {
+            let letter = self.volumes.get(rc.vol_index).map(|v| v.letter).unwrap_or('?');
+            crate::snapshot::debug_log(&format!(
+                "compact vol {letter} (paged) done wall={}ms busy={}ms slices={}",
+                rc.task.elapsed().as_millis(),
+                rc.task.busy().as_millis(),
+                rc.task.slices()
+            ));
+            self.flush_deferred();
+            true
+        } else {
+            self.running_compact = Some(rc);
+            false
+        }
+    }
+
+    /// 中止分片 compact(控制帧要重建/清空同一卷)。换血已发生时补做代次与
+    /// 拼音收尾,避免旧 Hit/拼音缓存指向已重排的 slot。
+    fn abort_compact(&mut self, reason: &str) {
+        let Some(rc) = self.running_compact.take() else { return };
+        let letter = self.volumes.get(rc.vol_index).map(|v| v.letter).unwrap_or('?');
+        if rc.task.installed() {
+            let i = rc.vol_index;
+            self.bump_generation(i);
+            if let Some(store) = &self.volumes[i].store {
+                self.pinyin[i] = PinyinCache::rebuild(store);
+            }
+        }
+        crate::snapshot::debug_log(&format!(
+            "compact vol {letter} (paged) aborted wall={}ms busy={}ms: {reason}",
+            rc.task.elapsed().as_millis(),
+            rc.task.busy().as_millis()
+        ));
+    }
+
+    /// 退出路径:把进行中的分片 compact 跑完(快照要求列已归并)。
+    fn finish_compact_sync(&mut self) {
+        while self.running_compact.is_some() {
+            self.advance_compact(Duration::from_secs(60));
+        }
+    }
+
     /// 限量回填 USN 增量条目的真实 mtime(查询路径不做 FS IO 的配套)。
     ///
     /// 每卷每轮最多 [`MTIME_BACKFILL_PER_ROUND`] 个 slot;`mtime != 0`
@@ -1735,6 +1841,11 @@ impl Engine {
     /// 空闲维护:需要的卷 compact + 落盘(旁车优先,全量降频)。
     /// 返回是否做了事(调用方可据此让路)。
     pub fn maintain(&mut self) -> bool {
+        // 有分片 compact 在进行:本轮只推进它(4ms 片),查询在片间出队。
+        if self.running_compact.is_some() {
+            self.advance_compact(COMPACT_STEP_BUDGET);
+            return true;
+        }
         // 有分段保存在进行:本轮只推进保存(小步 + 让路),不再做 compact/旁车
         // —— store 冻结,且磁盘争用越小,保存期间的查询延迟越稳。保存收尾后
         // 重放积压的修改消息。
@@ -1760,37 +1871,33 @@ impl Engine {
                 if self.volumes[i].syncing {
                     continue; // 对账期间不 compact/落盘:SEEN 位是临时态
                 }
-                let compacted = {
-                    let Some(store) = &mut self.volumes[i].store else { continue };
+                let task = {
+                    let Some(store) = &self.volumes[i].store else { continue };
                     if store.is_scanning() {
                         continue; // scan 模式的 compact 由 VolumeReady 触发
                     }
-                    if store.needs_compact() {
-                        let started = Instant::now();
-                        let len = store.len();
-                        store.compact();
-                        let ms = started.elapsed().as_millis();
-                        if ms > 50 {
-                            crate::snapshot::debug_log(&format!(
-                                "compact vol {} len={} took {}ms",
-                                self.volumes[i].letter, len, ms
-                            ));
-                        }
-                        true
-                    } else {
-                        false
+                    if !store.needs_compact() {
+                        continue;
                     }
+                    CompactTask::new(store)
                 };
-                if compacted {
-                    self.bump_generation(i);
-                    if let Some(store) = &self.volumes[i].store {
-                        self.pinyin[i] = PinyinCache::rebuild(store);
-                    }
-                    self.volumes[i].dirty = true;
-                    did = true;
-                    break; // 每轮至多一卷,避免多卷重排串成十秒级停顿
-                }
+                let Some(task) = task else { continue };
+                let guid = self.volumes[i].guid;
+                let letter = self.volumes[i].letter;
+                self.running_compact = Some(RunningCompact { guid, vol_index: i, task });
+                crate::snapshot::debug_log(&format!(
+                    "compact vol {letter} (paged) begin len={}",
+                    self.volumes[i].store.as_ref().map(|s| s.len()).unwrap_or(0)
+                ));
+                did = true;
+                break; // 每轮至多一卷,避免多卷重排串成十秒级停顿
             }
+        }
+        // 已启动分片 compact:本轮到此为止。回填/旁车/保存都在本线程上改
+        // store 或做重 IO,而任务要求修改类操作全部冻结(handle 已把消息
+        // 排进 deferred),等任务收尾后下一轮再继续。
+        if self.running_compact.is_some() {
+            return true;
         }
         // USN 增量条目的 mtime 回填:compact 已重建 pending,这里拿到的 slot
         // 与当前 store 一致。限量(每卷 128/轮),避免长时间占住引擎线程。
@@ -1885,7 +1992,7 @@ impl Engine {
     /// 启动分段保存(不写盘,只建状态机)。前置条件与 [`Engine::save_volume`]
     /// 相同:B-1 缓冲必须已清空、非对账窗口。
     fn start_save(&mut self, i: usize) -> bool {
-        if self.save_task.is_some() {
+        if self.save_task.is_some() || self.running_compact.is_some() {
             return false;
         }
         if self.has_pending_apply_for(self.volumes[i].guid) {
@@ -2147,6 +2254,8 @@ impl Engine {
     /// 回落全量保存,退出前变更必须以任一自洽形式落盘。
     /// 对账收尾/扫描断点(捕获未武装/扫描中)仍全量落盘。
     pub fn flush_all(&mut self) {
+        // 快照要求列已归并:先把进行中的分片 compact 跑完。
+        self.finish_compact_sync();
         // 退出路径没有查询压力:把进行中的分段保存一次跑完(复用同一状态机),
         // 再处理积压消息,避免把半成品 tmp 留在盘上等下次启动清理。
         if self.save_task.is_some() {
@@ -5098,10 +5207,134 @@ mod tests {
         engine.maintain();
         assert!(needs(&engine), "有等待查询时不得启动 compact");
 
-        // 3) 真正空闲:本轮完成 compact。
+        // 3) 真正空闲:启动分片 compact,按片推进直到完成。
         engine.set_query_yield_hook(Some(Box::new(|| false)));
         engine.maintain();
+        let mut slices = 0;
+        while engine.compact_in_progress() {
+            engine.maintain();
+            slices += 1;
+            assert!(slices < 10_000, "分片 compact 必须能收敛");
+        }
         assert!(!needs(&engine), "空闲时应完成 compact");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 分片 compact 期间:修改类消息排队(store 冻结)、查询照常;完成后按序重放。
+    #[test]
+    fn paged_compact_defers_mutations_and_replays() {
+        let dir = temp_index_dir("paged-compact-defer");
+        let guid = 0x78u128;
+        let mut engine = engine_with(&dir);
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'C',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: 125_000,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        let recs: Vec<Rec> = (0..125_000)
+            .map(|i| rec(1_000 + i, 0, 0, &format!("f{i}.txt")))
+            .collect();
+        engine.handle(EngineMsg::Records { guid, recs, next_usn: 100 });
+        engine.handle(EngineMsg::VolumeReady {
+            guid,
+            journal_id: 7,
+            next_usn: 100,
+            count: 125_000,
+        });
+        let removes: Vec<Rec> = (0..5_000)
+            .map(|i| Rec {
+                frn: 1_000 + i,
+                parent_frn: 0,
+                attrs: 0,
+                op: Op::Remove,
+                name: String::new(),
+                mtime: 0,
+            })
+            .collect();
+        engine.handle(EngineMsg::Records { guid, recs: removes, next_usn: 120 });
+        engine.set_compact_idle_gap(Duration::ZERO);
+
+        engine.maintain(); // 启动分片 compact（只跑 4ms 一片）
+        assert!(
+            engine.compact_in_progress(),
+            "12 万条在 4ms 预算内不可能一次压完"
+        );
+        // 冻结期间的查询照常走旧列。
+        let old_spec = QuerySpec {
+            tokens: vec!["f120000".to_string()],
+            ..Default::default()
+        };
+        assert!(engine.query(&old_spec).total >= 1, "压缩期间查询不得失效");
+
+        // 压缩期间到达的新文件：排队，查询暂时看不到。
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(9_000_000, 0, 0, "during_compact.txt")],
+            next_usn: 200,
+        });
+        assert!(engine.has_deferred_msgs(), "冻结期间修改必须排队");
+        let new_spec = QuerySpec {
+            tokens: vec!["during_compact".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(engine.query(&new_spec).total, 0, "冻结期间不得看到新消息");
+
+        let mut slices = 0usize;
+        while engine.compact_in_progress() {
+            engine.maintain();
+            slices += 1;
+            assert!(slices < 100_000, "分片 compact 必须收敛");
+        }
+        assert!(!engine.has_deferred_msgs(), "完成后必须重放积压消息");
+        assert_eq!(engine.query(&new_spec).total, 1, "重放后新文件必须可搜");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 控制帧(JournalReset)要清空同卷 store:必须中止分片任务,不能继续往
+    /// 已清空的列上换血。
+    #[test]
+    fn paged_compact_aborts_on_journal_reset() {
+        let dir = temp_index_dir("paged-compact-abort");
+        let guid = 0x79u128;
+        let mut engine = engine_with(&dir);
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'C',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: 125_000,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        let recs: Vec<Rec> = (0..125_000)
+            .map(|i| rec(1_000 + i, 0, 0, &format!("g{i}.txt")))
+            .collect();
+        engine.handle(EngineMsg::Records { guid, recs, next_usn: 100 });
+        engine.handle(EngineMsg::VolumeReady {
+            guid,
+            journal_id: 7,
+            next_usn: 100,
+            count: 125_000,
+        });
+        let removes: Vec<Rec> = (0..5_000)
+            .map(|i| Rec {
+                frn: 1_000 + i,
+                parent_frn: 0,
+                attrs: 0,
+                op: Op::Remove,
+                name: String::new(),
+                mtime: 0,
+            })
+            .collect();
+        engine.handle(EngineMsg::Records { guid, recs: removes, next_usn: 120 });
+        engine.set_compact_idle_gap(Duration::ZERO);
+        engine.maintain();
+        assert!(engine.compact_in_progress());
+        engine.handle(EngineMsg::JournalReset { guid });
+        assert!(!engine.compact_in_progress(), "控制帧必须中止分片 compact");
+        assert!(engine.volumes[0].store.is_none(), "JournalReset 已清空 store");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
