@@ -141,7 +141,7 @@ pub fn shutdown_and_wait(client: HANDLE, pipe_name: &str, timeout: Duration) -> 
 /// 避免各处手搓 `Frame` 与协议枚举漂移。
 pub fn command_frame(cmd: &crate::ClientCommand) -> Frame {
     match cmd {
-        crate::ClientCommand::Rescan(guid) => Frame::Rescan { guid: *guid },
+        crate::ClientCommand::RescanVolumes(mask) => Frame::Rescan { mask: *mask },
         crate::ClientCommand::Shutdown => Frame::Shutdown,
         crate::ClientCommand::SetVolumes(mask) => Frame::SetVolumes { mask: *mask },
     }
@@ -165,8 +165,8 @@ mod tests {
     #[test]
     fn command_frame_maps_every_command() {
         assert_eq!(
-            command_frame(&crate::ClientCommand::Rescan(0xabc)),
-            Frame::Rescan { guid: 0xabc }
+            command_frame(&crate::ClientCommand::RescanVolumes(0b100)),
+            Frame::Rescan { mask: 0b100 }
         );
         assert_eq!(command_frame(&crate::ClientCommand::Shutdown), Frame::Shutdown);
         // 掩码原样透传,不做语义解释(0 也照样传,worker 侧再决定回落)

@@ -36,14 +36,15 @@ pub use usn::{Op, Rec};
 /// v6:新增 UsnWatch 状态帧(usn 后端的每卷 USN 层状态上报 W→C)
 /// worker/client 必须同版本;升级后残留的旧提权 worker 会握手失败并退出
 /// (见 worker::run_session),新客户端重拉即可。
-pub const PROTO_VERSION: u32 = 6;
+pub const PROTO_VERSION: u32 = 7;
 pub const PIPE_NAME: &str = r"\\.\pipe\lstr-index";
 
 /// 引擎请求(主进程 → worker 的控制指令,经管道)。
 #[derive(Debug)]
 pub enum ClientCommand {
-    /// 请求重建指定卷(设置页「重建」按钮)。
-    Rescan(u128),
+    /// 重建卷(噪声排除规则变更后的「立即重建」)。mask = 盘符位掩码(bit i =
+    /// `'A'+i`),0 = 全部卷;盘符锚定的规则只需重扫对应盘。
+    RescanVolumes(u32),
     Shutdown,
     /// 运行期切换参与索引的卷:bit i 对应盘符 `'A' + i`,取
     /// [`volmask`] 的掩码(0 = 未设置,worker 回落到 `--index-volumes`)。

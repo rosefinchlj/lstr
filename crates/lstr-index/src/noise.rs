@@ -206,6 +206,21 @@ pub fn builtin_patterns() -> Vec<String> {
     NOISE_SEGMENTS.iter().map(|s| s.to_string()).collect()
 }
 
+/// 单个归一化模式影响哪些盘:None = 全部盘;Some = 仅这些盘符。
+/// 盘符锚定路径(`d:/x`)只影响 d 盘;段名(`node_modules`)与无盘符
+/// 锚定(`foo/bar`)影响所有盘。用于「立即重建」只重扫受影响卷。
+pub fn affected_drives_for_pattern(normalized: &str) -> Option<Vec<char>> {
+    if !normalized.contains('/') {
+        return None; // 段名 → 全部盘
+    }
+    let comps: Vec<&str> = normalized.split('/').collect();
+    if comps[0].len() == 2 && comps[0].as_bytes()[1] == b':' && comps.len() >= 2 {
+        Some(vec![comps[0].as_bytes()[0].to_ascii_uppercase() as char])
+    } else {
+        None // 无盘符锚定 → 全部盘
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

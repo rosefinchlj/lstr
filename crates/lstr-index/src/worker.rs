@@ -521,14 +521,33 @@ fn run_session(client: HANDLE) {
         // 指令(非阻塞)
         while let Some(frame) = try_read_frame(client) {
             match frame {
-                Frame::Rescan { guid } => {
-                    // guid==0 = 重扫全部卷(噪声规则变更后的「立即重建」)
-                    let targets: Vec<u128> = if guid == 0 {
-                        threads.keys().copied().collect()
-                    } else {
-                        vec![guid]
-                    };
-                    for guid in targets {
+                Frame::Rescan { mask } => {
+                    // mask=0 = 重扫全部卷;否则按盘符位掩码选卷(噪声排除规则
+                    // 变更后的「立即重建」:盘符锚定的规则只重扫对应盘)。
+                    let targets: Vec<(u128, char)> = threads
+                        .keys()
+                        .copied()
+                        .filter_map(|g| {
+                            let letter = last_drives
+                                .iter()
+                                .find(|(_, g2)| win::guid_to_u128(g2) == Some(g))
+                                .map(|(l, _)| *l)?;
+                            if mask == 0
+                                || (letter.is_ascii_alphabetic()
+                                    && mask & (1 << (letter.to_ascii_uppercase() as u8 - b'A'))
+                                        != 0)
+                            {
+                                Some((g, letter))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    crate::snapshot::debug_log(&format!(
+                        "worker: rescan requested mask=0x{mask:08x}, targets={:?}",
+                        targets.iter().map(|(_, l)| l).collect::<Vec<_>>()
+                    ));
+                    for (guid, letter) in targets {
                         if let Some(vt) = threads.get_mut(&guid) {
                             vt.stop.store(true, Ordering::Relaxed);
                             if let Some(h) = vt.handle.take() {
@@ -536,17 +555,15 @@ fn run_session(client: HANDLE) {
                             }
                             let stop = std::sync::Arc::new(AtomicBool::new(false));
                             let tx = tx.clone();
-                            let letter = last_drives
-                                .iter()
-                                .find(|(_, g)| win::guid_to_u128(g) == Some(guid))
-                                .map(|(l, _)| *l)
-                                .unwrap_or('C');
                             let stop2 = stop.clone();
                             let handle = std::thread::Builder::new()
                                 .name(format!("lstr-vol-{letter}"))
                                 .spawn(move || volume_loop(letter, guid, None, stop2, tx))
                                 .ok();
                             threads.insert(guid, VolumeThread { stop, handle });
+                            crate::snapshot::debug_log(&format!(
+                                "worker: rescan restart vol {letter}"
+                            ));
                         }
                     }
                 }

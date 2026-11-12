@@ -576,6 +576,47 @@ impl Engine {
         self.noise_rules().hash()
     }
 
+    /// 排除规则变更后的卷重置:`letters = None` 重置全部,否则仅这些盘。
+    /// 丢弃 store(旧 NOISE 位烙在列里)、清拼音、标记未就绪并失效代次;
+    /// 随后 Rescan 掩码触发逐卷重扫。若 Rescan 丢失,卷处于未就绪态,
+    /// 下次重连握手也会按未完成卷重新扫描(自愈)。返回受影响盘符列表。
+    pub fn reset_volumes_for_noise(&mut self, letters: Option<&[char]>) -> Vec<char> {
+        let mut affected: Vec<usize> = Vec::new();
+        for (i, v) in self.volumes.iter().enumerate() {
+            let hit = match letters {
+                None => true,
+                Some(ls) => ls.contains(&v.letter),
+            };
+            if hit && (v.store.is_some() || v.complete) {
+                affected.push(i);
+            }
+        }
+        let mut out = Vec::with_capacity(affected.len());
+        for i in affected {
+            let letter = self.volumes[i].letter;
+            let v = &mut self.volumes[i];
+            v.store = None;
+            v.complete = false;
+            v.capture_on = false;
+            v.sidecar_ops = Vec::new();
+            v.sidecar_pending = false;
+            v.sidecar_overflowed = false;
+            self.pinyin[i] = PinyinCache::empty();
+            self.bump_generation(i);
+            out.push(letter);
+        }
+        out
+    }
+
+    /// 已收到 ScanBegin(存在 store)的卷盘符:「立即重建」的重发自愈判定用。
+    pub fn letters_with_store(&self) -> Vec<char> {
+        self.volumes
+            .iter()
+            .filter(|v| v.store.is_some())
+            .map(|v| v.letter)
+            .collect()
+    }
+
     pub fn handle(&mut self, msg: EngineMsg) {
         // 保存期间 store 必须冻结(快照按启动时的冻结视图写列);修改类消息
         // 按到达顺序排队,保存收尾后原序重放。查询不走 EngineMsg,不受影响。

@@ -203,6 +203,7 @@ impl SearchService {
             Arc::clone(&worker_collected),
             Arc::clone(&client_done),
         );
+        let worker_index_cmd_tx = index_cmd_tx.clone();
         std::thread::Builder::new()
             .name("lstr-search".to_string())
             .spawn(move || {
@@ -215,6 +216,7 @@ impl SearchService {
                     apps_dirty: worker_apps_dirty,
                     status_slot: worker_status,
                     index_cmd_rx,
+                    index_cmd_tx: worker_index_cmd_tx,
                     volume_mask: worker_volume_mask,
                     noise_slot: worker_noise_slot,
                     shutdown_client: done_s,
@@ -275,13 +277,13 @@ impl SearchService {
         ));
     }
 
-    /// 「立即重建」:排除规则变更后调用。删旧快照 + 换引擎规则表 + 全卷重扫。
-    /// 顺序保证:共享槽先更新(重建出的 store 才用新规则),Rescan(0) 后发;
-    /// 引擎在 ScanBegin(resume_frn=0) 时丢弃旧 store,新 store 从槽里取新表。
-    /// worker 没在跑时指令静默失败:下次拉起按新表全量扫,语义不变。
+    /// 「立即重建」:排除规则变更后调用。更新共享槽 + 删旧快照。
+    /// run_worker 空闲轮询发现槽变化后:引擎重置受影响卷(丢弃旧 NOISE 位)
+    /// → 按差集算受影响盘发 Rescan 掩码 → worker 逐卷重扫。待重扫卷 3s
+    /// 未收到 ScanBegin 自动重发(自愈);重启后快照指纹不符也会重扫。
     pub fn rebuild_noise_index(&self, patterns: Vec<String>) {
         if let Ok(mut slot) = self.noise_slot.lock() {
-            *slot = patterns.clone();
+            *slot = patterns;
         }
         // 删旧快照:重建完成前的崩溃窗口里,旧快照指纹与新规则不符会被拒,
         // 这里删掉更直接(避免旧 store 的周期性保存把旧快照写回盘)。
@@ -299,11 +301,7 @@ impl SearchService {
                 }
             }
         }
-        if self.index_cmd.send(ClientCommand::Rescan(0)).is_ok() {
-            lstr_index::snapshot::debug_log(
-                "main: noise rules changed, full rescan requested",
-            );
-        }
+        lstr_index::snapshot::debug_log("main: noise rules changed (slot updated)");
     }
 
     pub fn search(
@@ -1432,6 +1430,8 @@ struct WorkerArgs {
     apps_dirty: Arc<AtomicBool>,
     status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
     index_cmd_rx: Receiver<ClientCommand>,
+    /// 控制指令发送端(run_worker 的排除规则变更检测用它发 Rescan 掩码)。
+    index_cmd_tx: Sender<ClientCommand>,
     volume_mask: Arc<AtomicU32>,
     /// 排除规则共享槽(与 SearchService 共享,重建时换表)。
     noise_slot: Arc<Mutex<Vec<String>>>,
@@ -1531,6 +1531,7 @@ fn run_worker(args: WorkerArgs) {
         apps_dirty,
         status_slot,
         index_cmd_rx,
+        index_cmd_tx,
         volume_mask,
         noise_slot,
         shutdown_client,
@@ -1539,6 +1540,10 @@ fn run_worker(args: WorkerArgs) {
     } = args;
     // finalize 硬过滤 + 引擎共用同一张排除表(实时取,重建后即新规则)。
     let noise = lstr_index::engine::NoiseRules::from_slot(Arc::clone(&noise_slot));
+    // 「立即重建」状态:槽内容与已应用表比对;待重扫卷 3s 未收到 ScanBegin 则重发。
+    let mut noise_applied_raw = noise_slot.lock().unwrap().clone();
+    let mut pending_rescan: Vec<(char, Instant)> = Vec::new();
+    let mut last_resend = Instant::now();
     // 显式选择「仅内置索引」:此时无论引擎是否就绪,都不再回落 Everything,
     // 否则与设置页文案矛盾(旧实现在 Fallback 时仍把查询发给 Everything)。
     let force_builtin = config.index.backend == "builtin";
@@ -1683,6 +1688,83 @@ fn run_worker(args: WorkerArgs) {
                     *handshake_slot.lock().unwrap() = b.engine.handshake_state();
                     maintenance_busy =
                         b.engine.save_in_progress() || b.engine.has_deferred_msgs();
+                }
+            }
+            // —— 排除规则表变化检测(「立即重建」)——
+            // 槽内容与已应用表不符 → 引擎重置受影响卷 + Rescan 掩码重扫
+            // (盘符锚定规则只重扫对应盘,段名规则重扫全部盘)。
+            // 待重扫卷 3s 未收到 ScanBegin 则重发(自愈)。
+            {
+                let cur_raw = noise_slot.lock().unwrap().clone();
+                let norm = |list: &[String]| -> std::collections::BTreeSet<String> {
+                    list.iter()
+                        .filter_map(|p| lstr_index::noise::normalize_pattern(p))
+                        .collect()
+                };
+                if norm(&cur_raw) != norm(&noise_applied_raw) {
+                    let cur = norm(&cur_raw);
+                    let old = norm(&noise_applied_raw);
+                    let diff: Vec<String> = cur
+                        .difference(&old)
+                        .chain(old.difference(&cur))
+                        .cloned()
+                        .collect();
+                    let mut letters: Vec<char> = Vec::new();
+                    let mut all = false;
+                    for p in &diff {
+                        match lstr_index::noise::affected_drives_for_pattern(p) {
+                            None => all = true,
+                            Some(ds) => letters.extend(ds),
+                        }
+                    }
+                    let scope: Option<Vec<char>> = if all {
+                        None
+                    } else {
+                        letters.sort_unstable();
+                        letters.dedup();
+                        (!letters.is_empty()).then_some(letters)
+                    };
+                    let (affected, mask) = if let Some(b) = &mut builtin {
+                        let affected = b.engine.reset_volumes_for_noise(scope.as_deref());
+                        *handshake_slot.lock().unwrap() = b.engine.handshake_state();
+                        let mask = match &scope {
+                            None => 0u32,
+                            Some(ls) => ls.iter().fold(0u32, |m, l| {
+                                m | (1 << (l.to_ascii_uppercase() as u8 - b'A'))
+                            }),
+                        };
+                        (affected, mask)
+                    } else {
+                        (scope.clone().unwrap_or_default(), 0)
+                    };
+                    let _ = index_cmd_tx.send(ClientCommand::RescanVolumes(mask));
+                    pending_rescan = affected.iter().map(|l| (*l, Instant::now())).collect();
+                    last_resend = Instant::now();
+                    lstr_index::snapshot::debug_log(&format!(
+                        "main: noise rules changed, reset {:?}, rescan mask=0x{mask:08x}",
+                        affected
+                    ));
+                    noise_applied_raw = cur_raw;
+                }
+                // 待重扫自愈:重发后 3s 仍未收到 ScanBegin 的卷 → 重发 Rescan
+                if !pending_rescan.is_empty()
+                    && last_resend.elapsed() >= Duration::from_secs(3)
+                {
+                    if let Some(b) = &builtin {
+                        let with_store = b.engine.letters_with_store();
+                        pending_rescan.retain(|(l, _)| !with_store.contains(l));
+                        if !pending_rescan.is_empty() {
+                            let mask = pending_rescan.iter().fold(0u32, |m, (l, _)| {
+                                m | (1 << (l.to_ascii_uppercase() as u8 - b'A'))
+                            });
+                            let _ =
+                                index_cmd_tx.send(ClientCommand::RescanVolumes(mask));
+                            lstr_index::snapshot::debug_log(&format!(
+                                "main: rescan retry, mask=0x{mask:08x} (volumes={pending_rescan:?})"
+                            ));
+                        }
+                        last_resend = Instant::now();
+                    }
                 }
             }
             let idle_ms = idle_start.elapsed().as_millis();

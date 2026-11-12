@@ -146,8 +146,10 @@ pub enum Frame {
     WorkerExit {
         reason: u32,
     },
+    /// 重建卷:mask = 盘符位掩码(bit i = `'A'+i`);0 = 全部卷。
+    /// 噪声排除规则变更后用:盘符锚定的规则只需重扫对应盘。
     Rescan {
-        guid: u128,
+        mask: u32,
     },
     /// 运行期切换索引卷的掩码(bit i = 盘符 `'A' + i`,0 = 未设置)。
     SetVolumes {
@@ -407,9 +409,9 @@ impl Frame {
                 w.u32(*reason);
                 w
             }
-            Frame::Rescan { guid } => {
+            Frame::Rescan { mask } => {
                 let mut w = W::new(frame_type::RESCAN);
-                w.u128(*guid);
+                w.u32(*mask);
                 w
             }
             Frame::SetVolumes { mask } => {
@@ -506,7 +508,7 @@ impl Frame {
                 letter: char::from_u32(r.u8()? as u32)?,
             },
             frame_type::WORKER_EXIT => Frame::WorkerExit { reason: r.u32()? },
-            frame_type::RESCAN => Frame::Rescan { guid: r.u128()? },
+            frame_type::RESCAN => Frame::Rescan { mask: r.u32()? },
             frame_type::SET_VOLUMES => Frame::SetVolumes { mask: r.u32()? },
             frame_type::USN_WATCH => Frame::UsnWatch {
                 guid: r.u128()?,
@@ -572,7 +574,7 @@ mod tests {
             Frame::VolumeGone { guid: 7 },
             Frame::VolumeAppeared { guid: 7, letter: 'E' },
             Frame::WorkerExit { reason: 0 },
-            Frame::Rescan { guid: 7 },
+            Frame::Rescan { mask: 0b100 },
             Frame::SetVolumes { mask: (1 << 2) | (1 << 3) },
             Frame::SetVolumes { mask: u32::MAX },
             Frame::UsnWatch { guid: 7, state: crate::usnwatch::UsnWatchState::Watching },

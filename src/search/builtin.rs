@@ -678,6 +678,9 @@ fn frame_loop(
             match index_cmd_rx.try_recv() {
                 Ok(cmd) => {
                     let frame = idx_client::command_frame(&cmd);
+                    lstr_index::snapshot::debug_log(&format!(
+                        "client: sending command {cmd:?}"
+                    ));
                     if !idx_client::write_frame(client, &frame) {
                         break 'frames;
                     }
