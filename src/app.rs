@@ -380,12 +380,87 @@ fn strip_condition_terminator(text: &str) -> &str {
     without.trim_end()
 }
 
+/// 条件操作撤销/重做用的一份状态快照。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConditionSnapshot {
+    filters: SearchFilters,
+    input: String,
+    chip_caret: Option<usize>,
+}
+
+/// 条件操作的 undo/redo 栈：提交/删除/编辑 chip、盘符还原路径、清空筛选
+/// 都会先记录一份快照。栈满 64 条，连续相同状态不重复入栈。
+#[derive(Default)]
+struct ConditionHistory {
+    undo: Vec<ConditionSnapshot>,
+    redo: Vec<ConditionSnapshot>,
+}
+
+impl ConditionHistory {
+    const LIMIT: usize = 64;
+
+    fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    fn record(&mut self, snapshot: ConditionSnapshot) {
+        // 新操作让 redo 失效；重复状态（例如同一帧多次提交）不重复入栈。
+        self.redo.clear();
+        if self.undo.last() == Some(&snapshot) {
+            return;
+        }
+        if self.undo.len() >= Self::LIMIT {
+            self.undo.remove(0);
+        }
+        self.undo.push(snapshot);
+    }
+
+    fn undo(&mut self, current: ConditionSnapshot) -> Option<ConditionSnapshot> {
+        let previous = self.undo.pop()?;
+        if self.redo.len() >= Self::LIMIT {
+            self.redo.remove(0);
+        }
+        self.redo.push(current);
+        Some(previous)
+    }
+
+    fn redo(&mut self, current: ConditionSnapshot) -> Option<ConditionSnapshot> {
+        let next = self.redo.pop()?;
+        if self.undo.len() >= Self::LIMIT {
+            self.undo.remove(0);
+        }
+        self.undo.push(current);
+        Some(next)
+    }
+
+    /// 用户主动取消编辑时，把刚压入的「进入编辑」快照撤掉，
+    /// 避免 Ctrl+Z 又回到同一个编辑态。
+    fn forget_last(&mut self, filters: &SearchFilters, input: &str) {
+        if self
+            .undo
+            .last()
+            .is_some_and(|snapshot| &snapshot.filters == filters && snapshot.input == input)
+        {
+            self.undo.pop();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+}
+
 /// 空查询帮助面板的内容高度（相对列表顶部）：宽窗口两列，以较高的左列
 /// 为准；窄窗口退化为单列顺排，两列内容相加。
 fn help_panel_height(width: f32) -> f32 {
     let group = |rows: f32| HELP_GROUP_HEAD_H + rows * HELP_ROW_H + HELP_GROUP_GAP;
-    // 左列：位置 3 行 / 筛选 5 行（含日期、大小、条件编辑）/ 范围 3 行。
-    let left = group(3.0) + group(5.0) + group(3.0);
+    // 左列：位置 3 行 / 筛选 6 行（含日期、大小、条件编辑、撤回）/ 范围 3 行。
+    let left = group(3.0) + group(6.0) + group(3.0);
     let head = HELP_TOP_PAD + HELP_TITLE_H;
     if width >= 560.0 {
         head + left
@@ -491,6 +566,8 @@ pub struct LstrApp {
     suggest_index: usize,
     /// 条件编辑前的 filters/输入快照：Esc 取消时恢复。
     condition_edit_backup: Option<(SearchFilters, String)>,
+    /// 条件操作的撤销/重做栈（Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z）。
+    condition_history: ConditionHistory,
     /// 对话框事件到达但探测失败时的重试截止时间（子控件可能还没建好）。
     dialog_retry_until: Option<Instant>,
     /// 设置面板当前分页。
@@ -664,6 +741,7 @@ impl LstrApp {
             suggest_dismissed: None,
             suggest_index: 0,
             condition_edit_backup: None,
+            condition_history: ConditionHistory::default(),
             dialog_retry_until: None,
             settings_tab: SettingsTab::Appearance,
             ime_composing: false,
@@ -1310,6 +1388,7 @@ impl LstrApp {
         if self.condition_edit_backup.is_none() {
             self.condition_edit_backup = Some((self.filters.clone(), self.input.clone()));
         }
+        self.record_condition_undo();
         if !self.remove_chip(index) {
             return false;
         }
@@ -1333,6 +1412,8 @@ impl LstrApp {
         let Some((filters, input)) = self.condition_edit_backup.take() else {
             return false;
         };
+        // 进入编辑时压过一条 undo 快照；用户主动取消 = 撤销这次编辑。
+        self.condition_history.forget_last(&filters, &input);
         self.filters = filters;
         self.input = input;
         self.condition_hold = false;
@@ -1343,7 +1424,60 @@ impl LstrApp {
         true
     }
 
-    /// 编辑态回车：时间/大小补终结冒号后提交；盘符直接提交。
+    /// 当前条件状态的快照（filters + 输入 + 虚拟光标）。
+    fn condition_snapshot(&self) -> ConditionSnapshot {
+        ConditionSnapshot {
+            filters: self.filters.clone(),
+            input: self.input.clone(),
+            chip_caret: self.chip_caret,
+        }
+    }
+
+    /// 在任何会改变条件/chip 的操作前记录一份快照。
+    fn record_condition_undo(&mut self) {
+        let snapshot = self.condition_snapshot();
+        self.condition_history.record(snapshot);
+    }
+
+    /// 恢复一份条件快照。输入里若有完整条件文本，进入「回车确认」态：
+    /// 不自动搜索，避免撤回后被立刻重新收成 chip。
+    fn restore_condition_snapshot(&mut self, ctx: &egui::Context, snapshot: ConditionSnapshot) {
+        self.filters = snapshot.filters;
+        self.input = snapshot.input;
+        self.chip_caret = snapshot.chip_caret;
+        self.condition_edit_backup = None;
+        self.suggest_dismissed = None;
+        self.suggest_index = 0;
+        self.condition_error = None;
+        self.menu_open = false;
+        self.filter_menu = None;
+        self.condition_hold = self.conditions_apply(self.scope)
+            && !crate::search::conditions::extract(&self.input).is_empty();
+        Self::reset_input_cursor(ctx);
+        self.focus_requested = true;
+    }
+
+    /// Ctrl+Z：撤回最近一次条件操作。
+    fn undo_condition(&mut self, ctx: &egui::Context) {
+        let current = self.condition_snapshot();
+        let Some(previous) = self.condition_history.undo(current) else {
+            return;
+        };
+        self.restore_condition_snapshot(ctx, previous);
+        self.toast(ctx, "已撤回条件".to_string());
+        self.trigger(ctx);
+    }
+
+    /// Ctrl+Y / Ctrl+Shift+Z：取消撤回（重做）。
+    fn redo_condition(&mut self, ctx: &egui::Context) {
+        let current = self.condition_snapshot();
+        let Some(next) = self.condition_history.redo(current) else {
+            return;
+        };
+        self.restore_condition_snapshot(ctx, next);
+        self.toast(ctx, "已重做条件".to_string());
+        self.trigger(ctx);
+    }
     /// 返回 true = 这次回车已被条件编辑消费（不再打开选中结果）。
     fn finish_condition_edit(&mut self, ctx: &egui::Context) -> bool {
         if self.condition_hold {
@@ -1379,9 +1513,11 @@ impl LstrApp {
 
     /// `C:` 已收成 chip 后用户继续打 `\`：还原成 `C:\`，回到路径浏览。
     fn restore_drive_for_path(&mut self) -> bool {
-        if !self.input.starts_with(['\\', '/']) {
+        if !self.input.starts_with(['\\', '/']) || self.filters.drives.is_empty() {
             return false;
         }
+        // 撤回这次还原 = 回到「盘符 chip + 分隔符文本」的状态。
+        self.record_condition_undo();
         let Some(drive) = self.filters.drives.pop() else {
             return false;
         };
@@ -1425,25 +1561,40 @@ impl LstrApp {
                 return false;
             }
         }
+        let mut drives = self.filters.drives.clone();
         for drive in extracted.drives {
-            match self
-                .filters
-                .drives
+            match drives
                 .iter()
                 .position(|existing| existing.letter == drive.letter)
             {
-                Some(pos) => self.filters.drives[pos] = drive,
-                None => self.filters.drives.push(drive),
+                Some(pos) => drives[pos] = drive,
+                None => drives.push(drive),
             }
         }
+        // 所有合并都通过后再记录快照：撤回会恢复条件原文（chip 撤掉），
+        // 重做再收成 chip。
+        self.record_condition_undo();
         self.input = extracted.cleaned;
         self.filters.modified = (!dates.is_empty()).then_some(dates);
         self.filters.size = (!sizes.is_empty()).then_some(sizes);
+        self.filters.drives = drives;
         self.condition_hold = false;
         self.condition_edit_backup = None;
         self.chip_caret = None;
         self.move_caret_to_end(ctx);
+        // 条件提交会程序化改写输入，TextEdit 自带的文本撤销历史不再对应
+        // 当前内容；清掉它，避免条件撤销栈空后 Ctrl+Z 又翻出旧文本。
+        Self::clear_text_undo(ctx);
         true
+    }
+
+    /// 清掉输入框 TextEdit 自带的撤销历史（不改变文本/光标）。
+    fn clear_text_undo(ctx: &egui::Context) {
+        let id = egui::Id::new("lstr-search-input");
+        if let Some(mut state) = egui::widgets::text_edit::TextEditState::load(ctx, id) {
+            state.clear_undoer();
+            state.store(ctx, id);
+        }
     }
 
     /// 程序化清空输入（不清筛选）：同时清掉条件错误与编辑/联想瞬态，
@@ -1533,6 +1684,7 @@ impl LstrApp {
             self.condition_error = None;
             self.browse_root = None;
             self.browse_forward.clear();
+            self.condition_history.clear();
         }
         Self::reset_input_cursor(ctx);
         self.filter_menu = None;
@@ -1573,6 +1725,7 @@ impl LstrApp {
         self.filters = SearchFilters::default();
         self.condition_error = None;
         self.filter_menu = None;
+        self.condition_history.clear();
         self.hidden = false;
         self.shown_at = Instant::now();
         // 对话框模式不居中：保持贴着对话框（center_frames 只用于双击 Space 唤出）。
@@ -1854,6 +2007,34 @@ impl LstrApp {
             }
         }
 
+        // 条件撤回 / 取消撤回：Ctrl+Z；Ctrl+Y 或 Ctrl+Shift+Z 重做。
+        // 只要条件历史里还有记录就接管这两个键（避免条件栈空后 TextEdit
+        // 翻出与当前 chip 不对应的旧文本）；完全没有历史时仍交给 TextEdit。
+        let history_active =
+            self.condition_history.can_undo() || self.condition_history.can_redo();
+        if history_active
+            && ctx.input_mut(|i| {
+                i.consume_key(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Z)
+            })
+        {
+            if self.condition_history.can_redo() {
+                self.redo_condition(ctx);
+            }
+            return;
+        }
+        if history_active && ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Y)) {
+            if self.condition_history.can_redo() {
+                self.redo_condition(ctx);
+            }
+            return;
+        }
+        if history_active && ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Z)) {
+            if self.condition_history.can_undo() {
+                self.undo_condition(ctx);
+            }
+            return;
+        }
+
         // Shift+Ctrl+Backspace：把光标左侧的条件 chip 还原成文本，进入编辑态
         // （没有虚拟光标时 chip 全在文本左侧，编辑最右 chip）。
         if self.condition_edit_target().is_some()
@@ -1873,6 +2054,7 @@ impl LstrApp {
             && ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backspace))
         {
             if let Some(index) = self.condition_delete_target(ctx) {
+                self.record_condition_undo();
                 if self.remove_chip(index) {
                     self.condition_error = None;
                     self.menu_open = false;
@@ -2729,6 +2911,7 @@ impl LstrApp {
                         );
                     }
                     if let Some(index) = removed {
+                        self.record_condition_undo();
                         if self.remove_chip(index) {
                             self.condition_error = None;
                             self.menu_open = false;
@@ -3606,6 +3789,7 @@ impl LstrApp {
                 if response.hovered() { theme.text } else { theme.dim },
             );
             if response.clicked() {
+                self.record_condition_undo();
                 self.filters = SearchFilters::default();
                 self.filter_menu = None;
                 self.trigger(ui.ctx());
@@ -3917,6 +4101,9 @@ impl LstrApp {
                     FilterChoice::Time(value) => {
                         // 预设与输入框自定义区间是「替换」而非叠加：选了预设
                         // 就清掉自定义 chip，避免用户看到两个时间条件同时生效。
+                        if self.filters.modified.is_some() {
+                            self.record_condition_undo();
+                        }
                         self.filters.time = *value;
                         self.filters.modified = None;
                     }
@@ -3989,6 +4176,7 @@ impl LstrApp {
                             ("日期", "date>2026-11-10: 冒号/回车"),
                             ("大小", "size>10M: 按文件大小"),
                             ("Ctrl+Bksp", "删条件；加 Shift 编辑"),
+                            ("Ctrl+Z/Y", "撤回 / 取消撤回条件"),
                             ("匹配", "大小写 / 全词 / 正则"),
                         ],
                     ),
@@ -7910,5 +8098,56 @@ mod path_layout_tests {
             strip_condition_terminator("size 10M..100M"),
             "size 10M..100M"
         );
+    }
+
+    fn condition_snap(input: &str) -> ConditionSnapshot {
+        ConditionSnapshot {
+            filters: SearchFilters::default(),
+            input: input.to_string(),
+            chip_caret: None,
+        }
+    }
+
+    #[test]
+    fn condition_history_undo_redo_roundtrip() {
+        let mut history = ConditionHistory::default();
+        let before = condition_snap("size>10M:");
+        history.record(before.clone());
+        assert!(history.can_undo());
+        assert!(!history.can_redo());
+
+        let after = condition_snap("");
+        let previous = history.undo(after.clone()).expect("undo");
+        assert_eq!(previous, before);
+        assert!(!history.can_undo());
+        assert!(history.can_redo());
+
+        let next = history.redo(before.clone()).expect("redo");
+        assert_eq!(next, after);
+        assert!(history.can_undo());
+        assert!(!history.can_redo());
+    }
+
+    #[test]
+    fn condition_history_new_record_clears_redo_and_dedupes() {
+        let mut history = ConditionHistory::default();
+        history.record(condition_snap("a"));
+        let previous = history.undo(condition_snap("b")).expect("undo");
+        assert_eq!(previous, condition_snap("a"));
+        assert!(history.can_redo());
+
+        history.record(condition_snap("c"));
+        assert!(!history.can_redo(), "新操作必须清空 redo");
+        history.record(condition_snap("c"));
+        assert_eq!(history.undo.len(), 1, "连续相同状态不重复入栈");
+    }
+
+    #[test]
+    fn condition_history_forgets_last_on_cancel() {
+        let mut history = ConditionHistory::default();
+        let before = condition_snap("a");
+        history.record(before.clone());
+        history.forget_last(&before.filters, "a");
+        assert!(!history.can_undo(), "取消编辑应撤掉进入编辑的快照");
     }
 }
