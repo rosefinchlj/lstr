@@ -38,6 +38,11 @@ const FRAME_CHANNEL_CAP: usize = 32;
 /// Shutdown」留下的提权 worker;正常关闭走 Shutdown 立即退出,不会等这么久。
 const IDLE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// 退出看门狗宽限:stop 发出后给卷线程这么久退出;到点仍未退则强制结束
+/// 进程,保证正常退出几秒内 worker 必退(不锁 exe 挡住重编译)。与主进程
+/// WORKER_EXIT_WAIT 同量级;卷线程大多 500ms 内响应 stop,看门狗只是兜底。
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
 /// 主进程在会话里显式发过 `Frame::Shutdown` 后置位(含 `try_read_frame`
 /// 在管道断开时合成的 Shutdown,以及握手被拒):本次会话结束后不再重建
 /// 管道,worker 直接退出。这样 lstr 正常关闭时不会留下常驻的提权进程。
@@ -594,11 +599,32 @@ fn run_session(client: HANDLE) {
             break 'session;
         }
     }
+    // 先给所有卷线程并行发 stop,再 join。旧实现逐个「设 stop→join」,慢退的
+    // 线程会拖延后续线程收到 stop,把退出延迟放大到几十秒(实测残留 worker
+    // 锁住 exe 挡住重编译)。
+    let mut joins: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for (_, vt) in threads.drain() {
         vt.stop.store(true, Ordering::Relaxed);
         if let Some(h) = vt.handle {
-            let _ = h.join();
+            joins.push(h);
         }
+    }
+    // 仅「真要退出」(EXIT_AFTER_SESSION)时武装看门狗:个别卷线程卡在不可中断
+    // IO 不能拖死退出。到点强制结束进程(worker 本就要退,OS 回收线程;clean-exit
+    // 标记先写,下次启动不降级)。管道重建场景(主进程崩溃、EXIT_AFTER_SESSION
+    // 未置位)不武装,以免误杀下一会话。
+    if EXIT_AFTER_SESSION.load(Ordering::Relaxed) {
+        std::thread::spawn(|| {
+            std::thread::sleep(SHUTDOWN_GRACE);
+            if let Some(dir) = clean_exit_flag_dir() {
+                write_clean_exit_flag(&dir);
+            }
+            crate::snapshot::debug_log("worker: shutdown grace expired, force exit");
+            std::process::exit(0);
+        });
+    }
+    for h in joins {
+        let _ = h.join();
     }
     // 先停生产、再断消费者:所有 tx 克隆随线程结束释放,rx.iter() 收尾后 writer 退出
     drop(tx);
