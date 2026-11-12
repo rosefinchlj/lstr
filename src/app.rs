@@ -110,6 +110,95 @@ impl IconStore {
     }
 }
 
+/// 预览内容缓存(图片缩略图/文本头部),后台线程加载,镜像 IconStore。
+struct PreviewStore {
+    cache: HashMap<String, Option<PreviewContent>>,
+    pending: HashSet<String>,
+    tx: std::sync::mpsc::Sender<PreviewJob>,
+    rx: std::sync::mpsc::Receiver<(String, Option<crate::preview::PreviewData>)>,
+}
+
+enum PreviewContent {
+    Image(egui::TextureHandle),
+    Text(String),
+}
+
+struct PreviewJob {
+    key: String,
+    entry: Entry,
+}
+
+impl PreviewStore {
+    fn new() -> Self {
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<PreviewJob>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("lstr-preview".to_string())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let data = crate::preview::load(&job.entry);
+                    if done_tx.send((job.key, data)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
+        Self {
+            cache: HashMap::new(),
+            pending: HashSet::new(),
+            tx: job_tx,
+            rx: done_rx,
+        }
+    }
+
+    /// 后台完成的预览转纹理/文本;有新内容时重绘。
+    fn drain(&mut self, ctx: &egui::Context) {
+        let mut loaded = false;
+        while let Ok((key, data)) = self.rx.try_recv() {
+            self.pending.remove(&key);
+            let content = data.map(|d| match d {
+                crate::preview::PreviewData::Image(img) => PreviewContent::Image(
+                    ctx.load_texture(key.clone(), img, egui::TextureOptions::LINEAR),
+                ),
+                crate::preview::PreviewData::Text(t) => PreviewContent::Text(t),
+            });
+            self.cache.insert(key, content);
+            loaded = true;
+        }
+        if self.cache.len() > 120 {
+            self.cache.clear();
+            self.pending.clear();
+        }
+        if loaded {
+            ctx.request_repaint();
+        }
+    }
+
+    fn request(&mut self, key: String, entry: &Entry) {
+        if crate::preview::kind_of(entry) == crate::preview::PreviewKind::None {
+            return;
+        }
+        if self.cache.contains_key(&key) || !self.pending.insert(key.clone()) {
+            return;
+        }
+        if self
+            .tx
+            .send(PreviewJob { key: key.clone(), entry: entry.clone() })
+            .is_err()
+        {
+            self.pending.remove(&key);
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&PreviewContent> {
+        self.cache.get(key).and_then(Option::as_ref)
+    }
+}
+
+fn preview_key(entry: &Entry) -> String {
+    format!("preview:{}", entry.full_path().to_lowercase())
+}
+
 fn icon_key(entry: &Entry) -> String {
     match entry.kind {
         // 文件夹共享一个图标，按扩展名共享文件图标，UWP/.lnk/程序按路径。
@@ -251,6 +340,8 @@ pub struct LstrApp {
     center_frames: u8,
     suppress_hide_until: Instant,
     icons: IconStore,
+    /// 预览面板内容缓存(图片缩略图/文本头部)。
+    previews: PreviewStore,
     /// P0-2：Explorer 内直接键入搜索（默认关闭）。
     typing: Option<crate::win::typing::TypingWatch>,
     /// 设置页「资产」的草稿输入状态。
@@ -393,6 +484,7 @@ impl LstrApp {
             center_frames: 0,
             suppress_hide_until: Instant::now(),
             icons: IconStore::new(),
+            previews: PreviewStore::new(),
             typing,
             assets_ui: crate::assets_ui::AssetUiState::default(),
             typing_folder: None,
@@ -1640,6 +1732,14 @@ impl LstrApp {
             }
             return;
         }
+        if entry.id == "calc:" {
+            // 计算器结果行:path 存结果字符串,Enter 复制到剪贴板(不收起,便于继续)。
+            if let Some(path) = &entry.path {
+                ctx.copy_text(path.to_string_lossy().to_string());
+                self.toast(ctx, "已复制计算结果".to_string());
+            }
+            return;
+        }
         match entry.id.as_str() {
             "cmd:settings" => self.open_settings(ctx),
             "cmd:reload" => {
@@ -1924,7 +2024,11 @@ impl LstrApp {
                 if response.changed() {
                     self.menu_open = false;
                     self.filter_menu = None;
-                    self.trigger(ctx);
+                    // IME 组合期(预编辑未上屏)不触发搜索:避免拼音字母逐键闪动
+                    // 结果;上屏后由 handle_keys 的组合结束检测补搜。
+                    if !self.ime_composing {
+                        self.trigger(ctx);
+                    }
                 }
                 let window_focused = ctx.input(|i| i.focused);
                 if self.focus_requested || (window_focused && !response.has_focus()) {
@@ -3222,6 +3326,9 @@ impl LstrApp {
             .x
             .max(1.0);
         let sub_budget = (((rect.width() - 16.0 - 64.0) / char_w).floor() as usize).max(16);
+        // 收藏置顶视觉标记:收藏过的条目副标题加 ★(每帧构建一次集合)。
+        let fav_set: std::collections::HashSet<String> =
+            self.cfg.favorites.iter().map(|f| f.path.to_lowercase()).collect();
         // 两行内容（标题 + 副标题）的墨迹几何（含关键词下划线）。每帧量一次，
         // 所有行共用同一组基线：按墨迹而不是 galley 盒居中——盒子上下留白
         // 不对称、下划线还画在盒底之外，按盒居中会让降部探出高亮底边。
@@ -3366,12 +3473,15 @@ impl LstrApp {
             // 先交代条目已在打开列表里,再说明本次为何命中。
             // 拼音标注只显示本次查询词（与应用行「应用 · 拼音 weixin」一致）：
             // 目的只是标明「这条是拼音命中」，不列名字的完整拼音。
-            let lead = match (entry.id.starts_with("qs:"), pinyin_path_hit) {
+            let mut lead = match (entry.id.starts_with("qs:"), pinyin_path_hit) {
                 (true, true) => format!("已打开 · 拼音 {} · ", query.text),
                 (true, false) => "已打开 · ".to_string(),
                 (false, true) => format!("拼音 {} · ", query.text),
                 (false, false) => String::new(),
             };
+            if is_path_row && fav_set.contains(&full_path.to_lowercase()) {
+                lead = format!("★ {lead}");
+            }
             let time_text = if is_path_row {
                 entry
                     .modified
@@ -3555,6 +3665,8 @@ impl LstrApp {
                             format!("网络搜索 · {host}")
                         } else if entry.id.starts_with("kwexec:") {
                             "关键字 · Enter 运行".to_string()
+                        } else if entry.id == "calc:" {
+                            "计算 · Enter 复制结果".to_string()
                         } else {
                             "命令 · Enter 执行".to_string()
                         }
@@ -4302,29 +4414,52 @@ impl LstrApp {
         let theme = self.theme;
         let mut y = pane.top() + 6.0;
 
-        // 和结果行共用同一份纹理，UWP 图标只解析一次。
-        let texture = if entry.kind == Kind::Command {
-            None
-        } else {
-            let key = icon_key(entry);
-            self.icons.request(key.clone(), entry);
-            self.icons.get(&key)
+        // 预览内容(图片缩略图/文本头部):后台加载,就绪后展示。
+        let pkey = preview_key(entry);
+        self.previews.request(pkey.clone(), entry);
+        let preview = self.previews.get(&pkey);
+
+        // 图片缩略图就绪时顶部画缩略图(替代小图标);否则画 32x32 图标。
+        let thumb = match preview {
+            Some(PreviewContent::Image(tex)) => Some(tex),
+            _ => None,
         };
-        let icon_rect =
-            Rect::from_min_size(egui::pos2(pane.left() + 8.0, y), egui::vec2(32.0, 32.0));
-        if let Some(texture) = texture {
+        if let Some(tex) = thumb {
+            let side = (pane.width() - 16.0).min(160.0);
+            let thumb_rect =
+                Rect::from_min_size(egui::pos2(pane.left() + 8.0, y), egui::vec2(side, side));
             painter.image(
-                texture.id(),
-                icon_rect,
+                tex.id(),
+                thumb_rect,
                 Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
-        } else if entry.kind == Kind::App {
-            ui::paint_app_tile(painter, icon_rect, entry);
+            y += side + 8.0;
         } else {
-            ui::paint_file_icon(painter, icon_rect, entry.kind, theme.sub);
+            // 和结果行共用同一份纹理，UWP 图标只解析一次。
+            let texture = if entry.kind == Kind::Command {
+                None
+            } else {
+                let key = icon_key(entry);
+                self.icons.request(key.clone(), entry);
+                self.icons.get(&key)
+            };
+            let icon_rect =
+                Rect::from_min_size(egui::pos2(pane.left() + 8.0, y), egui::vec2(32.0, 32.0));
+            if let Some(texture) = texture {
+                painter.image(
+                    texture.id(),
+                    icon_rect,
+                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            } else if entry.kind == Kind::App {
+                ui::paint_app_tile(painter, icon_rect, entry);
+            } else {
+                ui::paint_file_icon(painter, icon_rect, entry.kind, theme.sub);
+            }
+            y += 42.0;
         }
-        y += 42.0;
 
         let kind_label = match entry.kind {
             Kind::File => "文件",
@@ -4399,6 +4534,27 @@ impl LstrApp {
                 ui::mono_font(11.0),
                 theme.sub,
             );
+            y += 16.0;
+        }
+        // 文本速览:元数据下方画文件头部(等宽小字,裁剪到面板剩余高度)。
+        if let Some(PreviewContent::Text(text)) = preview {
+            y += 6.0;
+            let line_h = 14.0;
+            let max_y = pane.bottom() - 6.0;
+            for line in text.lines() {
+                if y + line_h > max_y {
+                    break;
+                }
+                let mut job =
+                    ui::text_job_case(line, "", &ui::mono_font(10.5), theme.sub, theme.amber, false);
+                job.wrap.max_width = pane.width() - 16.0;
+                job.wrap.max_rows = 1;
+                job.wrap.overflow_character = Some('…');
+                job.wrap.break_anywhere = true;
+                let galley = painter.layout_job(job);
+                painter.galley(egui::pos2(pane.left() + 8.0, y), galley, theme.sub);
+                y += line_h;
+            }
         }
     }
 
@@ -6148,6 +6304,7 @@ impl eframe::App for LstrApp {
         self.poll_tray(ctx);
         self.poll_search(ctx);
         self.icons.drain(ctx);
+        self.previews.drain(ctx);
 
         // 对话框模式：目标对话框被关掉就退出对话框模式（正在显示则一并隐藏）。
         if let Some(info) = &self.dialog {
@@ -6184,7 +6341,13 @@ impl eframe::App for LstrApp {
             }
             self.pending_show = false;
         }
+        let ime_was_composing = self.ime_composing;
         self.handle_keys(ctx);
+        // IME 组合结束(上屏/取消):补一次搜索,确保最终文本被搜到。
+        // 组合期不触发搜索(防拼音字母逐键闪动),上屏后拼音匹配仍生效。
+        if ime_was_composing && !self.ime_composing {
+            self.trigger(ctx);
+        }
         if self.hidden {
             return;
         }

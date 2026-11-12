@@ -1,5 +1,6 @@
 pub mod apps;
 pub mod browse;
+pub mod calc;
 #[cfg(test)]
 mod acceptance_tests;
 pub mod builtin;
@@ -511,6 +512,31 @@ fn pin_exact_name_matches(entries: &mut Vec<Entry>, needle: &str, case_sensitive
     *entries = exact;
 }
 
+/// 收藏置顶（Pin）：把收藏过的条目稳定移到结果前列，组内保持原有分数顺序。
+/// 按全路径小写匹配（Windows 大小写无关）；空收藏表直接返回。放在精确同名
+/// 置顶之前调用，使「精确同名」仍排在收藏之上。
+fn pin_favorites(entries: &mut Vec<Entry>, favorites: &[crate::assets::Favorite]) {
+    if favorites.is_empty() {
+        return;
+    }
+    let fav_paths: HashSet<String> = favorites.iter().map(|f| f.path.to_lowercase()).collect();
+    let mut pinned = Vec::new();
+    let mut rest = Vec::with_capacity(entries.len());
+    for entry in entries.drain(..) {
+        if fav_paths.contains(&entry.full_path().to_lowercase()) {
+            pinned.push(entry);
+        } else {
+            rest.push(entry);
+        }
+    }
+    if pinned.is_empty() {
+        *entries = rest;
+        return;
+    }
+    pinned.append(&mut rest);
+    *entries = pinned;
+}
+
 #[cfg(test)]
 mod pin_tests {
     use super::*;
@@ -557,6 +583,35 @@ mod pin_tests {
         let mut entries = vec![item("sub", "x"), item("exact", "ÄI")];
         pin_exact_name_matches(&mut entries, "äi", false);
         assert_eq!(entries[0].id, "exact");
+    }
+
+    #[test]
+    fn pin_favorites_moves_favorited_to_front() {
+        let mut entries = vec![
+            entry_at("a", "report", Kind::File, r"D:\a\report.txt"),
+            entry_at("b", "report", Kind::File, r"D:\b\report.txt"),
+            entry_at("c", "report", Kind::File, r"D:\c\report.txt"),
+        ];
+        let favs = vec![crate::assets::Favorite {
+            name: "report".to_string(),
+            path: r"D:\c\report.txt".to_string(),
+        }];
+        pin_favorites(&mut entries, &favs);
+        assert_eq!(entries[0].id, "c", "收藏条目应置顶");
+        // 路径大小写无关匹配
+        let favs2 = vec![crate::assets::Favorite {
+            name: "x".to_string(),
+            path: r"d:\A\REPORT.TXT".to_string(),
+        }];
+        pin_favorites(&mut entries, &favs2);
+        assert_eq!(entries[0].id, "a", "路径大小写无关匹配");
+        // 空收藏表保持原序
+        let before: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+        pin_favorites(&mut entries, &[]);
+        assert_eq!(
+            entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            before
+        );
     }
 
     fn command(id: &str, name: &str) -> Entry {
@@ -1235,6 +1290,8 @@ fn finalize_entries_with_pending(
         t_names = t_mark.elapsed().as_secs_f64() * 1000.0;
     }
     t_mark = Instant::now();
+    // 收藏置顶(Pin):收藏过的条目钉到结果前列;精确同名随后置顶,仍最优先。
+    pin_favorites(&mut entries, &request.favorites);
     // 名称完全一致的结果硬置顶：档位权重可能被用户调整，或被历史/位置加权翻过。
     pin_exact_name_matches(&mut entries, &needle_lower, case_sensitive);
     let t_pin = t_mark.elapsed().as_secs_f64() * 1000.0;
@@ -2200,6 +2257,16 @@ fn run_worker(args: WorkerArgs) {
                     _ => true,
                 }
             });
+        }
+
+        // 计算器:输入算式即出结果,钉在顶部(Enter 复制)。仅全部/命令范围、
+        // 非正则模式;放在 scope 匹配之后以免被 keyword_rows 重赋值覆盖。
+        if matches!(request.query.scope, Scope::All | Scope::Command)
+            && !request.filters.matches.regex
+        {
+            if let Some(calc_row) = calc::calc_entry(&request.query.raw) {
+                keyword_rows.push(calc_row);
+            }
         }
 
         let t_finalize = Instant::now();

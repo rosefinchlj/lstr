@@ -8,6 +8,7 @@ mod history;
 /// 唤起热键的纯逻辑定义（配置串解析 + 双击检测器）。
 mod hotkey;
 mod model;
+mod preview;
 mod search;
 mod ui;
 mod win;

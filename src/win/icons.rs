@@ -15,7 +15,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Shell::{
     IShellItemImageFactory, SHCreateItemFromParsingName, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON,
     SHGFI_LARGEICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SIIGBF_BIGGERSIZEOK,
-    SIIGBF_ICONONLY,
+    SIIGBF_ICONONLY, SIIGBF_THUMBNAILONLY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 
@@ -140,6 +140,34 @@ fn shell_path_image(path: &str, size: u32) -> Option<ColorImage> {
         color: bitmap,
         mask: HBITMAP::default(),
     };
+    let dc = ScreenDc(unsafe { GetDC(None) });
+    if dc.0.is_invalid() {
+        return None;
+    }
+    color_bitmap_image(dc.0, bitmaps.color, bitmaps.mask)
+}
+
+/// 取文件缩略图(图片预览用):SIIGBF_THUMBNAILONLY 让 shell 返回缩略图而非
+/// 图标,走系统缩略图缓存(支持 png/jpg/gif/bmp/webp 等,无需自解码)。非图片
+/// 文件会回退图标,调用方按扩展名先筛。与图标共用串行锁(shell 竞态)。
+pub fn load_thumbnail(path: &str, size: u32) -> Option<ColorImage> {
+    let _guard = SHELL_ICON_CALL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _com = ComGuard::new();
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let factory: IShellItemImageFactory = unsafe {
+        SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>)
+    }
+    .ok()?;
+    let bitmap = unsafe {
+        factory.GetImage(
+            SIZE { cx: size as i32, cy: size as i32 },
+            SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK,
+        )
+    }
+    .ok()?;
+    let bitmaps = IconBitmaps { color: bitmap, mask: HBITMAP::default() };
     let dc = ScreenDc(unsafe { GetDC(None) });
     if dc.0.is_invalid() {
         return None;
