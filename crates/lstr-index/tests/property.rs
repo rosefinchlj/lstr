@@ -258,7 +258,7 @@ fn verify_query(model: &Model, store: &VolumeStore, needle: &str) {
 fn random_op_stream_matches_model() {
     let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15);
     let mut model = Model::new();
-    let mut store = VolumeStore::new(false);
+    let mut store = VolumeStore::new(Default::default(), 'C');
     store.insert(5, 0, 0x10, b"volroot");
     // 种子结构
     for _ in 0..20 {
@@ -286,14 +286,14 @@ fn random_op_stream_matches_model() {
                 guid: 0xABC,
                 letter: 'C',
                 complete: true,
-                exclude_noise: false,
+                noise_hash: 0,
                 journal_id: 1,
                 next_usn: 100,
                 resume_frn: 0,
                 est_records: 0,
             };
             snapshot::save(&dir, &header, &mut store).unwrap();
-            let loaded = snapshot::load(&dir, 0xABC, false).unwrap();
+            let loaded = snapshot::load(&dir, 0xABC, 0, &Default::default()).unwrap();
             store = loaded.store;
             let _ = std::fs::remove_dir_all(&dir);
             verify(&model, &store);
@@ -311,7 +311,7 @@ fn scan_mode_append_stream_matches_model() {
     // scan 模式:纯追加(ENUM 语义,FRN 互异),compact 后与模型一致
     let mut rng = Rng::new(0xDEAD_BEEF_CAFE_1234);
     let mut model = Model::new();
-    let mut store = VolumeStore::new(false);
+    let mut store = VolumeStore::new(Default::default(), 'C');
     store.insert(5, 0, 0x10, b"volroot");
     // 目录先行(worker 的 ENUM 分两段发送),再文件;期间随时可查(渐进)
     let mut created: Vec<u64> = vec![5];
@@ -348,7 +348,10 @@ fn noise_subtree_never_visible() {
     // 关键时序:噪声目录先 compact(留下锚点),之后子文件才到达 —— 锚点必须
     // 让迟到子文件立即判噪,否则会永久泄漏可见条目。
     let mut model = Model::new();
-    let mut store = VolumeStore::new(true);
+    let mut store = VolumeStore::new(
+            lstr_index::noise::ExcludeRules::build(&lstr_index::noise::builtin_patterns()),
+            'C',
+        );
     store.insert(5, 0, 0x10, b"volroot");
     store.insert(100, 5, 0x10, b"project");
     model.entries.insert(100, ModelEntry { parent_frn: 5, name: "project".into(), is_dir: true });
@@ -407,7 +410,7 @@ fn mid_scan_compact_then_more_inserts_stay_consistent() {
     // (base_len 归位 → store 切换到 journal 模式),后续继续插入。
     let mut rng = Rng::new(0xCAFE_F00D_1234_5678);
     let mut model = Model::new();
-    let mut store = VolumeStore::new(false);
+    let mut store = VolumeStore::new(Default::default(), 'C');
     store.insert(5, 0, 0x10, b"volroot");
     model.entries.insert(5, ModelEntry { parent_frn: 0, name: "volroot".into(), is_dir: true });
 

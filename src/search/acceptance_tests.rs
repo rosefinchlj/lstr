@@ -121,7 +121,7 @@ fn fixture() -> Option<Fixture> {
     let _ = std::fs::remove_dir_all(&snap);
     let mut engine = Engine::new(EngineConfig {
         index_dir: snap.clone(),
-        exclude_noise: false,
+        noise: Default::default(),
         candidate_cap: 2000,
         volumes: Vec::new(),
     });

@@ -1242,7 +1242,7 @@ mod tests {
     /// 常见词命中把 cap 占满，目录内的条目一条都进不了 hits。
     #[test]
     fn path_prefix_filters_before_candidate_cap() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         // 卷根的直接子目录（生产快照里顶层条目 parent 就是 NO_PARENT）
         s.insert(10, 0, 0x10, b"target");
         s.insert(11, 0, 0x10, b"other");
@@ -1266,7 +1266,7 @@ mod tests {
     /// 前缀必须从卷根开始逐段连续匹配：`b\a\b\file` 不能命中 `a\b`。
     #[test]
     fn path_matcher_anchors_at_volume_root() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(10, 0, 0x10, b"b");
         s.insert(11, 10, 0x10, b"a");
         s.insert(12, 11, 0x10, b"b");
@@ -1277,7 +1277,7 @@ mod tests {
         assert!(!matcher.matches(&s, s.find_slot(13).unwrap()), "后缀碰巧相同不算");
 
         // 真正的 a\b\file 命中，目录自身不计。
-        let mut ok = VolumeStore::new(false);
+        let mut ok = VolumeStore::new(Default::default(), 'C');
         ok.insert(20, 0, 0x10, b"a");
         ok.insert(21, 20, 0x10, b"b");
         ok.insert(22, 21, 0, b"file.txt");
@@ -1289,7 +1289,7 @@ mod tests {
 
     #[test]
     fn query_is_cancelled_when_newer_generation_arrives() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for i in 0..50_000u32 {
             s.insert(1000 + i as u64, 0, 0, format!("file{i}.txt").as_bytes());
         }
@@ -1311,7 +1311,7 @@ mod tests {
     /// B 步:mtime 过滤(内置时间筛选)必须排除 mtime=0(未知)与早于下界的条目。
     #[test]
     fn mtime_filter_excludes_unknown_and_old_entries() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert_meta(5, 0, 0x10, b"root", 1_600_000_000);
         s.insert_meta(10, 5, 0, b"new.txt", 1_800_000_000);
         s.insert_meta(11, 5, 0, b"old.txt", 1_500_000_000);
@@ -1340,7 +1340,7 @@ mod tests {
     }
 
     fn setup() -> VolumeStore {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0, b"alpha.txt");
         s.insert(11, 5, 0x10, b"Program Files");
@@ -1416,7 +1416,7 @@ mod tests {
 
     #[test]
     fn cap_bounds_collection_but_total_exact() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for i in 0..100u64 {
             s.insert(1000 + i, 5, 0, format!("dup{i:03}.txt").as_bytes());
         }
@@ -1440,7 +1440,7 @@ mod tests {
     #[test]
     #[ignore = "manual bench: mutates global CANCEL_GEN"]
     fn bench_cancel_granularity() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         for i in 0..1_000_000u64 {
             s.insert(1000 + i, 5, 0, format!("alpha_{i:06}.txt").as_bytes());
@@ -1542,7 +1542,7 @@ mod tests {
 
     #[test]
     fn split_query_matches_two_pass_on_mixed_store() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         for i in 0..20_000u64 {
             let slot_kind = i % 10;
@@ -1604,7 +1604,7 @@ mod tests {
             assert_split_matches_two_pass(&s, &spec, 1000);
         }
         // scan 模式(memmem 兜底路径)也一致。
-        let mut scan = VolumeStore::new(false);
+        let mut scan = VolumeStore::new(Default::default(), 'C');
         scan.insert(5, 0, 0x10, b"root");
         scan.insert(10, 5, 0x10, b"ai_dir");
         scan.insert(11, 5, 0, b"ai_file.txt");
@@ -1622,7 +1622,7 @@ mod tests {
     /// 继续扫到 Folders 也到顶/库尾,两个 total 与旧双路各自的截断口径一致。
     #[test]
     fn split_total_cap_matches_two_pass() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         for i in 0..120_000u64 {
             let attrs = if i % 2 == 0 { 0x10 } else { 0 };
@@ -1642,7 +1642,7 @@ mod tests {
 
     #[test]
     fn scan_mode_query_works_before_compact() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0, b"alpha.txt");
         s.insert(11, 5, 0, b"alphabet.dat");
@@ -1662,7 +1662,7 @@ mod tests {
     /// 插入不得被 scan 模式挡住,查询必须回落 memmem 并命中。
     #[test]
     fn empty_compact_then_insert_is_searchable() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         assert!(s.is_scanning());
         s.compact();
         assert!(!s.is_scanning(), "空卷 compact 后必须退出 scan 模式");
@@ -1689,7 +1689,7 @@ mod tests {
     #[test]
     fn empty_tokens_list_by_filters() {
         // H5:只有过滤器(无文字 token)时按过滤条件全量列举,而不是返回空。
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0, b"a.rs");
         s.insert(11, 5, 0, b"b.txt");
@@ -1724,7 +1724,7 @@ mod tests {
     /// 区分大小写：只命中原始字节一致的名字；默认模式保持大小写不敏感。
     #[test]
     fn case_sensitive_matches_raw_names_only() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for (i, name) in ["README", "readme", "ReadMe", "report.txt", "ÄI", "äi"]
             .iter()
             .enumerate()
@@ -1755,7 +1755,7 @@ mod tests {
     }
 
     fn whole_word_store() -> VolumeStore {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for (i, name) in [
             "foo",
             "foo.txt",
@@ -1806,7 +1806,7 @@ mod tests {
 
     #[test]
     fn whole_word_multi_token_is_and() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for (i, name) in ["foo-bar", "bar-foo", "foo bar baz", "foobar bar"]
             .iter()
             .enumerate()
@@ -1828,7 +1828,7 @@ mod tests {
     /// 严格匹配必须前置到 cap 之前：全盘大量非整词命中不能把整词命中挤掉。
     #[test]
     fn whole_word_filters_before_candidate_cap() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for i in 0..3000u64 {
             s.insert(1000 + i, 0, 0, format!("foobar{i}.txt").as_bytes());
         }
@@ -1846,7 +1846,7 @@ mod tests {
 
     #[test]
     fn wildcard_prefix_and_suffix_filter_names() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for (i, name) in ["abc.txt", "abc.html", "xabc.txt", "abcd.txt", "report.abc"]
             .iter()
             .enumerate()
@@ -1882,7 +1882,7 @@ mod tests {
     /// 通配过滤必须先于 cap：目录/全盘里大量非前缀命中不能把前缀命中挤掉。
     #[test]
     fn wildcard_prefix_filters_before_candidate_cap() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for i in 0..2000u64 {
             s.insert(1000 + i, 0, 0, format!("zzz{i}.txt").as_bytes());
         }
@@ -1900,7 +1900,7 @@ mod tests {
     #[test]
     fn case_sensitive_works_in_scan_mode() {
         // 未 compact：ngram 不可用，走 memmem 全扫。
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(10, 0, 0, b"README");
         s.insert(11, 0, 0, b"readme");
         assert!(s.is_scanning());
@@ -1940,7 +1940,7 @@ mod tests {
 
     #[test]
     fn regex_matches_and_respects_case_flag() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for (i, name) in ["README.md", "readme.txt", "api-ms-win-core-file.dll", "foo.log"]
             .iter()
             .enumerate()
@@ -1967,7 +1967,7 @@ mod tests {
     /// 没有字面量的正则（只能全扫）也要与 oracle 一致。
     #[test]
     fn regex_without_literal_falls_back_to_full_scan() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for (i, name) in ["2024-11", "abc", "1234-56", "2024-11-11"]
             .iter()
             .enumerate()
@@ -1986,7 +1986,7 @@ mod tests {
 
     #[test]
     fn regex_respects_path_prefix() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(10, 0, 0x10, b"target");
         s.insert(11, 10, 0, b"a.txt");
         s.insert(12, 0, 0x10, b"other");
@@ -2004,7 +2004,7 @@ mod tests {
 
     #[test]
     fn invalid_regex_returns_empty_instead_of_panicking() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(10, 0, 0, b"anything.txt");
         s.compact();
         assert!(validate_regex("[", false).is_err());
@@ -2117,7 +2117,7 @@ mod tests {
     #[test]
     fn ngram_fast_path_matches_memmem_random_stream() {
         let mut rng = Lcg::new(0x5EED_2026_1117_0001);
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         let mut next_frn = 100u64;
         let mut alive: Vec<u64> = Vec::new();
         let mut dead: Vec<(u64, u32, String)> = Vec::new(); // (frn, attrs, name)
@@ -2208,7 +2208,7 @@ mod tests {
     /// 偏移序一致;删除/复活/compact 前后查询不变。
     #[test]
     fn ngram_overlay_rename_remove_revive_semantics() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0, b"alphabet.txt");
         s.insert(11, 5, 0, b"beta");
@@ -2262,7 +2262,7 @@ mod tests {
     /// DEAD 位落盘)→ 加载后倒排仍覆盖这些槽,原地复活必须可查。
     #[test]
     fn ngram_covers_dead_slots_surviving_snapshot_load() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0, b"ghost.txt");
         s.insert(11, 5, 0, b"keep.txt");
@@ -2274,14 +2274,15 @@ mod tests {
             guid: 0xDEAD_BEEF_1234,
             letter: 'C',
             complete: true,
-            exclude_noise: false,
+            noise_hash: 0,
             journal_id: 1,
             next_usn: 1,
             resume_frn: 0,
             est_records: 0,
         };
         crate::snapshot::save(&dir, &h, &mut s).unwrap();
-        let mut s = crate::snapshot::load(&dir, h.guid, false).unwrap().store;
+        let mut s =
+            crate::snapshot::load(&dir, h.guid, 0, &Default::default()).unwrap().store;
         let spec = |t: &str| QuerySpec { tokens: vec![t.into()], ..Default::default() };
         let (_, total, _) = query_volume(&s, &spec("ghost"), 100);
         assert_eq!(total, 0, "死槽不可见");
@@ -2302,7 +2303,7 @@ mod regex_literal_tests {
     use crate::store::VolumeStore;
 
     fn store_with(names: &[&str]) -> VolumeStore {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for (i, n) in names.iter().enumerate() {
             s.insert(100 + i as u64, 0, 0, n.as_bytes());
         }
@@ -2385,7 +2386,7 @@ mod prefix_slots_tests {
     fn prefix_supplement_recovers_cut_prefix_match() {
         // 3000 个低 FRN 的子串命中占满 cap=2000,高 FRN 的前缀命中 sub_target
         // 被挤出主候选窗;prefix_slots 用二分把它找回。
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for i in 0..3000u64 {
             s.insert(1000 + i, 0, 0, format!("a_sub_{i:04}.txt").as_bytes());
         }
@@ -2408,7 +2409,7 @@ mod prefix_slots_tests {
 
     #[test]
     fn prefix_slots_case_sensitive_and_cap() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(1, 0, 0, b"Foo.txt");
         s.insert(2, 0, 0, b"foo.txt");
         s.insert(3, 0, 0, b"foobar.txt");

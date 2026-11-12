@@ -77,7 +77,12 @@ fn normalize_max_load_results(value: usize) -> usize {
 pub struct IndexConfig {
     pub backend: String,
     /// 排除噪声目录(node_modules/.git/target 等,实测省 53% 内存)。
+    /// 历史字段:迁移后由 rank.noise_rules 的排除行接替,仅作首次迁移种子。
+    #[serde(default, skip_serializing)]
     pub exclude_noise: bool,
+    /// 内置排除段名是否已迁入 rank.noise_rules(一次性迁移标记)。
+    #[serde(default)]
+    pub noise_seeded: bool,
     /// 单次查询候选收集上限(total 仍精确)。
     pub candidate_cap: usize,
     /// 首扫模式(历史字段):`dir` 目录枚举。仅旧配置手动写 `usn` 时保留旧行为。
@@ -118,6 +123,7 @@ impl Default for IndexConfig {
         Self {
             backend: "auto".into(),
             exclude_noise: true,
+            noise_seeded: false,
             candidate_cap: 2000,
             scan_mode: "dir".into(),
             journal_enabled: false,
@@ -250,15 +256,20 @@ pub struct RankConfig {
     pub recent_boost: i32,
     /// 噪声目录/临时文件降权强度（百分比，100 = 默认）
     pub noise_strength: i32,
-    /// 噪声规则表：路径片段命中即按分值降权。可在设置「噪声规则」页增删改。
+    /// 噪声规则表：可在设置「噪声」页增删改。`exclude = true` 的行是「排除」
+    /// 语义（索引层整树剔除，不进结果），`exclude = false` 为降权行。
     pub noise_rules: Vec<NoiseRule>,
 }
 
-/// 一条噪声规则：路径（不区分大小写）包含 `pattern` 时扣 `penalty` 分。
+/// 一条噪声规则：`exclude = false` 时路径（不区分大小写）包含 `pattern`
+/// 即扣 `penalty` 分；`exclude = true` 时语义变为「整树排除」：该目录的
+/// 子孙不进索引、不进结果（目录自身仍可搜），penalty 不生效。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NoiseRule {
     pub pattern: String,
     pub penalty: i32,
+    #[serde(default)]
+    pub exclude: bool,
 }
 
 impl Default for RankConfig {
@@ -375,6 +386,7 @@ pub fn default_noise_rules() -> Vec<NoiseRule> {
         .map(|(pattern, penalty)| NoiseRule {
             pattern: pattern.to_string(),
             penalty: *penalty,
+            exclude: false,
         })
         .collect()
 }
@@ -513,6 +525,36 @@ pub fn attach_dir() -> PathBuf {
 }
 
 impl Config {
+    /// 把内置排除段名迁入 rank.noise_rules(排除行)。旧配置只有
+    /// index.exclude_noise 开关 + 硬编码 NOISE_SEGMENTS;统一列表后内置项
+    /// 就是普通排除行(可删)。幂等:已存在的模式不重复;noise_seeded 已置位
+    /// 则跳过(用户删掉的内置项不会被偷偷加回来)。
+    pub fn migrate_noise_list(&mut self) {
+        if self.index.noise_seeded {
+            return;
+        }
+        if self.index.exclude_noise {
+            let existing: std::collections::HashSet<String> = self
+                .rank
+                .noise_rules
+                .iter()
+                .filter(|r| r.exclude)
+                .map(|r| r.pattern.trim().to_lowercase().replace('\\', "/"))
+                .collect();
+            let mut pos = 0usize;
+            for seg in lstr_index::noise::builtin_patterns() {
+                if !existing.contains(&seg) {
+                    self.rank.noise_rules.insert(
+                        pos,
+                        NoiseRule { pattern: seg, penalty: 0, exclude: true },
+                    );
+                    pos += 1;
+                }
+            }
+        }
+        self.index.noise_seeded = true;
+    }
+
     pub fn path() -> PathBuf {
         attach_dir().join("config.toml")
     }
@@ -520,7 +562,8 @@ impl Config {
     pub fn load() -> Self {
         let path = Self::path();
         let Ok(text) = fs::read_to_string(&path) else {
-            let cfg = Self::default();
+            let mut cfg = Self::default();
+            cfg.migrate_noise_list();
             let _ = cfg.save();
             return cfg;
         };
@@ -533,9 +576,18 @@ impl Config {
                 cfg.index.migrate_legacy_backend();
                 cfg.index.normalize_volumes();
                 cfg.index.normalize();
+                // 内置排除段名迁入统一噪声列表(一次性,幂等)。实际发生迁移时
+                // 落盘一次:让 config.toml 即刻反映新结构(排除行/noise_seeded),
+                // 否则要等下一次任意保存才写回。
+                let seeded_before = cfg.index.noise_seeded;
+                cfg.migrate_noise_list();
+                let migrated = !seeded_before;
                 // 唤起热键：手写 config.toml 的非法值（如裸字母）回退默认，
                 // 避免静默变成「永不生效」或全局吞键。
                 cfg.hotkey = crate::hotkey::normalize_hotkey_or_default(&cfg.hotkey);
+                if migrated {
+                    let _ = cfg.save();
+                }
                 cfg
             },
             Err(err) => {
@@ -799,6 +851,7 @@ mod tests {
         cfg.noise_rules.push(NoiseRule {
             pattern: "node_modules/".to_string(),
             penalty: 42,
+            exclude: false,
         });
 
         cfg.backfill_missing_noise_rules();

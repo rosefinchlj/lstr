@@ -522,24 +522,32 @@ fn run_session(client: HANDLE) {
         while let Some(frame) = try_read_frame(client) {
             match frame {
                 Frame::Rescan { guid } => {
-                    if let Some(vt) = threads.get_mut(&guid) {
-                        vt.stop.store(true, Ordering::Relaxed);
-                        if let Some(h) = vt.handle.take() {
-                            let _ = h.join();
+                    // guid==0 = 重扫全部卷(噪声规则变更后的「立即重建」)
+                    let targets: Vec<u128> = if guid == 0 {
+                        threads.keys().copied().collect()
+                    } else {
+                        vec![guid]
+                    };
+                    for guid in targets {
+                        if let Some(vt) = threads.get_mut(&guid) {
+                            vt.stop.store(true, Ordering::Relaxed);
+                            if let Some(h) = vt.handle.take() {
+                                let _ = h.join();
+                            }
+                            let stop = std::sync::Arc::new(AtomicBool::new(false));
+                            let tx = tx.clone();
+                            let letter = last_drives
+                                .iter()
+                                .find(|(_, g)| win::guid_to_u128(g) == Some(guid))
+                                .map(|(l, _)| *l)
+                                .unwrap_or('C');
+                            let stop2 = stop.clone();
+                            let handle = std::thread::Builder::new()
+                                .name(format!("lstr-vol-{letter}"))
+                                .spawn(move || volume_loop(letter, guid, None, stop2, tx))
+                                .ok();
+                            threads.insert(guid, VolumeThread { stop, handle });
                         }
-                        let stop = std::sync::Arc::new(AtomicBool::new(false));
-                        let tx = tx.clone();
-                        let letter = last_drives
-                            .iter()
-                            .find(|(_, g)| win::guid_to_u128(g) == Some(guid))
-                            .map(|(l, _)| *l)
-                            .unwrap_or('C');
-                        let stop2 = stop.clone();
-                        let handle = std::thread::Builder::new()
-                            .name(format!("lstr-vol-{letter}"))
-                            .spawn(move || volume_loop(letter, guid, None, stop2, tx))
-                            .ok();
-                        threads.insert(guid, VolumeThread { stop, handle });
                     }
                 }
                 Frame::SetVolumes { mask } => {

@@ -347,6 +347,8 @@ pub struct LstrApp {
     learn_badges: HashMap<String, crate::history::LearnBadge>,
     /// 学习数据页视图:false=按词学习,true=常用排行。
     learning_view_frecency: bool,
+    /// 已生效的排除规则表(「立即重建」时更新;与当前配置比对决定是否提示重建)。
+    noise_exclude_applied: Vec<String>,
     /// P0-2：Explorer 内直接键入搜索（默认关闭）。
     typing: Option<crate::win::typing::TypingWatch>,
     /// 设置页「资产」的草稿输入状态。
@@ -421,6 +423,14 @@ impl LstrApp {
         let manual_size = cfg
             .height
             .map(|height| egui::vec2(cfg.width.clamp(420.0, 1000.0), height.clamp(160.0, 800.0)));
+        // 已生效排除表:与当前配置比对决定「立即重建」按钮是否出现。
+        let noise_exclude_applied = cfg
+            .rank
+            .noise_rules
+            .iter()
+            .filter(|r| r.exclude)
+            .map(|r| r.pattern.clone())
+            .collect();
 
         Self {
             cfg,
@@ -493,6 +503,7 @@ impl LstrApp {
             learn_for: String::new(),
             learn_badges: HashMap::new(),
             learning_view_frecency: false,
+            noise_exclude_applied,
             typing,
             assets_ui: crate::assets_ui::AssetUiState::default(),
             typing_folder: None,
@@ -4727,7 +4738,7 @@ impl LstrApp {
             (SettingsTab::Search, "搜索"),
             (SettingsTab::Behavior, "行为"),
             (SettingsTab::Ranking, "排序规则"),
-            (SettingsTab::Noise, "噪声规则"),
+            (SettingsTab::Noise, "噪声"),
             (SettingsTab::Maintenance, "维护"),
             (SettingsTab::Assets, "资产"),
             (SettingsTab::Learning, "学习数据"),
@@ -5593,6 +5604,9 @@ impl LstrApp {
         }
     }
 
+    /// 「噪声」页:统一规则列表。每行一个行为——排除(整树不索引,重建后
+    /// 生效)或降权(片段命中扣分,立即生效)。内置段名(node_modules 等)
+    /// 也是普通排除行,可删。改了排除类规则后「立即重建」生效。
     fn paint_settings_noise(
         &mut self,
         ui: &mut egui::Ui,
@@ -5605,8 +5619,8 @@ impl LstrApp {
             painter,
             &theme,
             area,
-            "噪声规则",
-            "路径命中片段即降权（正斜杠、不区分大小写）；搜索词本身命中规则时不降权",
+            "噪声",
+            "排除 = 不索引、搜不到、省内存（需重建）；降权 = 仍可搜、命中时沉底（立即生效）",
         );
         let mut rules = self.cfg.rank.noise_rules.clone();
         let mut changed = false;
@@ -5627,23 +5641,82 @@ impl LstrApp {
                 ui.set_width(list_rect.width());
                 for (index, rule) in rules.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
-                        let edit_w = (list_rect.width() - 220.0).max(160.0);
+                        let edit_w = (list_rect.width() - 236.0).max(140.0);
                         let response = ui.add_sized(
                             [edit_w, 22.0],
                             egui::TextEdit::singleline(&mut rule.pattern)
-                                .hint_text("路径片段，如 node_modules/"),
+                                .hint_text("目录或片段，如 D:\\ProgramData / node_modules / xxx-target/"),
                         );
                         if response.changed() {
                             changed = true;
                         }
-                        let mut penalty = rule.penalty as f32;
-                        let slider = ui.add_sized(
-                            [96.0, 22.0],
-                            egui::Slider::new(&mut penalty, 0.0..=300.0).integer(),
+                        // 行为切换:点击在 排除/降权 间翻转
+                        let label = if rule.exclude { "排除" } else { "降权" };
+                        let chip_id = Id::new(("lstr-noise-behavior", index));
+                        let chip_w = 52.0;
+                        let cur_top = ui.cursor().top();
+                        let chip = Rect::from_min_size(
+                            egui::pos2(ui.cursor().left() + 6.0, cur_top),
+                            egui::vec2(chip_w, 22.0),
                         );
-                        if slider.changed() {
-                            rule.penalty = penalty.round() as i32;
+                        let chip_resp = ui.interact(chip, chip_id, Sense::click());
+                        if chip_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        ui.painter().rect_filled(
+                            chip,
+                            CornerRadius::same(5),
+                            if rule.exclude { theme.amber_soft } else { theme.surface_hi },
+                        );
+                        ui.painter().rect_stroke(
+                            chip,
+                            CornerRadius::same(5),
+                            Stroke::new(
+                                1.0_f32,
+                                if rule.exclude { theme.amber } else { theme.hair },
+                            ),
+                            StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            chip.center(),
+                            Align2::CENTER_CENTER,
+                            label,
+                            ui::text_font(11.0),
+                            if rule.exclude { theme.text } else { theme.sub },
+                        );
+                        if chip_resp.clicked() {
+                            rule.exclude = !rule.exclude;
                             changed = true;
+                        }
+                        if rule.exclude {
+                            // 排除行:罚分无意义,展示生效时机
+                            ui.painter().text(
+                                egui::pos2(chip.right() + 10.0, cur_top + 11.0),
+                                Align2::LEFT_CENTER,
+                                "重建后生效",
+                                ui::mono_font(10.0),
+                                theme.dim,
+                            );
+                            ui.allocate_rect(
+                                Rect::from_min_size(
+                                    egui::pos2(chip.right() + 6.0, cur_top),
+                                    egui::vec2(96.0, 22.0),
+                                ),
+                                Sense::hover(),
+                            );
+                        } else {
+                            let mut penalty = rule.penalty as f32;
+                            let slider = ui.put(
+                                Rect::from_min_size(
+                                    egui::pos2(chip.right() + 6.0, cur_top),
+                                    egui::vec2(96.0, 22.0),
+                                ),
+                                egui::Slider::new(&mut penalty, 0.0..=300.0).integer(),
+                            );
+                            if slider.changed() {
+                                rule.penalty = penalty.round() as i32;
+                                changed = true;
+                            }
                         }
                         if ui.button("×").clicked() {
                             remove = Some(index);
@@ -5660,63 +5733,80 @@ impl LstrApp {
             }
         }
 
-        // 底部：添加规则 / 恢复默认
-        let add = Rect::from_min_size(
-            egui::pos2(area.left(), area.bottom() - 28.0),
-            egui::vec2(104.0, 24.0),
-        );
-        let response = ui.interact(add, Id::new("lstr-noise-add"), Sense::click());
-        if response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
+        // 排除集是否已生效:归一化后比较(顺序无关)
+        let norm = |p: &String| p.trim().to_lowercase().replace('\\', "/");
+        let current: std::collections::BTreeSet<String> = rules
+            .iter()
+            .filter(|r| r.exclude)
+            .map(|r| norm(&r.pattern))
+            .filter(|p| !p.is_empty())
+            .collect();
+        let applied: std::collections::BTreeSet<String> = self
+            .noise_exclude_applied
+            .iter()
+            .map(norm)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let needs_rebuild = current != applied;
 
-        painter.rect_filled(add, CornerRadius::same(6), theme.hover);
-        painter.rect_stroke(
-            add,
-            CornerRadius::same(6),
-            Stroke::new(1.0_f32, theme.hair),
-            StrokeKind::Inside,
-        );
-        painter.text(
-            add.center(),
-            Align2::CENTER_CENTER,
-            "＋ 添加规则",
-            ui::text_font(11.5),
-            theme.text,
-        );
-        if response.clicked() {
+        // 底部：添加规则 / 立即重建 / 恢复默认
+        let mk_btn = |ui: &mut egui::Ui, x: f32, w: f32, id: &str, label: &str, accent: bool| -> bool {
+            let r = Rect::from_min_size(egui::pos2(x, area.bottom() - 28.0), egui::vec2(w, 24.0));
+            let resp = ui.interact(r, Id::new(id), Sense::click());
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            painter.rect_filled(r, CornerRadius::same(6), if accent { theme.amber_soft } else { theme.hover });
+            painter.rect_stroke(
+                r,
+                CornerRadius::same(6),
+                Stroke::new(1.0_f32, if accent { theme.amber } else { theme.hair }),
+                StrokeKind::Inside,
+            );
+            painter.text(r.center(), Align2::CENTER_CENTER, label, ui::text_font(11.5), theme.text);
+            resp.clicked()
+        };
+        if mk_btn(ui, area.left(), 104.0, "lstr-noise-add", "＋ 添加规则", false) {
             rules.push(crate::config::NoiseRule {
                 pattern: String::new(),
                 penalty: 100,
+                exclude: false,
             });
             changed = true;
         }
-
-        let reset = Rect::from_min_size(
-            egui::pos2(area.right() - 96.0, area.bottom() - 28.0),
-            egui::vec2(92.0, 24.0),
-        );
-        let response = ui.interact(reset, Id::new("lstr-noise-reset"), Sense::click());
-        if response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        if needs_rebuild
+            && mk_btn(ui, area.left() + 112.0, 110.0, "lstr-noise-rebuild", "立即重建", true)
+        {
+            self.cfg.rank.noise_rules = rules.clone();
+            let _ = self.cfg.save();
+            let patterns = rules
+                .iter()
+                .filter(|r| r.exclude)
+                .map(|r| r.pattern.clone())
+                .collect();
+            self.service.rebuild_noise_index(patterns);
+            self.noise_exclude_applied = rules
+                .iter()
+                .filter(|r| r.exclude)
+                .map(|r| r.pattern.clone())
+                .collect();
+            self.toast(ctx, "正在重建索引（后台进行，完成即生效）".to_string());
+            return;
         }
-
-        painter.rect_filled(reset, CornerRadius::same(6), theme.hover);
-        painter.rect_stroke(
-            reset,
-            CornerRadius::same(6),
-            Stroke::new(1.0_f32, theme.hair),
-            StrokeKind::Inside,
-        );
-        painter.text(
-            reset.center(),
-            Align2::CENTER_CENTER,
+        if mk_btn(
+            ui,
+            area.right() - 96.0,
+            92.0,
+            "lstr-noise-reset",
             "恢复默认",
-            ui::text_font(11.5),
-            theme.text,
-        );
-        if response.clicked() {
-            rules = crate::config::default_noise_rules();
+            false,
+        ) {
+            // 默认 = 内置排除段名(排除行) + 降权规则默认表
+            rules = lstr_index::noise::builtin_patterns()
+                .into_iter()
+                .map(|pattern| crate::config::NoiseRule { pattern, penalty: 0, exclude: true })
+                .chain(crate::config::default_noise_rules())
+                .collect();
             changed = true;
         }
 
@@ -5959,25 +6049,15 @@ impl LstrApp {
             y += rows as f32 * BACKEND_CHIP_H + (rows.saturating_sub(1)) as f32 * BACKEND_CHIP_GAP + 10.0;
         }
 
-        // —— 噪声排除开关 ——
-        Self::settings_label(painter, &theme, area.left(), y, "噪声目录");
-        let noise_on = self.cfg_index_noise();
-        let rect = Rect::from_min_size(egui::pos2(area.left() + 130.0, y), egui::vec2(180.0, 26.0));
-        let response = ui.interact(rect, Id::new("lstr-idx-noise"), Sense::click());
-        painter.rect_filled(rect, CornerRadius::same(6), if noise_on { theme.amber_soft } else { theme.hover });
-        painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0_f32, if noise_on { theme.amber } else { theme.hair }), StrokeKind::Inside);
-        painter.text(rect.center(), Align2::CENTER_CENTER, if noise_on { "已排除(node_modules 等)" } else { "不过滤(内存占用更高)" }, ui::text_font(10.5), if noise_on { theme.amber } else { theme.text });
-        if response.clicked() {
-            self.set_cfg_index_noise(!noise_on);
-        }
+        // 噪声排除开关已移入「噪声」页(统一规则列表,支持自定义排除目录)。
         y += ROW;
 
-        // 帮助:按实际生效时机分开写——切卷立即生效,后端/噪声要重启。
+        // 帮助:按实际生效时机分开写——切卷立即生效,后端/实时层要重启。
         // 这里用 layout+wrap 按 area 宽度自动折行:文案再长也不会跑出右边界
         // (painter.text 是 no-wrap,旧版单行长段落其实早就被窗口右侧裁掉了)。
         let help = "索引引擎:自动=内置优先,内置未就绪时用 Everything 兜底;仅内置=完全不读取 Everything;仅 Everything=只用 Everything。\n\
 内置索引实时层:USN journal(默认)=目录首扫后按 journal 增量,快照完整且游标可信时免扫直读,卷不可用自动退回目录监视;目录监视=ReadDirectoryChangesW,零 USN FSCTL。\n\
-索引卷勾选立即生效(worker 自动起停该盘扫描);索引引擎/实时层与噪声目录仍需重启 lstr 生效。\n\
+索引卷勾选立即生效(worker 自动起停该盘扫描);索引引擎/实时层需重启 lstr 生效;噪声排除见「噪声」页。\n\
 时间筛选在内置索引(目录扫描)模式下可用。\n\
 内置索引只覆盖本机固定 NTFS 卷;网络盘/FAT32/exFAT 等需 Everything。";
         let galley = painter.layout(
@@ -6014,34 +6094,6 @@ impl LstrApp {
 
     fn set_cfg_index_incremental(&mut self, key: &str) {
         self.cfg.index.incremental = key.to_string();
-        let _ = self.cfg.save();
-    }
-
-    fn cfg_index_noise(&self) -> bool {
-        self.cfg.index.exclude_noise
-    }
-
-    fn set_cfg_index_noise(&mut self, on: bool) {
-        self.cfg.index.exclude_noise = on;
-        // 噪声位在扫描/compact 期写进 attrs,改开关只能重建快照。快照现在带
-        // exclude_noise 指纹,加载时不匹配会自行拒绝;这里主动删掉旧快照,
-        // 让用户在下次启动时就得到重建,而不是等到下次扫描。
-        // 只删 vol_*.bin:不动 index 目录里的日志等文件,也避免与引擎落盘
-        // 竞争(整目录 remove_dir_all 可能撞上正在写的临时文件)。
-        let dir = crate::config::attach_dir().join("index");
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let looks_like_snapshot = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("vol_") && n.ends_with(".bin"))
-                    .unwrap_or(false);
-                if looks_like_snapshot {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
         let _ = self.cfg.save();
     }
 

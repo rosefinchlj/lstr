@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn cache_build_and_search() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0, "报告.docx".as_bytes());
         s.insert(11, 5, 0, "文件.txt".as_bytes());
@@ -198,7 +198,7 @@ mod tests {
     /// 改成 ASCII 名的槽必须从缓存移除(否则旧拼音会误命中)。
     #[test]
     fn refresh_slots_tracks_new_rename_and_ascii() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0, "报告.docx".as_bytes());
         s.compact();

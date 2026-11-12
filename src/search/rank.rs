@@ -74,6 +74,8 @@ impl RankPlan {
         let noise = cfg
             .noise_rules
             .iter()
+            // exclude 行是「整树排除」语义,索引层已不收录,不参与降权。
+            .filter(|rule| !rule.exclude)
             .filter_map(|rule| {
                 let pattern = rule.pattern.trim().to_lowercase().replace('\\', "/");
                 (!pattern.is_empty()).then_some((pattern, rule.penalty))

@@ -375,8 +375,12 @@ pub struct VolumeStore {
     /// 噪声锚点:compact 时被整树剔除的「顶层噪声目录」FRN。
     /// 之后到达的子文件按锚点立即判噪,避免父链断裂导致泄漏。
     noise_anchors: std::collections::HashSet<u64>,
-    /// 噪声排除开关(关=不分类、不回收)。
-    pub noise_enabled: bool,
+    /// 排除规则(空=不分类、不回收)。语义见 noise.rs:目录自身可见,子孙剔除。
+    pub exclude: crate::noise::ExcludeRules,
+    /// 本卷盘符(锚定路径模式的盘符过滤用;未知时 '?')。
+    pub letter: char,
+    /// classify_chain 的祖先链暂存(小写名字,0 分隔,逆序)。仅锚定模式存在时使用。
+    chain_buf: Vec<u8>,
     /// n-gram 倒排(覆盖 0..ngram_base_len;scan 模式为 None,查询退 memmem)。
     ngram: Option<NgramIndex>,
     /// 倒排构建时的 slot 总数;之后的追加/改名进 reindex overlay。
@@ -445,7 +449,7 @@ fn slice_at(buf: &[u8], off: usize) -> &[u8] {
 }
 
 impl VolumeStore {
-    pub fn new(noise_enabled: bool) -> Self {
+    pub fn new(exclude: crate::noise::ExcludeRules, letter: char) -> Self {
         Self {
             names: Vec::with_capacity(4 << 20),
             names_lc: Vec::with_capacity(4 << 20),
@@ -466,7 +470,9 @@ impl VolumeStore {
             renames: 0,
             unresolved: HashMap::new(),
             noise_anchors: std::collections::HashSet::new(),
-            noise_enabled,
+            exclude,
+            letter,
+            chain_buf: Vec::new(),
             ngram: None,
             ngram_base_len: 0,
             reindex: Vec::new(),
@@ -474,6 +480,11 @@ impl VolumeStore {
             children: HashMap::new(),
             children_built: false,
         }
+    }
+
+    /// 运行期得知盘符时补设(锚定路径模式的盘符过滤)。
+    pub fn set_letter(&mut self, letter: char) {
+        self.letter = letter;
     }
 
     /// 从快照列构建(已处于 compact 后的有序态)。`unresolved` = 保存时
@@ -488,7 +499,8 @@ impl VolumeStore {
         mtime: Vec<u32>,
         name_off: Vec<u32>,
         unresolved: Vec<(u32, u64)>,
-        noise_enabled: bool,
+        exclude: crate::noise::ExcludeRules,
+        letter: char,
     ) -> Self {
         let names_lc = fold_case(&names);
         let base_len = name_off.len() as u32;
@@ -523,7 +535,9 @@ impl VolumeStore {
             .filter(|&(_, parent_frn)| parent_frn != 0 && parent_frn != ROOT_FRN)
             .collect(),
             noise_anchors: std::collections::HashSet::new(),
-            noise_enabled,
+            exclude,
+            letter,
+            chain_buf: Vec::new(),
             ngram: None,
             ngram_base_len: 0,
             reindex: Vec::new(),
@@ -1054,7 +1068,7 @@ impl VolumeStore {
                     | if parent_frn == ROOT_FRN { ATTR_ROOT_CHILD } else { 0 };
                 self.mtime[old as usize] = mtime;
                 self.note_mtime_pending(old, mtime, name);
-                if self.noise_enabled {
+                if !self.exclude.is_empty() {
                     // 父/名变了,重新判噪(结果可能解除或加深)
                     self.attrs[old as usize] &= !ATTR_NOISE;
                     self.classify_chain(old);
@@ -1071,7 +1085,7 @@ impl VolumeStore {
         self.names_lc.extend_from_slice(&fold_case(name));
         self.names_lc.push(0);
         self.frn.push(frn);
-        let anchored = self.noise_enabled && self.noise_anchors.contains(&parent_frn);
+        let anchored = !self.exclude.is_empty() && self.noise_anchors.contains(&parent_frn);
         let p = if parent_frn == 0 || anchored {
             NO_PARENT
         } else {
@@ -1110,7 +1124,7 @@ impl VolumeStore {
         if parent_frn != 0 && parent_frn != ROOT_FRN && !anchored && p == NO_PARENT {
             self.unresolved.insert(slot, parent_frn);
         }
-        if self.noise_enabled {
+        if !self.exclude.is_empty() {
             if anchored {
                 self.attrs[slot as usize] |= ATTR_NOISE;
             } else {
@@ -1134,34 +1148,74 @@ impl VolumeStore {
         false
     }
 
-    /// 沿父链做噪声分类(可达部分)。父未解析时由 compact 全量重分类兜底。
+    /// 沿父链做噪声分类(可达部分)。父未解析时由 compact 全量重分类兑底。
     ///
-    /// 语义(A-2):噪声目录**自身保留可见**(搜 node_modules/temp 能找到目录),
-    /// 只排除其子孙。因此从**父槽**开始向上查、跳过 slot 自身:slot 自己是噪声段
-    /// 不判噪,但它的子项分类时会查到它(名字是噪声段)而判噪。子孙泄漏由
-    /// 「祖先 NOISE 位」与 compact 重建的噪声锚点双重兜底。
+    /// 语义(A-2):排除目录**自身保留可见**(搜 node_modules/temp 能找到目录),
+    /// 只排除其子孙。因此从**父槽**开始向上查、跳过 slot 自身:slot 自己是排除
+    /// 段不判噪,但它的子项分类时会查到它(名字命中)而判噪。子孙泄漏由
+    /// 「祖先 NOISE 位」与 compact 重建的噪声锚点双重兑底。
+    ///
+    /// 两类模式:段名(任意层级同名,热路径早退零额外开销)与锚定路径
+    /// (盘符锚定+从根起逐段匹配,此时收集祖先链再判定;自身为目录且命中时
+    /// 记入锚点,让后续子项无需重组路径即判噪)。
     fn classify_chain(&mut self, slot: u32) {
         let mut hops = 0;
         let mut cur = self.parent[slot as usize];
         let mut self_noise = false;
+        let mut broke_early = false;
+        let has_anchored = self.exclude.has_anchored();
+        self.chain_buf.clear();
         while cur != NO_PARENT && hops < 64 {
             let name_lc = self.name_lc(cur);
-            if crate::noise::is_noise_segment(name_lc) {
+            if self.exclude.is_segment(name_lc) {
                 self_noise = true;
+                broke_early = true;
                 break;
             }
             if self.noise_anchors.contains(&self.frn[cur as usize]) {
                 self_noise = true;
+                broke_early = true;
                 break;
             }
             if self.attrs[cur as usize] & ATTR_NOISE != 0 {
                 // 祖先已判噪(其父链可能已断),子孙必然同判
                 self_noise = true;
+                broke_early = true;
                 break;
+            }
+            if has_anchored {
+                // 逆序暂存祖先名(最近的祖先在前),0 分隔(名字内不会有 0)。
+                // to_vec 打破 name 切片对 self 的借用,chain_buf 可写。
+                let name = self.name_lc(cur).to_vec();
+                self.chain_buf.extend_from_slice(&name);
+                self.chain_buf.push(0);
             }
             cur = self.parent[cur as usize];
             hops += 1;
         }
+        if has_anchored && !broke_early && hops > 0 {
+            // 先读(不可变借用)后写:祖先链命中 → 判噪;自身目录命中 → 记锚点
+            let mut segs: Vec<&[u8]> = self
+                .chain_buf
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .collect();
+            segs.reverse(); // [根子, ..., 最近祖先]
+            let ancestor_hit = self.exclude.chain_anchored(&segs, self.letter);
+            let mut anchor_hit = false;
+            if !ancestor_hit && self.attrs[slot as usize] & 0x10 != 0 {
+                segs.push(self.name_lc(slot));
+                anchor_hit = self.exclude.chain_anchored(&segs, self.letter);
+            }
+            if ancestor_hit {
+                self_noise = true;
+            }
+            if anchor_hit {
+                let frn = self.frn[slot as usize];
+                self.noise_anchors.insert(frn);
+            }
+        }
+        self.chain_buf.clear();
         if self_noise {
             self.attrs[slot as usize] |= ATTR_NOISE;
         }
@@ -1229,7 +1283,7 @@ impl VolumeStore {
                 match self.find_slot(pfrn) {
                     Some(p) => {
                         self.parent[slot as usize] = p;
-                        if self.noise_enabled {
+                        if !self.exclude.is_empty() {
                             self.classify_chain(slot);
                         }
                     }
@@ -1249,7 +1303,7 @@ impl VolumeStore {
             }
         }
         // 3. 噪声分类(全量重走;insert 时已分类的会重算,结果一致)
-        if self.noise_enabled {
+        if !self.exclude.is_empty() {
             for &s in &live {
                 self.classify_chain(s);
             }
@@ -1263,7 +1317,7 @@ impl VolumeStore {
                 if (a & ATTR_INTERNAL) != 0 || (a & 0x10) == 0 {
                     continue; // 只看可见目录
                 }
-                if crate::noise::is_noise_segment(self.name_lc(s)) {
+                if self.exclude.is_segment(self.name_lc(s)) {
                     self.noise_anchors.insert(self.frn[s as usize]);
                 }
             }
@@ -1425,7 +1479,7 @@ mod tests {
     /// maintain 每轮全量 compact 250 万条(实测 CPU 单核打满、查询被饿死)。
     #[test]
     fn root_parent_never_becomes_unresolved() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         insert(&mut s, 100, 5, 0x10, "Users");
         insert(&mut s, 101, 100, 0, "readme.txt");
         assert_eq!(s.parent[s.find_slot(100).unwrap() as usize], NO_PARENT);
@@ -1442,7 +1496,7 @@ mod tests {
     /// compact 重排 slot 后按 mtime 列重建,旧队列不得残留失效编号。
     #[test]
     fn mtime_pending_rebuilds_after_compact() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         insert(&mut s, 100, 5, 0x10, "dir");
         s.compact(); // ready:后续 insert 走增量更新/追加路径
         s.insert_meta(101, 100, 0, b"unknown.txt", 0);
@@ -1469,7 +1523,7 @@ mod tests {
     /// overlay,`Some(空倒排)` 让 2/3 字符查询静默返回 0。
     #[test]
     fn empty_compact_exits_scan_mode_and_skips_empty_ngram() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         assert!(s.is_scanning());
         s.compact();
         assert!(!s.is_scanning(), "空卷 compact 后 scan 模式必须结束");
@@ -1490,7 +1544,7 @@ mod tests {
     /// 查询拖成 O(改名数) 的排序 + memmem。
     #[test]
     fn rename_storm_overlay_triggers_compact() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for i in 0..COMPACT_DELTA as u64 {
             s.insert(1000 + i, 0, 0, format!("f{i}.txt").as_bytes());
         }
@@ -1515,7 +1569,7 @@ mod tests {
     /// 不能把「父未消解」条目一起删掉。
     #[test]
     fn root_child_refresh_removes_root_level_deletes_only() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         insert(&mut s, 100, 5, 0x10, "folder");
         insert(&mut s, 101, 5, 0, "keep.txt");
         insert(&mut s, 200, 99, 0, "orphan.txt"); // 父未消解,不是根子项
@@ -1540,7 +1594,7 @@ mod tests {
 
     #[test]
     fn insert_find_remove_roundtrip() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         insert(&mut s, 5, 0, 0x10, "vol-root");
         insert(&mut s, 10, 5, 0x10, "users");
         insert(&mut s, 11, 10, 0, "readme.txt");
@@ -1559,7 +1613,7 @@ mod tests {
 
     #[test]
     fn rename_keeps_slot_and_rebuilds_offs_order() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         insert(&mut s, 5, 0, 0x10, "root");
         insert(&mut s, 10, 5, 0, "alpha.txt");
         insert(&mut s, 11, 5, 0, "beta.txt");
@@ -1580,7 +1634,7 @@ mod tests {
 
     #[test]
     fn in_place_rename_keeps_slot_identity_and_offindex_sorted() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         insert(&mut s, 1, 0, 0, "aaa");
         insert(&mut s, 2, 0, 0, "bbb");
         s.compact();
@@ -1608,7 +1662,7 @@ mod tests {
     /// H3:改名 = 原地更新,slot 身份不变 → 子项 parent 指针继续有效。
     #[test]
     fn rename_keeps_slot_and_children_pointers() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         insert(&mut s, 5, 0, 0x10, "root");
         insert(&mut s, 10, 5, 0x10, "old-dir");
         insert(&mut s, 11, 10, 0, "child.txt");
@@ -1629,7 +1683,7 @@ mod tests {
     /// 不追加重复 slot。
     #[test]
     fn dead_slot_revived_in_place() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         insert(&mut s, 5, 0, 0x10, "root");
         insert(&mut s, 10, 5, 0, "ghost.txt");
         s.compact();
@@ -1649,7 +1703,7 @@ mod tests {
     /// H3:delta 槽删除后同 FRN 再出现同样原地复活(delta_frn 保留死映射)。
     #[test]
     fn dead_delta_slot_revived_in_place() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         insert(&mut s, 5, 0, 0x10, "root");
         s.compact();
         insert(&mut s, 20, 5, 0, "tmp.txt");
@@ -1665,7 +1719,7 @@ mod tests {
 
     #[test]
     fn parent_resolution_across_compact() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         insert(&mut s, 5, 0, 0x10, "root");
         insert(&mut s, 10, 5, 0x10, "dir");
         insert(&mut s, 11, 10, 0, "file.txt");
@@ -1682,7 +1736,10 @@ mod tests {
     #[test]
     fn noise_dir_visible_but_subtree_dropped_at_compact() {
         // A-2:噪声目录自身保留可搜,子孙整树剔除。
-        let mut s = VolumeStore::new(true);
+        let mut s = VolumeStore::new(
+        crate::noise::ExcludeRules::build(&crate::noise::builtin_patterns()),
+        'C',
+    );
         insert(&mut s, 5, 0, 0x10, "root");
         insert(&mut s, 10, 5, 0x10, "node_modules");
         insert(&mut s, 11, 10, 0, "dep.txt");
@@ -1702,7 +1759,10 @@ mod tests {
     #[test]
     fn packages_source_is_searchable() {
         // A-2:packages 是常见 monorepo 源码目录(pnpm/lerna workspace),不再误排。
-        let mut s = VolumeStore::new(true);
+        let mut s = VolumeStore::new(
+        crate::noise::ExcludeRules::build(&crate::noise::builtin_patterns()),
+        'C',
+    );
         insert(&mut s, 5, 0, 0x10, "root");
         insert(&mut s, 10, 5, 0x10, "packages");
         insert(&mut s, 11, 10, 0, "app.js");
@@ -1715,7 +1775,7 @@ mod tests {
 
     #[test]
     fn scan_mode_substring_then_prefix_consistent() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         insert(&mut s, 5, 0, 0x10, "prog");
         insert(&mut s, 10, 5, 0, "myprog.txt");
         insert(&mut s, 11, 5, 0, "Program Files"); // 大小写折叠命中 "prog"
@@ -1760,7 +1820,7 @@ mod tests {
             name: name.to_string(),
             mtime: 0,
         };
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0x10, b"dirA");
         s.insert(20, 5, 0x10, b"dirB");

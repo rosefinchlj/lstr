@@ -216,9 +216,54 @@ pub enum EngineMsg {
     WorkerLost,
 }
 
+/// 排除规则表(共享槽)。设置页「立即重建」时改槽内容 → 引擎在建新 store/
+/// 落快照指纹时取到新表;测试用 from_static 静态表。
+#[derive(Clone)]
+pub struct NoiseRules {
+    slot: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    static_raw: Vec<String>,
+}
+
+impl NoiseRules {
+    /// 静态表(测试/简单构造)。
+    pub fn from_static(raw: Vec<String>) -> Self {
+        Self { slot: None, static_raw: raw }
+    }
+
+    /// 内置默认段名(node_modules 等,与 noise::NOISE_SEGMENTS 同源)。
+    pub fn builtin() -> Self {
+        Self::from_static(crate::noise::builtin_patterns())
+    }
+
+    /// 共享槽(生产:设置页运行期改表,「立即重建」时生效)。
+    pub fn from_slot(slot: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        Self { slot: Some(slot), static_raw: Vec::new() }
+    }
+
+    /// 当前原始模式表。
+    pub fn raw(&self) -> Vec<String> {
+        match &self.slot {
+            Some(s) => s.lock().map(|g| g.clone()).unwrap_or_default(),
+            None => self.static_raw.clone(),
+        }
+    }
+
+    /// 当前规则集(归一化)。
+    pub fn rules(&self) -> crate::noise::ExcludeRules {
+        crate::noise::ExcludeRules::build(&self.raw())
+    }
+}
+
+impl Default for NoiseRules {
+    fn default() -> Self {
+        Self::from_static(Vec::new())
+    }
+}
+
 pub struct EngineConfig {
     pub index_dir: PathBuf,
-    pub exclude_noise: bool,
+    /// 排除规则表(共享槽/静态表,见 [`NoiseRules`])。
+    pub noise: NoiseRules,
     pub candidate_cap: usize,
     /// 勾选要索引的盘符(大写单字母,如 `'C'`);空 vec = 全部卷。
     /// 只影响启动时加载哪些 `vol_*.bin` 快照:未选中卷的旧快照留在磁盘上,
@@ -390,7 +435,7 @@ impl Engine {
                 continue;
             };
             let Ok(guid) = u128::from_str_radix(hex, 16) else { continue };
-            if let Some(snap) = snapshot::load(&dir, guid, self.cfg.exclude_noise) {
+            if let Some(snap) = snapshot::load(&dir, guid, self.noise_hash(), &self.noise_rules()) {
                 let h = &snap.header;
                 // 配置勾选了盘符时只加载选中的卷:不 push VolumeState、不建
                 // PinyinCache;快照文件保留,重新勾选后可直接复用(不重扫)。
@@ -521,6 +566,16 @@ impl Engine {
         None
     }
 
+    /// 当前排除规则集(共享槽实时取,建 store/判定用)。
+    fn noise_rules(&self) -> crate::noise::ExcludeRules {
+        self.cfg.noise.rules()
+    }
+
+    /// 排除规则内容哈希(快照指纹)。
+    fn noise_hash(&self) -> u64 {
+        self.noise_rules().hash()
+    }
+
     pub fn handle(&mut self, msg: EngineMsg) {
         // 保存期间 store 必须冻结(快照按启动时的冻结视图写列);修改类消息
         // 按到达顺序排队,保存收尾后原序重放。查询不走 EngineMsg,不受影响。
@@ -553,6 +608,10 @@ impl Engine {
                 if let Some(i) = self.volume_idx(guid, true, letter) {
                     let v = &mut self.volumes[i];
                     v.letter = letter;
+                    // 锚定路径模式的盘符过滤依赖盘符:store 已存在时同步
+                    if let Some(s) = &mut v.store {
+                        s.set_letter(letter);
+                    }
                     // 就绪卷不接受游标对 (journal_id, next_usn) 覆盖:Full 计划
                     // 下该值是扫描起点高水位,与随后的 ScanBegin 之间存在「游标
                     // 超前于内容」的窄落盘窗口;增量计划的 VolumeMeta 本就是握手
@@ -566,12 +625,20 @@ impl Engine {
             }
             EngineMsg::ScanBegin { guid, resume_frn } => {
                 if let Some(i) = self.volume_idx(guid, true, '?') {
+                    let rules = self.noise_rules();
                     {
                         let v = &mut self.volumes[i];
                         v.resume_frn = resume_frn;
                         v.complete = false;
+                        if resume_frn == 0 {
+                            // 从头重扫(显式 Rescan/journal 重建):旧 store 的
+                            // NOISE 位按旧规则烙在列里,必须整卷丢弃重建,
+                            // 否则排除规则变更不会生效。
+                            v.store = None;
+                            self.pinyin[i] = PinyinCache::empty();
+                        }
                         if v.store.is_none() {
-                            v.store = Some(VolumeStore::new(self.cfg.exclude_noise));
+                            v.store = Some(VolumeStore::new(rules, v.letter));
                         }
                         // 重扫窗口不进旁车:store 将整卷重建,断点由 20s 全量
                         // 快照承载。日志清零;旧旁车文件仍与旧快照自洽,留着
@@ -720,7 +787,9 @@ impl Engine {
             EngineMsg::DirSyncBegin { guid } => {
                 if let Some(i) = self.volume_idx(guid, true, '?') {
                     if self.volumes[i].store.is_none() {
-                        self.volumes[i].store = Some(VolumeStore::new(self.cfg.exclude_noise));
+                        let rules = self.noise_rules();
+                        let letter = self.volumes[i].letter;
+                        self.volumes[i].store = Some(VolumeStore::new(rules, letter));
                         self.pinyin[i] = PinyinCache::empty();
                         self.bump_generation(i);
                     }
@@ -1740,7 +1809,7 @@ impl Engine {
                 guid: v.guid,
                 letter: v.letter,
                 complete: v.complete,
-                exclude_noise: self.cfg.exclude_noise,
+                noise_hash: self.noise_hash(),
                 journal_id: v.journal_id,
                 next_usn: v.next_usn,
                 resume_frn: v.resume_frn,
@@ -1920,7 +1989,7 @@ impl Engine {
                 guid: v.guid,
                 letter: v.letter,
                 complete: v.complete,
-                exclude_noise: self.cfg.exclude_noise,
+                noise_hash: self.noise_hash(),
                 journal_id: v.journal_id,
                 next_usn: v.next_usn,
                 resume_frn: v.resume_frn,
@@ -2053,7 +2122,7 @@ mod tests {
     fn engine_with_volumes(dir: &std::path::Path, volumes: Vec<char>) -> Engine {
         Engine::new(EngineConfig {
             index_dir: dir.to_path_buf(),
-            exclude_noise: true,
+            noise: NoiseRules::builtin(),
             candidate_cap: 1000,
             volumes,
         })
@@ -2805,7 +2874,8 @@ mod tests {
             "保存不 remap slot,拼音缓存天然不越界"
         );
         // 快照本身必须是 compact 后语义:DEAD 条目被排除,改名生效。
-        let loaded = snapshot::load(&dir, guid, true).expect("snapshot loads");
+        let nr = NoiseRules::builtin().rules();
+        let loaded = snapshot::load(&dir, guid, nr.hash(), &nr).expect("snapshot loads");
         assert_eq!(loaded.store.len(), 2, "快照视图必须排除 DEAD 条目");
         assert!(loaded.store.find_slot(12).is_none());
         assert_eq!(
@@ -3894,7 +3964,7 @@ mod tests {
             Engine::new(EngineConfig {
                 // 目录不存在 → 不读也不写快照,基准零磁盘 IO
                 index_dir: std::env::temp_dir().join("lstr-bench-nonexistent"),
-                exclude_noise: true,
+                noise: NoiseRules::builtin(),
                 candidate_cap: 100,
                 volumes: Vec::new(),
             })
@@ -4088,7 +4158,7 @@ mod tests {
         let guid = 0xcafeu128;
         let mut engine = Engine::new(EngineConfig {
             index_dir: dir.to_path_buf(),
-            exclude_noise: true,
+            noise: NoiseRules::builtin(),
             candidate_cap: 100,
             volumes: Vec::new(),
         });
@@ -4199,7 +4269,7 @@ mod tests {
                         guid,
                         letter: 'C',
                         complete: true,
-                        exclude_noise: true,
+                        noise_hash: 0,
                         journal_id: 7,
                         next_usn: usn,
                         resume_frn: 0,
@@ -4286,7 +4356,7 @@ mod tests {
         let make_engine = |dir: &std::path::Path| {
             let mut e = Engine::new(EngineConfig {
                 index_dir: dir.to_path_buf(),
-                exclude_noise: true,
+                noise: NoiseRules::builtin(),
                 candidate_cap: 100,
                 volumes: Vec::new(),
             });
@@ -4363,7 +4433,7 @@ mod tests {
                 guid: GUID,
                 letter: 'C',
                 complete: true,
-                exclude_noise: true,
+                noise_hash: 0,
                 journal_id: 7,
                 next_usn: 1_000 + round as i64,
                 resume_frn: 0,
@@ -4485,7 +4555,7 @@ mod tests {
     }
 
     fn profile_store() -> (VolumeStore, PinyinCache) {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         for d in 0..PROFILE_DIRS {
             s.insert(10 + d, crate::store::ROOT_FRN, 0x0010, format!("dir{d:05}").as_bytes());
         }
@@ -4782,7 +4852,8 @@ mod tests {
         assert_eq!(find(&engine, "post"), 1, "保存后新增量必须应用");
 
         // 快照只含保存开始时的状态;post 由旁车承载。
-        let loaded = snapshot::load(&dir, guid, true).expect("snapshot loads");
+        let nr = NoiseRules::builtin().rules();
+        let loaded = snapshot::load(&dir, guid, nr.hash(), &nr).expect("snapshot loads");
         assert!(loaded.store.find_slot(13).is_some(), "pre 必须进快照");
         assert!(loaded.store.find_slot(14).is_none(), "post 不得进本次快照");
         engine.maintain(); // 旁车节流写盘(几 KB)
@@ -4821,7 +4892,8 @@ mod tests {
         assert!(!engine.save_in_progress(), "退出收尾必须完成分段保存");
         assert!(!engine.has_deferred_msgs());
         assert!(snapshot::snapshot_path(&dir, guid).is_file());
-        let loaded = snapshot::load(&dir, guid, true).expect("snapshot loads");
+        let nr = NoiseRules::builtin().rules();
+        let loaded = snapshot::load(&dir, guid, nr.hash(), &nr).expect("snapshot loads");
         assert!(loaded.store.find_slot(13).is_some());
         let tmp = dir.join(format!("vol_{:032x}.tmp", std::process::id()));
         assert!(!tmp.exists());

@@ -162,6 +162,9 @@ pub struct SearchService {
     volume_mask: Arc<AtomicU32>,
     /// 发给索引 worker 的控制指令(运行期切卷/重建),由 client 线程非阻塞写帧。
     index_cmd: mpsc::Sender<ClientCommand>,
+    /// 排除规则表共享槽(原始模式):设置页「立即重建」时更新,引擎在建新
+    /// store/落快照指纹时取新表;finalize 硬过滤也实时取。
+    noise_slot: Arc<Mutex<Vec<String>>>,
     /// 优雅退出标志:on_exit 置位后 client 线程给 worker 发 Shutdown 并等其
     /// 退出;run_worker 的请求循环也据此提前收尾(flush_all 不再依赖通道断开)。
     shutdown_client: Arc<AtomicBool>,
@@ -184,6 +187,9 @@ impl SearchService {
         // 在运行期切卷,不需要重启 lstr。
         let volume_mask = Arc::new(AtomicU32::new(config.index.volume_mask()));
         let worker_volume_mask = Arc::clone(&volume_mask);
+        // 排除规则表共享槽:初始 = 配置里的排除行(内置段已迁移进来)。
+        let noise_slot = Arc::new(Mutex::new(exclude_patterns(&config)));
+        let worker_noise_slot = Arc::clone(&noise_slot);
         let (index_cmd_tx, index_cmd_rx) = mpsc::channel::<ClientCommand>();
         // 优雅退出三件套(缺陷修复:GUI 退出必须收提权 worker):
         // shutdown_client → client 线程/请求循环的收尾信号;
@@ -210,6 +216,7 @@ impl SearchService {
                     status_slot: worker_status,
                     index_cmd_rx,
                     volume_mask: worker_volume_mask,
+                    noise_slot: worker_noise_slot,
                     shutdown_client: done_s,
                     worker_collected: done_w,
                     client_done: done_c,
@@ -233,6 +240,7 @@ impl SearchService {
             index_status: status_slot,
             volume_mask,
             index_cmd: index_cmd_tx,
+            noise_slot,
             shutdown_client,
             worker_collected,
         }
@@ -265,6 +273,37 @@ impl SearchService {
             "main: set volumes mask=0x{mask:08x} ({})",
             lstr_index::volmask::describe(mask)
         ));
+    }
+
+    /// 「立即重建」:排除规则变更后调用。删旧快照 + 换引擎规则表 + 全卷重扫。
+    /// 顺序保证:共享槽先更新(重建出的 store 才用新规则),Rescan(0) 后发;
+    /// 引擎在 ScanBegin(resume_frn=0) 时丢弃旧 store,新 store 从槽里取新表。
+    /// worker 没在跑时指令静默失败:下次拉起按新表全量扫,语义不变。
+    pub fn rebuild_noise_index(&self, patterns: Vec<String>) {
+        if let Ok(mut slot) = self.noise_slot.lock() {
+            *slot = patterns.clone();
+        }
+        // 删旧快照:重建完成前的崩溃窗口里,旧快照指纹与新规则不符会被拒,
+        // 这里删掉更直接(避免旧 store 的周期性保存把旧快照写回盘)。
+        let dir = crate::config::attach_dir().join("index");
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let looks_like_snapshot = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("vol_") && n.ends_with(".bin"))
+                    .unwrap_or(false);
+                if looks_like_snapshot {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        if self.index_cmd.send(ClientCommand::Rescan(0)).is_ok() {
+            lstr_index::snapshot::debug_log(
+                "main: noise rules changed, full rescan requested",
+            );
+        }
     }
 
     pub fn search(
@@ -1134,6 +1173,16 @@ fn fill_one_meta_with(entry: Entry, correct_kind: bool, filler: &mut MetaFiller)
     Some(entry)
 }
 
+/// 配置里的排除行模式表(共享槽初始值/测试用)。
+fn exclude_patterns(cfg: &Config) -> Vec<String> {
+    cfg.rank
+        .noise_rules
+        .iter()
+        .filter(|r| r.exclude)
+        .map(|r| r.pattern.clone())
+        .collect()
+}
+
 #[cfg(test)]
 fn finalize_entries(
     entries: Vec<Entry>,
@@ -1142,7 +1191,8 @@ fn finalize_entries(
     config: &Config,
     keyword_rows: Vec<Entry>,
 ) -> Vec<Entry> {
-    finalize_entries_with_pending(entries, request, history, config, keyword_rows, None).0
+    let noise = lstr_index::engine::NoiseRules::from_static(exclude_patterns(config));
+    finalize_entries_with_pending(entries, request, history, config, keyword_rows, &noise, None).0
 }
 
 /// finalize 的惰性元数据版:rank 之后、去重/截断之前,只对「会进入最终列表」
@@ -1158,8 +1208,20 @@ fn finalize_entries_with_pending(
     history: &Arc<Mutex<History>>,
     config: &Config,
     keyword_rows: Vec<Entry>,
+    noise: &lstr_index::engine::NoiseRules,
     pending: Option<&PendingMeta>,
 ) -> (Vec<Entry>, f64) {
+    // 排除行硬过滤:索引层已不收录排除目录,但 Everything/历史等来源仍可能
+    // 带进已排除路径;这里统一剔除,保证「排除=搜不到」对所有来源成立。
+    // 目录自身可见(与索引层语义一致),只剔严格位于排除目录之下的条目。
+    let exclude = noise.rules();
+    if !exclude.is_empty() {
+        entries.retain(|e| match &e.path {
+            Some(p) => !exclude
+                .path_excluded(&p.to_string_lossy().to_lowercase().replace('\\', "/")),
+            None => true,
+        });
+    }
     // 分项计时:唯一慢查询日志的补充,>3ms 时落 engine.log 定位 rank/去重/
     // 置顶哪一段退化(优化前真实机器 7.3ms 几乎全在 rank 的逐候选 SQL/规则
     // 归一化上)。计时本身 5 次 Instant::now ≈ 0.1µs。
@@ -1371,6 +1433,8 @@ struct WorkerArgs {
     status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
     index_cmd_rx: Receiver<ClientCommand>,
     volume_mask: Arc<AtomicU32>,
+    /// 排除规则共享槽(与 SearchService 共享,重建时换表)。
+    noise_slot: Arc<Mutex<Vec<String>>>,
     shutdown_client: Arc<AtomicBool>,
     worker_collected: Arc<AtomicBool>,
     client_done: Arc<AtomicBool>,
@@ -1468,10 +1532,13 @@ fn run_worker(args: WorkerArgs) {
         status_slot,
         index_cmd_rx,
         volume_mask,
+        noise_slot,
         shutdown_client,
         worker_collected,
         client_done,
     } = args;
+    // finalize 硬过滤 + 引擎共用同一张排除表(实时取,重建后即新规则)。
+    let noise = lstr_index::engine::NoiseRules::from_slot(Arc::clone(&noise_slot));
     // 显式选择「仅内置索引」:此时无论引擎是否就绪,都不再回落 Everything,
     // 否则与设置页文案矛盾(旧实现在 Fallback 时仍把查询发给 Everything)。
     let force_builtin = config.index.backend == "builtin";
@@ -1510,7 +1577,10 @@ fn run_worker(args: WorkerArgs) {
             drop(index_cmd_rx);
         }
         _ => {
-            let mut engine = builtin::make_engine(&config.index);
+            let mut engine = builtin::make_engine(
+                            &config.index,
+                            lstr_index::engine::NoiseRules::from_slot(Arc::clone(&noise_slot)),
+                        );
             // 分批 apply 的块间让路检查:对账/首扫的记录按块消化,块间发现
             // 等待中的查询(QUERY_INFLIGHT>0)立即收手,让主循环出队服务。
             engine.set_query_yield_hook(Some(Box::new(|| {
@@ -2278,6 +2348,7 @@ fn run_worker(args: WorkerArgs) {
             &history,
             &config,
             keyword_rows,
+            &noise,
             (!pending_meta.is_empty()).then_some(&pending_meta),
         );
         let diag_meta = meta_ms as f32;
@@ -2636,6 +2707,75 @@ mod tests {
         let out = finalize_entries(entries, &request, &history, &test_config(), Vec::new());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "ABC.txt");
+    }
+
+    /// 排除行硬过滤:排除目录的子孙不进结果(目录自身可见),对所有来源成立。
+    #[test]
+    fn finalize_hard_filters_excluded_paths() {
+        let mut cfg = test_config();
+        cfg.rank.noise_rules.push(crate::config::NoiseRule {
+            pattern: r"D:\ProgramData".into(),
+            penalty: 0,
+            exclude: true,
+        });
+        let request = Request {
+            generation: 1,
+            sent_at: Instant::now(),
+            query: Query {
+                raw: "app".to_string(),
+                scope: Scope::All,
+                text: "app".to_string(),
+                ext: None,
+                path_filter: None,
+                drives_include: 0,
+                drives_exclude: 0,
+                prefix: None,
+                suffix: None,
+            },
+            limit: 10,
+            deliver: MIN_DELIVER,
+            keywords: Vec::new(),
+            dialog_quick: false,
+            filters: SearchFilters::default(),
+            rank: RankConfig::default(),
+            show_history: false,
+            favorites: Vec::new(),
+            base_folder: None,
+            browse_root: None,
+        };
+        let history = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::history::History::in_memory(),
+        ));
+        let mk = |id: &str, name: &str, path: &str, kind: Kind| Entry {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            path: Some(std::path::PathBuf::from(path)),
+            size: None,
+            modified: None,
+            pinyin: None,
+            initial: String::new(),
+            tone: 0,
+        };
+        let entries = vec![
+            mk("inside", "app.ini", r"D:\ProgramData\app.ini", Kind::File),
+            mk("self", "ProgramData", r"D:\ProgramData", Kind::Folder),
+            mk("outside", "app.ini", r"D:\Other\app.ini", Kind::File),
+        ];
+        let noise = lstr_index::engine::NoiseRules::from_static(vec![r"D:\ProgramData".into()]);
+        let (out, _) = finalize_entries_with_pending(
+            entries,
+            &request,
+            &history,
+            &cfg,
+            Vec::new(),
+            &noise,
+            None,
+        );
+        let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
+        assert!(!ids.contains(&"inside"), "排除目录子孙必须被剔除");
+        assert!(ids.contains(&"self"), "排除目录自身可见(与索引层语义一致)");
+        assert!(ids.contains(&"outside"), "无关路径保留");
     }
 
     fn google() -> Vec<KeywordConfig> {

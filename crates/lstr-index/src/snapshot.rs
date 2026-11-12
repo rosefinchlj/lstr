@@ -26,7 +26,8 @@ use crate::store::{VolumeStore, ATTR_INTERNAL, ATTR_SEEN, NO_PARENT};
 pub const MAGIC: &[u8; 4] = b"LIDX";
 /// v3:未消解父链接 (slot, parent_frn) 也落盘(v2 没有,重启后这些条目永久退化)。
 /// v4:增加 mtime 列(unix 秒),内置时间筛选/结果元数据使用。
-pub const VERSION: u32 = 4;
+/// v5:排除表从布尔开关改为内容哈希(noise_hash),排除规则任意变更即失配重扫。
+pub const VERSION: u32 = 5;
 
 /// 覆盖日志目录的环境变量(集成测试/诊断隔离用)。
 const LOG_DIR_ENV: &str = "LSTR_INDEX_LOG_DIR";
@@ -87,16 +88,14 @@ fn chrono_now() -> String {
 }
 
 pub const FLAG_COMPLETE: u8 = 0x01;
-/// 快照生成时 `exclude_noise` 的取值(M3):NOISE 位是扫描/compact 期
-/// 写进 attrs 的,开关切换后旧快照的可见性与新配置不符,必须拒绝重扫。
-pub const FLAG_NOISE: u8 = 0x02;
 
 #[derive(Clone, Debug)]
 pub struct SnapshotHeader {
     pub guid: u128,
     pub letter: char,
     pub complete: bool,
-    pub exclude_noise: bool,
+    /// 排除规则内容哈希(小写正斜杠归一化后排序哈希)。规则变更即失配重扫。
+    pub noise_hash: u64,
     pub journal_id: u64,
     pub next_usn: i64,
     pub resume_frn: u64,
@@ -157,11 +156,12 @@ pub fn save_report(
     w.write_all(&VERSION.to_le_bytes())?;
     w.write_all(&header.guid.to_le_bytes())?;
     w.write_all(&[header.letter as u32 as u8])?;
-    w.write_all(&[flags_of(header.complete, header.exclude_noise)])?;
+    w.write_all(&[flags_of(header.complete)])?;
     w.write_all(&header.journal_id.to_le_bytes())?;
     w.write_all(&header.next_usn.to_le_bytes())?;
     w.write_all(&header.resume_frn.to_le_bytes())?;
     w.write_all(&header.est_records.to_le_bytes())?;
+    w.write_all(&header.noise_hash.to_le_bytes())?;
     w.write_all(&(store.name_off.len() as u64).to_le_bytes())?;
     write_blob(&mut w, &store.names)?;
     write_col_u32(&mut w, &store.offs)?;
@@ -199,8 +199,8 @@ pub fn save_report(
     })
 }
 
-fn flags_of(complete: bool, exclude_noise: bool) -> u8 {
-    (if complete { FLAG_COMPLETE } else { 0 }) | (if exclude_noise { FLAG_NOISE } else { 0 })
+fn flags_of(complete: bool) -> u8 {
+    if complete { FLAG_COMPLETE } else { 0 }
 }
 
 fn write_blob<W: Write>(w: &mut W, bytes: &[u8]) -> std::io::Result<()> {
@@ -559,14 +559,12 @@ impl SaveTask {
                     out.extend_from_slice(&VERSION.to_le_bytes());
                     out.extend_from_slice(&self.header.guid.to_le_bytes());
                     out.push(self.header.letter as u32 as u8);
-                    out.push(flags_of(
-                        self.header.complete,
-                        self.header.exclude_noise,
-                    ));
+                    out.push(flags_of(self.header.complete));
                     out.extend_from_slice(&self.header.journal_id.to_le_bytes());
                     out.extend_from_slice(&self.header.next_usn.to_le_bytes());
                     out.extend_from_slice(&self.header.resume_frn.to_le_bytes());
                     out.extend_from_slice(&self.header.est_records.to_le_bytes());
+                    out.extend_from_slice(&self.header.noise_hash.to_le_bytes());
                     out.extend_from_slice(&(self.order.len() as u64).to_le_bytes());
                     out.extend_from_slice(&self.names_len.to_le_bytes());
                     self.file_mut()?.write_all(&out)?;
@@ -987,7 +985,7 @@ impl FileBytes {
 }
 
 /// 读快照;任何不一致(魔数/版本/长度)返回 None,由调用方触发全量重扫。
-pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapshot> {
+pub fn load(dir: &Path, guid: u128, noise_hash: u64, exclude: &crate::noise::ExcludeRules) -> Option<LoadedSnapshot> {
     let path = snapshot_path(dir, guid);
     // 优先 mmap(降低冷启动峰值私有内存并加速);映射失败回落整读。
     let bytes = match MappedFile::open(&path) {
@@ -1031,17 +1029,18 @@ pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapsho
     cur = &cur[1..];
     let flags = *cur.first()?;
     cur = &cur[1..];
-    let noise_flag = flags & FLAG_NOISE != 0;
-    if noise_flag != noise_enabled {
-        debug_log(&format!(
-            "load {guid:032x}: exclude_noise snapshot={noise_flag} cfg={noise_enabled}"
-        ));
-        return None;
-    }
     let journal_id = u64::from_le_array(&mut cur)?;
     let next_usn = i64::from_le_array(&mut cur)?;
     let resume_frn = u64::from_le_array(&mut cur)?;
     let est_records = u64::from_le_array(&mut cur)?;
+    let stored_noise_hash = u64::from_le_array(&mut cur)?;
+    if stored_noise_hash != noise_hash {
+        debug_log(&format!(
+            "load {guid:032x}: noise hash snapshot={:016x} cfg={:016x}, stale (full rescan)",
+            stored_noise_hash, noise_hash
+        ));
+        return None;
+    }
     let count = u64::from_le_array(&mut cur)? as usize;
 
     let names = read_blob(&mut cur)?;
@@ -1117,14 +1116,15 @@ pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapsho
         mtime,
         name_off,
         unresolved,
-        noise_enabled,
+        exclude.clone(),
+        letter,
     );
     Some(LoadedSnapshot {
         header: SnapshotHeader {
             guid,
             letter,
             complete: flags & FLAG_COMPLETE != 0,
-            exclude_noise: noise_flag,
+            noise_hash: stored_noise_hash,
             journal_id,
             next_usn,
             resume_frn,
@@ -1265,7 +1265,10 @@ mod tests {
 
     #[test]
     fn snapshot_roundtrip() {
-        let mut s = VolumeStore::new(true);
+        let mut s = VolumeStore::new(
+        crate::noise::ExcludeRules::build(&crate::noise::builtin_patterns()),
+        'C',
+    );
         s.insert(5, 0, 0x10, b"root");
         s.insert_meta(10, 5, 0, b"alpha.txt", 1_700_000_123);
         s.insert(11, 5, 0, "报告.docx".as_bytes());
@@ -1276,7 +1279,7 @@ mod tests {
             guid: 0x1234_5678_9abc_def0_1122_3344,
             letter: 'C',
             complete: true,
-            exclude_noise: true,
+            noise_hash: 0xA11CE,
             journal_id: 0xfeed,
             next_usn: 0x42,
             resume_frn: 0,
@@ -1285,10 +1288,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lstr-idx-test-{}", std::process::id()));
         let size = save(&dir, &header, &mut s).unwrap();
         assert!(size > 0);
-        let loaded = load(&dir, header.guid, true).unwrap();
-        // M3:噪声排除开关与快照生成时不符 → 拒绝加载(触发全量重扫),
-        // 否则切换开关后旧快照里的 NOISE 位会让结果与设置页承诺不一致。
-        assert!(load(&dir, header.guid, false).is_none());
+        let loaded = load(&dir, header.guid, 0xA11CE, &Default::default()).unwrap();
+        // v5:排除表内容哈希与快照生成时不符 → 拒绝加载(触发全量重扫),
+        // 否则改排除规则后旧快照里的 NOISE 位会让结果与设置页承诺不一致。
+        assert!(load(&dir, header.guid, 0xB0B, &Default::default()).is_none());
         assert_eq!(loaded.header.journal_id, 0xfeed);
         assert_eq!(loaded.header.next_usn, 0x42);
         assert!(loaded.header.complete);
@@ -1321,7 +1324,7 @@ mod tests {
     fn unresolved_parents_survive_roundtrip() {
         let dir = tmpdir("unres");
         let _ = std::fs::remove_dir_all(&dir);
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         // 子项先到、父 FRN 99 未到 → 进 unresolved
         s.insert(20, 99, 0, b"orphan.txt");
@@ -1329,7 +1332,7 @@ mod tests {
         assert_eq!(s.unresolved_pairs().len(), 1);
         let h = header(0x1234, false);
         save(&dir, &h, &mut s).unwrap();
-        let mut ls = load(&dir, h.guid, false).expect("load").store;
+        let mut ls = load(&dir, h.guid, 0, &Default::default()).expect("load").store;
         assert_eq!(ls.unresolved_pairs().len(), 1);
         // 父项在后续 journal 事件里补到 → compact 消解,不需要全量重扫
         ls.insert(99, 5, 0x10, b"late-dir");
@@ -1347,9 +1350,9 @@ mod tests {
             guid,
             letter: 'C',
             complete,
-            // 这些用例的 store 都是 VolumeStore::new(false),load 也传 false;
-            // 指纹必须一致,否则 M3 的加载校验会按设计拒绝(v1 快照语义)。
-            exclude_noise: false,
+            // 这些用例的 store 都是空规则表,load 也传同值哈希;
+            // 指纹不一致会按设计拒绝(v5 起排除表内容入指纹)。
+            noise_hash: 0,
             journal_id: 7,
             next_usn: 900,
             resume_frn: 0,
@@ -1364,7 +1367,7 @@ mod tests {
     /// 增量 insert 后 load 因 `offs.len() != count` 永久拒绝。
     #[test]
     fn incremental_state_survives_roundtrip() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0, b"alpha.txt");
         s.compact();
@@ -1378,7 +1381,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let h = header(0xabc, true);
         save(&dir, &h, &mut s).unwrap();
-        let loaded = load(&dir, h.guid, false).unwrap();
+        let loaded = load(&dir, h.guid, 0, &Default::default()).unwrap();
         let mut ls = loaded.store;
         assert!(loaded.header.complete);
         assert_eq!(ls.len(), n);
@@ -1425,7 +1428,7 @@ mod tests {
     /// (property 随机流约 1/4 概率踩中,表现为偶发 load=None)。
     #[test]
     fn rename_without_delta_survives_roundtrip() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0, b"alpha.txt");
         s.compact();
@@ -1437,7 +1440,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let h = header(0xfeed, true);
         save(&dir, &h, &mut s).unwrap();
-        let loaded = load(&dir, h.guid, false).expect("改名后落盘的快照必须可 load");
+        let loaded = load(&dir, h.guid, 0, &Default::default()).expect("改名后落盘的快照必须可 load");
         let ls = loaded.store;
         assert_eq!(ls.len(), 2);
         assert_eq!(
@@ -1455,7 +1458,7 @@ mod tests {
     /// `is_scanning` 本身,但 count/名字/父链必须完整可用,后续 append 不坏。
     #[test]
     fn partial_scan_snapshot_roundtrip() {
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0x10, b"users");
         s.insert(11, 10, 0, b"a.txt");
@@ -1465,7 +1468,7 @@ mod tests {
         let mut h = header(0xdef, false);
         h.resume_frn = 1234;
         save(&dir, &h, &mut s).unwrap();
-        let loaded = load(&dir, h.guid, false).unwrap();
+        let loaded = load(&dir, h.guid, 0, &Default::default()).unwrap();
         assert!(!loaded.header.complete);
         assert_eq!(loaded.header.resume_frn, 1234);
         let mut ls = loaded.store;
@@ -1490,15 +1493,15 @@ mod tests {
         let dir = tmpdir("h1-twice");
         let _ = std::fs::remove_dir_all(&dir);
         let guid = 0x5150;
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0, b"one.txt");
         s.compact();
         save(&dir, &header(guid, true), &mut s).unwrap();
-        let mut s = load(&dir, guid, false).unwrap().store;
+        let mut s = load(&dir, guid, 0, &Default::default()).unwrap().store;
         s.insert(11, 5, 0, b"two.txt");
         save(&dir, &header(guid, true), &mut s).unwrap();
-        let ls = load(&dir, guid, false).unwrap().store;
+        let ls = load(&dir, guid, 0, &Default::default()).unwrap().store;
         assert_eq!(ls.len(), 3);
         assert_eq!(
             ls.find_slot(11).map(|x| ls.name(x).to_vec()),
@@ -1517,7 +1520,7 @@ mod tests {
         let dir = tmpdir("stale-ver");
         let _ = std::fs::remove_dir_all(&dir);
         let guid = 0x7777;
-        let mut s = VolumeStore::new(false);
+        let mut s = VolumeStore::new(Default::default(), 'C');
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0, b"a.txt");
         s.compact();
@@ -1527,7 +1530,7 @@ mod tests {
         let mut bytes = std::fs::read(&p).unwrap();
         bytes[4..8].copy_from_slice(&1u32.to_le_bytes()); // 伪造成 v1
         std::fs::write(&p, &bytes).unwrap();
-        assert!(load(&dir, guid, false).is_none());
+        assert!(load(&dir, guid, 0, &Default::default()).is_none());
         assert!(!p.exists(), "旧版本快照加载失败后应被删除");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1538,14 +1541,17 @@ mod tests {
         let guid = 42u128;
         let p = snapshot_path(&dir, guid);
         std::fs::write(&p, b"garbage-data-here").unwrap();
-        assert!(load(&dir, guid, false).is_none());
+        assert!(load(&dir, guid, 0, &Default::default()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 分段保存的列视图测试数据:base compact 后叠加 delta、就地改名、
     /// 删除、未消解父链接 —— 覆盖保存视图需要重建的全部状态。
     fn view_store() -> VolumeStore {
-        let mut s = VolumeStore::new(true);
+        let mut s = VolumeStore::new(
+        crate::noise::ExcludeRules::build(&crate::noise::builtin_patterns()),
+        'C',
+    );
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0x10, b"docs");
         s.insert(11, 10, 0, b"alpha.txt");
@@ -1573,7 +1579,7 @@ mod tests {
             guid,
             letter: 'V',
             complete: true,
-            exclude_noise: true,
+            noise_hash: 0,
             journal_id: 0xabc,
             next_usn: 12345,
             resume_frn: 0,
@@ -1612,7 +1618,7 @@ mod tests {
         assert!(!task.tmp_path.exists(), "完成后 tmp 必须已 rename");
 
         // 视图语义:改名生效、删除项不落盘、delta/unresolved 可恢复。
-        let loaded = load(&dir_one, h.guid, true).unwrap();
+        let loaded = load(&dir_one, h.guid, 0, &Default::default()).unwrap();
         let ls = &loaded.store;
         assert_eq!(ls.len(), 9, "9 个活项(删除项不落盘)");
         assert_eq!(ls.find_slot(11).map(|s| ls.name(s).to_vec()), Some(b"alpha-renamed.txt".to_vec()));
@@ -1634,7 +1640,10 @@ mod tests {
     /// 不得进快照;compact 后迟到的噪声子树子项(靠锚点立即判噪)同样必须被视图过滤。
     #[test]
     fn save_view_respects_noise_bits() {
-        let mut s = VolumeStore::new(true);
+        let mut s = VolumeStore::new(
+        crate::noise::ExcludeRules::build(&crate::noise::builtin_patterns()),
+        'C',
+    );
         s.insert(5, 0, 0x10, b"root");
         s.insert(10, 5, 0x10, b"node_modules");
         s.insert(11, 10, 0, b"dep.js");
@@ -1647,7 +1656,7 @@ mod tests {
         let dir = tmpdir("seg-noise");
         let _ = std::fs::remove_dir_all(&dir);
         save_view_sync(&dir, &h, &s).unwrap();
-        let loaded = load(&dir, h.guid, true).expect("view snapshot loads");
+        let loaded = load(&dir, h.guid, 0, &Default::default()).expect("view snapshot loads");
         assert_eq!(loaded.store.find_slot(12).map(|x| loaded.store.name(x).to_vec()), Some(b"keep.txt".to_vec()));
         assert!(loaded.store.find_slot(10).is_some(), "噪声目录自身保留进快照");
         assert!(loaded.store.find_slot(11).is_none());
@@ -1673,7 +1682,7 @@ mod tests {
             }
         }
         let mut rng = Lcg(0x5eed_1234_abcd);
-        let mut store = VolumeStore::new(false);
+        let mut store = VolumeStore::new(Default::default(), 'C');
         store.insert(5, 0, 0x10, b"root");
         let mut frns: Vec<u64> = vec![5];
         let mut next_frn = 10u64;
@@ -1725,11 +1734,10 @@ mod tests {
         // 末尾至少留 delta/改名的视图态
         store.insert(next_frn, 5, 0, b"tail-delta.txt");
         let mut h = view_header(0x7a7);
-        h.exclude_noise = false;
         let dir = tmpdir("seg-random");
         let _ = std::fs::remove_dir_all(&dir);
         save_view_sync(&dir, &h, &store).unwrap();
-        let loaded = load(&dir, h.guid, false).expect("view snapshot loads");
+        let loaded = load(&dir, h.guid, 0, &Default::default()).expect("view snapshot loads");
         let ls = &loaded.store;
         let live: Vec<u64> = (0..store.len() as u32)
             .filter(|&s| store.visible(s))
@@ -1756,7 +1764,7 @@ mod tests {
         let dir2 = tmpdir("seg-random-compact");
         let _ = std::fs::remove_dir_all(&dir2);
         save_view_sync(&dir2, &h, &store).unwrap();
-        let old = load(&dir2, h.guid, false).expect("compacted snapshot loads");
+        let old = load(&dir2, h.guid, 0, &Default::default()).expect("compacted snapshot loads");
         assert_eq!(old.store.len(), live.len());
         for frn in &live {
             let a = store.find_slot(*frn).unwrap();
@@ -1803,7 +1811,7 @@ mod tests {
         let report = save_view_sync(&dir, &h, &store).unwrap();
         assert!(report.bytes > 0);
         assert!(!tmp.exists(), "完成后残留 tmp 必须消失");
-        let loaded = load(&dir, h.guid, true).expect("resumed snapshot must load");
+        let loaded = load(&dir, h.guid, 0, &Default::default()).expect("resumed snapshot must load");
         assert_eq!(loaded.store.len(), 9);
         let _ = std::fs::remove_dir_all(&dir);
     }

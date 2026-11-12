@@ -817,11 +817,14 @@ pub fn launch_worker(extra_args: &str) -> bool {
     crate::win::shell::shell_execute_runas_with_args(&exe_str, &params).is_ok()
 }
 
-/// 引擎构造(主进程内,加载快照)。
-pub fn make_engine(cfg: &crate::config::IndexConfig) -> Engine {
+/// 引擎构造(主进程内,加载快照)。`noise` = 排除规则共享槽(重建时换表)。
+pub fn make_engine(
+    cfg: &crate::config::IndexConfig,
+    noise: lstr_index::engine::NoiseRules,
+) -> Engine {
     Engine::new(EngineConfig {
         index_dir: crate::config::attach_dir().join("index"),
-        exclude_noise: cfg.exclude_noise,
+        noise,
         candidate_cap: cfg.candidate_cap,
         // 只加载选中盘的快照;未选中的快照留在磁盘,重新勾选即可秒开。
         volumes: cfg.volume_letters(),
@@ -976,7 +979,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&snap_dir);
         let mut engine = Engine::new(EngineConfig {
             index_dir: snap_dir.clone(),
-            exclude_noise: false,
+        noise: Default::default(),
             candidate_cap: 2000,
             volumes: Vec::new(),
         });
@@ -1368,6 +1371,7 @@ mod tests {
 
         let history = std::sync::Arc::new(std::sync::Mutex::new(History::in_memory()));
         let config = crate::config::Config::default();
+                let noise = lstr_index::engine::NoiseRules::from_static(Vec::new());
         let request = Request {
             generation: 1,
             sent_at: Instant::now(),
@@ -1396,6 +1400,7 @@ mod tests {
             &history,
             &config,
             Vec::new(),
+            &noise,
             Some(&pending),
         );
         assert_eq!(old_final, new_final, "最终 Entry 逐字段/顺序不一致");
@@ -1451,6 +1456,7 @@ mod tests {
 
         let history = std::sync::Arc::new(std::sync::Mutex::new(History::in_memory()));
         let config = crate::config::Config::default();
+                let noise = lstr_index::engine::NoiseRules::from_static(Vec::new());
         let request = Request {
             generation: 1,
             sent_at: Instant::now(),
@@ -1479,6 +1485,7 @@ mod tests {
             &history,
             &config,
             Vec::new(),
+            &noise,
             Some(&pending),
         );
         assert_eq!(
@@ -1538,6 +1545,7 @@ mod tests {
 
         let history = std::sync::Arc::new(std::sync::Mutex::new(History::in_memory()));
         let config = crate::config::Config::default();
+                let noise = lstr_index::engine::NoiseRules::from_static(Vec::new());
         let request = Request {
             generation: 1,
             sent_at: Instant::now(),
@@ -1566,6 +1574,7 @@ mod tests {
             &history,
             &config,
             Vec::new(),
+            &noise,
             Some(&pending),
         );
         assert_eq!(
@@ -1624,6 +1633,7 @@ mod tests {
         let old_entry = super::super::fill_one_meta(entry(), false).unwrap();
         let history = std::sync::Arc::new(std::sync::Mutex::new(History::in_memory()));
         let config = crate::config::Config::default();
+                let noise = lstr_index::engine::NoiseRules::from_static(Vec::new());
         let query = parse(&name, Scope::All);
         let request = Request {
             generation: 1,
@@ -1653,6 +1663,7 @@ mod tests {
             &history,
             &config,
             Vec::new(),
+            &noise,
             Some(&pending),
         );
         assert_eq!(old_final, new_final);
@@ -1730,6 +1741,7 @@ mod tests {
 
         let history = std::sync::Arc::new(std::sync::Mutex::new(History::in_memory()));
         let config = crate::config::Config::default();
+                let noise = lstr_index::engine::NoiseRules::from_static(Vec::new());
         let request = Request {
             generation: 1,
             sent_at: Instant::now(),
@@ -1808,6 +1820,7 @@ mod tests {
                     &history,
                     &config,
                     Vec::new(),
+                    &noise,
                     Some(&pending),
                 );
                 assert!(!out.is_empty());
@@ -1821,6 +1834,7 @@ mod tests {
             &history,
             &config,
             Vec::new(),
+            &noise,
             Some(&pending),
         );
         let (engine_p50, _) = samples(
