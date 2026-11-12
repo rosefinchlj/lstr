@@ -828,16 +828,6 @@ pub fn make_engine(
     noise: lstr_index::engine::NoiseRules,
 ) -> Engine {
     let index_dir = if cfg!(test) {
-        // 测试进程的引擎日志也必须隔离:主 crate 的单测把 lstr-index 当普通
-        // 依赖编译(cfg(test) 不生效),debug_log 会写真实
-        // %APPDATA%\lstr\index\engine.log —— 数百个用例的「loaded 0 volumes」
-        // 会把真实日志刷到 2MB 轮转,排障证据全被挤掉(真实踩坑)。
-        static LOG_INIT: std::sync::Once = std::sync::Once::new();
-        LOG_INIT.call_once(|| {
-            let log_dir = std::env::temp_dir()
-                .join(format!("lstr-test-log-{}", std::process::id()));
-            std::env::set_var("LSTR_INDEX_LOG_DIR", log_dir);
-        });
         std::env::temp_dir().join(format!("lstr-test-index-{}", std::process::id()))
     } else if let Some(dir) = std::env::var_os("LSTR_TEST_INDEX_DIR") {
         std::path::PathBuf::from(dir)

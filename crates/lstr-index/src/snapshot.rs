@@ -51,11 +51,12 @@ fn rotate_if_oversized(path: &Path) {
 /// 引擎调试日志(默认 %APPDATA%\lstr\index\engine.log;[`LOG_DIR_ENV`] 可
 /// 覆盖目录)。worker 提权进程与 UI 都写同用户目录;失败静默。
 ///
-/// 单元测试默认旁路:引擎/snapshot 的单测高频经过这里,不得污染真实日志
-/// (线上排障依据);显式设了 [`LOG_DIR_ENV`] 的用例写覆盖目录。
+/// 测试二进制一律旁路(显式设了 [`LOG_DIR_ENV`] 的用例除外):`cfg(test)`
+/// 只覆盖 lstr-index 自己的单测;主 crate 的单测/集成测试把本 crate 当普通
+/// 依赖编译,数百个用例的「loaded 0 volumes」会写进真实日志并把 2MB 排障
+/// 证据刷到轮转(真实踩坑)。测试二进制在 `target/*/deps/` 下,据此识别。
 pub fn debug_log(msg: &str) {
-    #[cfg(test)]
-    if std::env::var_os(LOG_DIR_ENV).is_none() {
+    if std::env::var_os(LOG_DIR_ENV).is_none() && running_under_test_harness() {
         return;
     }
     let Some(dir) = log_dir() else { return };
@@ -67,6 +68,15 @@ pub fn debug_log(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "[{}] {}", chrono_now(), msg);
     }
+}
+
+/// 当前进程是否为 cargo 测试二进制(可执行文件位于 `.../deps/` 下)。
+fn running_under_test_harness() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .is_some_and(|name| name == "deps")
 }
 
 fn log_dir() -> Option<PathBuf> {
