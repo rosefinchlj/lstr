@@ -33,6 +33,9 @@ pub struct VolumeProgress {
     /// 0.0~1.0,未知时为 None。
     pub pct: Option<f32>,
     pub count: u32,
+    /// 该卷索引堆内存占用(MB,含列与 n-gram 倒排),供设置页评估
+    /// 「哪个盘占内存多」以决定是否取消勾选。0 = 尚未加载。
+    pub heap_mb: u32,
     /// USN 实时增量层状态(worker `UsnWatch` 帧上报;非 Off 才显示)。
     pub usn_state: Option<UsnWatchState>,
     /// 游标年龄(秒):自引擎上次推进该卷位点(journal 批次/Ready)以来;
@@ -1063,6 +1066,8 @@ impl Engine {
                     complete: v.complete,
                     pct,
                     count,
+                    heap_mb: (v.store.as_ref().map(|s| s.heap_bytes()).unwrap_or(0)
+                        / (1024 * 1024)) as u32,
                     // Off 是「worker 从未上报」的缺省:不显示,避免旧后端 UI 噪音。
                     usn_state: (v.usn_watch != UsnWatchState::Off).then_some(v.usn_watch),
                     cursor_age_secs: v.cursor_at.map(|t| t.elapsed().as_secs()),

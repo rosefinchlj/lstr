@@ -95,6 +95,15 @@ pub struct HistItem {
     pub entry: Entry,
 }
 
+/// 结果行学习徽标(自学习可视化)。
+#[derive(Clone, Copy, Default, Debug)]
+pub struct LearnBadge {
+    /// 当前查询词下用户选过它(query_hits)。
+    pub recent_pick: bool,
+    /// 全局常用(frecency count≥3)。
+    pub frequent: bool,
+}
+
 /// 老版本（JSON 存储）的文件格式，仅用于一次性迁移。
 #[derive(Deserialize)]
 struct LegacyHistory {
@@ -305,6 +314,34 @@ impl History {
             boosts,
             now: now_secs(),
         }
+    }
+
+    /// 学习徽标:返回每个条目的「上次选中」(当前查询词下选过)与
+    /// 「常用」(全局 frecency count≥3)标记,供结果行可视化自学习。
+    /// 与排序用的 rank_snapshot 同源(history + query_hits),只是阅后即弃。
+    pub fn learn_badges(&self, query: &str) -> HashMap<String, LearnBadge> {
+        let mut out: HashMap<String, LearnBadge> = HashMap::new();
+        if let Ok(mut stmt) = self.db.prepare("SELECT id FROM history WHERE count >= 3") {
+            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                for id in rows.flatten() {
+                    out.entry(id).or_default().frequent = true;
+                }
+            }
+        }
+        let key = query.trim().to_lowercase();
+        if !key.is_empty() {
+            if let Ok(mut stmt) = self
+                .db
+                .prepare("SELECT entry_id FROM query_hits WHERE query = ?1")
+            {
+                if let Ok(rows) = stmt.query_map(params![key], |row| row.get::<_, String>(0)) {
+                    for id in rows.flatten() {
+                        out.entry(id).or_default().recent_pick = true;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// 按最后使用时间倒序返回历史条目快照。
@@ -562,5 +599,23 @@ mod tests {
         history.seed(&entry("a"), 1, now_secs());
         history.clear();
         assert!(history.recent_entries(10).is_empty());
+    }
+
+    #[test]
+    fn learn_badges_reflect_query_and_frecency() {
+        let mut history = History::in_memory();
+        let a = entry("alpha");
+        let b = entry("beta");
+        history.seed(&a, 5, now_secs()); // 常用(count≥3)
+        history.seed(&b, 1, now_secs()); // 不常用
+        history.record_query("al", &a); // 搜 al 时选过 alpha
+        let badges = history.learn_badges("al");
+        assert!(badges.get("alpha").unwrap().frequent);
+        assert!(badges.get("alpha").unwrap().recent_pick);
+        assert!(!badges.get("beta").map(|x| x.frequent).unwrap_or(false));
+        // 换查询词:recent_pick 不再生效,frequent 仍在
+        let other = history.learn_badges("zz");
+        assert!(other.get("alpha").unwrap().frequent);
+        assert!(!other.get("alpha").unwrap().recent_pick);
     }
 }

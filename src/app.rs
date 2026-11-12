@@ -342,6 +342,9 @@ pub struct LstrApp {
     icons: IconStore,
     /// 预览面板内容缓存(图片缩略图/文本头部)。
     previews: PreviewStore,
+    /// 学习徽标缓存(按当前查询词),让自学习在结果行可见。
+    learn_for: String,
+    learn_badges: HashMap<String, crate::history::LearnBadge>,
     /// P0-2：Explorer 内直接键入搜索（默认关闭）。
     typing: Option<crate::win::typing::TypingWatch>,
     /// 设置页「资产」的草稿输入状态。
@@ -485,6 +488,8 @@ impl LstrApp {
             suppress_hide_until: Instant::now(),
             icons: IconStore::new(),
             previews: PreviewStore::new(),
+            learn_for: String::new(),
+            learn_badges: HashMap::new(),
             typing,
             assets_ui: crate::assets_ui::AssetUiState::default(),
             typing_folder: None,
@@ -3329,6 +3334,15 @@ impl LstrApp {
         // 收藏置顶视觉标记:收藏过的条目副标题加 ★(每帧构建一次集合)。
         let fav_set: std::collections::HashSet<String> =
             self.cfg.favorites.iter().map(|f| f.path.to_lowercase()).collect();
+        // 学习徽标:查询词变化时刷新一次(每帧查 HashMap,不重复 SQL)。
+        if self.learn_for != self.input {
+            self.learn_badges = self
+                .history
+                .lock()
+                .map(|h| h.learn_badges(&self.input))
+                .unwrap_or_default();
+            self.learn_for = self.input.clone();
+        }
         // 两行内容（标题 + 副标题）的墨迹几何（含关键词下划线）。每帧量一次，
         // 所有行共用同一组基线：按墨迹而不是 galley 盒居中——盒子上下留白
         // 不对称、下划线还画在盒底之外，按盒居中会让降部探出高亮底边。
@@ -3479,6 +3493,13 @@ impl LstrApp {
                 (false, true) => format!("拼音 {} · ", query.text),
                 (false, false) => String::new(),
             };
+            if let Some(b) = self.learn_badges.get(&entry.id) {
+                if b.recent_pick {
+                    lead = format!("上次选中 · {lead}");
+                } else if b.frequent {
+                    lead = format!("常用 · {lead}");
+                }
+            }
             if is_path_row && fav_set.contains(&full_path.to_lowercase()) {
                 lead = format!("★ {lead}");
             }
@@ -5503,7 +5524,10 @@ impl LstrApp {
             for v in &st.volumes {
                 let mark = if v.complete { "✓" } else { "…" };
                 let pct = v.pct.map(|p| format!(" {:.0}%", p * 100.0)).unwrap_or_default();
-                let mut line = format!("{} 卷 {}:{}  {} 万项", mark, v.letter, pct, v.count / 10_000);
+                let mut line = format!(
+                    "{} 卷 {}:{}  {} 万项 · {}MB",
+                    mark, v.letter, pct, v.count / 10_000, v.heap_mb
+                );
                 // USN 实时增量层状态(usn 后端 worker 经 UsnWatch 帧上报;
                 // 非 Off 才显示,旧后端零噪音)。游标 age 说明增量新鲜度。
                 if let Some(usn) = v.usn_state {
