@@ -1003,9 +1003,10 @@ impl PendingMeta {
 /// 一次索引扫描后又被修改),这是刻意取舍:排序要避免每个候选一次 FS
 /// 调用,展示则要求时间新鲜。索引 mtime 为 0(未知)时,本函数从 FS 拿到
 /// 的值仍可补上,从而不影响展示。
+#[cfg(test)]
 fn fill_one_meta(entry: Entry, correct_kind: bool) -> Option<Entry> {
     // 单条入口(测试 oracle 与无批量上下文用):fresh filler 首个候选必逐条,
-    // 行为与旧实现逐字节一致。
+    // 行为与旧实现逐字节一致。生产路径走 fill_one_meta_with(共享 filler)。
     fill_one_meta_with(entry, correct_kind, &mut MetaFiller::default())
 }
 
