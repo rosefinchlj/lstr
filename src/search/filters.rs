@@ -79,6 +79,15 @@ impl SearchFilters {
             && self.modified.is_none()
             && self.size.is_none()
     }
+
+    /// 从右往左删一个条件 chip：先大小、再日期。返回是否删了。
+    /// 与 UI 绘制顺序一致（日期 chip 在左、大小在右）。
+    pub fn remove_last_condition(&mut self) -> bool {
+        if self.size.take().is_some() {
+            return true;
+        }
+        self.modified.take().is_some()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -477,6 +486,27 @@ mod tests {
             ..Default::default()
         });
         assert!(!filters.is_empty());
+    }
+
+    #[test]
+    fn keyboard_delete_removes_size_then_date() {
+        let mut filters = SearchFilters {
+            modified: Some(DateRange {
+                after: Some(1),
+                ..Default::default()
+            }),
+            size: Some(SizeRange {
+                after: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(filters.remove_last_condition());
+        assert!(filters.size.is_none(), "先删右边的 size chip");
+        assert!(filters.modified.is_some());
+        assert!(filters.remove_last_condition());
+        assert!(filters.modified.is_none());
+        assert!(!filters.remove_last_condition(), "没有条件时返回 false");
     }
 
     #[test]

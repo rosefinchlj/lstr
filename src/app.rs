@@ -1098,15 +1098,7 @@ impl LstrApp {
     /// Ctrl+Backspace：输入框为空时从右往左删一个条件 chip（大小 → 日期）。
     /// 返回是否真的删了；没有条件时不消费按键，交给 TextEdit。
     fn remove_last_condition(&mut self) -> bool {
-        if self.filters.size.is_some() {
-            self.filters.size = None;
-            return true;
-        }
-        if self.filters.modified.is_some() {
-            self.filters.modified = None;
-            return true;
-        }
-        false
+        self.filters.remove_last_condition()
     }
 
     fn trigger(&mut self, ctx: &egui::Context) {
