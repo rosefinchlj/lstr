@@ -4,7 +4,8 @@ pub mod calc;
 #[cfg(test)]
 mod acceptance_tests;
 pub mod builtin;
-pub mod everything;
+pub mod conditions;
+pub mod entrymeta;
 pub mod filters;
 pub mod fuzzy;
 pub mod pinyin;
@@ -35,7 +36,7 @@ pub(crate) const MIN_DELIVER: usize = 100;
 /// 而不是丢弃——总数与可滚动到的条数必须一致。精确同名（name == 查询词）
 /// 不设上限：用户打的就是完整文件名，每个不同路径都是有效结果。
 const SAME_NAME_KEEP: usize = 3;
-/// 「加载更多」时单次向索引/Everything 要的候选数上限。
+/// 「加载更多」时单次向索引要的候选数上限。
 /// 3000 条交付上限按 2 倍留去重余量 → 6000。
 const MAX_FETCH: usize = 6000;
 
@@ -263,7 +264,7 @@ impl SearchService {
     }
 
     /// 设置页勾选/取消盘后调用:更新掩码并通知 worker 线程切卷。
-    /// worker 没在跑(后端 off / Everything / UAC 被拒)时指令会静默失败,
+    /// worker 没在跑(UAC 被拒/首次连接前)时指令会静默失败,
     /// 下次拉起 worker 会按最新掩码生成启动参数,所以不会丢。
     pub fn set_index_volumes(&self, mask: u32) {
         self.volume_mask.store(mask, Ordering::Relaxed);
@@ -1240,7 +1241,7 @@ fn finalize_entries_with_pending(
     noise: &lstr_index::engine::NoiseRules,
     pending: Option<&PendingMeta>,
 ) -> (Vec<Entry>, f64) {
-    // 排除行硬过滤:索引层已不收录排除目录,但 Everything/历史等来源仍可能
+    // 排除行硬过滤:索引层已不收录排除目录,但历史/收藏等来源仍可能
     // 带进已排除路径;这里统一剔除,保证「排除=搜不到」对所有来源成立。
     // 目录自身可见(与索引层语义一致),只剔严格位于排除目录之下的条目。
     let exclude = noise.rules();
@@ -1353,7 +1354,7 @@ fn finalize_entries_with_pending(
         // 需要丢弃的无效条目)。
         // 去重：retain 闭包持有 seen 集合，一遍完成（旧实现先算 Vec<bool> 掩码
         // 再 retain，两遍且多一次分配；结果完全相同：保留首次出现的条目）。
-        // Windows 路径/ID 大小写不敏感，内置索引与 Everything 对同一个路径给的
+        // Windows 路径/ID 大小写不敏感，索引与历史对同一个路径给的
         // 大小写可能不同，所以 id 先归一化成小写再比较，否则同一条目出现两行。
         let mut seen_ids: HashSet<String> = HashSet::with_capacity(entries.len());
         entries.retain(|entry| seen_ids.insert(entry.id.to_lowercase()));
@@ -1455,9 +1456,9 @@ fn finalize_entries_with_pending(
 
 /// 内置索引能否自带时间筛选:目录枚举(dir 首扫)会把 mtime 写进快照;
 /// incremental="usn"(默认)固定走 dir 首扫(见 config 注释),同样有 mtime。
-/// 纯 USN 首扫(旧 scan_mode="usn")没有 mtime,时间筛选仍需 Everything。
+/// 纯 USN 首扫(旧 scan_mode="usn")没有 mtime,日期筛选无法工作。
 fn builtin_index_has_mtime(index: &crate::config::IndexConfig) -> bool {
-    index.scan_mode == "dir" || index.incremental == "usn" || index.backend == "usn"
+    index.scan_mode == "dir" || index.incremental == "usn"
 }
 
 /// 搜索 worker 的启动参数：字段多且都是「一次注入、全程只读」的句柄，
@@ -1481,7 +1482,7 @@ struct WorkerArgs {
     client_done: Arc<AtomicBool>,
 }
 
-/// 列目录响应：路径模式与深路径浏览共用（不碰 Everything/内置引擎）。
+/// 列目录响应：路径模式与深路径浏览共用（不碰内置引擎）。
 fn browse_response(
     dir: &str,
     filter: &str,
@@ -1499,6 +1500,9 @@ fn browse_response(
         .then(|| request.filters.time.map(|time| time.since_unix()))
         .flatten();
     let group = local_filters.then_some(request.filters.group).flatten();
+    let modified = local_filters
+        .then_some(request.filters.modified.as_ref())
+        .flatten();
     let mut entries: Vec<Entry> = dir_cache
         .children(dir)
         .iter()
@@ -1511,6 +1515,14 @@ fn browse_response(
         })
         .filter(|entry| {
             time_after.is_none_or(|after| entry.modified.is_some_and(|mtime| mtime >= after))
+        })
+        .filter(|entry| {
+            modified.is_none_or(|range| {
+                entry.modified.is_some_and(|mtime| {
+                    range.after.is_none_or(|after| mtime >= after)
+                        && range.before.is_none_or(|before| mtime <= before)
+                })
+            })
         })
         .filter(|entry| {
             // 类型筛选只过滤文件，文件夹保留用于继续导航。
@@ -1589,80 +1601,43 @@ fn run_worker(args: WorkerArgs) {
     let mut noise_applied_raw = noise_slot.lock().unwrap().clone();
     let mut pending_rescan: Vec<(char, Instant)> = Vec::new();
     let mut last_resend = Instant::now();
-    // 显式选择「仅内置索引」:此时无论引擎是否就绪,都不再回落 Everything,
-    // 否则与设置页文案矛盾(旧实现在 Fallback 时仍把查询发给 Everything)。
-    let force_builtin = config.index.backend == "builtin";
-    // 目录扫描(dir)会把 mtime 写进快照,所以内置索引自己能做时间筛选;
-    // 纯 USN 首扫没有 mtime,时间筛选仍需 Everything(或直接报错)。
+    // 目录扫描(dir)会把 mtime 写进快照。纯 USN 首扫(旧 scan_mode="usn")
+    // 没有 mtime，日期筛选只能明确报错，不能静默返回空。
     let builtin_time_ok = builtin_index_has_mtime(&config.index);
-    // 严格模式:用户选了「仅内置索引」就完全不碰 Everything —— 连 IPC 探测
-    // 都不做(既避免 IPC 超时拖慢首次查询,也保证观察不到一切 Everything 结果)。
-    let mut everything = if force_builtin {
-        None
-    } else {
-        match everything::EverythingProvider::new() {
-            Ok(provider) => Some(provider),
-            Err(err) => {
-                eprintln!("lstr: Everything 不可用: {err}");
-                None
-            }
-        }
-    };
-    // 「Everything 不可用」的重试节流：首次探测可能等 IPC 超时(~2s)，
-    // 未运行时常驻用户每次查询都重试会把交互拖慢；最多 10s 试一次。
-    let mut last_everything_probe = Instant::now();
-    // —— 自研索引后端(方案 §4/§6):engine 由本线程独占;client 线程推 EngineMsg ——
+    // —— 自研索引（唯一后端）:engine 由本线程独占;client 线程推 EngineMsg ——
     // 有界通道(背压):client 线程跑得快时会阻塞在 send,防止整个卷的记录
     // 积压在通道内存里(实测无界时 UI 进程冲到 877MB)。
     let (engine_tx, engine_rx) = mpsc::sync_channel::<EngineMsg>(16);
-    let mut builtin: Option<builtin::BuiltinProvider> = None;
     let handshake_slot: Arc<Mutex<Vec<(u128, u64, i64, u64, bool)>>> =
         Arc::new(Mutex::new(Vec::new()));
-    // client 线程是否在跑(优雅退出时要等它确认 worker 已收尾;off/everything
-    // 后端没有 client 线程,收尾等待直接跳过,退出不空转)。
-    let mut client_spawned = false;
-    match config.index.backend.as_str() {
-        // 这两个后端不拉 worker:控制通道直接丢弃(发送端失败即忽略)。
-        "off" | "everything" => {
-            drop(index_cmd_rx);
-        }
-        _ => {
-            let mut engine = builtin::make_engine(
-                            &config.index,
-                            lstr_index::engine::NoiseRules::from_slot(Arc::clone(&noise_slot)),
-                        );
-            // 分批 apply 的块间让路检查:对账/首扫的记录按块消化,块间发现
-            // 等待中的查询(QUERY_INFLIGHT>0)立即收手,让主循环出队服务。
-            engine.set_query_yield_hook(Some(Box::new(|| {
-                QUERY_INFLIGHT.load(Ordering::Relaxed) > 0
-            })));
-            *handshake_slot.lock().unwrap() = engine.handshake_state();
-            builtin::spawn_client_thread(
-                Arc::clone(&handshake_slot),
-                engine_tx.clone(),
-                Arc::clone(&shutdown_client),
-                false,
-                config.index.clone(),
-                index_cmd_rx,
-                volume_mask,
-                Arc::clone(&client_done),
-            );
-            client_spawned = true;
-            builtin = Some(builtin::BuiltinProvider::new(engine));
-        }
-    }
+    let mut engine = builtin::make_engine(
+        &config.index,
+        lstr_index::engine::NoiseRules::from_slot(Arc::clone(&noise_slot)),
+    );
+    // 分批 apply 的块间让路检查:对账/首扫的记录按块消化,块间发现
+    // 等待中的查询(QUERY_INFLIGHT>0)立即收手,让主循环出队服务。
+    engine.set_query_yield_hook(Some(Box::new(|| {
+        QUERY_INFLIGHT.load(Ordering::Relaxed) > 0
+    })));
+    *handshake_slot.lock().unwrap() = engine.handshake_state();
+    builtin::spawn_client_thread(
+        Arc::clone(&handshake_slot),
+        engine_tx.clone(),
+        Arc::clone(&shutdown_client),
+        false,
+        config.index.clone(),
+        index_cmd_rx,
+        volume_mask,
+        Arc::clone(&client_done),
+    );
+    let mut builtin = Some(builtin::BuiltinProvider::new(engine));
     let publish_status = |builtin: Option<&builtin::BuiltinProvider>,
-                          everything: Option<&everything::EverythingProvider>,
                           slot: &Arc<Mutex<Option<builtin::IndexUiStatus>>>| {
         if let Some(b) = builtin {
-            let mut st = b.status();
-            st.everything_ok = everything.is_some();
-            *slot.lock().unwrap() = Some(st);
-        } else if let Some(_e) = everything {
-            *slot.lock().unwrap() = None;
+            *slot.lock().unwrap() = Some(b.status());
         }
     };
-    publish_status(builtin.as_ref(), everything.as_ref(), &status_slot);
+    publish_status(builtin.as_ref(), &status_slot);
     let mut apps = apps::AppIndex::load();
     let mut apps_loaded = Instant::now();
     let mut dir_cache = browse::DirCache::new();
@@ -1822,7 +1797,7 @@ fn run_worker(args: WorkerArgs) {
                 ));
             }
         }
-        publish_status(builtin.as_ref(), everything.as_ref(), &status_slot);
+        publish_status(builtin.as_ref(), &status_slot);
         // 状态变化时唤醒 UI(横幅进度条不击键也要动)
         {
             let st = status_slot.lock().unwrap();
@@ -1852,27 +1827,6 @@ fn run_worker(args: WorkerArgs) {
                 }
             }
         };
-        // 用户可能刚点了提示条启动 Everything；每次查询前尝试重连，
-        // 而不是启动时连不上就永久报错。
-        // 但 IPC 探测在 Everything 未运行时要等超时(实测 ~2s)，而 UI 显示的
-        // elapsed_ms 从请求出队后才开始计，用户就会看到「显示 70ms、实际等 2s」。
-        // 因此：只有可能用到 Everything 的阶段才重试，且最多 10s 一次。
-        if everything.is_none() {
-            let phase_ready = builtin
-                .as_ref()
-                .map(|b| b.status().phase == lstr_index::Phase::Ready)
-                .unwrap_or(false);
-            // 严格「仅内置索引」模式:任何阶段都不探测/回落 Everything。
-            let need_everything = !force_builtin
-                && (config.index.backend == "everything"
-                    || !phase_ready
-                    // dir 扫描的索引自己带 mtime:Ready 后时间筛选不再需要 Everything
-                    || (request.filters.time.is_some() && !builtin_time_ok));
-            if need_everything && last_everything_probe.elapsed() >= Duration::from_secs(10) {
-                last_everything_probe = Instant::now();
-                everything = everything::EverythingProvider::new().ok();
-            }
-        }
         while let Ok(uwp_entries) = uwp_rx.try_recv() {
             apps.append_uwp(uwp_entries);
         }
@@ -1900,7 +1854,7 @@ fn run_worker(args: WorkerArgs) {
                 ));
             }
         }
-        // 诊断:记录本次请求的解析结果与索引阶段,用来解释「为什么走了 Everything」。
+        // 诊断:记录本次请求的解析结果与索引阶段。
         // 仅剖析模式(LSTR_PROFILE_QUERY)逐查询落盘;默认不写——旧实现每查询
         // 无条件 open/append/close 一次日志,是热路径上的无谓 IO(慢查询另有分项日志)。
         if profile_queries() {
@@ -1909,13 +1863,12 @@ fn run_worker(args: WorkerArgs) {
                 .map(|b| b.status().phase)
                 .unwrap_or(lstr_index::Phase::Fallback);
             lstr_index::snapshot::debug_log(&format!(
-                "search: req gen={} text={:?} scope={:?} phase={:?} builtin={} everything={}",
+                "search: req gen={} text={:?} scope={:?} phase={:?} builtin={}",
                 request.generation,
                 request.query.text,
                 request.query.scope,
                 phase,
                 builtin.is_some(),
-                everything.is_some()
             ));
         }
 
@@ -1966,7 +1919,7 @@ fn run_worker(args: WorkerArgs) {
         }
 
         // 路径模式（D:\foo\bar、\\server\share）：直接列目录，
-        // 不碰 Everything，也不必为它懒启动 PowerShell 枚举 UWP。
+        // 纯内置索引，也不必为 Everything 懒启动 PowerShell 枚举 UWP。
         if let Some(path_query) = if request.filters.matches.regex
             || request.browse_root.is_some()
         {
@@ -2046,6 +1999,16 @@ fn run_worker(args: WorkerArgs) {
         let mut entries = Vec::new();
         let mut total = 0usize;
         let mut error = None;
+        // 旧 scan_mode="usn" 的纯 USN 首扫没有 mtime：日期/时间条件无法成立。
+        // 明确提示，避免用户把「0 结果」误当成「真的没有匹配文件」。
+        if (request.filters.time.is_some() || request.filters.modified.is_some())
+            && !builtin_time_ok
+        {
+            error = Some(
+                "当前索引模式不记录修改时间，无法按日期筛选（请改用 incremental=usn）"
+                    .to_string(),
+            );
+        }
         // 分项耗时（诊断「引擎 35ms 花在哪」）：split=一次 All-kind 双路查询
         // （旧实现 folders/files 各一次）、exact 补齐、apps 应用索引，
         // finalize 合并打分排序。>15ms 的慢查询落 engine.log。
@@ -2059,7 +2022,9 @@ fn run_worker(args: WorkerArgs) {
         // 展示条目逐条 find_meta(见 finalize_entries_with_pending)。
         let mut pending_meta = PendingMeta::new();
 
-        if request.query.is_empty() {
+        // 输入框为空但筛选/日期条件仍生效时，不能走「最近使用」分支：
+        // 条件单独查询要交给引擎做全表过滤（空 token 的过滤器路径）。
+        if request.query.is_empty() && request.filters.is_empty() {
             if request.show_history {
                 if let Ok(history) = history.lock() {
                     entries = history.recent_entries(request.limit.max(8));
@@ -2124,24 +2089,6 @@ fn run_worker(args: WorkerArgs) {
                         keyword_rows = keyword_entries(&request.keywords, &request.query.text);
                     }
                     let mut needs_exact = false;
-                    let phase = builtin
-                        .as_ref()
-                        .map(|b| b.engine.status().phase)
-                        .unwrap_or(lstr_index::Phase::Fallback);
-                    let use_builtin = force_builtin || phase != lstr_index::Phase::Fallback;
-                    // 正则是内置引擎的 bytes regex；Everything 的 PCRE 语法/结果不同，
-                    // 索引未就绪时宁可明确报错，也不把 pattern 当普通文本误搜。
-                    let regex_needs_builtin =
-                        request.filters.matches.regex && !use_builtin;
-                    // 时间筛选依赖文件 mtime:USN 不含(方案 §3.2),降级走 Everything
-                    let time_forced = request.filters.time.is_some();
-                    // 构建期与 Everything 合并(方案 §5.2.2);Ready 后纯内置
-                    let merge_everything = use_builtin
-                        && !force_builtin
-                        && phase != lstr_index::Phase::Ready
-                        && !time_forced
-                        && !request.filters.matches.regex
-                        && everything.is_some();
                     let fetch = fetch_count(&request.query, request.limit, request.deliver);
                     // 加载更多时同比例放宽文件夹候选预算；首屏仍以 120 封顶（行为不变）。
                     let folder_cap = 120 + request.deliver.saturating_sub(MIN_DELIVER) / 4;
@@ -2151,9 +2098,8 @@ fn run_worker(args: WorkerArgs) {
                     // split 并趟产出的精确同名补齐(旧 search_exact 第二趟)。
                     let mut split_exact: Option<Vec<Entry>> = None;
                     let mut split_exact_ms = 0f32;
-                    if use_builtin && (!time_forced || builtin_time_ok) {
+                    if let Some(b) = &builtin {
                         // 内置索引:本地引擎,双路语义在 kind 过滤层保持
-                        if let Some(b) = &builtin {
                             // H4:内置双路都用同一 spec 时,旧实现把同一个 All-kind
                             // 总数加了两次(total=2N),且 truncation 恒 >0 → 每次
                             // All 查询都走“先发一版 + exact 补”两阶段。
@@ -2206,66 +2152,6 @@ fn run_worker(args: WorkerArgs) {
                                     error = Some(err)
                                 }
                             }
-                        }
-                    } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
-                        match provider.search_split(
-                            &request.query,
-                            &request.filters,
-                            folder_fetch,
-                            true,
-                        ) {
-                            Ok((mut folders, count)) => {
-                                total += count;
-                                truncation += count.saturating_sub(folders.len());
-                                entries.append(&mut folders);
-                            }
-                            Err(err) => error = Some(err),
-                        }
-                        match provider.search_split(
-                            &request.query,
-                            &request.filters,
-                            file_fetch,
-                            false,
-                        ) {
-                            Ok((mut files, count)) => {
-                                total += count;
-                                truncation += count.saturating_sub(files.len());
-                                entries.append(&mut files);
-                            }
-                            Err(err) => error = error.or(Some(err)),
-                        }
-                        // 截断才需要 wfn 精确兜底；延后到第一版结果发出后再查。
-                        needs_exact = truncation > 0;
-                    } else if regex_needs_builtin {
-                        error = Some("正则搜索需要内置索引就绪".to_string());
-                    } else if time_forced {
-                        error = Some(if force_builtin {
-                            "仅内置索引模式不支持时间筛选(USN 不含修改时间)".to_string()
-                        } else {
-                            "时间筛选需要 Everything(内置索引暂不含文件修改时间)".to_string()
-                        });
-                    } else {
-                        error = Some("索引未启用且 Everything 未运行".to_string());
-                    }
-                    if merge_everything {
-                        if let Some(provider) = &everything {
-                            if let Ok((mut folders, _)) = provider.search_split(
-                                &request.query,
-                                &request.filters,
-                                folder_fetch,
-                                true,
-                            ) {
-                                entries.append(&mut folders);
-                            }
-                            if let Ok((mut files, _)) = provider.search_split(
-                                &request.query,
-                                &request.filters,
-                                file_fetch,
-                                false,
-                            ) {
-                                entries.append(&mut files);
-                            }
-                        }
                     }
                     if request.filters.is_empty()
                         && !in_folder_context
@@ -2289,7 +2175,7 @@ fn run_worker(args: WorkerArgs) {
                         total += command_hits.len();
                         entries.append(&mut command_hits);
                     }
-                    // M7:合并进来的 Everything 结果与应用/命令命中也要计入总数,
+                    // M7:应用/命令命中也要计入总数,
                     // 否则会出现「显示 0 个结果但列表里有内容」。
                     total = total.max(entries.len());
                     // 精确同名补齐必须在唯一一次返回之前完成。旧实现把补齐放在
@@ -2298,42 +2184,22 @@ fn run_worker(args: WorkerArgs) {
                     // 100),UI 会停在这一版上,用户就看不到 ai。现在只发一次,
                     // 每次返回都经过 pin 置顶,不存在“中间错列表”的窗口。
                     if needs_exact {
-                        let phase = builtin
-                            .as_ref()
-                            .map(|b| b.engine.status().phase)
-                            .unwrap_or(lstr_index::Phase::Fallback);
                         if let Some(b) = &builtin {
-                            if (force_builtin || phase != lstr_index::Phase::Fallback)
-                                && request.filters.time.is_none()
-                            {
-                                // split 并趟已带回精确同名候选(与旧 search_exact
-                                // 逐条一致),直接 append;仅在拿不到(如 split 出错)
-                                // 时才回退第二趟查询。
-                                if let Some(mut exact) = split_exact.take() {
-                                    entries.append(&mut exact);
-                                    diag_exact = split_exact_ms;
-                                } else {
-                                    let t_exact = Instant::now();
-                                    let r_exact =
-                                        b.search_exact(&request.query, &request.filters, 50);
-                                    diag_exact = t_exact.elapsed().as_secs_f32() * 1000.0;
-                                    if let Ok((mut exact, _)) = r_exact {
-                                        pending_meta.mark(&exact, false);
-                                        entries.append(&mut exact);
-                                    }
-                                }
-                            } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
-                                if let Ok((mut exact, _)) =
-                                    provider.search_exact(&request.query, &request.filters, 50)
-                                {
-                                    entries.append(&mut exact);
-                                }
-                            }
-                        } else if let Some(provider) = &everything {
-                            if let Ok((mut exact, _)) =
-                                provider.search_exact(&request.query, &request.filters, 50)
-                            {
+                            // split 并趟已带回精确同名候选(与旧 search_exact
+                            // 逐条一致),直接 append;仅在拿不到(如 split 出错)
+                            // 时才回退第二趟查询。
+                            if let Some(mut exact) = split_exact.take() {
                                 entries.append(&mut exact);
+                                diag_exact = split_exact_ms;
+                            } else {
+                                let t_exact = Instant::now();
+                                let r_exact =
+                                    b.search_exact(&request.query, &request.filters, 50);
+                                diag_exact = t_exact.elapsed().as_secs_f32() * 1000.0;
+                                if let Ok((mut exact, _)) = r_exact {
+                                    pending_meta.mark(&exact, false);
+                                    entries.append(&mut exact);
+                                }
                             }
                         }
                         total = total.max(entries.len());
@@ -2341,99 +2207,29 @@ fn run_worker(args: WorkerArgs) {
                 }
                 _ => {
                     let mut needs_exact = false;
-                    let phase = builtin
-                        .as_ref()
-                        .map(|b| b.engine.status().phase)
-                        .unwrap_or(lstr_index::Phase::Fallback);
-                    let time_forced = request.filters.time.is_some();
-                    let used_builtin = (force_builtin || phase != lstr_index::Phase::Fallback)
-                        && (!time_forced || builtin_time_ok);
                     if let Some(b) = &builtin {
-                        if used_builtin {
-                            let fetch = fetch_count(&request.query, request.limit, request.deliver);
-                            match b.search(&request.query, &request.filters, fetch) {
-                                Ok((mut files, count)) => {
-                                    total = count;
-                                    needs_exact = count > files.len();
-                                    pending_meta.mark(&files, true);
-                                    entries.append(&mut files);
-                                }
-                                Err(err) => error = Some(err),
-                            }
-                        } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
-                            let fetch = fetch_count(&request.query, request.limit, request.deliver);
-                            match provider.search(&request.query, &request.filters, fetch) {
-                                Ok((mut files, count)) => {
-                                    total = count;
-                                    needs_exact = count > files.len();
-                                    entries.append(&mut files);
-                                }
-                                Err(err) => error = Some(err),
-                            }
-                        } else {
-                            error = Some(if time_forced {
-                                "时间筛选需要 Everything(内置索引暂不含文件修改时间)".to_string()
-                            } else {
-                                "内置索引尚未就绪(需管理员授权或等待首次构建)".to_string()
-                            });
-                        }
-                    } else if let Some(provider) = &everything {
                         let fetch = fetch_count(&request.query, request.limit, request.deliver);
-                        match provider.search(&request.query, &request.filters, fetch) {
+                        match b.search(&request.query, &request.filters, fetch) {
                             Ok((mut files, count)) => {
                                 total = count;
                                 needs_exact = count > files.len();
+                                pending_meta.mark(&files, true);
                                 entries.append(&mut files);
                             }
                             Err(err) => error = Some(err),
                         }
                     } else {
-                        error = Some("索引未启用且 Everything 未运行".to_string());
+                        error = Some("内置索引尚未就绪(需管理员授权或等待首次构建)".to_string());
                     }
-                    // M5:内置索引还没 Ready(Fallback 以上的构建期)时,单 scope
-                    // 也要像 All scope 一样合并 Everything 的结果;否则构建期
-                    // 只能看到半成品索引,查不到尚未扫到的文件。
-                    if used_builtin && phase != lstr_index::Phase::Ready {
-                        if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
-                            let fetch = fetch_count(&request.query, request.limit, request.deliver);
-                            if let Ok((mut extra, count)) =
-                                provider.search(&request.query, &request.filters, fetch)
-                            {
-                                total = total.max(count);
-                                entries.append(&mut extra);
-                            }
-                        }
-                    }
-                    // M7:合并的 Everything 结果与精确补齐都要计入总数。
                     total = total.max(entries.len());
                     // 同 All 分支:精确补齐在唯一一次返回之前完成,避免 UI 停在
                     // 未置顶的中间版本上。
                     if needs_exact {
-                        let phase = builtin
-                            .as_ref()
-                            .map(|b| b.engine.status().phase)
-                            .unwrap_or(lstr_index::Phase::Fallback);
                         if let Some(b) = &builtin {
-                            if (force_builtin || phase != lstr_index::Phase::Fallback)
-                                && request.filters.time.is_none()
-                            {
-                                if let Ok((mut exact, _)) =
-                                    b.search_exact(&request.query, &request.filters, 50)
-                                {
-                                    pending_meta.mark(&exact, false);
-                                    entries.append(&mut exact);
-                                }
-                            } else if let Some(provider) = everything.as_ref().filter(|_| !force_builtin) {
-                                if let Ok((mut exact, _)) =
-                                    provider.search_exact(&request.query, &request.filters, 50)
-                                {
-                                    entries.append(&mut exact);
-                                }
-                            }
-                        } else if let Some(provider) = &everything {
                             if let Ok((mut exact, _)) =
-                                provider.search_exact(&request.query, &request.filters, 50)
+                                b.search_exact(&request.query, &request.filters, 50)
                             {
+                                pending_meta.mark(&exact, false);
                                 entries.append(&mut exact);
                             }
                         }
@@ -2443,7 +2239,7 @@ fn run_worker(args: WorkerArgs) {
             }
         }
 
-        // 盘符过滤兜底：内置引擎已按卷掩码查询；Everything/历史等其余来源的
+        // 盘符过滤兜底：内置引擎已按卷掩码查询；历史等其余来源的
         // 路径条目在这里统一裁掉（应用/命令无盘符，不受影响）。
         if let Some(mask) = request.query.drive_mask() {
             entries.retain(|e| {
@@ -2515,9 +2311,9 @@ send_response(&tx, &request, Response {
     // M4 + 退出收 worker:client 线程收到 shutdown 后会发 Shutdown 并等
     // worker 退出(≤3s),随后置 client_done;这里给它一个略宽的有界等待
     // (窗口还能覆盖管道半开/重连间隙的收尾),完成后向 on_exit 发出
-    // worker_collected。没有 client 线程(off/everything 后端)直接跳过。
+    // worker_collected。
     shutdown_client.store(true, Ordering::Relaxed);
-    if client_spawned {
+    {
         let deadline = Instant::now() + Duration::from_secs(4);
         while !client_done.load(Ordering::Relaxed) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -2538,7 +2334,7 @@ fn fetch_count(query: &Query, limit: usize, deliver: usize) -> usize {
     let base = if short {
         80
     } else {
-        // 实测 Everything IPC 的瓶颈在查询评估本身（~120ms，与条数基本无关），
+        // 实测引擎查询评估本身是主要成本（与条数基本无关），
         // 300→500 只多花约 8ms，却能给排序多 66% 的候选，值得保留。
         (limit * 50).min(500)
     };
@@ -2618,7 +2414,6 @@ fn commands(q: &str, custom: &[crate::assets::CommandDef]) -> Vec<Entry> {
     let all = [
         ("cmd:settings", "打开设置"),
         ("cmd:reload", "重新加载"),
-        ("cmd:everything", "启动 Everything"),
         ("cmd:quit", "退出 lstr"),
     ];
     let needle = q.to_lowercase();
@@ -2770,22 +2565,15 @@ mod tests {
 
         index.scan_mode = "usn".to_string();
         assert!(!builtin_index_has_mtime(&index), "纯 USN 首扫无 mtime");
-
-        // 旧 backend=usn：同样固定 dir 首扫
-        index.backend = "usn".to_string();
-        assert!(builtin_index_has_mtime(&index), "旧 usn 后端固定 dir 首扫,有 mtime");
     }
 
-    /// 测试隔离:默认配置 backend=auto 会让服务线程真去探活/拉起 worker
-    /// (runas → 可能弹 UAC),在测试机器上既慢又打扰用户。单测一律关掉
-    /// 内置索引;需要 Everything 的用例本来就标了 #[ignore]。
+    /// 测试隔离:测试进程不会拉起提权 worker(cfg(test) 下 spawn_client_thread
+    /// 直接拒绝启动),引擎目录也走临时目录,不会触碰真实索引。
     fn test_config() -> crate::config::Config {
-        let mut config = crate::config::Config::default();
-        config.index.backend = "off".to_string();
-        config
+        crate::config::Config::default()
     }
 
-    /// L6:Windows 路径/ID 大小写不敏感,内置索引与 Everything 对同一路径给的
+    /// L6:Windows 路径/ID 大小写不敏感,索引与历史对同一路径给的
     /// 大小写可能不同,去重必须归一化,否则同一条目出现两行。
     #[test]
     fn duplicate_ids_are_deduped_case_insensitively() {
@@ -2968,47 +2756,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a running Everything instance"]
-    fn exact_folder_survives_candidate_truncation() {
-        // 回归：E:\use 这种老目录在常规候选里会被「最近修改的 User*」挤出，
-        // wfn: 兜底后必须能搜到。机器上没有 E:\use 时跳过。
-        let target = std::path::Path::new(r"E:\use");
-        if !target.exists() {
-            return;
-        }
-        let config = test_config();
-        let history = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::history::History::in_memory(),
-        ));
-        let ctx = eframe::egui::Context::default();
-        let mut service = SearchService::new(config, history, ctx);
-        let generation = service.search("use", crate::model::Scope::All, false, &Default::default(), &Default::default(), true);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            if let Some(response) = service.poll() {
-                if response.generation == generation {
-                    assert!(
-                        response
-                            .entries
-                            .iter()
-                            .any(|e| e.full_path().eq_ignore_ascii_case(r"E:\use")),
-                        "「use」的结果里应有 E:\\use，实际前几条: {:?}",
-                        response
-                            .entries
-                            .iter()
-                            .take(8)
-                            .map(|e| e.full_path())
-                            .collect::<Vec<_>>()
-                    );
-                    return;
-                }
-            }
-            assert!(std::time::Instant::now() < deadline, "等待搜索结果超时");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
-    #[test]
     fn stale_history_entries_are_filtered() {
         use std::path::PathBuf;
 
@@ -3075,7 +2822,7 @@ mod tests {
     #[test]
     fn browse_mode_flows_through_service() {
         let _guard = SERVICE_TEST_LOCK.lock().unwrap();
-        // 路径模式只依赖 read_dir，无需 Everything，可做端到端回归。
+        // 路径模式只依赖 read_dir，可做端到端回归。
         fn wait(service: &SearchService, generation: u64) -> Response {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
@@ -3239,36 +2986,6 @@ mod tests {
         assert_eq!(service.deliver, MIN_DELIVER);
     }
 
-    #[test]
-    #[ignore = "requires a running Everything instance"]
-    fn pipeline_perf() {
-        let config = test_config();
-        let history = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::history::History::in_memory(),
-        ));
-        let ctx = eframe::egui::Context::default();
-        let mut service = SearchService::new(config, history, ctx);
-        for q in ["c", "rs", "clip", "设置", "weixin"] {
-            let generation = service.search(q, crate::model::Scope::All, false, &Default::default(), &Default::default(), true);
-            let started = std::time::Instant::now();
-            loop {
-                if let Some(response) = service.poll() {
-                    if response.generation == generation {
-                        println!(
-                            "{q}: {} entries (total {}) worker {:.1}ms, pipeline {:.1}ms",
-                            response.entries.len(),
-                            response.total,
-                            response.elapsed_ms,
-                            started.elapsed().as_secs_f32() * 1000.0
-                        );
-                        break;
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-        }
-    }
-
     /// 回归(2026-11-09 截图):搜 "ai" 时精确同名文件夹必须出现在**唯一一次**
     /// 返回里并置顶。旧实现在精确补齐之前先发了一版未置顶的结果,而且那一版
     /// 里根本没有 E:\use\ai(文件夹候选预算 100,它在第 246 个),UI 一旦停在那
@@ -3282,8 +2999,6 @@ mod tests {
             return;
         }
         let mut config = crate::config::Config::default();
-        // 强制纯内置索引:不依赖 Everything,也不会有双后端合并干扰。
-        config.index.backend = "builtin".to_string();
         config.max_results = 10;
         let history = std::sync::Arc::new(std::sync::Mutex::new(
             crate::history::History::in_memory(),
@@ -3341,8 +3056,6 @@ mod tests {
     #[ignore = "requires the machine's builtin index snapshot"]
     fn program_scope_only_returns_programs() {
         let mut config = crate::config::Config::default();
-        // 强制纯内置索引:Everything 合并会掩盖分类过滤的回归。
-        config.index.backend = "builtin".to_string();
         config.max_results = 20;
         let history = std::sync::Arc::new(std::sync::Mutex::new(
             crate::history::History::in_memory(),

@@ -13,7 +13,7 @@ const APP_BOOST_UNIT: i32 = 10;
 // 同分时文件夹略微优先于文件。
 const FOLDER_TIE_BONUS: i32 = 5;
 // 命令的别名精确命中（如「设置」）要压过最近用过的同名应用，但不能
-// 让「启动 Everything」这类命令在搜索 everything 时盖过应用本身。
+// 让「打开设置」这类命令在搜索 settings 时盖过应用本身。
 const COMMAND_BOOST: i32 = 300;
 // 精确同名时按路径深浅再排一次：E:\use 应压过
 // C:\...\perl5\core_perl\Test\use 这种深埋的同名目录（home 加权会反过来）。
@@ -412,7 +412,7 @@ fn match_tier(
     }
 
     // 多词查询：所有词都出现在名称里（`my report` → `my_report.pdf`）。
-    // Everything 已按 AND 过滤，这里给个合理档位，别让它们沉底。
+    // 引擎已按 AND 过滤，这里给个合理档位，别让它们沉底。
     if needle.contains(char::is_whitespace) {
         let tokens: Vec<&str> = needle.split_whitespace().collect();
         if tokens.len() > 1 && tokens.iter().all(|token| name.contains(token)) {
@@ -456,7 +456,7 @@ fn match_tier(
     }
 
     // 子序列模糊只作用于本地索引能新产出结果的类别（应用/命令/程序）；
-    // 文件类由 Everything 按子串过滤，模糊档加不出新结果只会带来噪声。
+    // 文件类由引擎按子串过滤，模糊档加不出新结果只会带来噪声。
     if matches!(entry.kind, Kind::App | Kind::Command | Kind::Program) {
         let mut best = crate::search::fuzzy::score_dense(&entry.name, needle);
         if best.is_none() {
@@ -763,7 +763,7 @@ mod tests {
 
     #[test]
     fn files_do_not_fuzzy_match() {
-        // 文件类结果由 Everything 按子串过滤，客户端不再做模糊，避免噪声。
+        // 文件类结果由引擎按子串过滤，客户端不再做模糊，避免噪声。
         let file = entry("f", "calendar.ics", Kind::File);
         assert_eq!(score_entry(&file, "cdr", &History::in_memory(), 3), 0);
     }

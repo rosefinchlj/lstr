@@ -1,7 +1,7 @@
 //! 验收表自动化版（2026-11-10 的 `LstrAcc` 夹具）。
 //!
 //! 用户按编号逐条手测过一张 30 行的搜索验收表，这组测试把其中
-//! **能在无 GUI / 无 Everything / 无权限依赖下复现的行**固化成断言：
+//! **能在无 GUI / 无管理员权限依赖下复现的行**固化成断言：
 //! 输入字符串 → `query::parse` → `build_spec` → 内置索引引擎 → Entry 列表。
 //! 夹具是测试自己创建的真实文件（挂在 target-opt 下），索引由真实
 //! `Engine` 吃 `EngineMsg::Records` 建立，因此路径拼接、拼音缓存、
@@ -22,7 +22,7 @@ use lstr_index::{Engine, EngineConfig, EngineMsg, Op, Phase, Rec};
 
 use crate::model::{Entry, Kind, Scope};
 use crate::search::builtin::BuiltinProvider;
-use crate::search::filters::{SearchFilters, TimeFilter};
+use crate::search::filters::{DateRange, SearchFilters, TimeFilter};
 use crate::search::{browse, query};
 
 const DIR_ATTR: u32 = 0x10;
@@ -39,6 +39,8 @@ struct Fixture {
     empty_dir: PathBuf,
     snap: PathBuf,
     letter: char,
+    /// 夹具根目录在索引里的 FRN（日期条件测试要给根文件发新记录）。
+    root_frn: u64,
 }
 
 impl Drop for Fixture {
@@ -215,6 +217,7 @@ fn fixture() -> Option<Fixture> {
         empty_dir: root.join("LstrAcc-空目录"),
         snap,
         letter,
+        root_frn,
     })
 }
 
@@ -452,4 +455,99 @@ fn acceptance_g_time_filter_and_relative_time() {
 
     // G26 空态技巧面板、G27 Esc 后再次唤出保留输入/结果、G29 预览面板
     // 「修改 刚刚」属于 egui 状态与布局，保留在手工验收表。
+}
+
+// ---------------------------------------------------------------------------
+// H. 输入框日期条件（Phase 1）
+// ---------------------------------------------------------------------------
+
+/// 用真实文件 + 真实引擎验证：日期条件在候选过滤阶段生效，total 与返回
+/// 条数同口径；空输入只有条件时走引擎的全表过滤，而不是「最近使用」。
+#[test]
+fn acceptance_h_date_condition_filters_by_index_mtime() {
+    let Some(mut fx) = fixture() else { return };
+    // 文件时间；过滤发生在引擎的 mtime 列上）。
+    let old = 1_700_000_000i64;
+    let mid = 1_780_000_000i64;
+    let new = 1_790_000_000i64;
+    let rec = |frn: u64, parent_frn: u64, name: &str, mtime: i64| Rec {
+        frn,
+        parent_frn,
+        attrs: 0,
+        op: Op::Upsert,
+        name: name.to_string(),
+        mtime,
+    };
+    fx.provider.engine.handle(EngineMsg::Records {
+        guid: 0xACC5,
+        recs: vec![
+            rec(2001, 1001, "LstrAcc-全匹配.md", old),
+            rec(2002, 1001, "LstrAcc-扩展名测试.RS", mid),
+            rec(2007, fx.root_frn, "LstrAcc-根文件.log", new),
+        ],
+        next_usn: 100,
+    });
+
+    let date_filters = |after: Option<i64>, before: Option<i64>| SearchFilters {
+        modified: Some(DateRange {
+            after,
+            before,
+            after_text: after.map(|_| "条件".to_string()),
+            before_text: before.map(|_| "条件".to_string()),
+        }),
+        ..Default::default()
+    };
+    let names = |input: &str, filters: &SearchFilters| {
+        let (entries, total) = search(&fx, input, Scope::All, filters);
+        assert_eq!(entries.len(), total, "H1 total 与返回条数必须一致");
+        entries.into_iter().map(|e| e.name).collect::<Vec<_>>()
+    };
+
+    // 下界：mid 之前的文件被排除。
+    assert_eq!(
+        names("LstrAcc-全匹配", &date_filters(Some(mid), None)),
+        Vec::<String>::new(),
+        "H2 老文件应被下界排除"
+    );
+    assert_eq!(
+        names("LstrAcc-扩展名测试", &date_filters(Some(mid), None)),
+        vec!["LstrAcc-扩展名测试.RS".to_string()],
+        "H3 边界含等号"
+    );
+    assert_eq!(
+        names("LstrAcc-根文件", &date_filters(Some(mid), None)),
+        vec!["LstrAcc-根文件.log".to_string()],
+        "H4 新文件应通过下界"
+    );
+
+    // 上界：只留 mid 之前的文件。
+    assert_eq!(
+        names("LstrAcc-全匹配", &date_filters(None, Some(mid - 1))),
+        vec!["LstrAcc-全匹配.md".to_string()],
+        "H5 上界含边界"
+    );
+    assert_eq!(
+        names("LstrAcc-扩展名测试", &date_filters(None, Some(mid - 1))),
+        Vec::<String>::new(),
+        "H6 上界应排除边界文件"
+    );
+
+    // 双边区间：只有 mid 这一个文件，目录（mtime=今天）也被上界排除。
+    assert_eq!(
+        names("LstrAcc-", &date_filters(Some(mid), Some(new - 1))),
+        vec!["LstrAcc-扩展名测试.RS".to_string()],
+        "H7 区间过滤应同时收窄上下界"
+    );
+
+    // 空输入 + 只有条件：必须走引擎过滤，不能退化成「最近使用」。
+    let (entries, total) = search(&fx, "", Scope::All, &date_filters(Some(mid), None));
+    assert!(total >= 3, "H8 条件单独查询应有结果，实际 total={total}");
+    assert!(
+        entries.iter().all(|e| e.modified.is_some_and(|m| m >= mid)),
+        "H8 返回条目的 mtime 必须满足下界: {:?}",
+        entries
+            .iter()
+            .map(|e| (e.name.clone(), e.modified))
+            .collect::<Vec<_>>()
+    );
 }

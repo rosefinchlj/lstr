@@ -68,14 +68,10 @@ fn normalize_max_load_results(value: usize) -> usize {
     value.clamp(MIN_LOAD_RESULTS, MAX_LOAD_RESULTS)
 }
 
-/// 自研索引引擎配置。backend:
-/// `auto` = worker 可用走内置,否则 Everything;`builtin` 强制内置(不碰
-/// Everything);`everything` 只用 Everything。`off` 是历史值,load 时迁移为
-/// `everything`(两者搜索行为相同)。
+/// 自研索引引擎配置。程序只使用内置索引（无 Everything 后端）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IndexConfig {
-    pub backend: String,
     /// 排除噪声目录(node_modules/.git/target 等,实测省 53% 内存)。
     /// 历史字段:迁移后由 rank.noise_rules 的排除行接替,仅作首次迁移种子。
     #[serde(default, skip_serializing)]
@@ -95,7 +91,6 @@ pub struct IndexConfig {
     /// - `usn`（默认）：目录首扫 + USN journal 轮询；快照游标可信时免扫直读。
     ///   卷打不开 / journal 不可用时，worker 按卷自动退回目录监视。
     /// - `watch`：只用 ReadDirectoryChangesW 目录监视，零 USN FSCTL。
-    /// 仅在 backend 使用内置索引时生效（everything/off 忽略）。
     #[serde(default = "default_incremental")]
     pub incremental: String,
     /// 只索引这些盘(如 `["F"]`);空 = 全部本机固定 NTFS 卷。
@@ -121,7 +116,6 @@ fn default_journal_poll_ms() -> u64 {
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
-            backend: "auto".into(),
             exclude_noise: true,
             noise_seeded: false,
             candidate_cap: 2000,
@@ -153,19 +147,6 @@ impl IndexConfig {
             "watch" => "watch".to_string(),
             _ => "usn".to_string(),
         };
-    }
-
-    /// 旧 `backend` 值迁移（Config::load 时调用）：
-    /// - `usn` → `auto` + `incremental = usn`（USN 现在只是内置索引的实时层，
-    ///   不再是一个“后端”）；
-    /// - `off` → `everything`（两者搜索行为相同，去掉重复选项）。
-    pub fn migrate_legacy_backend(&mut self) {
-        if self.backend == "usn" {
-            self.backend = "auto".to_string();
-            self.incremental = "usn".to_string();
-        } else if self.backend == "off" {
-            self.backend = "everything".to_string();
-        }
     }
 
     fn normalize_letters<I>(letters: I) -> Vec<String>
@@ -572,8 +553,6 @@ impl Config {
             Ok(mut cfg) => {
                 cfg.rank.backfill_missing_noise_rules();
                 cfg.max_load_results = normalize_max_load_results(cfg.max_load_results);
-                cfg.index.backend = normalize_backend(&cfg.index.backend);
-                cfg.index.migrate_legacy_backend();
                 cfg.index.normalize_volumes();
                 cfg.index.normalize();
                 // 内置排除段名迁入统一噪声列表(一次性,幂等)。实际发生迁移时
@@ -608,20 +587,6 @@ impl Config {
         let tmp = path.with_extension("toml.tmp");
         fs::write(&tmp, text).map_err(|e| format!("写入配置失败: {e}"))?;
         fs::rename(&tmp, &path).map_err(|e| format!("替换配置失败: {e}"))
-    }
-}
-
-/// 后端名归一化:接受 auto/builtin/everything;`usn`/`off` 是旧值,
-/// 由 [`IndexConfig::migrate_legacy_backend`] 迁移。未知值一律回 auto,
-/// 避免手写 config.toml 里的错拼被静默当成「建内置引擎」。
-pub fn normalize_backend(raw: &str) -> String {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "auto" => "auto".into(),
-        "builtin" => "builtin".into(),
-        "usn" => "usn".into(),
-        "everything" => "everything".into(),
-        "off" => "off".into(),
-        _ => "auto".into(),
     }
 }
 
@@ -689,26 +654,11 @@ mod tests {
         assert_eq!(cfg.volumes, vec!["F".to_string()]);
     }
 
-    #[test]
-    fn backend_names_are_normalized() {
-        assert_eq!(normalize_backend("auto"), "auto");
-        assert_eq!(normalize_backend("  BuIlTiN "), "builtin");
-        assert_eq!(normalize_backend("everything"), "everything");
-        assert_eq!(normalize_backend("off"), "off");
-        // USN 增量后端:归一化接受,大小写/空白容忍
-        assert_eq!(normalize_backend("usn"), "usn");
-        assert_eq!(normalize_backend(" USN "), "usn");
-        // 手写错拼不再静默创建内置引擎,回落 auto
-        assert_eq!(normalize_backend("bogus"), "auto");
-        assert_eq!(normalize_backend(""), "auto");
-    }
-
-    /// 提交约束:backend 默认值(auto)与既有字段默认值不变;新增字段默认
-    /// 是「零行为差异」(不限流 + 500ms 轮询)。
+    /// 提交约束:既有字段默认值不变;新增字段默认是「零行为差异」
+    /// (不限流 + 500ms 轮询)。
     #[test]
     fn throttle_and_poll_defaults_are_neutral() {
         let cfg = IndexConfig::default();
-        assert_eq!(cfg.backend, "auto");
         assert_eq!(cfg.scan_mode, "dir");
         assert!(!cfg.journal_enabled);
         assert_eq!(cfg.scan_throttle_ms, 0, "默认不限流,行为与旧版一致");
@@ -716,33 +666,22 @@ mod tests {
     }
 
     /// 旧配置文件缺新字段 → serde default 补齐(向后兼容读取)。
+    /// 已删除的 `backend` 键会被 serde 忽略，不会导致整份配置回落默认值。
     #[test]
     fn legacy_index_section_gets_new_field_defaults() {
         let cfg: IndexConfig =
             toml::from_str("backend = 'builtin'\n").expect("parse minimal index section");
-        assert_eq!(cfg.backend, "builtin");
         assert_eq!(cfg.scan_throttle_ms, 0);
         assert_eq!(cfg.journal_poll_ms, 500);
         assert_eq!(cfg.incremental, "usn", "缺 incremental 时默认走 USN");
     }
 
-    /// 实时层默认 USN；旧 backend=usn 迁移为 auto+usn，off 迁移为 everything。
+    /// 实时层默认 USN；手写值归一化：大小写/空白容忍，未知值回默认 USN。
     #[test]
-    fn incremental_defaults_and_legacy_backend_migrate() {
+    fn incremental_defaults_and_normalizes() {
         let cfg = IndexConfig::default();
-        assert_eq!(cfg.backend, "auto");
         assert_eq!(cfg.incremental, "usn");
 
-        let mut cfg = IndexConfig { backend: "usn".into(), ..Default::default() };
-        cfg.migrate_legacy_backend();
-        assert_eq!(cfg.backend, "auto");
-        assert_eq!(cfg.incremental, "usn");
-
-        let mut cfg = IndexConfig { backend: "off".into(), ..Default::default() };
-        cfg.migrate_legacy_backend();
-        assert_eq!(cfg.backend, "everything");
-
-        // 手写值归一化：大小写/空白容忍，未知值回默认 USN。
         let mut cfg = IndexConfig { incremental: " WATCH ".into(), ..Default::default() };
         cfg.normalize();
         assert_eq!(cfg.incremental, "watch");

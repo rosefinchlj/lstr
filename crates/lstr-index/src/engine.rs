@@ -22,7 +22,7 @@ pub enum Phase {
     Scanning,
     /// 全部卷就绪。
     Ready,
-    /// worker 不可用(拒绝提权/未运行),走 Everything。
+    /// worker 不可用(拒绝提权/未运行)，查询返回空结果。
     Fallback,
 }
 

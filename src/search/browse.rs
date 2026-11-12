@@ -1,4 +1,4 @@
-//! 路径模式：输入形如 `D:\foo\bar` 或 `\\server\share` 时直接列目录，不走 Everything。
+//! 路径模式：输入形如 `D:\foo\bar` 或 `\\server\share` 时直接列目录，不走索引。
 //! 这是 Listary 的「就地翻目录」：路径模式下 Enter/→ 进入子文件夹，
 //! Backspace 沿文本自然回退上级，全程不需要资源管理器。
 
@@ -14,9 +14,9 @@ pub struct PathQuery {
 }
 
 /// 判定输入是否处于路径模式。驱动器路径（`D:` / `D:\` / `D:/`）或 UNC（`\\server`）触发；
-/// Everything 语法（`path:E:\foo`）、`>`/`a `/`f ` 前缀都不会误判。
+/// 查询语法（`path:E:\foo`）、`>`/`a `/`f ` 前缀都不会误判。
 /// 只打 `D:`（冒号后没分隔符）也算——按 Listary 习惯直接列 D:\ 根目录，
-/// 否则会落进 Everything 被当成「D 盘全盘」查询（三百万条候选、排序无意义）。
+/// 否则会落进索引被当成「D 盘全盘」查询（三百万条候选、排序无意义）。
 /// **例外**：`D: <词>`（冒号后跟空白）不按路径浏览处理——这是搜索框的
 /// 盘符过滤语法（`d: ap` = 只在 D 盘搜 ap），交给 query::parse 的 drive token。
 pub fn parse(raw: &str) -> Option<PathQuery> {

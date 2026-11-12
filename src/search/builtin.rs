@@ -1,6 +1,6 @@
-//! 自研索引后端(方案 §4/§6):BuiltinProvider 对齐 EverythingProvider 的
-//! 查询面(search / search_split / search_exact),产出 Entry 走既有
-//! finalize/rank 管线;client 线程负责 worker 连接与帧→EngineMsg 转换。
+//! 自研索引后端(方案 §4/§6):BuiltinProvider 提供 search / search_split /
+//! search_exact 查询面,产出 Entry 走既有 finalize/rank 管线;client 线程负责
+//! worker 连接与帧→EngineMsg 转换。
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
@@ -13,25 +13,15 @@ use lstr_index::{
 };
 
 use crate::model::{Entry, Kind, Query, Scope};
-use crate::search::everything::{initial_of, kept_in_scope, kind_of, tone_for};
+use crate::search::entrymeta::{initial_of, kept_in_scope, kind_of, tone_for};
 use crate::search::filters::SearchFilters;
 use crate::search::pinyin;
 
-/// 运行期后端形态(供 UI 文案)。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BackendKind {
-    /// 自研索引(worker 管道在线)。
-    Builtin,
-}
-
-/// UI 聚合状态:索引构建进度 + 当前实际后端。
+/// UI 聚合状态:索引构建进度。
 #[derive(Clone, Debug)]
 pub struct IndexUiStatus {
     pub phase: lstr_index::Phase,
     pub volumes: Vec<lstr_index::VolumeProgress>,
-    pub backend: BackendKind,
-    /// Everything IPC 是否可用(时间筛选的降级依据)。
-    pub everything_ok: bool,
 }
 
 pub struct BuiltinProvider {
@@ -95,8 +85,6 @@ impl BuiltinProvider {
         IndexUiStatus {
             phase: st.phase,
             volumes: st.volumes,
-            backend: BackendKind::Builtin,
-            everything_ok: false,
         }
     }
 
@@ -185,8 +173,9 @@ impl BuiltinProvider {
     ) -> Result<SplitOnceResult, String> {
         let mut spec = build_spec(query, filters);
         spec.kind = KindFilter::All;
-        // 时间筛选时 mod.rs 不会补 exact(Everything 分支才支持),这里不做无用功。
-        let exact_needle = (filters.time.is_none() && !filters.matches.regex).then(|| {
+        // 精确同名补集与时间/日期条件同查：候选仍要过 mtime 过滤，不会把
+        // 区间外的同名项带回来。
+        let exact_needle = (!filters.matches.regex).then(|| {
             if filters.matches.case_sensitive {
                 query.text.clone()
             } else {
@@ -516,9 +505,18 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
             spec.path_prefix = Some(p);
         }
     }
-    // 时间筛选:B 步起目录扫描把 mtime 写进索引,内置模式也能按时间过滤。
+    // 时间筛选:内置索引的 mtime 列(目录扫描写入)。
+    // 预设「今天/7天/…」与输入框日期条件是交集：下界取更晚的，上界取更早的。
     if let Some(t) = filters.time {
         spec.mtime_after = Some(t.since_unix());
+    }
+    if let Some(range) = &filters.modified {
+        if let Some(after) = range.after {
+            spec.mtime_after = Some(spec.mtime_after.map_or(after, |old| old.max(after)));
+        }
+        if let Some(before) = range.before {
+            spec.mtime_before = Some(spec.mtime_before.map_or(before, |old| old.min(before)));
+        }
     }
     if spec.ext.is_none() {
         if let Some(group) = &filters.group {
@@ -594,7 +592,7 @@ pub fn spawn_client_thread(
                     return;
                 }
                 // 先拉起 worker 再连接(UAC 一次/会话);已提权常驻时秒连。
-                // 用户拒绝过 UAC 就不再弹(防骚扰),保持 Fallback 走 Everything。
+                // 用户拒绝过 UAC 就不再弹(防骚扰),保持 Fallback 等下次启动。
                 // 守卫还要求距上次拉起 >1s:worker 启动后要一点时间建管道,
                 // 否则 HandShake 失败与「管道不存在」会在循环里空转重拉。
                 // 参数按「当前」掩码现算:设置页可能改过卷选择,worker 重启后
@@ -774,9 +772,9 @@ pub fn worker_launch_args(index: &crate::config::IndexConfig, volume_mask: u32) 
     // 实时层选择：incremental="usn"（默认）走 dir 首扫 + journal 轮询；
     // "watch" 只目录监视、零 USN FSCTL。卷打不开时 worker 会按卷退回
     // dir + watcher，所以 USN 不是单点故障。
-    if index.incremental == "usn" || index.backend == "usn" {
+    if index.incremental == "usn" {
         // 固定 dir 首扫（与设置页文案一致），这是唯一会下发 --index-journal
-        // 的自动路径。backend=="usn" 是旧配置兼容。
+        // 的自动路径。
         extra.push_str(" --index-scan-mode dir --index-journal");
         extra.push_str(&format!(" --index-poll-ms {}", index.journal_poll_ms.max(100)));
     } else if index.scan_mode.eq_ignore_ascii_case("usn") {
@@ -1913,7 +1911,7 @@ mod tests {
     }
 
     /// incremental 决定内置索引的实时层:usn(默认)→ dir 首扫 + journal +
-    /// poll-ms;watch → 零 USN 开关;旧 backend="usn" 兼容仍启用 journal。
+    /// poll-ms;watch → 零 USN 开关。
     #[test]
     fn incremental_layer_selects_journal_or_watch() {
         // 默认配置:USN 增量(目录首扫 + journal 轮询)
@@ -1932,15 +1930,6 @@ mod tests {
         assert!(!args.contains("--index-journal"), "args={args}");
         assert!(!args.contains("--index-poll-ms"), "args={args}");
         assert!(!args.contains("--index-scan-mode usn"), "args={args}");
-
-        // 旧 backend="usn" 配置兼容:即使 incremental 被写成 watch 也启用 journal
-        let cfg = crate::config::IndexConfig {
-            backend: "usn".into(),
-            incremental: "watch".into(),
-            ..Default::default()
-        };
-        let args = worker_launch_args(&cfg, lstr_index::volmask::MASK_ALL);
-        assert!(args.contains(" --index-scan-mode dir --index-journal"), "args={args}");
 
         // poll-ms 下限在参数侧同样兜底
         let cfg = crate::config::IndexConfig {

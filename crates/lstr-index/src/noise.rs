@@ -170,7 +170,7 @@ impl ExcludeRules {
         false
     }
 
-    /// 全路径判定(排序层硬过滤兜底 Everything/历史等来源)。
+    /// 全路径判定(排序层硬过滤兜底历史/收藏等来源)。
     /// `norm_path` = 小写正斜杠的完整路径(含 `d:` 盘符段)。
     /// 语义与索引层一致:目录自身可见,只有**严格位于**排除目录之下的条目被剔除。
     pub fn path_excluded(&self, norm_path: &str) -> bool {

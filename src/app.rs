@@ -260,8 +260,10 @@ pub struct LstrApp {
     /// 与 elapsed_ms(引擎纯执行)并列显示,定位「引擎快但手感慢」。
     ui_total_ms: Option<f32>,
     error: Option<String>,
-    /// 正则模式下的编译错误（不触发搜索，单独提示，不显示“点击启动 Everything”）。
+    /// 正则模式下的编译错误（不触发搜索，单独提示）。
     regex_error: Option<String>,
+    /// 输入框日期条件解析错误（非法日期/空区间等，保留原文不提交）。
+    condition_error: Option<String>,
     /// 自研索引状态行(渐进启动:构建中/未启用提示;错误条优先)。
     index_note: Option<String>,
     /// 状态行首次出现时间(>300ms 才显示,避免闪烁)。
@@ -325,7 +327,7 @@ pub struct LstrApp {
     more_pending: bool,
     /// 本次查询已加载到后端给不出更多（或到上限），滚到底不再空转。
     more_exhausted: bool,
-    /// 筛选条选择：位置 / 时间 / 类型（按钮操作，不输入 Everything 语法）。
+    /// 筛选条选择：位置 / 时间 / 类型（按钮操作，不输入查询语法）。
     filters: SearchFilters,
     /// 打开中的筛选下拉菜单。
     filter_menu: Option<FilterMenuKind>,
@@ -446,6 +448,7 @@ impl LstrApp {
             ui_total_ms: None,
             error: None,
             regex_error: None,
+            condition_error: None,
             index_note: None,
             index_note_since: None,
             index_drives: None,
@@ -946,6 +949,32 @@ impl LstrApp {
         }
     }
 
+    /// 扫描输入框里的日期条件：成功的片段从文本删除并合并进 filters，
+    /// 非法条件保留原文、只记录错误。返回是否改动了输入。
+    ///
+    /// 只在 TextEdit changed 后调用；IME 组合期不调用（避免把预编辑当条件）。
+    fn commit_conditions(&mut self, ctx: &egui::Context) -> bool {
+        if self.filters.matches.regex {
+            return false;
+        }
+        let extracted = crate::search::conditions::extract(&self.input);
+        self.condition_error = extracted.errors.first().cloned();
+        if extracted.conditions.is_empty() {
+            return false;
+        }
+        let mut merged = self.filters.modified.clone().unwrap_or_default();
+        for condition in extracted.conditions {
+            if let Err(err) = merged.merge(condition) {
+                self.condition_error = Some(err);
+                return false;
+            }
+        }
+        self.input = extracted.cleaned;
+        self.filters.modified = (!merged.is_empty()).then_some(merged);
+        self.move_caret_to_end(ctx);
+        true
+    }
+
     fn trigger(&mut self, ctx: &egui::Context) {
         // 一旦输入/筛选变化就进入「搜索中」：防抖窗口里结果还没回来，
         // 空列表不应该先闪一下「没有匹配项」。
@@ -1006,6 +1035,7 @@ impl LstrApp {
             self.scroll_y = 0.0;
             self.scroll_to_selection = false;
             self.filters = SearchFilters::default();
+            self.condition_error = None;
             self.browse_root = None;
             self.browse_forward.clear();
         }
@@ -1040,6 +1070,7 @@ impl LstrApp {
         self.selected = 0;
         self.scroll_y = 0.0;
         self.filters = SearchFilters::default();
+        self.condition_error = None;
         self.filter_menu = None;
         self.hidden = false;
         self.shown_at = Instant::now();
@@ -1113,9 +1144,27 @@ impl LstrApp {
     /// 否则提示条会叠在帮助内容中间。
     fn help_tips_active(&self, query_empty: bool) -> bool {
         query_empty
+            && self.filters.is_empty()
             && self.entries.is_empty()
             && self.browse_root.is_none()
             && !self.settings_open
+    }
+
+    /// 结果区顶部提示条占用的高度。窗口定高与绘制循环必须共用这一处：
+    /// worker 错误与输入错误可以同时存在（两条 24px 横幅 + 间距）。
+    fn banner_height(&self) -> f32 {
+        let mut count = 0u32;
+        if self.error.is_some() {
+            count += 1;
+        }
+        if self.regex_error.is_some() || self.condition_error.is_some() {
+            count += 1;
+        }
+        // 索引状态提示只在没有错误横幅时显示（见绘制处的 gate）。
+        if count == 0 && self.index_note.is_some() {
+            count = 1;
+        }
+        count as f32 * 30.0
     }
 
     fn apply_size(&mut self, ctx: &egui::Context) {
@@ -1150,7 +1199,7 @@ impl LstrApp {
                 let content_w = (width - PAD - if self.preview_open { 216.0 } else { 0.0 }).max(1.0);
                 list_h = list_h.max(help_panel_height(content_w));
             }
-            let banner_h = if self.error.is_some() || self.regex_error.is_some() || self.index_note.is_some() { 30.0 } else { 0.0 };
+            let banner_h = self.banner_height();
             let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
             let computed_h = (SEARCH_H
                 + TABS_H
@@ -1773,10 +1822,6 @@ impl LstrApp {
                 self.trigger(ctx);
                 self.toast(ctx, "已重新加载（含应用索引）".to_string());
             }
-            "cmd:everything" => match shell::launch_everything() {
-                Ok(()) => self.toast(ctx, "Everything 已启动".to_string()),
-                Err(err) => self.toast(ctx, err),
-            },
             "cmd:quit" => {
                 // 二次确认：命令页里的「退出 lstr」太容易误触（点一下整个程序
                 // 就消失，体感像崩溃）。首次回车/点击给提示，3 秒内再次触发才退出。
@@ -1823,47 +1868,27 @@ impl LstrApp {
                 } else {
                     format!("({}/{})", complete, st.volumes.len())
                 };
-                // Everything 未运行时不要声称「正与 Everything 合并」。
-                let suffix = if st.everything_ok {
-                    "（结果暂不完整，正与 Everything 合并）"
-                } else {
-                    "（结果暂不完整）"
-                };
                 note = Some(format!(
-                    "正在构建索引 {} · 已收录 {} 万项{}",
+                    "正在构建索引 {} · 已收录 {} 万项（结果暂不完整）",
                     progress,
                     total / 10_000,
-                    suffix
                 ));
             } else if st.phase == lstr_index::Phase::Loading {
                 // 主界面不显示任何提示时，用户会以为「卡住了」：等 UAC、等 worker
                 // 连管道都可能停在这一阶段（旧 worker 占管道时甚至永久停住）。
-                note = Some(if st.everything_ok {
-                    "索引准备中：等待管理员授权 / worker 连接（当前由 Everything 出结果）"
-                        .to_string()
-                } else {
+                note = Some(
                     "索引准备中：等待管理员授权 / worker 连接（首次构建约 1~3 分钟）"
-                        .to_string()
-                });
-            } else if st.phase == lstr_index::Phase::Fallback {
-                // 只有配置期望用内置索引时才提示；backend=everything/off 是用户主动选择。
-                let expect_builtin = matches!(
-                    self.cfg.index.backend.as_str(),
-                    "auto" | "builtin" | "usn"
+                        .to_string(),
                 );
-                if expect_builtin {
-                    note = Some(if st.everything_ok {
-                        "内置索引不可用（未获管理员授权或 worker 未运行），当前结果来自 Everything"
-                            .to_string()
-                    } else {
-                        "内置索引不可用（未获管理员授权或 worker 未运行），暂时没有搜索结果"
-                            .to_string()
-                    });
-                }
+            } else if st.phase == lstr_index::Phase::Fallback {
+                note = Some(
+                    "内置索引不可用（未获管理员授权或 worker 未运行），暂时没有搜索结果"
+                        .to_string(),
+                );
             } else if st.phase == lstr_index::Phase::Ready {
                 // USN 增量层:异常状态要浮出来(退避/停用 = 实时增量不可靠,
                 // worker 正在自动对账或已停用该卷);正常 Watching 不打扰(安静原则)。
-                if self.cfg.index.incremental == "usn" || self.cfg.index.backend == "usn" {
+                if self.cfg.index.incremental == "usn" {
                     let degraded: Vec<String> = st
                         .volumes
                         .iter()
@@ -1942,7 +1967,7 @@ impl LstrApp {
         } else {
             entries.len() as f32 * row_h
         };
-        let banner_h = if self.error.is_some() || self.regex_error.is_some() || self.index_note.is_some() { 30.0 } else { 0.0 };
+        let banner_h = self.banner_height();
         let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
         let height = if self.settings_open {
             600.0
@@ -2029,8 +2054,78 @@ impl LstrApp {
                 } else {
                     hint_for(query.scope).to_string()
                 };
+                // 日期条件 chip：固定在输入框左侧，文本区整体右移。
+                // 标签用比例字体、值用等宽字体 + 琥珀色，和普通输入文字区分。
+                let cond_label = self
+                    .filters
+                    .modified
+                    .as_ref()
+                    .filter(|range| !range.is_empty())
+                    .map(|range| range.label());
+                let mut text_rect = search_rect;
+                if let Some(label) = &cond_label {
+                    let disabled = self.path_ui()
+                        || self.filters.matches.regex
+                        || matches!(query.scope, Scope::App | Scope::Command);
+                    let color = if disabled { theme.dim } else { theme.amber };
+                    let bg = if disabled { theme.hover } else { theme.amber_soft };
+                    let label_galley = painter.layout_no_wrap("时间".to_string(), ui::text_font(11.0), color);
+                    let value_galley = painter.layout_no_wrap(label.clone(), ui::mono_font(10.5), color);
+                    let clear_w = 14.0;
+                    let chip_w = 8.0 + label_galley.size().x + 6.0 + value_galley.size().x
+                        + 6.0 + clear_w;
+                    let chip_h = 20.0;
+                    let chip = Rect::from_min_size(
+                        egui::pos2(search_rect.left(), search_rect.top() + 4.0),
+                        egui::vec2(chip_w, chip_h),
+                    );
+                    painter.rect_filled(chip, CornerRadius::same(6), bg);
+                    painter.rect_stroke(
+                        chip,
+                        CornerRadius::same(6),
+                        Stroke::new(1.0_f32, color.gamma_multiply(0.45)),
+                        StrokeKind::Inside,
+                    );
+                    painter.galley(
+                        egui::pos2(chip.left() + 8.0, chip.center().y - label_galley.size().y / 2.0),
+                        label_galley.clone(),
+                        color,
+                    );
+                    painter.galley(
+                        egui::pos2(
+                            chip.left() + 8.0 + label_galley.size().x + 6.0,
+                            chip.center().y - value_galley.size().y / 2.0,
+                        ),
+                        value_galley.clone(),
+                        color,
+                    );
+                    let clear = Rect::from_min_size(
+                        egui::pos2(chip.right() - clear_w - 2.0, chip.top() + 3.0),
+                        egui::vec2(clear_w, chip_h - 6.0),
+                    );
+                    painter.text(
+                        clear.center(),
+                        Align2::CENTER_CENTER,
+                        "×",
+                        ui::mono_font(11.0),
+                        color,
+                    );
+                    let response = ui
+                        .interact(clear, Id::new("lstr-date-chip-clear"), Sense::click())
+                        .on_hover_text(if disabled {
+                            "日期条件只作用于文件搜索；此处不生效（点 × 移除）"
+                        } else {
+                            "修改时间条件（本地时间）；点 × 移除"
+                        });
+                    if response.clicked() {
+                        self.filters.modified = None;
+                        self.trigger(ctx);
+                    }
+                    text_rect.min.x = (chip.right() + 8.0)
+                        .min((search_rect.right() - 80.0).max(chip.right() + 4.0));
+                }
                 let response = ui.put(
-                    search_rect,
+                    text_rect,
                     egui::TextEdit::singleline(&mut self.input)
                         .frame(false)
                         .margin(egui::Margin::same(0))
@@ -2046,6 +2141,10 @@ impl LstrApp {
                     // IME 组合期(预编辑未上屏)不触发搜索:避免拼音字母逐键闪动
                     // 结果;上屏后由 handle_keys 的组合结束检测补搜。
                     if !self.ime_composing {
+                        // 正则模式下整串都是 pattern，不解析日期条件。
+                        if !self.filters.matches.regex {
+                            self.commit_conditions(ctx);
+                        }
                         self.trigger(ctx);
                     }
                 }
@@ -2248,7 +2347,7 @@ impl LstrApp {
 
                 let banner_top = list_top + list_h.min(view_h) + LIST_GAP;
                 let mut extra_top = banner_top;
-                if self.error.is_none() && self.regex_error.is_none() {
+                if self.error.is_none() && self.regex_error.is_none() && self.condition_error.is_none() {
                     if let Some(note) = self.index_note.clone() {
                         let banner = Rect::from_min_size(
                             egui::pos2(rect.left() + PAD, extra_top),
@@ -2275,20 +2374,11 @@ impl LstrApp {
                         egui::pos2(rect.left() + PAD, extra_top),
                         egui::vec2(rect.width() - 2.0 * PAD, 24.0),
                     );
-                    let response =
-                        ui.interact(banner, Id::new("lstr-error-banner"), Sense::click());
                     painter.rect_filled(banner, CornerRadius::same(7), theme.amber_soft);
                     painter.rect_stroke(
                         banner,
                         CornerRadius::same(7),
-                        Stroke::new(
-                            1.0_f32,
-                            if response.hovered() {
-                                theme.amber.gamma_multiply(0.6)
-                            } else {
-                                theme.amber.gamma_multiply(0.35)
-                            },
-                        ),
+                        Stroke::new(1.0_f32, theme.amber.gamma_multiply(0.35)),
                         StrokeKind::Inside,
                     );
                     painter.circle_filled(
@@ -2299,23 +2389,17 @@ impl LstrApp {
                     painter.text(
                         egui::pos2(banner.left() + 21.0, banner.center().y),
                         Align2::LEFT_CENTER,
-                        format!("{error} · 点击启动 Everything"),
+                        error,
                         ui::text_font(11.5),
                         theme.text,
                     );
-                    if response.clicked() {
-                        match shell::launch_everything() {
-                            Ok(()) => {
-                                self.error = None;
-                                self.toast(ctx, "Everything 已启动，正在连接…".to_string());
-                                self.trigger(ctx);
-                            }
-                            Err(err) => self.toast(ctx, err),
-                        }
-                    }
                     extra_top += 30.0;
                 }
-                if let Some(error) = self.regex_error.clone() {
+                if let Some(error) = self
+                    .regex_error
+                    .clone()
+                    .or_else(|| self.condition_error.clone())
+                {
                     let banner = Rect::from_min_size(
                         egui::pos2(rect.left() + PAD, extra_top),
                         egui::vec2(rect.width() - 2.0 * PAD, 24.0),
@@ -2677,7 +2761,7 @@ impl LstrApp {
     }
 
     /// 筛选条：位置 / 时间 / 类型三个按钮。用户点选即可，内部自动翻译成
-    /// Everything 的 path:/dm:/ext: 查询段——不需要记语法。
+    /// 引擎查询规格——不需要记语法。
     /// 匹配 chip 的标签要能看出当前选了什么，而不是永远只写「匹配」。
     fn match_chip_label(&self) -> String {
         let matches = self.filters.matches;
@@ -2739,7 +2823,13 @@ impl LstrApp {
                     self.filters
                         .time
                         .map(|time| time.label())
-                        .unwrap_or("不限")
+                        .unwrap_or_else(|| {
+                            if self.filters.modified.is_some() {
+                                "自定义"
+                            } else {
+                                "不限"
+                            }
+                        })
                 ),
                 self.filters.time.is_some(),
             ),
@@ -3083,7 +3173,12 @@ impl LstrApp {
                         return;
                     }
                     FilterChoice::Location(value) => self.filters.location = value.clone(),
-                    FilterChoice::Time(value) => self.filters.time = *value,
+                    FilterChoice::Time(value) => {
+                        // 预设与输入框自定义区间是「替换」而非叠加：选了预设
+                        // 就清掉自定义 chip，避免用户看到两个时间条件同时生效。
+                        self.filters.time = *value;
+                        self.filters.modified = None;
+                    }
                     FilterChoice::Group(value) => self.filters.group = *value,
                 }
                 self.filter_menu = None;
@@ -3142,7 +3237,7 @@ impl LstrApp {
                         "筛选",
                         &[
                             ("ext:rs", "按扩展名"),
-                            ("时间 · 类型", "用下方筛选条切换"),
+                            ("日期", "date > 2026-11-10: 冒号提交"),
                             ("匹配", "大小写 / 全词 / 正则"),
                         ],
                     ),
@@ -3270,7 +3365,7 @@ impl LstrApp {
             } else if self.typing_folder.is_some() && !self.typing_global {
                 "当前目录内无匹配 · Ctrl+Shift+G 全局搜索"
             } else {
-                "试试 ext:rs、path: 或 a 微信"
+                "试试 ext:rs、date > 2026-11-10: 或 a 微信"
             };
             painter.text(
                 egui::pos2(rect.center().x, list_top + 68.0),
@@ -3901,7 +3996,7 @@ impl LstrApp {
             Stroke::new(1.0_f32, theme.hair),
         );
 
-        let mut default_text = if query.is_empty() {
+        let mut default_text = if query.is_empty() && self.filters.is_empty() {
             format!(
                 "{} 项{}",
                 entries.len(),
@@ -5853,15 +5948,7 @@ impl LstrApp {
                     lstr_index::Phase::Loading => "内置索引:等待 worker 连接…".to_string(),
                     lstr_index::Phase::Fallback => "内置索引:未启用(需管理员授权)".to_string(),
                 };
-                // L4:运行期后端与 Everything 可用性以前只赋值、没人读。显示出来
-                // 才能解释「自动」模式此刻是谁在出结果、时间筛选是否可用。
-                format!(
-                    "{base} · 后端:{} · Everything:{}",
-                    match st.backend {
-                        crate::search::builtin::BackendKind::Builtin => "内置索引",
-                    },
-                    if st.everything_ok { "在线" } else { "离线" }
-                )
+                format!("{base} · 后端:内置索引")
             }
             None => "内置索引:未启用".to_string(),
         };
@@ -5995,17 +6082,9 @@ impl LstrApp {
             }
         }
 
-        // —— 索引引擎 + 实时层 ——
-        // 两者正交：引擎决定「用谁搜」，实时层决定「内置索引怎么追变化」。
-        // 旧版把 USN 混在引擎列表里，看起来像第三个引擎，实际 USN 只是
-        // 内置索引的增量方式（同一套 dir 首扫 + 同一个 store）。
-        let current_engine = self.cfg_index_backend();
+        // —— 内置索引实时层 ——
+        // 程序只使用自研内置索引；实时层决定索引怎么追文件变化。
         let current_incremental = self.cfg_index_incremental();
-        const ENGINES: [(&str, &str); 3] = [
-            ("auto", "自动(内置优先+Everything 兜底)"),
-            ("builtin", "仅内置索引(不碰 Everything)"),
-            ("everything", "仅 Everything"),
-        ];
         const INCREMENTALS: [(&str, &str); 2] = [
             ("usn", "USN journal(默认)"),
             ("watch", "目录监视"),
@@ -6017,8 +6096,7 @@ impl LstrApp {
         let start_x = area.left() + 130.0;
         let avail = (area.right() - start_x).max(160.0);
         let chip_w = ((avail - BACKEND_CHIP_GAP * (BACKEND_COLS - 1) as f32) / BACKEND_COLS as f32).floor();
-        let groups: [(&str, bool, &[(&str, &str)], &str); 2] = [
-            ("索引引擎", false, &ENGINES, current_engine),
+        let groups: [(&str, bool, &[(&str, &str)], &str); 1] = [
             ("内置索引实时层", true, &INCREMENTALS, current_incremental),
         ];
         for (label, incremental_group, items, current) in groups {
@@ -6044,8 +6122,6 @@ impl LstrApp {
                 if response.clicked() {
                     if incremental_group {
                         self.set_cfg_index_incremental(key);
-                    } else {
-                        self.set_cfg_index_backend(key);
                     }
                 }
             }
@@ -6056,14 +6132,13 @@ impl LstrApp {
         // 噪声排除开关已移入「噪声」页(统一规则列表,支持自定义排除目录)。
         y += ROW;
 
-        // 帮助:按实际生效时机分开写——切卷立即生效,后端/实时层要重启。
+        // 帮助:按实际生效时机分开写——切卷立即生效,实时层要重启。
         // 这里用 layout+wrap 按 area 宽度自动折行:文案再长也不会跑出右边界
         // (painter.text 是 no-wrap,旧版单行长段落其实早就被窗口右侧裁掉了)。
-        let help = "索引引擎:自动=内置优先,内置未就绪时用 Everything 兜底;仅内置=完全不读取 Everything;仅 Everything=只用 Everything。\n\
-内置索引实时层:USN journal(默认)=目录首扫后按 journal 增量,快照完整且游标可信时免扫直读,卷不可用自动退回目录监视;目录监视=ReadDirectoryChangesW,零 USN FSCTL。\n\
-索引卷勾选立即生效(worker 自动起停该盘扫描);索引引擎/实时层需重启 lstr 生效;噪声排除见「噪声」页。\n\
-时间筛选在内置索引(目录扫描)模式下可用。\n\
-内置索引只覆盖本机固定 NTFS 卷;网络盘/FAT32/exFAT 等需 Everything。";
+        let help = "内置索引实时层:USN journal(默认)=目录首扫后按 journal 增量,快照完整且游标可信时免扫直读,卷不可用自动退回目录监视;目录监视=ReadDirectoryChangesW,零 USN FSCTL。\n\
+索引卷勾选立即生效(worker 自动起停该盘扫描);实时层需重启 lstr 生效;噪声排除见「噪声」页。\n\
+日期/时间筛选依赖索引里的文件修改时间(目录扫描写入)。\n\
+内置索引只覆盖本机固定 NTFS 卷。";
         let galley = painter.layout(
             help.to_string(),
             ui::text_font(10.5),
@@ -6071,21 +6146,6 @@ impl LstrApp {
             area.width(),
         );
         painter.galley(egui::pos2(area.left(), y + 8.0), galley, theme.sub);
-    }
-
-    fn cfg_index_backend(&self) -> &'static str {
-        match self.cfg.index.backend.as_str() {
-            "builtin" => "builtin",
-            "everything" => "everything",
-            // off 是历史值；Config::load 已迁移为 everything，这里兜底。
-            "off" => "everything",
-            _ => "auto",
-        }
-    }
-
-    fn set_cfg_index_backend(&mut self, key: &str) {
-        self.cfg.index.backend = key.to_string();
-        let _ = self.cfg.save();
     }
 
     fn cfg_index_incremental(&self) -> &'static str {

@@ -1,6 +1,6 @@
-//! 界面筛选条的数据模型：位置 / 时间 / 类型。
-//! 用户只点按钮，不输入 `path:` / `dm:` / `ext:` 语法；
-//! 这些枚举负责把选择翻译成 Everything 查询段。
+//! 界面筛选条的数据模型：位置 / 时间 / 类型，以及输入框提交的日期条件。
+//! 用户只点按钮/输入条件，不直接写引擎查询语法；这些枚举由
+//! `builtin::build_spec` 翻译成引擎查询规格。
 
 use std::path::PathBuf;
 
@@ -61,6 +61,9 @@ pub struct SearchFilters {
     pub location: Option<LocationFilter>,
     pub time: Option<TimeFilter>,
     pub group: Option<FileGroup>,
+    /// 输入框里提交的日期条件（修改时间，unix 秒，含边界）。
+    /// 与 `time` 预设是交集语义：两者都设置时取更紧的上下界。
+    pub modified: Option<DateRange>,
     /// 文件名匹配选项。`is_empty` 刻意忽略它：开启匹配选项不应让
     /// 应用/命令/关键字结果被当成“有筛选”而消失。
     pub matches: MatchOptions,
@@ -68,34 +71,10 @@ pub struct SearchFilters {
 
 impl SearchFilters {
     pub fn is_empty(&self) -> bool {
-        self.location.is_none() && self.time.is_none() && self.group.is_none()
-    }
-
-    /// 生成 Everything 查询段。用户手输的 ext:/path: 优先于按钮选择，
-    /// 避免「ext:rs + 类型=图片」这种自相矛盾的组合。
-    pub fn query_parts(&self, typed_ext: bool, typed_path: bool) -> Vec<String> {
-        let mut parts = Vec::new();
-        if !typed_path {
-            if let Some(location) = &self.location {
-                parts.push(format!("path:{}", location.path().display()));
-            }
-        }
-        if !typed_ext {
-            if let Some(group) = &self.group {
-                parts.push(format!("ext:{}", group.extensions().join(";")));
-            }
-        }
-        if let Some(time) = &self.time {
-            parts.push(time.query().to_string());
-        }
-        // Everything 的内联修饰符；内置后端走 build_spec，不看这里。
-        if self.matches.case_sensitive {
-            parts.push("case:".to_string());
-        }
-        if self.matches.whole_word {
-            parts.push("whole-words:".to_string());
-        }
-        parts
+        self.location.is_none()
+            && self.time.is_none()
+            && self.group.is_none()
+            && self.modified.is_none()
     }
 }
 
@@ -141,16 +120,6 @@ impl TimeFilter {
         }
     }
 
-    /// Everything 的日期函数（1.4 支持）。
-    pub fn query(self) -> &'static str {
-        match self {
-            TimeFilter::Today => "dm:today",
-            TimeFilter::Week => "dm:thisweek",
-            TimeFilter::Month => "dm:thismonth",
-            TimeFilter::Year => "dm:thisyear",
-        }
-    }
-
     /// 内置索引用的时间过滤下界(unix 秒,含)。
     /// Today 取本地零点;其余按固定天数回退(不用日历月,够用且不引依赖)。
     pub fn since_unix(self) -> i64 {
@@ -171,6 +140,65 @@ fn local_seconds_of_day() -> Option<u32> {
     use windows::Win32::System::SystemInformation::GetLocalTime;
     let st = unsafe { GetLocalTime() };
     Some(st.wHour as u32 * 3600 + st.wMinute as u32 * 60 + st.wSecond as u32)
+}
+
+/// 输入框提交的修改时间区间。上下界都是 unix 秒且含边界（与引擎
+/// `QuerySpec::mtime_after/before` 语义一致）；`None` = 该方向不限。
+///
+/// `after_text` / `before_text` 只用于 chip 文案，保留用户输入的比较符
+/// （`> 2026-11-10` / `≤ 2026-11-30`），不参与查询。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DateRange {
+    pub after: Option<i64>,
+    pub before: Option<i64>,
+    pub after_text: Option<String>,
+    pub before_text: Option<String>,
+}
+
+impl DateRange {
+    pub fn is_empty(&self) -> bool {
+        self.after.is_none() && self.before.is_none()
+    }
+
+    /// chip 文案：单边保留原始比较符；双边用 ` · ` 连接。
+    pub fn label(&self) -> String {
+        match (&self.after_text, &self.before_text) {
+            (Some(after), Some(before)) => format!("{after} · {before}"),
+            (Some(after), None) => after.clone(),
+            (None, Some(before)) => before.clone(),
+            (None, None) => String::new(),
+        }
+    }
+
+    /// 合并一条新条件：上下界取更紧的一侧，文案跟着被收紧的那一侧更新。
+    /// 合并后为空区间（after > before）返回错误，调用方保留原状态。
+    pub fn merge(&mut self, other: DateRange) -> Result<(), String> {
+        let after = match (self.after, other.after) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let before = match (self.before, other.before) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let (Some(a), Some(b)) = (after, before) {
+            if a > b {
+                return Err("日期条件互相冲突，区间为空".to_string());
+            }
+        }
+        if other.after.is_some_and(|b| self.after.is_none_or(|a| b > a)) {
+            self.after_text = other.after_text;
+        }
+        if other
+            .before
+            .is_some_and(|b| self.before.is_none_or(|a| b < a))
+        {
+            self.before_text = other.before_text;
+        }
+        self.after = after;
+        self.before = before;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,42 +288,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_filters_produce_no_query_parts() {
+    fn default_filters_are_empty() {
         assert!(SearchFilters::default().is_empty());
-        assert!(SearchFilters::default().query_parts(false, false).is_empty());
     }
 
     #[test]
-    fn filters_translate_to_everything_syntax() {
-        let filters = SearchFilters {
-            location: Some(LocationFilter::Drive('D')),
-            time: Some(TimeFilter::Week),
-            group: Some(FileGroup::Images),
-            ..Default::default()
-        };
-        let parts = filters.query_parts(false, false);
-        assert_eq!(parts[0], r"path:D:\");
-        assert_eq!(parts[1], "ext:png;jpg;jpeg;gif;svg;webp;ico;bmp;tif;tiff");
-        assert_eq!(parts[2], "dm:thisweek");
-    }
-
-    #[test]
-    fn typed_syntax_wins_over_buttons() {
-        let filters = SearchFilters {
-            location: Some(LocationFilter::Drive('D')),
-            time: None,
-            group: Some(FileGroup::Code),
-            ..Default::default()
-        };
-        // 用户手输了 ext: 和 path: 时，按钮选择让位，避免自相矛盾的交集。
-        let parts = filters.query_parts(true, true);
-        assert_eq!(parts.len(), 0);
-    }
-
-    #[test]
-    fn time_labels_and_queries_are_stable() {
-        assert_eq!(TimeFilter::Today.query(), "dm:today");
+    fn time_labels_are_stable() {
         assert_eq!(TimeFilter::Year.label(), "一年内");
+    }
+
+    #[test]
+    fn date_range_merges_tighter_bounds() {
+        let mut range = DateRange {
+            after: Some(100),
+            before: Some(300),
+            after_text: Some("> 2026-11-01".into()),
+            before_text: Some("< 2026-11-30".into()),
+        };
+        range
+            .merge(DateRange {
+                after: Some(200),
+                before: None,
+                after_text: Some("≥ 2026-11-10".into()),
+                before_text: None,
+            })
+            .expect("tighter lower bound");
+        assert_eq!(range.after, Some(200));
+        assert_eq!(range.before, Some(300));
+        assert_eq!(range.label(), "≥ 2026-11-10 · < 2026-11-30");
+
+        // 更松的边界不会改动既有区间。
+        range
+            .merge(DateRange {
+                after: Some(50),
+                before: None,
+                after_text: Some("> 2026-10-01".into()),
+                before_text: None,
+            })
+            .expect("looser lower bound is ignored");
+        assert_eq!(range.after, Some(200));
+        assert_eq!(range.label(), "≥ 2026-11-10 · < 2026-11-30");
+    }
+
+    #[test]
+    fn conflicting_date_range_is_rejected() {
+        let mut range = DateRange {
+            after: Some(200),
+            before: None,
+            after_text: Some("≥ 2026-11-10".into()),
+            before_text: None,
+        };
+        let before = range.clone();
+        let err = range
+            .merge(DateRange {
+                after: None,
+                before: Some(100),
+                after_text: None,
+                before_text: Some("< 2026-11-01".into()),
+            })
+            .expect_err("empty interval must be rejected");
+        assert!(err.contains("冲突"));
+        assert_eq!(range, before, "失败时不得改动原区间");
     }
 
     #[test]
@@ -320,8 +373,17 @@ mod tests {
         let mut filters = SearchFilters::default();
         filters.matches.case_sensitive = true;
         assert!(filters.is_empty(), "匹配选项不应改变 is_empty 语义");
-        // Everything 后端仍需要收到修饰符。
-        assert_eq!(filters.query_parts(false, false), vec!["case:".to_string()]);
+    }
+
+    /// 输入框日期条件属于文件筛选：激活后应用/命令/关键字应退出。
+    #[test]
+    fn typed_date_condition_makes_filters_non_empty() {
+        let mut filters = SearchFilters::default();
+        filters.modified = Some(DateRange {
+            after: Some(1),
+            ..Default::default()
+        });
+        assert!(!filters.is_empty());
     }
 
     #[test]
