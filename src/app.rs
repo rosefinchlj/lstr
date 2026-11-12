@@ -507,6 +507,10 @@ pub struct LstrApp {
     /// 学习徽标缓存(按当前查询词),让自学习在结果行可见。
     learn_for: String,
     learn_badges: HashMap<String, crate::history::LearnBadge>,
+    /// 产生当前结果列表的查询词（请求发出时的输入，条件已剥离）。
+    /// 结果行的「拼音 xx / 模糊 xx / 关键词高亮」必须用它：条件编辑/联想
+    /// 暂停期间输入框里是半截条件，拿它当查询词会把 `size >= …` 标成拼音命中。
+    results_query_text: String,
     /// 学习数据页视图:false=按词学习,true=常用排行。
     learning_view_frecency: bool,
     /// 已生效的排除规则表(「立即重建」时更新;与当前配置比对决定是否提示重建)。
@@ -670,6 +674,7 @@ impl LstrApp {
             previews: PreviewStore::new(),
             learn_for: String::new(),
             learn_badges: HashMap::new(),
+            results_query_text: String::new(),
             learning_view_frecency: false,
             noise_exclude_applied,
             typing,
@@ -1047,6 +1052,9 @@ impl LstrApp {
                 } else {
                     self.typing_folder.clone()
                 };
+                // 这批结果对应的查询词（条件已剥离）。结果行标注/高亮用它，
+                // 避免条件编辑期间把 `size >= …` 半截条件当拼音查询词。
+                self.results_query_text = self.input.clone();
                 self.pending_gen = if let Some(root) = self.browse_root.clone() {
                     self.service.search_browse(
                         &self.input,
@@ -3064,7 +3072,10 @@ impl LstrApp {
                         egui::pos2(rect.right() - PAD, footer_top - 6.0),
                     );
                     if let Some(entry) = entries.get(self.selected) {
-                        self.paint_preview(ui, &painter, pane, entry, &query.text);
+                        // 预览高亮同样用产生这批结果的查询词（条件编辑期间
+                        // 输入框里是半截条件）。
+                        let preview_text = self.results_query_text.clone();
+                        self.paint_preview(ui, &painter, pane, entry, &preview_text);
                     }
                 }
                 if let Some(dialog) = &self.dialog {
@@ -3950,6 +3961,10 @@ impl LstrApp {
         query: &crate::model::Query,
     ) {
         let theme = self.theme;
+        // 行内「拼音 / 模糊 / 关键词高亮」必须用真正产生这批结果的查询词：
+        // 条件编辑/联想暂停期间输入框里是半截条件，用它标注会显示成
+        // 「拼音 size >= 104857601B」这类错误提示。
+        let display_text = self.results_query_text.clone();
         if entries.is_empty() {
             // 空查询（还没开始搜索）：分类两列的搜索技巧面板。
             if self.help_tips_active(query.is_empty()) {
@@ -4188,7 +4203,7 @@ impl LstrApp {
         let mut hovered = None;
         let mut clicked = None;
         let mut drag_started = None;
-        let q = query.text.to_lowercase();
+        let q = display_text.to_lowercase();
         // Browse 下不是“浏览目录条目”而是递归搜索结果，关键词照常高亮。
         let path_mode = self.path_mode();
         // 副标题（等宽字体）的字符预算：用实际字符宽度换算，尽量把行宽用满。
@@ -4203,13 +4218,13 @@ impl LstrApp {
         let fav_set: std::collections::HashSet<String> =
             self.cfg.favorites.iter().map(|f| f.path.to_lowercase()).collect();
         // 学习徽标:查询词变化时刷新一次(每帧查 HashMap,不重复 SQL)。
-        if self.learn_for != self.input {
+        if self.learn_for != display_text {
             self.learn_badges = self
                 .history
                 .lock()
-                .map(|h| h.learn_badges(&self.input))
+                .map(|h| h.learn_badges(&display_text))
                 .unwrap_or_default();
-            self.learn_for = self.input.clone();
+            self.learn_for = display_text.clone();
         }
         // 两行内容（标题 + 副标题）的墨迹几何（含关键词下划线）。每帧量一次，
         // 所有行共用同一组基线：按墨迹而不是 galley 盒居中——盒子上下留白
@@ -4338,7 +4353,7 @@ impl LstrApp {
             let title_q = if pinyin_hit || path_mode {
                 ""
             } else {
-                &query.text
+                &display_text
             };
             // 路径行判定与 meta（修改时间；选中且开启时并列大小）先在标题前算好：
             // meta 占右侧固定宽度，标题/路径的可用宽度都必须扣掉它，否则长路径
@@ -4349,16 +4364,16 @@ impl LstrApp {
             // 也要让用户看出结果不是名字字面命中(如 weixin → 微信资料)。
             // 判定只看名字/查询 token,不额外做 IO;path 模式是浏览目录,不标。
             let pinyin_path_hit =
-                is_path_row && !path_mode && is_pinyin_path_hit(&entry.name, &query.text);
+                is_path_row && !path_mode && is_pinyin_path_hit(&entry.name, &display_text);
             // 「已打开」(对话框 Quick Switch 的近期目录)与「拼音」是两种
             // 不同来源提示:同时满足时保留两者,读作「已打开 · 拼音 · …」,
             // 先交代条目已在打开列表里,再说明本次为何命中。
             // 拼音标注只显示本次查询词（与应用行「应用 · 拼音 weixin」一致）：
             // 目的只是标明「这条是拼音命中」，不列名字的完整拼音。
             let mut lead = match (entry.id.starts_with("qs:"), pinyin_path_hit) {
-                (true, true) => format!("已打开 · 拼音 {} · ", query.text),
+                (true, true) => format!("已打开 · 拼音 {} · ", display_text),
                 (true, false) => "已打开 · ".to_string(),
-                (false, true) => format!("拼音 {} · ", query.text),
+                (false, true) => format!("拼音 {} · ", display_text),
                 (false, false) => String::new(),
             };
             if let Some(b) = self.learn_badges.get(&entry.id) {
@@ -4475,7 +4490,7 @@ impl LstrApp {
             }
 
             if two_line_path {
-                let needle = if path_mode { "" } else { &query.text };
+                let needle = if path_mode { "" } else { &display_text };
                 let cut = split_path_head(
                     |candidate| {
                         painter
@@ -4535,9 +4550,9 @@ impl LstrApp {
                 let mut subtitle = match entry.kind {
                     Kind::App => {
                         if pinyin_hit {
-                            format!("应用 · 拼音 {}", query.text)
+                            format!("应用 · 拼音 {}", display_text)
                         } else if fuzzy_hit.is_some() {
-                            format!("应用 · 模糊 {}", query.text)
+                            format!("应用 · 模糊 {}", display_text)
                         } else if entry.id.starts_with("sys:") {
                             format!("系统功能 · {}", ui::display_path(entry))
                         } else {
@@ -4581,7 +4596,7 @@ impl LstrApp {
                 }
                 let mut sub_job = ui::text_job_case(
                     &subtitle,
-                    if path_mode { "" } else { &query.text },
+                    if path_mode { "" } else { &display_text },
                     &ui::mono_font(11.5),
                     theme.sub,
                     theme.amber,
