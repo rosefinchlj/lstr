@@ -2062,34 +2062,13 @@ impl LstrApp {
 
         // Ctrl+Backspace：删光标左侧的条件 chip（虚拟光标优先；文本在开头时
         // 删最右 chip）。没有 chip 可删时不拦截，让 TextEdit 按词删除。
+        // 普通 Backspace 不删 chip（约定：只有 Ctrl+Backspace 动条件）。
         if self.condition_delete_target(ctx).is_some()
             && ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backspace))
         {
             if let Some(index) = self.condition_delete_target(ctx) {
                 self.record_condition_undo();
                 if self.remove_chip(index) {
-                    self.condition_error = None;
-                    self.menu_open = false;
-                    self.filter_menu = None;
-                    self.condition_edit_backup = None;
-                    self.trigger(ctx);
-                }
-            }
-            return;
-        }
-
-        // 输入框为空且不在浏览/路径模式：普通 Backspace 也从右往左删 chip
-        //（标签输入的通用习惯；浏览模式下 Backspace 仍是回上一级）。
-        if self.input.is_empty()
-            && self.filters.has_input_conditions()
-            && !self.in_browse()
-            && !self.path_mode()
-            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace))
-        {
-            let count = self.condition_chips().len();
-            if count > 0 {
-                self.record_condition_undo();
-                if self.remove_chip(count - 1) {
                     self.condition_error = None;
                     self.menu_open = false;
                     self.filter_menu = None;
