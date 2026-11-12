@@ -118,6 +118,23 @@ impl ExcludeRules {
         !self.anchored.is_empty()
     }
 
+    /// 摘要(诊断日志用):段名数 + 锚定模式明细。
+    pub fn summary(&self) -> String {
+        let anchored: Vec<String> = self
+            .anchored
+            .iter()
+            .map(|(d, segs)| {
+                format!("{}{}", d.map(|c| c.to_string()).unwrap_or_default(), segs.join("/"))
+            })
+            .collect();
+        format!(
+            "segments={} [{}] anchored=[{}]",
+            self.segments.len(),
+            self.segments.join(","),
+            anchored.join(", ")
+        )
+    }
+
     /// 段名快查(热路径:逐条目逐祖先调用)。
     pub fn is_segment(&self, name_lc: &[u8]) -> bool {
         std::str::from_utf8(name_lc)
@@ -127,10 +144,12 @@ impl ExcludeRules {
 
     /// 锚定匹配:祖先链(从卷根起、不含盘符段)是否落在某个锚定模式之下。
     /// `chain` = 该祖先的相对段名序列(根优先);`letter` = 本卷盘符。
+    /// 盘符大小写无关(worker 上报的盘符可能是小写)。
     pub fn chain_anchored(&self, chain: &[&[u8]], letter: char) -> bool {
         if self.anchored.is_empty() || chain.is_empty() {
             return false;
         }
+        let letter = letter.to_ascii_uppercase();
         for (drive, segs) in &self.anchored {
             if let Some(d) = drive {
                 if *d != letter {
@@ -251,9 +270,9 @@ mod tests {
     #[test]
     fn anchored_pattern_scopes_to_drive() {
         let r = ExcludeRules::build(&[r"D:\ProgramData".into()]);
-        // D 盘下命中
+        // D 盘下命中(盘符大小写无关:worker 上报盘符可能小写)
         assert!(r.chain_anchored(&[b"programdata"], 'D'));
-        assert!(r.chain_anchored(&[b"programdata", b"foo"], 'D'));
+        assert!(r.chain_anchored(&[b"programdata", b"foo"], 'd'));
         // C 盘的同名目录不受影响
         assert!(!r.chain_anchored(&[b"programdata"], 'C'));
         assert!(!r.chain_anchored(&[], 'D'));

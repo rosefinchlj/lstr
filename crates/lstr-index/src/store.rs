@@ -450,6 +450,10 @@ fn slice_at(buf: &[u8], off: usize) -> &[u8] {
 
 impl VolumeStore {
     pub fn new(exclude: crate::noise::ExcludeRules, letter: char) -> Self {
+        crate::snapshot::debug_log(&format!(
+            "store {letter}: {}",
+            exclude.summary()
+        ));
         Self {
             names: Vec::with_capacity(4 << 20),
             names_lc: Vec::with_capacity(4 << 20),
@@ -1218,6 +1222,13 @@ impl VolumeStore {
         self.chain_buf.clear();
         if self_noise {
             self.attrs[slot as usize] |= ATTR_NOISE;
+            // 即时锚定:判噪的目录记入锚点——它稍后会被 compact 剔除,但迟到
+            // 子项(USN/journal 回放)的 parent 解析需要这个锚点才能立即判噪,
+            // 否则子项 parent=NO_PARENT 永久泄漏(实测 D:\ProgramData 漏 24 条)。
+            if self.attrs[slot as usize] & 0x10 != 0 {
+                let frn = self.frn[slot as usize];
+                self.noise_anchors.insert(frn);
+            }
         }
     }
 
@@ -1307,11 +1318,10 @@ impl VolumeStore {
             for &s in &live {
                 self.classify_chain(s);
             }
-            // 噪声锚点(A-2):自身可见、名字是噪声段的**目录**。其未来子项
-            // (journal 增量,父可能尚未解析)按锚点立即判噪,杜绝子孙泄漏。
-            // 噪声目录自身保留可搜,故锚点是「保留下来的噪声目录本身」,
-            // 而非旧语义的「被剔除的顶层噪声」。
-            self.noise_anchors.clear();
+            // 噪声锚点(A-2):可见段名目录累加入锚点;**历史锚点保留**(不清空)
+            // ——已被剔除的噪声目录 FRN 仍在集合里,其迟到子项(USN/journal)
+            // 靠锚点立即判噪,否则 parent=NO_PARENT 永久泄漏。规则变更时整卷
+            // 重扫会重建全新 store,锚点随之清空,无残留问题。
             for s in 0..self.name_off.len() as u32 {
                 let a = self.attrs[s as usize];
                 if (a & ATTR_INTERNAL) != 0 || (a & 0x10) == 0 {
@@ -1731,6 +1741,42 @@ mod tests {
         insert(&mut s, 12, 10, 0, "file2.txt");
         let f2 = s.find_slot(12).unwrap();
         assert_eq!(s.parent[f2 as usize], dir_slot);
+    }
+
+    #[test]
+    fn anchored_path_pattern_excludes_subtree() {
+        // 生产形态:卷根(FRN 5)不入库,顶层目录 parent=NO_PARENT。
+        // D:\ProgramData 排除:目录自身可见,foo/bar.txt 整树剔除。
+        let mut s = VolumeStore::new(
+            crate::noise::ExcludeRules::build(&[r"D:\ProgramData".to_string()]),
+            'D',
+        );
+        s.insert(100, 5, 0x10, b"ProgramData");
+        s.insert(101, 100, 0x10, b"foo");
+        s.insert(102, 101, 0, b"bar.txt");
+        s.compact();
+        assert!(s.find_slot(100).is_some(), "排除目录自身可见");
+        assert!(s.find_slot(101).is_none(), "排除目录子孙剔除(foo)");
+        assert!(s.find_slot(102).is_none(), "排除目录子孙剔除(bar.txt)");
+    }
+
+    #[test]
+    fn late_child_of_dropped_noise_dir_is_anchored() {
+        // 泄漏回归:排除目录的子目录被判噪 + compact 剔除后,USN/journal 迟到
+        // 子项的 parent 解析不到已剔除的父 → 必须靠锚点立即判噪,否则永久泄漏
+        // (实测 D:\ProgramData 漏 24 条)。
+        let mut s = VolumeStore::new(
+            crate::noise::ExcludeRules::build(&[r"D:\ProgramData".to_string()]),
+            'D',
+        );
+        s.insert(100, 5, 0x10, b"ProgramData");
+        s.insert(101, 100, 0x10, b"foo");
+        s.insert(102, 101, 0, b"bar.txt");
+        s.compact(); // foo/bar.txt 剔除,foo 记入锚点
+        s.insert(103, 101, 0, b"late.txt"); // 迟到子项(父已不在库)
+        s.compact();
+        assert!(s.find_slot(100).is_some(), "排除目录自身可见");
+        assert!(s.find_slot(103).is_none(), "迟到子项靠锚点判噪,不得泄漏");
     }
 
     #[test]

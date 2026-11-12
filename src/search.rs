@@ -1540,6 +1540,10 @@ fn run_worker(args: WorkerArgs) {
     } = args;
     // finalize 硬过滤 + 引擎共用同一张排除表(实时取,重建后即新规则)。
     let noise = lstr_index::engine::NoiseRules::from_slot(Arc::clone(&noise_slot));
+    lstr_index::snapshot::debug_log(&format!(
+        "run_worker: noise slot patterns={}",
+        noise_slot.lock().map(|g| g.len()).unwrap_or(0)
+    ));
     // 「立即重建」状态:槽内容与已应用表比对;待重扫卷 3s 未收到 ScanBegin 则重发。
     let mut noise_applied_raw = noise_slot.lock().unwrap().clone();
     let mut pending_rescan: Vec<(char, Instant)> = Vec::new();

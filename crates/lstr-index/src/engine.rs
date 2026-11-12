@@ -585,7 +585,10 @@ impl Engine {
         for (i, v) in self.volumes.iter().enumerate() {
             let hit = match letters {
                 None => true,
-                Some(ls) => ls.contains(&v.letter),
+                // 盘符大小写无关(worker 上报盘符可能是小写)
+                Some(ls) => ls.iter().any(|l| {
+                    l.to_ascii_uppercase() == v.letter.to_ascii_uppercase()
+                }),
             };
             if hit && (v.store.is_some() || v.complete) {
                 affected.push(i);

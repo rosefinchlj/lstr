@@ -821,12 +821,21 @@ pub fn launch_worker(extra_args: &str) -> bool {
 }
 
 /// 引擎构造(主进程内,加载快照)。`noise` = 排除规则共享槽(重建时换表)。
+/// 测试进程(cfg(test) 或 LSTR_TEST_INDEX_DIR)用隔离目录:测试无 worker,
+/// 引擎的周期性保存会把「空 store + hash0」覆写到真实快照上(真实踩坑)。
 pub fn make_engine(
     cfg: &crate::config::IndexConfig,
     noise: lstr_index::engine::NoiseRules,
 ) -> Engine {
+    let index_dir = if cfg!(test) {
+        std::env::temp_dir().join(format!("lstr-test-index-{}", std::process::id()))
+    } else if let Some(dir) = std::env::var_os("LSTR_TEST_INDEX_DIR") {
+        std::path::PathBuf::from(dir)
+    } else {
+        crate::config::attach_dir().join("index")
+    };
     Engine::new(EngineConfig {
-        index_dir: crate::config::attach_dir().join("index"),
+        index_dir,
         noise,
         candidate_cap: cfg.candidate_cap,
         // 只加载选中盘的快照;未选中的快照留在磁盘,重新勾选即可秒开。
