@@ -240,8 +240,16 @@ pub struct SplitOutcome {
     pub total_all: usize,
     pub total_folders: usize,
     pub exact_hits: Vec<Hit>,
+    /// 前缀补集(A-3):名字以查询词开头的命中,offs 二分直接拿。独立于
+    /// file/folder_hits,不并入主候选也不计入 total——保证宽查询的前缀命中
+    /// 不被字母序靠前的海量子串命中挤出候选窗,去重交给 finalize。
+    pub prefix_hits: Vec<Hit>,
     pub aborted: bool,
 }
+
+/// 前缀补集单卷收集上限:补集只是把前缀命中送进排序池,rank 会再按分
+/// 挑选,200 条足够覆盖常见宽查询;builtin 侧再截到展示预算。
+const PREFIX_SUPPLEMENT_CAP: usize = 200;
 
 pub struct Engine {
     cfg: EngineConfig,
@@ -1155,10 +1163,14 @@ impl Engine {
                 let tokens: Vec<Vec<u8>> = spec
                     .tokens
                     .iter()
-                    .map(|t| crate::store::fold_ascii(t.as_bytes()))
+                    .map(|t| crate::store::fold_case(t.as_bytes()))
                     .collect();
+                // 拼音去重用 HashSet（旧实现 hits.iter().any 是 O(n²)，
+                // 2000 候选×2000 拼音命中最坏数百万次比较）。
+                let mut hit_slots: std::collections::HashSet<u32> =
+                    hits.iter().map(|h| h.slot).collect();
                 for slot in self.pinyin[i].search(store, &tokens, self.cfg.candidate_cap) {
-                    if !hits.iter().any(|h| h.slot == slot)
+                    if hit_slots.insert(slot)
                         && crate::query::passes_filters(store, slot, spec)
                         && path_matcher
                             .as_ref()
@@ -1169,8 +1181,10 @@ impl Engine {
                     }
                 }
             }
-            // 深路径前缀后置过滤:目录自身不算命中(见 path_in_prefix)。
-            if let Some(prefix) = &spec.path_prefix {
+            // 深路径前缀后置过滤:仅 UNC 等 PathMatcher 无法处理的前缀需要
+            // （本地盘符前缀已在 emit 内与拼音补集里用 PathMatcher 过滤，
+            // 再走一遍 path_of+to_lowercase 是冗余的父链拼接+分配）。
+            if let (Some(prefix), None) = (&spec.path_prefix, &path_matcher) {
                 hits.retain(|h| {
                     self.path_of(h)
                         .is_some_and(|p| crate::query::path_in_prefix(&p.to_lowercase(), prefix))
@@ -1287,6 +1301,28 @@ impl Engine {
                     exact_set = exact_hits.iter().map(|h| h.slot).collect();
                 }
             }
+            // 前缀补集(A-3):与精确同名补集并列,offs 二分拿前缀区间,保证
+            // 宽查询的前缀命中不被子串候选窗挤出。独立 vec,不并入 all/folder_hits
+            // 也不计 total,双路对拍 invariant 不受影响;去重交给 finalize。
+            // 全词模式下前缀不一定满足词边界,跳过(主候选 walk 已按 MatchMatcher 过滤)。
+            let mut prefix_hits: Vec<Hit> = Vec::new();
+            if let Some(needle) = exact {
+                if !spec.tokens.is_empty() && spec.regex.is_none() && !spec.whole_word {
+                    for slot in crate::query::prefix_slots(
+                        store,
+                        spec,
+                        needle.as_bytes(),
+                        PREFIX_SUPPLEMENT_CAP,
+                    ) {
+                        if path_matcher
+                            .as_ref()
+                            .is_none_or(|m| m.matches(store, slot))
+                        {
+                            prefix_hits.push(hit(slot));
+                        }
+                    }
+                }
+            }
             // 拼音候选(仅 ASCII 查询;名字里不含查询词时靠拼音命中)。
             // 旧双路各自调一次 pinyin.search(同一序列),这里只扫一次,再按
             // 「是否已在各自 hits 里」独立补进两条前缀并各自计数 —— 与旧实现
@@ -1300,7 +1336,7 @@ impl Engine {
                 let tokens: Vec<Vec<u8>> = spec
                     .tokens
                     .iter()
-                    .map(|t| crate::store::fold_ascii(t.as_bytes()))
+                    .map(|t| crate::store::fold_case(t.as_bytes()))
                     .collect();
                 let mut all_set: std::collections::HashSet<u32> =
                     all_hits.iter().map(|h| h.slot).collect();
@@ -1345,6 +1381,7 @@ impl Engine {
                 all_hits.retain(|h| in_prefix(h));
                 folder_hits.retain(|h| in_prefix(h));
                 exact_hits.retain(|h| in_prefix(h));
+                prefix_hits.retain(|h| in_prefix(h));
             }
             // total 精确化(与 Engine::query 同规则):本卷过滤前计数未超 cap
             // 时 hit 已全部收集,用过滤后实际保留数修正;超 cap 保持近似。
@@ -1365,6 +1402,7 @@ impl Engine {
             );
             out.folder_hits.append(&mut folder_hits);
             out.exact_hits.append(&mut exact_hits);
+            out.prefix_hits.append(&mut prefix_hits);
         }
         out
     }

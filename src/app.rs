@@ -836,18 +836,18 @@ impl LstrApp {
     }
 
     fn trigger(&mut self, ctx: &egui::Context) {
-        // 一旦输入/筛选变化就进入「搜索中」：防抖的 150ms 里结果还没回来，
+        // 一旦输入/筛选变化就进入「搜索中」：防抖窗口里结果还没回来，
         // 空列表不应该先闪一下「没有匹配项」。
         self.waiting = true;
         // 新查询从首屏 100 条重新开始，加载更多的状态也必须清零。
         self.more_pending = false;
         self.more_exhausted = false;
-        // 30ms：只用来合并同一帧内的连击/粘贴，不再人为拖慢输入。
-        // 请求在 worker 里是 latest-wins 合并的，逐键查询不会堆积。
-        // 打字防抖:150ms 内还有击键就只搜最后的状态,避免每个字符都发一次
-        // 全量查询(单字符 "a" 在 600 万条索引里是几百毫秒级的扫描)。
-        self.dirty_at = Some(Instant::now() + Duration::from_millis(150));
-        ctx.request_repaint_after(Duration::from_millis(35));
+        // 打字防抖 40ms：只合并同一帧内的连击/粘贴，不人为拖慢首字响应。
+        // 请求在 worker 里 latest-wins 合并，且引擎热循环按 CANCEL_GEN 代次取消
+        // （新击键到达后旧查询数百 µs 内中止），逐键查询不会堆积；稳态查询
+        // 通常 <10ms，故无需旧 150ms 那么保守（那会让首字结果明显迟滞）。
+        self.dirty_at = Some(Instant::now() + Duration::from_millis(40));
+        ctx.request_repaint_after(Duration::from_millis(16));
     }
 
     fn toggle(&mut self, ctx: &egui::Context) {

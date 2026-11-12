@@ -48,6 +48,8 @@ pub struct SplitOnceResult {
     pub folder_total: usize,
     pub all_total: usize,
     pub exact: Vec<Entry>,
+    /// 前缀补集(A-3):宽查询下保证名字以查询词开头的命中进入排序。
+    pub prefix: Vec<Entry>,
     pub exact_ms: f32,
 }
 
@@ -228,6 +230,11 @@ impl BuiltinProvider {
             self.collect_exact_entries(&outcome.exact_hits, query, 50, &mut exact);
             exact_ms = t_exact.elapsed().as_secs_f32() * 1000.0;
         }
+        // 前缀补集(A-3):与精确同名补集同条件(有截断才补),复用同一收尾。
+        let mut prefix = Vec::new();
+        if truncation > 0 && exact_needle.is_some() {
+            self.collect_exact_entries(&outcome.prefix_hits, query, 50, &mut prefix);
+        }
         // 测试构建不落盘日志。
         #[cfg(test)]
         let _ = (engine_ms, folder_collect_ms, file_collect_ms);
@@ -252,6 +259,7 @@ impl BuiltinProvider {
             folder_total: outcome.total_folders,
             all_total: outcome.total_all,
             exact,
+            prefix,
             exact_ms,
         })
     }
@@ -1212,6 +1220,45 @@ mod tests {
         fx.provider
             .fill_exact_entries_per_entry(&outcome.exact_hits, &query, 50, &mut per_entry);
         assert_eq!(lazy, per_entry, "exact 惰性填充与逐条填充不一致");
+    }
+
+    /// 批量元数据填充对拍:共享 MetaFiller(同父目录第 2 条起批量枚举)必须与
+    /// 逐条 fill_one_meta 逐字段相等(复用含已删/无权限/类型漂移的真实夹具)。
+    #[test]
+    fn lazy_meta_batched_matches_per_entry_on_real_files() {
+        let Some(fx) = real_index(600, 120, "meta-batch") else { return };
+        let query = parse("ai", Scope::All);
+        let filters = SearchFilters::default();
+        let mut spec = build_spec(&query, &filters);
+        spec.kind = KindFilter::All;
+        let outcome = fx.provider.engine.query_split_with_exact(&spec, Some("ai"));
+        assert!(!outcome.aborted);
+        for (hits, keep_folder) in [(&outcome.folder_hits, true), (&outcome.file_hits, false)] {
+            let keep = |kind: Kind| {
+                if keep_folder {
+                    kind == Kind::Folder
+                } else {
+                    kind != Kind::Folder
+                }
+            };
+            let mut entries = Vec::new();
+            fx.provider.collect_entries(hits, &query, usize::MAX, keep, &mut entries);
+            let mut filler = super::super::MetaFiller::default();
+            let batched: Vec<Entry> = entries
+                .clone()
+                .into_iter()
+                .filter_map(|e| super::super::fill_one_meta_with(e, true, &mut filler))
+                .collect();
+            let per_entry: Vec<Entry> = entries
+                .into_iter()
+                .filter_map(|e| super::super::fill_one_meta(e, true))
+                .collect();
+            assert_eq!(
+                batched, per_entry,
+                "批量填充与逐条填充不一致(folder={keep_folder}, hits={})",
+                hits.len()
+            );
+        }
     }
 
     /// split 并趟带回的 exact 候选:惰性填充后与旧 `search_exact` 逐条一致

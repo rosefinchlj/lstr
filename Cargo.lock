@@ -1603,6 +1603,7 @@ dependencies = [
  "memchr",
  "pinyin",
  "regex",
+ "regex-syntax",
  "windows",
 ]
 

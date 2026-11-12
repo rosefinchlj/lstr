@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use regex::bytes::{Regex, RegexBuilder};
 
-use crate::store::{fold_ascii, VolumeStore, ATTR_INTERNAL, NO_PARENT};
+use crate::store::{fold_case, VolumeStore, ATTR_INTERNAL, NO_PARENT};
 
 pub const FILE_ATTRIBUTE_DIRECTORY_U16: u16 = 0x0010;
 
@@ -40,7 +40,7 @@ impl MatchMatcher {
                 if spec.case_sensitive {
                     token.as_bytes().to_vec()
                 } else {
-                    fold_ascii(token.as_bytes())
+                    fold_case(token.as_bytes())
                 }
             })
             .collect();
@@ -125,8 +125,8 @@ pub fn name_matches(
         token_matches(name.as_bytes(), token.as_bytes(), whole_word)
     } else {
         token_matches(
-            &fold_ascii(name.as_bytes()),
-            &fold_ascii(token.as_bytes()),
+            &fold_case(name.as_bytes()),
+            &fold_case(token.as_bytes()),
             whole_word,
         )
     }
@@ -149,27 +149,65 @@ pub fn regex_name_matches(name: &str, pattern: &str, case_sensitive: bool) -> bo
     regex_for(pattern, case_sensitive).is_some_and(|regex| regex.is_match(name.as_bytes()))
 }
 
-/// 从正则里抽一段最长的字面量（≥2 字节）做 n-gram 预筛；抽不到就全扫。
+/// 从正则里抽一段「每个匹配都必然包含」的最长字面量（≥2 字节）做 n-gram
+/// 预筛；抽不到就全扫（查询可取消）。预筛只是超集，最终仍由 `regex.is_match`
+/// 判定，因此宁可少筛（全扫）也不能误筛（假阴性）。
+///
+/// 旧实现按字节扫「最长字母数字串」，不解析正则结构，会把交替分支 / 字符类 /
+/// 转义类里的片段误当必然字面量，造成静默漏结果：`(foo|bar)` 只筛 foo 漏 bar、
+/// `[a-z]abc` 抽出 "a-z" 漏 xabc、`\wfoo` 抽出 "wfoo" 漏 xfoo。这里改为解析 HIR
+/// 后只取保证出现的字面量（见 [`required_literal`]）。
 fn regex_literal(pattern: &str) -> Option<Vec<u8>> {
-    let bytes = pattern.as_bytes();
-    let mut best: &[u8] = &[];
-    let mut start: Option<usize> = None;
-    for (i, &byte) in bytes.iter().enumerate() {
-        let literal = byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-';
-        if literal {
-            start.get_or_insert(i);
-        } else if let Some(s) = start.take() {
-            if i - s > best.len() {
-                best = &bytes[s..i];
+    // 用默认（大小写敏感）解析提取结构；预筛字面量随后 fold_case 与小写名区
+    // 对齐。大小写不敏感匹配的最终判定仍由 compiled_regex 的 case_insensitive
+    // 正则完成，故按原样提取字面量再折叠是安全的超集预筛。
+    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+    let lit = required_literal(&hir)?;
+    (lit.len() >= 2).then(|| fold_case(&lit))
+}
+
+/// 递归提取 HIR 中「必然出现」的最长连续字面量；无保证字面量时返回 None。
+/// - Literal：该字面量本身；
+/// - Concat：相邻的必然字面量可拼接（全体按序出现），被「无必然字面量」的
+///   子项（如字符类）断开，取各连续段中最长者；
+/// - Repetition：min≥1 时内部必然出现，否则（可选重复）None；
+/// - Capture：递归取捕获组内部；
+/// - Alternation：各分支不一定共享字面量，保守返回 None（全扫，绝不漏）；
+/// - Class / Look / Empty：零宽或不确定，None。
+fn required_literal(hir: &regex_syntax::hir::Hir) -> Option<Vec<u8>> {
+    use regex_syntax::hir::HirKind;
+    match hir.kind() {
+        HirKind::Literal(lit) => Some(lit.0.to_vec()),
+        HirKind::Concat(subs) => {
+            let mut best: Vec<u8> = Vec::new();
+            let mut cur: Vec<u8> = Vec::new();
+            for sub in subs {
+                match required_literal(sub) {
+                    Some(piece) => cur.extend_from_slice(&piece),
+                    None => {
+                        if cur.len() > best.len() {
+                            best = std::mem::take(&mut cur);
+                        } else {
+                            cur.clear();
+                        }
+                    }
+                }
+            }
+            if cur.len() > best.len() {
+                best = cur;
+            }
+            (!best.is_empty()).then_some(best)
+        }
+        HirKind::Repetition(rep) => {
+            if rep.min >= 1 {
+                required_literal(&rep.sub)
+            } else {
+                None
             }
         }
+        HirKind::Capture(cap) => required_literal(&cap.sub),
+        HirKind::Alternation(_) | HirKind::Class(_) | HirKind::Look(_) | HirKind::Empty => None,
     }
-    if let Some(s) = start {
-        if bytes.len() - s > best.len() {
-            best = &bytes[s..];
-        }
-    }
-    (best.len() >= 2).then(|| fold_ascii(best))
 }
 
 fn walk_regex(
@@ -522,7 +560,7 @@ fn query_tokens(spec: &QuerySpec) -> Vec<Vec<u8>> {
     spec.tokens
         .iter()
         .filter(|t| !t.is_empty())
-        .map(|t| fold_ascii(t.as_bytes()))
+        .map(|t| fold_case(t.as_bytes()))
         .collect()
 }
 
@@ -533,7 +571,7 @@ pub(crate) fn exact_slots(store: &VolumeStore, spec: &QuerySpec, ex: &[u8]) -> V
     let mut slots = Vec::new();
     // offs 按小写名排序；大小写敏感时先用折叠名定位区间，再按原始名判等。
     let folded = if spec.case_sensitive {
-        fold_ascii(ex)
+        fold_case(ex)
     } else {
         ex.to_vec()
     };
@@ -557,6 +595,58 @@ pub(crate) fn exact_slots(store: &VolumeStore, spec: &QuerySpec, ex: &[u8]) -> V
             store.name_lc(slot) == ex
         };
         if exact_ok && passes_filters(store, slot, spec) {
+            slots.push(slot);
+        }
+    }
+    slots
+}
+
+/// 前缀候选集(A-3):名字以 prefix 开头的槽位,ready 走 offs 二分、scan 全扫。
+/// 宽查询的子串候选按名字序封顶 candidate_cap,前缀命中(排序仅次于精确同名)
+/// 可能被字母序靠前的海量子串命中挤出候选窗。此函数供「前缀补集」用二分
+/// 直接拿前缀区间(成本 ~µs),保证前缀命中总能进入排序。cap 限制收集量。
+pub(crate) fn prefix_slots(
+    store: &VolumeStore,
+    spec: &QuerySpec,
+    prefix: &[u8],
+    cap: usize,
+) -> Vec<u32> {
+    let mut slots = Vec::new();
+    let folded = if spec.case_sensitive {
+        fold_case(prefix)
+    } else {
+        prefix.to_vec()
+    };
+    if folded.is_empty() || cap == 0 {
+        return slots;
+    }
+    if !store.offs.is_empty() {
+        let lo = store.offs.partition_point(|&s| store.name_lc(s) < &folded[..]);
+        for &slot in &store.offs[lo..] {
+            if slots.len() >= cap {
+                break;
+            }
+            // 小写名序里前缀区间连续;一旦不再以 folded 开头即可停止。
+            if !store.name_lc(slot).starts_with(&folded[..]) {
+                break;
+            }
+            let ok = !spec.case_sensitive || store.name(slot).starts_with(prefix);
+            if ok && passes_filters(store, slot, spec) {
+                slots.push(slot);
+            }
+        }
+        return slots;
+    }
+    for slot in 0..store.name_off.len() as u32 {
+        if slots.len() >= cap {
+            break;
+        }
+        let ok = if spec.case_sensitive {
+            store.name(slot).starts_with(prefix)
+        } else {
+            store.name_lc(slot).starts_with(&folded[..])
+        };
+        if ok && passes_filters(store, slot, spec) {
             slots.push(slot);
         }
     }
@@ -769,7 +859,7 @@ fn walk_candidates(
             .filter(|literal| !literal.is_empty())
         {
             if let Some(candidates) =
-                store.ngram_candidates(&fold_ascii(literal.as_bytes()))
+                store.ngram_candidates(&fold_case(literal.as_bytes()))
             {
                 for (i, slot) in candidates.into_iter().enumerate() {
                     if i & CANCEL_CHECK_MASK == 0 && cancelled(cancel) {
@@ -815,7 +905,7 @@ fn walk_candidates(
         let exb = ex.as_bytes();
         // offs 按小写名排序；大小写敏感时先用折叠名定位区间，再用原始名判等。
         let folded = if spec.case_sensitive {
-            fold_ascii(exb)
+            fold_case(exb)
         } else {
             exb.to_vec()
         };
@@ -1080,11 +1170,43 @@ pub(crate) fn query_volume_memmem_scan(
     (slots, total, capped, false)
 }
 
-/// 拼音候选匹配:全部 token 命中 initials 或 full(前缀或子串)。
+/// 拼音候选匹配:全部 token 命中 initials 或 full。前缀任意长度可用
+/// (首字母 w → wx/weixin);子串需 ≥2 字符(A-5)——单字符做子串会命中
+/// 大量拼音中间含该字母的弱相关名字(350 档噪声),只保留其前缀语义。
 pub fn pinyin_match(initials: &[u8], full: &[u8], tokens: &[Vec<u8>]) -> bool {
-    tokens
-        .iter()
-        .all(|t| memchr::memmem::find(initials, t).is_some() || memchr::memmem::find(full, t).is_some())
+    tokens.iter().all(|t| {
+        initials.starts_with(t)
+            || full.starts_with(t)
+            || (t.len() >= 2
+                && (memchr::memmem::find(initials, t).is_some()
+                    || memchr::memmem::find(full, t).is_some()))
+    })
+}
+
+#[cfg(test)]
+mod pinyin_match_tests {
+    use super::pinyin_match;
+
+    #[test]
+    fn single_char_prefix_ok_substring_rejected() {
+        // w → 微信(initials wx / full weixin) 前缀命中保留
+        assert!(pinyin_match(b"wx", b"weixin", &[b"w".to_vec()]));
+        // 单字符子串(拼音中间含 w)拒绝:如「文件」wj 不含 w 前缀但... 用反例
+        // 「啊」a:initials a / full a,w 不是其前缀也不应子串命中
+        assert!(!pinyin_match(b"a", b"a", &[b"w".to_vec()]));
+        // 「安全」anquan:full 中间含 w? 不含。用「中文」zhongwen:full 含 w 但非前缀
+        assert!(!pinyin_match(b"zw", b"zhongwen", &[b"w".to_vec()]), "单字符不做子串");
+    }
+
+    #[test]
+    fn multi_char_substring_still_works() {
+        // ei → weixin 子串命中(≥2)保留
+        assert!(pinyin_match(b"wx", b"weixin", &[b"ei".to_vec()]));
+        assert!(pinyin_match(b"bgdocx", b"baogaodocx", &[b"gao".to_vec()]));
+        // 多 token AND
+        assert!(pinyin_match(b"wx", b"weixin", &[b"w".to_vec(), b"ei".to_vec()]));
+        assert!(!pinyin_match(b"wx", b"weixin", &[b"w".to_vec(), b"zz".to_vec()]));
+    }
 }
 
 #[cfg(test)]
@@ -1624,9 +1746,12 @@ mod tests {
         assert_eq!(run("ReadMe", true), 1);
         assert_eq!(run("read", true), 1, "只应命中全小写的 readme");
         assert_eq!(run("read", false), 3, "默认大小写不敏感仍命中三例");
-        // 非 ASCII 本来就是字节精确；fold_ascii 不折叠 Ä/ä。
+        // 区分大小写:非 ASCII 仍按原始字节精确(MatchMatcher 用 store.name)。
         assert_eq!(run("ÄI", true), 1);
         assert_eq!(run("äi", true), 1);
+        // A-6:大小写不敏感时 Unicode 简单折叠使 Ä/ä 互配(旧 fold_ascii 不互配)。
+        assert_eq!(run("äi", false), 2, "ÄI 与 äi 都应命中");
+        assert_eq!(run("ÄI", false), 2);
     }
 
     fn whole_word_store() -> VolumeStore {
@@ -1929,7 +2054,7 @@ mod tests {
             .tokens
             .iter()
             .filter(|t| !t.is_empty())
-            .map(|t| fold_ascii(t.as_bytes()))
+            .map(|t| fold_case(t.as_bytes()))
             .collect();
         let (gi, g) = gen_of(&tokens);
         for cap in [3usize, 100, 100_000] {
@@ -2166,5 +2291,144 @@ mod tests {
         assert_eq!(s.name(slots[0]), b"ghost.txt");
         assert_equivalent(&s, &spec("ghost"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod regex_literal_tests {
+    //! A-1 回归：正则字面量预筛不得产生假阴性。旧实现按字节扫最长字母数字串，
+    //! 会把交替分支 / 字符类 / 转义类里的片段误当必然字面量。现改为 HIR 提取。
+    use super::{query_volume, regex_literal, QuerySpec};
+    use crate::store::VolumeStore;
+
+    fn store_with(names: &[&str]) -> VolumeStore {
+        let mut s = VolumeStore::new(false);
+        for (i, n) in names.iter().enumerate() {
+            s.insert(100 + i as u64, 0, 0, n.as_bytes());
+        }
+        s.compact(); // 建倒排，确保走 n-gram 预筛路径
+        s
+    }
+
+    fn regex_hits(s: &VolumeStore, pattern: &str, case_sensitive: bool) -> Vec<String> {
+        let spec = QuerySpec {
+            regex: Some(pattern.to_string()),
+            case_sensitive,
+            ..Default::default()
+        };
+        let (slots, _, _) = query_volume(s, &spec, 2000);
+        let mut names: Vec<String> = slots
+            .iter()
+            .map(|&slot| String::from_utf8_lossy(s.name(slot)).into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn alternation_matches_all_branches() {
+        let s = store_with(&["foo.txt", "bar.txt", "baz.txt"]);
+        let h = regex_hits(&s, "(foo|bar)", true);
+        assert_eq!(h, vec!["bar.txt".to_string(), "foo.txt".to_string()]);
+    }
+
+    #[test]
+    fn char_class_is_not_a_literal() {
+        let s = store_with(&["xabc.txt", "a-zabc.txt", "zzz.txt"]);
+        let h = regex_hits(&s, "[a-z]abc", true);
+        assert!(h.contains(&"xabc.txt".to_string()), "xabc 应命中 [a-z]abc: {h:?}");
+        assert!(!h.contains(&"zzz.txt".to_string()));
+    }
+
+    #[test]
+    fn escaped_class_does_not_leak_literal() {
+        let s = store_with(&["xfoo.txt", "wfoo.txt", "nope.txt"]);
+        let h = regex_hits(&s, r"\wfoo", true);
+        assert_eq!(h, vec!["wfoo.txt".to_string(), "xfoo.txt".to_string()]);
+    }
+
+    #[test]
+    fn anchored_literal_still_prefilters_correctly() {
+        let s = store_with(&["report_2024.pdf", "other.txt", "report_.pdf"]);
+        let h = regex_hits(&s, r"^report_\d+\.pdf$", true);
+        assert_eq!(h, vec!["report_2024.pdf".to_string()]);
+    }
+
+    #[test]
+    fn case_insensitive_prefilter_matches_uppercase_name() {
+        let s = store_with(&["REPORT_2024.pdf", "other.txt"]);
+        let h = regex_hits(&s, r"^report_\d+\.pdf$", false);
+        assert_eq!(h, vec!["REPORT_2024.pdf".to_string()]);
+    }
+
+    #[test]
+    fn required_literal_extraction() {
+        assert_eq!(regex_literal("(foo|bar)"), None, "交替无必然字面量");
+        assert_eq!(regex_literal("[a-z]abc"), Some(b"abc".to_vec()));
+        assert_eq!(regex_literal(r"\wfoo"), Some(b"foo".to_vec()));
+        assert_eq!(regex_literal(r"^report_\d+\.pdf$"), Some(b"report_".to_vec()));
+        assert_eq!(regex_literal("abc"), Some(b"abc".to_vec()));
+        assert_eq!(regex_literal(r"a?bc"), Some(b"bc".to_vec()), "可选 a 后的 bc 仍必然");
+        assert_eq!(regex_literal(r"(abc)+"), Some(b"abc".to_vec()));
+        assert_eq!(regex_literal(r"abc*"), Some(b"ab".to_vec()), "c 可选重复，ab 仍必然");
+        assert_eq!(regex_literal(r"a*b*c*"), None, "全部可选，无必然字面量");
+    }
+}
+
+#[cfg(test)]
+mod prefix_slots_tests {
+    //! A-3 回归：宽查询的前缀命中不被子串候选窗挤出。
+    use super::{prefix_slots, query_volume, QuerySpec};
+    use crate::store::VolumeStore;
+
+    #[test]
+    fn prefix_supplement_recovers_cut_prefix_match() {
+        // 3000 个低 FRN 的子串命中占满 cap=2000,高 FRN 的前缀命中 sub_target
+        // 被挤出主候选窗;prefix_slots 用二分把它找回。
+        let mut s = VolumeStore::new(false);
+        for i in 0..3000u64 {
+            s.insert(1000 + i, 0, 0, format!("a_sub_{i:04}.txt").as_bytes());
+        }
+        s.insert(99999, 0, 0, b"sub_target.txt");
+        s.compact();
+        let spec = QuerySpec { tokens: vec!["sub".into()], ..Default::default() };
+        let (slots, total, capped) = query_volume(&s, &spec, 2000);
+        assert!(capped, "应触发候选封顶");
+        assert!(total > 2000);
+        assert!(
+            !slots.iter().any(|&x| s.name(x) == b"sub_target.txt"),
+            "前缀命中确实被主候选窗挤出"
+        );
+        let pre = prefix_slots(&s, &spec, b"sub", 200);
+        assert!(
+            pre.iter().any(|&x| s.name(x) == b"sub_target.txt"),
+            "前缀补集应找回前缀命中"
+        );
+    }
+
+    #[test]
+    fn prefix_slots_case_sensitive_and_cap() {
+        let mut s = VolumeStore::new(false);
+        s.insert(1, 0, 0, b"Foo.txt");
+        s.insert(2, 0, 0, b"foo.txt");
+        s.insert(3, 0, 0, b"foobar.txt");
+        s.insert(4, 0, 0, b"bar.txt");
+        s.compact();
+        let spec = QuerySpec { tokens: vec!["foo".into()], ..Default::default() };
+        let mut names: Vec<Vec<u8>> =
+            prefix_slots(&s, &spec, b"foo", 200).iter().map(|&x| s.name(x).to_vec()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![b"Foo.txt".to_vec(), b"foo.txt".to_vec(), b"foobar.txt".to_vec()]
+        );
+        // 大小写敏感:Foo 只命中 Foo.txt
+        let spec_cs =
+            QuerySpec { tokens: vec!["Foo".into()], case_sensitive: true, ..Default::default() };
+        let cs = prefix_slots(&s, &spec_cs, b"Foo", 200);
+        assert_eq!(cs.len(), 1);
+        assert_eq!(s.name(cs[0]), b"Foo.txt");
+        // cap 限制收集量
+        assert_eq!(prefix_slots(&s, &spec, b"foo", 2).len(), 2);
     }
 }

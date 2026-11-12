@@ -390,11 +390,36 @@ pub(crate) fn mask_of_bytes(name: &[u8]) -> u32 {
     m
 }
 
-pub fn fold_ascii(bytes: &[u8]) -> Vec<u8> {
-    bytes
-        .iter()
-        .map(|&b| if b.is_ascii_uppercase() { b + 32 } else { b })
-        .collect()
+/// 大小写折叠(大小写不敏感匹配用):ASCII 字母转小写;非 ASCII 做 Unicode
+/// 「简单折叠」——仅当 char::to_lowercase 恰好产出单个字符且 UTF-8 字节长与
+/// 原字符相同时才替换(Ä→ä、全角 Ａ→ａ、西里尔/希腊字母等),否则保留原字节。
+/// 折叠前后**字节长度不变**是硬约束(names 与 names_lc 共享 name_off 偏移);
+/// 长度会变的折叠(ß→ss、İ→i̇)不做。旧 fold_ascii 只折 ASCII,Ä/ä 不互配,
+/// 与 rank/pin 的 Unicode lowercase 跨层不一致(A-6),这里补齐常见等长情形。
+pub fn fold_case(bytes: &[u8]) -> Vec<u8> {
+    // 快路径:纯 ASCII 逐字节折叠(绝大多数名字),与旧行为逐字节一致。
+    if bytes.is_ascii() {
+        return bytes
+            .iter()
+            .map(|&b| if b.is_ascii_uppercase() { b + 32 } else { b })
+            .collect();
+    }
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        return bytes.to_vec(); // 非法 UTF-8 原样(名字区理论上均合法)
+    };
+    let mut out = String::with_capacity(bytes.len());
+    for ch in s.chars() {
+        if ch.is_ascii() {
+            out.push(ch.to_ascii_lowercase());
+            continue;
+        }
+        let mut lower = ch.to_lowercase();
+        match lower.next() {
+            Some(lc) if lower.next().is_none() && lc.len_utf8() == ch.len_utf8() => out.push(lc),
+            _ => out.push(ch),
+        }
+    }
+    out.into_bytes()
 }
 
 fn slice_at(buf: &[u8], off: usize) -> &[u8] {
@@ -446,7 +471,7 @@ impl VolumeStore {
         unresolved: Vec<(u32, u64)>,
         noise_enabled: bool,
     ) -> Self {
-        let names_lc = fold_ascii(&names);
+        let names_lc = fold_case(&names);
         let base_len = name_off.len() as u32;
         let off_index: Vec<(u32, u32)> =
             name_off.iter().enumerate().map(|(i, &o)| (o, i as u32)).collect();
@@ -915,7 +940,7 @@ impl VolumeStore {
                     self.name_off[old as usize] = self.names.len() as u32;
                     self.names.extend_from_slice(name);
                     self.names.push(0);
-                    self.names_lc.extend_from_slice(&fold_ascii(name));
+                    self.names_lc.extend_from_slice(&fold_case(name));
                     self.names_lc.push(0);
                     self.off_index.push((self.name_off[old as usize], old));
                     self.char_mask[old as usize] = mask_of_bytes(name);
@@ -946,7 +971,7 @@ impl VolumeStore {
         self.off_index.push((off, slot));
         self.names.extend_from_slice(name);
         self.names.push(0);
-        self.names_lc.extend_from_slice(&fold_ascii(name));
+        self.names_lc.extend_from_slice(&fold_case(name));
         self.names_lc.push(0);
         self.frn.push(frn);
         let anchored = self.noise_enabled && self.noise_anchors.contains(&parent_frn);
@@ -1010,11 +1035,16 @@ impl VolumeStore {
     }
 
     /// 沿父链做噪声分类(可达部分)。父未解析时由 compact 全量重分类兜底。
+    ///
+    /// 语义(A-2):噪声目录**自身保留可见**(搜 node_modules/temp 能找到目录),
+    /// 只排除其子孙。因此从**父槽**开始向上查、跳过 slot 自身:slot 自己是噪声段
+    /// 不判噪,但它的子项分类时会查到它(名字是噪声段)而判噪。子孙泄漏由
+    /// 「祖先 NOISE 位」与 compact 重建的噪声锚点双重兜底。
     fn classify_chain(&mut self, slot: u32) {
         let mut hops = 0;
-        let mut cur = slot;
+        let mut cur = self.parent[slot as usize];
         let mut self_noise = false;
-        loop {
+        while cur != NO_PARENT && hops < 64 {
             let name_lc = self.name_lc(cur);
             if crate::noise::is_noise_segment(name_lc) {
                 self_noise = true;
@@ -1029,11 +1059,7 @@ impl VolumeStore {
                 self_noise = true;
                 break;
             }
-            let p = self.parent[cur as usize];
-            if p == NO_PARENT || hops >= 64 {
-                break;
-            }
-            cur = p;
+            cur = self.parent[cur as usize];
             hops += 1;
         }
         if self_noise {
@@ -1127,18 +1153,17 @@ impl VolumeStore {
             for &s in &live {
                 self.classify_chain(s);
             }
-            // 记录噪声锚点:将被剔除的 slot 中,父不是「同为噪声被剔除」的顶层者
-            let live_set: std::collections::HashSet<u32> = live.iter().copied().collect();
+            // 噪声锚点(A-2):自身可见、名字是噪声段的**目录**。其未来子项
+            // (journal 增量,父可能尚未解析)按锚点立即判噪,杜绝子孙泄漏。
+            // 噪声目录自身保留可搜,故锚点是「保留下来的噪声目录本身」,
+            // 而非旧语义的「被剔除的顶层噪声」。
+            self.noise_anchors.clear();
             for s in 0..self.name_off.len() as u32 {
-                if self.visible(s) || self.attrs[s as usize] & ATTR_NOISE == 0 {
-                    continue;
+                let a = self.attrs[s as usize];
+                if (a & ATTR_INTERNAL) != 0 || (a & 0x10) == 0 {
+                    continue; // 只看可见目录
                 }
-                let p = self.parent[s as usize];
-                let parent_dropped = p != NO_PARENT
-                    && !live_set.contains(&p)
-                    && self.alive(p)
-                    && self.attrs[p as usize] & ATTR_NOISE != 0;
-                if !parent_dropped {
+                if crate::noise::is_noise_segment(self.name_lc(s)) {
                     self.noise_anchors.insert(self.frn[s as usize]);
                 }
             }
@@ -1164,7 +1189,7 @@ impl VolumeStore {
             names.extend_from_slice(&self.names[start..end]);
             names.push(0);
         }
-        let names_lc = fold_ascii(&names);
+        let names_lc = fold_case(&names);
         // 6. parent 重映射
         let mut parent = Vec::with_capacity(by_frn.len());
         for &(_, old) in &by_frn {
@@ -1551,17 +1576,37 @@ mod tests {
     }
 
     #[test]
-    fn noise_excluded_subtree_dropped_at_compact() {
+    fn noise_dir_visible_but_subtree_dropped_at_compact() {
+        // A-2:噪声目录自身保留可搜,子孙整树剔除。
         let mut s = VolumeStore::new(true);
         insert(&mut s, 5, 0, 0x10, "root");
         insert(&mut s, 10, 5, 0x10, "node_modules");
         insert(&mut s, 11, 10, 0, "dep.txt");
         insert(&mut s, 12, 5, 0, "keep.txt");
         s.compact();
-        assert_eq!(s.find_slot(10), None);
-        assert_eq!(s.find_slot(11), None);
-        assert_eq!(s.find_slot(12), Some(s.find_slot(12).unwrap()));
-        assert_eq!(s.len(), 2); // root + keep.txt
+        assert!(s.find_slot(10).is_some(), "噪声目录自身应保留可见");
+        assert_eq!(s.find_slot(11), None, "噪声子孙应被剔除");
+        assert!(s.find_slot(12).is_some());
+        assert_eq!(s.len(), 3); // root + node_modules + keep.txt
+        let spec = |t: &str| crate::query::QuerySpec { tokens: vec![t.into()], ..Default::default() };
+        let (_, total, _) = crate::query::query_volume(&s, &spec("node_modules"), 100);
+        assert_eq!(total, 1, "搜 node_modules 应找到目录本身");
+        let (_, total, _) = crate::query::query_volume(&s, &spec("dep"), 100);
+        assert_eq!(total, 0, "噪声内容不可搜");
+    }
+
+    #[test]
+    fn packages_source_is_searchable() {
+        // A-2:packages 是常见 monorepo 源码目录(pnpm/lerna workspace),不再误排。
+        let mut s = VolumeStore::new(true);
+        insert(&mut s, 5, 0, 0x10, "root");
+        insert(&mut s, 10, 5, 0x10, "packages");
+        insert(&mut s, 11, 10, 0, "app.js");
+        s.compact();
+        let spec = crate::query::QuerySpec { tokens: vec!["app".into()], ..Default::default() };
+        let (slots, total, _) = crate::query::query_volume(&s, &spec, 100);
+        assert_eq!(total, 1, "packages/ 下的源码应可搜到");
+        assert_eq!(s.name(slots[0]), b"app.js");
     }
 
     #[test]
@@ -1580,5 +1625,23 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn fold_case_unicode_equal_length() {
+        // ASCII 与旧行为逐字节一致
+        assert_eq!(fold_case(b"Hello.TXT"), b"hello.txt");
+        // 等长 Unicode 简单折叠:Ä→ä(2字节)、全角 Ａ→ａ(3字节)、西里尔 А→а
+        assert_eq!(fold_case("Ä".as_bytes()), "ä".as_bytes());
+        assert_eq!(fold_case("ＡＢＣ".as_bytes()), "ａｂｃ".as_bytes());
+        assert_eq!(fold_case("Привет".as_bytes()), "привет".as_bytes());
+        // 长度会变的折叠不做,保留原字节(ß→ss 会变长)
+        assert_eq!(fold_case("ß".as_bytes()), "ß".as_bytes());
+        // 中文不受影响,仅 ASCII 部分折叠
+        assert_eq!(fold_case("报告.DOCX".as_bytes()), "报告.docx".as_bytes());
+        // 硬约束:任意输入折叠前后字节长度不变(names/names_lc 共享偏移)
+        for s in ["ÄI", "äi", "ＡＢＣ", "Привет", "ß", "报告.docx", "İstanbul", "aÄbＢc"] {
+            assert_eq!(fold_case(s.as_bytes()).len(), s.len(), "长度必须不变: {s}");
+        }
     }
 }

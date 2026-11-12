@@ -30,6 +30,11 @@ const APPS_RELOAD_INTERVAL: Duration = Duration::from_secs(90);
 
 /// 首屏交付的候选上限。窗口只按「一屏结果数」长高，其余靠滚轮查看。
 pub(crate) const MIN_DELIVER: usize = 100;
+/// 非精确同名条目每种 (kind, name) 最多保留几条（A-4）。旧实现只留 1，
+/// 搜 config/report/README 这类通用名时跨项目的多个同名文件只能看到一个，
+/// 且 load more 也补不回（去重在截断前）。放宽到 3 改善召回，又不至于让
+/// 列表被同名变体灌满；精确同名（name == 查询词）另有 6 条豁免。
+const SAME_NAME_KEEP: usize = 3;
 /// 「加载更多」时单次向索引/Everything 要的候选数上限。
 /// 3000 条交付上限按 2 倍留去重余量 → 6000。
 const MAX_FETCH: usize = 6000;
@@ -669,6 +674,32 @@ mod pin_tests {
         );
     }
 
+    #[test]
+    fn finalize_keeps_top_n_non_exact_same_names() {
+        // A-4:搜 config（非精确同名）时，跨项目的多个 config.json 应保留前 N 个，
+        // 而不是旧实现的仅 1 个（那会让用户找不到其它项目里的同名文件）。
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let entries: Vec<Entry> = (0..5)
+            .map(|i| {
+                entry_at(
+                    &format!("cfg{i}"),
+                    "config.json",
+                    Kind::File,
+                    &format!(r"D:\proj{i}\config.json"),
+                )
+            })
+            .collect();
+        let out = finalize_entries(
+            entries,
+            &request("config", 8),
+            &history,
+            &Config::default(),
+            Vec::new(),
+        );
+        let count = out.iter().filter(|e| e.name == "config.json").count();
+        assert_eq!(count, SAME_NAME_KEEP, "非精确同名应保留前 N 个");
+    }
+
     /// 基准:finalize 约 480 个候选的分项成本。release 下运行:
     /// `cargo test -p lstr --release bench_finalize_candidates -- --nocapture`
     #[test]
@@ -973,11 +1004,65 @@ impl PendingMeta {
 /// 调用,展示则要求时间新鲜。索引 mtime 为 0(未知)时,本函数从 FS 拿到
 /// 的值仍可补上,从而不影响展示。
 fn fill_one_meta(entry: Entry, correct_kind: bool) -> Option<Entry> {
+    // 单条入口(测试 oracle 与无批量上下文用):fresh filler 首个候选必逐条,
+    // 行为与旧实现逐字节一致。
+    fill_one_meta_with(entry, correct_kind, &mut MetaFiller::default())
+}
+
+/// 惰性元数据填充的批量优化:同一父目录第 2 个候选起改用一次
+/// `list_dir_meta` 目录枚举批量取 size/mtime,取代逐条 `GetFileAttributesExW`
+/// (load more 到数千条、结果集中在少数目录时收益明显)。首个候选仍逐条,
+/// 避免为单个条目枚举巨型目录;枚举失败/名字歧义一律回退逐条,语义不变。
+#[derive(Default)]
+struct MetaFiller {
+    dirs: HashMap<String, DirMetaState>,
+}
+
+enum DirMetaState {
+    /// 只见过一个候选:尚未枚举(逐条查)。
+    SeenOnce,
+    /// 已枚举(可能失败=None);后续候选按名取,取不到回退逐条。
+    Batched(Option<lstr_index::win::DirMeta>),
+}
+
+impl MetaFiller {
+    fn find(&mut self, path: &str) -> Option<(u64, i64, bool)> {
+        let p = std::path::Path::new(path);
+        let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
+            return lstr_index::win::find_meta(path);
+        };
+        let parent = parent.to_string_lossy().into_owned();
+        let name = name.to_string_lossy().into_owned();
+        use std::collections::hash_map::Entry;
+        match self.dirs.entry(parent) {
+            Entry::Vacant(v) => {
+                v.insert(DirMetaState::SeenOnce);
+                lstr_index::win::find_meta(path)
+            }
+            Entry::Occupied(mut o) => {
+                if matches!(o.get(), DirMetaState::SeenOnce) {
+                    let dm = lstr_index::win::list_dir_meta(o.key());
+                    o.insert(DirMetaState::Batched(dm));
+                }
+                let dm = match o.get() {
+                    DirMetaState::Batched(d) => d.as_ref(),
+                    DirMetaState::SeenOnce => None,
+                };
+                match dm.and_then(|d| d.get(&name)) {
+                    Some(m) => Some((m.size, m.mtime, m.is_dir)),
+                    None => lstr_index::win::find_meta(path),
+                }
+            }
+        }
+    }
+}
+
+fn fill_one_meta_with(entry: Entry, correct_kind: bool, filler: &mut MetaFiller) -> Option<Entry> {
     let Some(path) = entry.path.as_ref() else {
         return Some(entry);
     };
     let path_str = path.to_string_lossy();
-    let Some((size, modified, fs_dir)) = lstr_index::win::find_meta(&path_str) else {
+    let Some((size, modified, fs_dir)) = filler.find(&path_str) else {
         return None;
     };
     // 候选阶段按索引 attrs 定的 kind:Folder ⇔ 索引说 is_dir。
@@ -1052,12 +1137,14 @@ fn finalize_entries_with_pending(
         // seen_* 记账之前就被丢弃,不占名额;后续同名/同 id 候选可正常补位。
         let t_meta = Instant::now();
         let mut seen_ids = HashSet::with_capacity(entries.len());
-        let mut seen_names = HashSet::with_capacity(entries.len());
+        let mut name_counts: HashMap<(Kind, String), usize> = HashMap::with_capacity(entries.len());
         let mut exact_counts: HashMap<(Kind, String), usize> = HashMap::with_capacity(8);
         let mut kept = Vec::with_capacity(deliver.saturating_add(8));
         let mut non_exact = 0usize;
         // 同一 id 的 split/exact 副本按出现顺序消费 PendingMeta 里的语义。
         let mut pending_uses: HashMap<String, usize> = HashMap::new();
+        // 跨候选共享的元数据填充器:同父目录批量枚举(见 MetaFiller)。
+        let mut filler = MetaFiller::default();
         for entry in entries {
             let name_lower = entry.name.to_lowercase();
             let is_exact = !needle_lower.is_empty()
@@ -1078,7 +1165,7 @@ fn finalize_entries_with_pending(
                 if exact_counts.get(&name_key).copied().unwrap_or(0) >= 6 {
                     continue;
                 }
-            } else if seen_names.contains(&name_key) {
+            } else if name_counts.get(&name_key).copied().unwrap_or(0) >= SAME_NAME_KEEP {
                 continue;
             }
             let id_lower = entry.id.to_lowercase();
@@ -1097,7 +1184,7 @@ fn finalize_entries_with_pending(
                 continue;
             }
             let filled = match mode {
-                Some(correct_kind) => fill_one_meta(entry, correct_kind),
+                Some(correct_kind) => fill_one_meta_with(entry, correct_kind, &mut filler),
                 None => Some(entry),
             };
             let Some(entry) = filled else { continue };
@@ -1105,7 +1192,7 @@ fn finalize_entries_with_pending(
             if is_exact {
                 *exact_counts.entry(name_key).or_insert(0) += 1;
             } else {
-                seen_names.insert(name_key);
+                *name_counts.entry(name_key).or_insert(0) += 1;
                 non_exact += 1;
             }
             kept.push(entry);
@@ -1125,10 +1212,11 @@ fn finalize_entries_with_pending(
         entries.retain(|entry| seen_ids.insert(entry.id.to_lowercase()));
         t_ids = t_mark.elapsed().as_secs_f64() * 1000.0;
         t_mark = Instant::now();
-        // 同名条目（不同路径下的 clip 文件夹、debug/release 同名 exe）只保留排名最高的一个。
+        // 同名条目（不同路径下的 clip 文件夹、debug/release 同名 exe）每种最多保留
+        // SAME_NAME_KEEP 个（A-4：旧实现只留 1，通用名召回太差）。
         // 例外：精确同名（用户就是打的名字，如 use → E:\use）保留前 6 个，
         // 多个同名目录是正常需求，全砍掉会让 E:\use 被系统深处同名目录挤掉。
-        let mut seen_names = HashSet::with_capacity(entries.len());
+        let mut name_counts: HashMap<(Kind, String), usize> = HashMap::with_capacity(entries.len());
         let mut exact_counts: std::collections::HashMap<(Kind, String), usize> =
             std::collections::HashMap::new();
         entries.retain(|entry| {
@@ -1138,7 +1226,9 @@ fn finalize_entries_with_pending(
                 *count += 1;
                 *count <= 6
             } else {
-                seen_names.insert(key)
+                let count = name_counts.entry(key).or_insert(0);
+                *count += 1;
+                *count <= SAME_NAME_KEEP
             }
         });
         t_names = t_mark.elapsed().as_secs_f64() * 1000.0;
@@ -1553,7 +1643,9 @@ fn run_worker(args: WorkerArgs) {
             }
         }
         // 诊断:记录本次请求的解析结果与索引阶段,用来解释「为什么走了 Everything」。
-        {
+        // 仅剖析模式(LSTR_PROFILE_QUERY)逐查询落盘;默认不写——旧实现每查询
+        // 无条件 open/append/close 一次日志,是热路径上的无谓 IO(慢查询另有分项日志)。
+        if profile_queries() {
             let phase = builtin
                 .as_ref()
                 .map(|b| b.status().phase)
@@ -1838,6 +1930,12 @@ fn run_worker(args: WorkerArgs) {
                                     pending_meta.mark(&result.files, true);
                                     entries.append(&mut result.folders);
                                     entries.append(&mut result.files);
+                                    // 前缀补集(A-3):宽查询下保证名字以查询词开头的命中
+                                    // 进入排序,与精确同名补集一样不做类型漂移校正。
+                                    if !result.prefix.is_empty() {
+                                        pending_meta.mark(&result.prefix, false);
+                                        entries.append(&mut result.prefix);
+                                    }
                                     if !result.exact.is_empty() {
                                         // 精确同名补齐不做类型漂移校正(旧路径也不做)。
                                         pending_meta.mark(&result.exact, false);

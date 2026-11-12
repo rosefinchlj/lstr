@@ -17,7 +17,7 @@
 //! 分段写);scan 模式/外部调用走 [`save_report`](先 compact 再整写)。两条
 //! 路径都沿 tmp+fsync+rename 原子替换。
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,22 @@ pub const VERSION: u32 = 4;
 
 /// 覆盖日志目录的环境变量(集成测试/诊断隔离用)。
 const LOG_DIR_ENV: &str = "LSTR_INDEX_LOG_DIR";
+
+/// engine.log 轮转阈值:超过即把当前日志改名为 .1(覆盖旧 .1),只保留最近
+/// 一段历史。旧实现无上限追加,长期运行会无限增长吃磁盘。
+const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 超限轮转(纯函数,可离线单测):当前日志 ≥ 阈值时 rename 为同名 .1。
+/// Windows 的 rename 不覆盖已存在目标,故先删旧 .1。失败静默(日志非关键)。
+fn rotate_if_oversized(path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() >= MAX_LOG_BYTES {
+            let bak = path.with_extension("log.1");
+            let _ = std::fs::remove_file(&bak);
+            let _ = std::fs::rename(path, &bak);
+        }
+    }
+}
 
 /// 引擎调试日志(默认 %APPDATA%\lstr\index\engine.log;[`LOG_DIR_ENV`] 可
 /// 覆盖目录)。worker 提权进程与 UI 都写同用户目录;失败静默。
@@ -46,6 +62,7 @@ pub fn debug_log(msg: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    rotate_if_oversized(&path);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "[{}] {}", chrono_now(), msg);
     }
@@ -905,22 +922,85 @@ pub struct LoadedSnapshot {
     pub store: VolumeStore,
 }
 
+/// 只读内存映射文件(快照冷启动加载用)。相比 read_to_end 的整卷私有缓冲,
+/// 映射走页缓存、按需调入,峰值私有内存约减半且更快;失败时调用方回落整读。
+/// 映射对象持有文件引用,File 句柄可先关;Drop 里 unmap + 关映射句柄。
+struct MappedFile {
+    view: windows::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
+    mapping: windows::Win32::Foundation::HANDLE,
+    len: usize,
+}
+
+impl MappedFile {
+    fn open(path: &Path) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::Memory::{
+            CreateFileMappingW, MapViewOfFile, FILE_MAP_READ, PAGE_READONLY,
+        };
+        let file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len() as usize;
+        if len == 0 {
+            return None;
+        }
+        let h = HANDLE(file.as_raw_handle() as *mut _);
+        unsafe {
+            let mapping =
+                CreateFileMappingW(h, None, PAGE_READONLY, 0, 0, windows::core::PCWSTR::null())
+                    .ok()?;
+            let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+            if view.Value.is_null() {
+                let _ = CloseHandle(mapping);
+                return None;
+            }
+            Some(Self { view, mapping, len })
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.view.Value as *const u8, self.len) }
+    }
+}
+
+impl Drop for MappedFile {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::System::Memory::UnmapViewOfFile(self.view);
+            let _ = windows::Win32::Foundation::CloseHandle(self.mapping);
+        }
+    }
+}
+
+/// 快照字节来源:优先内存映射,回落 owned 整读。解析只读 &[u8],列拷贝为 owned。
+enum FileBytes {
+    Mapped(MappedFile),
+    Owned(Vec<u8>),
+}
+
+impl FileBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            FileBytes::Mapped(m) => m.as_slice(),
+            FileBytes::Owned(v) => v,
+        }
+    }
+}
+
 /// 读快照;任何不一致(魔数/版本/长度)返回 None,由调用方触发全量重扫。
 pub fn load(dir: &Path, guid: u128, noise_enabled: bool) -> Option<LoadedSnapshot> {
     let path = snapshot_path(dir, guid);
-    let mut data = Vec::with_capacity(64 << 20);
-    let mut f = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(err) => {
-            debug_log(&format!("load {guid:032x}: open failed: {err}"));
-            return None;
-        }
+    // 优先 mmap(降低冷启动峰值私有内存并加速);映射失败回落整读。
+    let bytes = match MappedFile::open(&path) {
+        Some(m) => FileBytes::Mapped(m),
+        None => match std::fs::read(&path) {
+            Ok(v) => FileBytes::Owned(v),
+            Err(err) => {
+                debug_log(&format!("load {guid:032x}: read failed: {err}"));
+                return None;
+            }
+        },
     };
-    if let Err(err) = f.read_to_end(&mut data) {
-        debug_log(&format!("load {guid:032x}: read failed: {err}"));
-        return None;
-    }
-    let mut cur = &data[..];
+    let mut cur = bytes.as_slice();
 
     if cur.len() < 4 + 4 || &cur[0..4] != MAGIC {
         debug_log(&format!("load {guid:032x}: bad magic/short ({} bytes)", cur.len()));
@@ -1161,6 +1241,29 @@ mod tests {
     }
 
     #[test]
+    fn log_rotates_when_oversized() {
+        // 直接测轮转纯函数,不依赖全局 LOG_DIR_ENV(避免并行测试竞态)。
+        let dir = std::env::temp_dir().join(format!("lstr-log-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("engine.log");
+        std::fs::write(&path, vec![b'x'; MAX_LOG_BYTES as usize]).unwrap();
+        rotate_if_oversized(&path);
+        assert!(dir.join("engine.log.1").exists(), "超限日志应轮转为 .1");
+        assert!(!path.exists(), "原日志已轮转走");
+        // 小日志不触发轮转
+        std::fs::write(&path, b"small").unwrap();
+        rotate_if_oversized(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"small");
+        // 再次超限:旧 .1 被覆盖(Windows rename 不覆盖,需先删)
+        std::fs::write(&path, vec![b'y'; MAX_LOG_BYTES as usize]).unwrap();
+        rotate_if_oversized(&path);
+        assert!(dir.join("engine.log.1").exists());
+        assert_eq!(std::fs::metadata(dir.join("engine.log.1")).unwrap().len(), MAX_LOG_BYTES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn snapshot_roundtrip() {
         let mut s = VolumeStore::new(true);
         s.insert(5, 0, 0x10, b"root");
@@ -1190,7 +1293,7 @@ mod tests {
         assert_eq!(loaded.header.next_usn, 0x42);
         assert!(loaded.header.complete);
         let ls = &loaded.store;
-        assert_eq!(ls.name_off.len(), 3); // node_modules 子树被排除
+        assert_eq!(ls.name_off.len(), 4); // A-2:node_modules 子孙被排除,目录自身保留
         assert!(ls.find_slot(10).is_some());
         let slot = ls.find_slot(10).unwrap();
         assert_eq!(ls.name(slot), b"alpha.txt");
@@ -1527,8 +1630,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_seg);
     }
 
-    /// 噪声排除:NOISE slot 不得进快照;compact 后迟到的噪声子树子项
-    /// (靠锚点立即判噪)同样必须被视图过滤。
+    /// 噪声排除(A-2):噪声目录自身保留进快照(可搜),但其子孙 NOISE slot
+    /// 不得进快照;compact 后迟到的噪声子树子项(靠锚点立即判噪)同样必须被视图过滤。
     #[test]
     fn save_view_respects_noise_bits() {
         let mut s = VolumeStore::new(true);
@@ -1537,7 +1640,7 @@ mod tests {
         s.insert(11, 10, 0, b"dep.js");
         s.insert(12, 5, 0, b"keep.txt");
         s.compact();
-        // compact 已剔除噪声子树,锚点保留;迟到子项立即判噪。
+        // compact 已剔除噪声子孙,目录自身与锚点保留;迟到子项立即判噪。
         s.insert(13, 10, 0, b"late.js");
         assert!(!s.visible(s.find_slot(13).unwrap()), "迟到子项应判噪");
         let h = view_header(0x0e5);
@@ -1546,7 +1649,7 @@ mod tests {
         save_view_sync(&dir, &h, &s).unwrap();
         let loaded = load(&dir, h.guid, true).expect("view snapshot loads");
         assert_eq!(loaded.store.find_slot(12).map(|x| loaded.store.name(x).to_vec()), Some(b"keep.txt".to_vec()));
-        assert!(loaded.store.find_slot(10).is_none(), "噪声目录不得进快照");
+        assert!(loaded.store.find_slot(10).is_some(), "噪声目录自身保留进快照");
         assert!(loaded.store.find_slot(11).is_none());
         assert!(loaded.store.find_slot(13).is_none(), "迟到的噪声子项不得进快照");
         let _ = std::fs::remove_dir_all(&dir);

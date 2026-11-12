@@ -344,8 +344,9 @@ fn scan_mode_append_stream_matches_model() {
 
 #[test]
 fn noise_subtree_never_visible() {
-    // 关键时序:噪声目录先被 compact 剔除(留下锚点),之后子文件才到达。
-    // 锚点机制必须让迟到子文件立即判噪,否则会永久泄漏可见条目。
+    // A-2 语义:噪声目录自身保留可搜,但整棵子孙(含迟到增量)绝不泄漏可见。
+    // 关键时序:噪声目录先 compact(留下锚点),之后子文件才到达 —— 锚点必须
+    // 让迟到子文件立即判噪,否则会永久泄漏可见条目。
     let mut model = Model::new();
     let mut store = VolumeStore::new(true);
     store.insert(5, 0, 0x10, b"volroot");
@@ -354,8 +355,8 @@ fn noise_subtree_never_visible() {
     store.insert(101, 100, 0x10, b"node_modules");
     model.entries.insert(101, ModelEntry { parent_frn: 100, name: "node_modules".into(), is_dir: true });
     store.compact();
-    // 此时 node_modules 已被剔除,仅留锚点
-    assert_eq!(store.find_slot(101), None);
+    // 噪声目录自身保留可见(可搜),但已建立锚点
+    assert!(store.find_slot(101).is_some(), "噪声目录自身应可见");
     // 迟到的子文件与子目录(journal 增量)
     for i in 0..500u64 {
         let frn = 1000 + i;
@@ -367,7 +368,7 @@ fn noise_subtree_never_visible() {
     model.entries.insert(2000, ModelEntry { parent_frn: 101, name: "lodash".into(), is_dir: true });
     store.insert(2001, 2000, 0, b"index.js");
     model.entries.insert(2001, ModelEntry { parent_frn: 2000, name: "index.js".into(), is_dir: false });
-    // 立即不可见(锚点判噪,孙代沿父链)
+    // 子孙立即不可见(锚点判噪,孙代沿父链)
     let spec = QuerySpec {
         tokens: vec!["dep".into()],
         kind: KindFilter::All,
@@ -382,13 +383,22 @@ fn noise_subtree_never_visible() {
     };
     let (_, total, _) = query_volume(&store, &spec, 100_000);
     assert_eq!(total, 0);
+    // 搜噪声目录本身能命中
+    let spec = QuerySpec {
+        tokens: vec!["node_modules".into()],
+        kind: KindFilter::All,
+        ..Default::default()
+    };
+    let (_, total, _) = query_volume(&store, &spec, 100_000);
+    assert_eq!(total, 1, "噪声目录自身可搜");
     store.compact();
-    // compact 后整棵子树物理消失,project 保留
-    for frn in std::iter::once(101u64).chain((1000..1500).chain([2000, 2001])) {
+    // compact 后子孙物理消失,噪声目录自身与 project 保留
+    for frn in (1000..1500).chain([2000, 2001]) {
         assert_eq!(store.find_slot(frn), None, "frn {frn} should be noise-dropped");
     }
+    assert!(store.find_slot(101).is_some(), "噪声目录自身保留");
     assert!(store.find_slot(100).is_some());
-    assert_eq!(store.len(), 2); // volroot + project
+    assert_eq!(store.len(), 3); // volroot + project + node_modules
 }
 
 #[test]

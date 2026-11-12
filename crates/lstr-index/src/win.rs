@@ -392,7 +392,7 @@ impl DirMeta {
     /// 按名字查元数据。None = 目录枚举不可用 / 名字歧义 / 名字不在目录内,
     /// 调用方一律回退逐条查询(与旧路径语义完全一致)。
     pub fn get(&self, name: &str) -> Option<FileMeta> {
-        let folded = crate::store::fold_ascii(name.as_bytes());
+        let folded = crate::store::fold_case(name.as_bytes());
         if self.ambiguous.contains(folded.as_slice()) {
             return None;
         }
@@ -441,7 +441,7 @@ pub fn list_dir_meta(dir: &str) -> Option<DirMeta> {
         // "." / ".." 正常不会由通配匹配返回;防御性跳过,绝不进入映射。
         if !name.is_empty() && name != "." && name != ".." {
             let meta = win32_meta(&ffd);
-            let folded = crate::store::fold_ascii(name.as_bytes());
+            let folded = crate::store::fold_case(name.as_bytes());
             if out.map.contains_key(folded.as_slice()) {
                 out.ambiguous.insert(folded);
             } else {
