@@ -837,6 +837,10 @@ impl LstrApp {
     }
 
     fn poll_search(&mut self, ctx: &egui::Context) {
+        // 切到正则/PathTyping/应用页时日期条件不生效，残留的错误条也不能留着。
+        if !self.conditions_apply(self.scope) {
+            self.condition_error = None;
+        }
         // 正则先在 UI 侧编译：非法表达式不发给 worker，避免“空结果=没找到”的误导。
         if self.filters.matches.regex {
             let pattern = self.input.trim();
@@ -958,12 +962,20 @@ impl LstrApp {
         }
     }
 
+    /// 日期条件是否在当前上下文生效：正则、PathTyping、应用/命令页不解析；
+    /// 浏览模式生效（与时间/类型筛选一致）。
+    fn conditions_apply(&self, scope: Scope) -> bool {
+        !self.filters.matches.regex
+            && !self.path_mode()
+            && !matches!(scope, Scope::App | Scope::Command)
+    }
+
     /// 扫描输入框里的日期条件：成功的片段从文本删除并合并进 filters，
     /// 非法条件保留原文、只记录错误。返回是否改动了输入。
     ///
     /// 只在 TextEdit changed 后调用；IME 组合期不调用（避免把预编辑当条件）。
     fn commit_conditions(&mut self, ctx: &egui::Context) -> bool {
-        if self.filters.matches.regex {
+        if !self.conditions_apply(self.scope) {
             return false;
         }
         let extracted = crate::search::conditions::extract(&self.input);
@@ -994,7 +1006,9 @@ impl LstrApp {
     fn trigger(&mut self, ctx: &egui::Context) {
         // 正在输入日期条件（`date>` / `date > 2026-11-`，还没打冒号）时不发查询：
         // 半截条件当文件名搜只会闪出 0 结果，等冒号提交或输入被改掉再搜。
-        if crate::search::conditions::is_composing(&self.input) {
+        if self.conditions_apply(self.scope)
+            && crate::search::conditions::is_composing(&self.input)
+        {
             self.dirty_at = None;
             self.waiting = false;
             ctx.request_repaint();
@@ -2088,9 +2102,7 @@ impl LstrApp {
                     .map(|range| range.label());
                 let mut text_rect = search_rect;
                 if let Some(label) = &cond_label {
-                    let disabled = self.path_ui()
-                        || self.filters.matches.regex
-                        || matches!(query.scope, Scope::App | Scope::Command);
+                    let disabled = !self.conditions_apply(query.scope);
                     let color = if disabled { theme.dim } else { theme.amber };
                     let bg = if disabled { theme.hover } else { theme.amber_soft };
                     let label_galley = painter.layout_no_wrap("时间".to_string(), ui::text_font(11.0), color);
@@ -2419,11 +2431,11 @@ impl LstrApp {
                     );
                     extra_top += 30.0;
                 }
-                if let Some(error) = self
-                    .regex_error
-                    .clone()
-                    .or_else(|| self.condition_error.clone())
-                {
+                let condition_error = self
+                    .conditions_apply(query.scope)
+                    .then(|| self.condition_error.clone())
+                    .flatten();
+                if let Some(error) = self.regex_error.clone().or(condition_error) {
                     let banner = Rect::from_min_size(
                         egui::pos2(rect.left() + PAD, extra_top),
                         egui::vec2(rect.width() - 2.0 * PAD, 24.0),
@@ -3351,7 +3363,9 @@ impl LstrApp {
             }
             // 正在输入日期条件：查询已暂停，给出明确反馈，别让用户以为
             // 「打了一半就搜不到」。
-            if crate::search::conditions::is_composing(&self.input) {
+            if self.conditions_apply(query.scope)
+                && crate::search::conditions::is_composing(&self.input)
+            {
                 painter.text(
                     egui::pos2(rect.center().x, list_top + 44.0),
                     Align2::CENTER_CENTER,
@@ -4041,7 +4055,9 @@ impl LstrApp {
             Stroke::new(1.0_f32, theme.hair),
         );
 
-        let mut default_text = if crate::search::conditions::is_composing(&self.input) {
+        let mut default_text = if self.conditions_apply(query.scope)
+            && crate::search::conditions::is_composing(&self.input)
+        {
             "正在输入日期条件 · 冒号提交后生效".to_string()
         } else if query.is_empty() && self.filters.is_empty() {
             format!(
