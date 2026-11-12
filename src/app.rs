@@ -4963,15 +4963,20 @@ impl LstrApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_width(rows_rect.width());
-                    // 单元格:显式左对齐(默认会继承父布局对齐导致右偏)。
+                    // 单元格:直接用 painter.galley 左对齐绘制。不用 ui.put——它内部
+                    // 是 centered_and_justified 布局,会把短文本居中(Label.halign
+                    // 只改 galley 内部对齐,改变不了整体居中)。
                     let cell = |ui: &mut egui::Ui, x: f32, width: f32, text: String, color: Color32| {
                         let r = Rect::from_min_size(egui::pos2(x, ui.cursor().top()), egui::vec2(width, row_h));
-                        ui.put(
-                            r,
-                            egui::Label::new(egui::RichText::new(text).font(mono.clone()).color(color))
-                                .truncate()
-                                .halign(egui::Align::LEFT),
-                        );
+                        let mut job = ui::text_job_case(&text, "", &mono, color, color, false);
+                        job.wrap.max_width = width;
+                        job.wrap.max_rows = 1;
+                        job.wrap.break_anywhere = true;
+                        job.wrap.overflow_character = Some('…');
+                        job.halign = egui::Align::LEFT;
+                        let galley = ui.painter().layout_job(job);
+                        let y = r.center().y - galley.size().y * 0.5;
+                        ui.painter().galley(egui::pos2(x, y), galley, color);
                     };
                     let del_btn = |ui: &mut egui::Ui, x: f32, id: Id| -> bool {
                         let r = Rect::from_min_size(egui::pos2(x, ui.cursor().top()), egui::vec2(del_w, row_h));
