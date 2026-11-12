@@ -6,6 +6,8 @@
 >
 > **2026-11-12 更新：Everything 后端已从程序中移除，只保留自研索引。**
 > 本文中「Everything 兜底 / 双后端 / Fallback 走 Everything」等段落仅作历史设计记录。
+> 同日已落地 size 索引列（`VolumeStore.size`、快照 v6、USN/mtime 合并回填），
+> 文中「不存 size/mtime 列」的取舍与内存估算已过时。
 
 ## 0. 结论（TL;DR）
 
