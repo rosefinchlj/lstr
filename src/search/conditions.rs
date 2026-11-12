@@ -257,14 +257,21 @@ enum Op {
 }
 
 fn parse_op(input: &str) -> Option<(Op, usize)> {
-    // 长的在前。
+    // 长的在前；中文输入法下常见的全角比较符也接受。
     for (text, op) in [
         (">=", Op::Ge),
         ("<=", Op::Le),
         ("==", Op::Eq),
+        ("＞=", Op::Ge),
+        ("＜=", Op::Le),
+        ("＝", Op::Eq),
+        ("≥", Op::Ge),
+        ("≤", Op::Le),
         (">", Op::Gt),
         ("<", Op::Lt),
         ("=", Op::Eq),
+        ("＞", Op::Gt),
+        ("＜", Op::Lt),
     ] {
         if input.starts_with(text) {
             return Some((op, text.len()));
@@ -526,6 +533,17 @@ mod tests {
         let out = extract("updatedate > 2026-11-10: x");
         assert!(out.conditions.is_empty());
         assert_eq!(out.cleaned, "updatedate > 2026-11-10: x");
+    }
+
+    #[test]
+    fn fullwidth_operators_are_accepted() {
+        let out = extract("date ＞ 2026-11-10: a.log");
+        assert_eq!(out.cleaned, "a.log");
+        assert_eq!(out.conditions[0].after, Some(midnight(2026, 11, 11)));
+        let ge = extract("date ≥ 2026-11-10: a.log");
+        assert_eq!(ge.conditions[0].after, Some(midnight(2026, 11, 10)));
+        let le = extract("date ≤ 2026-11-10: a.log");
+        assert_eq!(le.conditions[0].before, Some(midnight(2026, 11, 11) - 1));
     }
 
     #[test]
