@@ -345,6 +345,8 @@ pub struct LstrApp {
     /// 学习徽标缓存(按当前查询词),让自学习在结果行可见。
     learn_for: String,
     learn_badges: HashMap<String, crate::history::LearnBadge>,
+    /// 学习数据页视图:false=按词学习,true=常用排行。
+    learning_view_frecency: bool,
     /// P0-2：Explorer 内直接键入搜索（默认关闭）。
     typing: Option<crate::win::typing::TypingWatch>,
     /// 设置页「资产」的草稿输入状态。
@@ -490,6 +492,7 @@ impl LstrApp {
             previews: PreviewStore::new(),
             learn_for: String::new(),
             learn_badges: HashMap::new(),
+            learning_view_frecency: false,
             typing,
             assets_ui: crate::assets_ui::AssetUiState::default(),
             typing_folder: None,
@@ -4727,6 +4730,7 @@ impl LstrApp {
             (SettingsTab::Noise, "噪声规则"),
             (SettingsTab::Maintenance, "维护"),
             (SettingsTab::Assets, "资产"),
+            (SettingsTab::Learning, "学习数据"),
         ];
         let mut y = rect.top() + 60.0;
         for (tab, label) in tabs {
@@ -4790,6 +4794,247 @@ impl LstrApp {
             SettingsTab::Noise => self.paint_settings_noise(ui, ctx, &painter, area),
             SettingsTab::Maintenance => self.paint_settings_maintenance(ui, ctx, &painter, area),
             SettingsTab::Assets => self.paint_settings_assets(ui, ctx, &painter, area),
+            SettingsTab::Learning => self.paint_settings_learning(ui, ctx, &painter, area),
+        }
+    }
+
+    fn paint_settings_learning(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        area: Rect,
+    ) {
+        let theme = self.theme;
+        Self::settings_heading(
+            painter,
+            &theme,
+            area,
+            "学习数据",
+            "从你的打开与选择中学习：常用度随时间衰减，按词学习记住「搜这个词时你要哪个」",
+        );
+
+        // 概览统计
+        let (nq, np, ni) = self
+            .history
+            .lock()
+            .map(|h| h.learning_stats())
+            .unwrap_or((0, 0, 0));
+        painter.text(
+            egui::pos2(area.left(), area.top() + 48.0),
+            Align2::LEFT_TOP,
+            format!("已学习 {nq} 个查询词 · {np} 条选择记录 · {ni} 个常用条目"),
+            ui::mono_font(11.5),
+            theme.sub,
+        );
+
+        // 视图切换 + 清空按钮
+        let toggle_y = area.top() + 72.0;
+        let mk_btn = |ui: &mut egui::Ui, x: f32, label: &str, active: bool| -> bool {
+            let r = Rect::from_min_size(egui::pos2(x, toggle_y), egui::vec2(96.0, 26.0));
+            let resp = ui.interact(r, Id::new(("lstr-learn-view", label)), Sense::click());
+            let bg = if active {
+                theme.amber_soft
+            } else if resp.hovered() {
+                theme.hover
+            } else {
+                theme.surface_hi
+            };
+            painter.rect_filled(r, CornerRadius::same(6), bg);
+            painter.rect_stroke(
+                r,
+                CornerRadius::same(6),
+                Stroke::new(1.0_f32, if active { theme.amber } else { theme.hair }),
+                StrokeKind::Inside,
+            );
+            painter.text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                label,
+                ui::text_font(11.5),
+                if active { theme.text } else { theme.sub },
+            );
+            resp.clicked()
+        };
+        if mk_btn(ui, area.left(), "按词学习", !self.learning_view_frecency) {
+            self.learning_view_frecency = false;
+        }
+        if mk_btn(ui, area.left() + 104.0, "常用排行", self.learning_view_frecency) {
+            self.learning_view_frecency = true;
+        }
+        // 清空按词学习(保留使用历史)
+        let clear_rect =
+            Rect::from_min_size(egui::pos2(area.right() - 120.0, toggle_y), egui::vec2(120.0, 26.0));
+        let clear_resp = ui.interact(clear_rect, Id::new("lstr-learn-clear"), Sense::click());
+        painter.rect_filled(
+            clear_rect,
+            CornerRadius::same(6),
+            if clear_resp.hovered() { theme.hover } else { theme.surface_hi },
+        );
+        painter.rect_stroke(
+            clear_rect,
+            CornerRadius::same(6),
+            Stroke::new(1.0_f32, theme.hair),
+            StrokeKind::Inside,
+        );
+        painter.text(
+            clear_rect.center(),
+            Align2::CENTER_CENTER,
+            "清空按词学习",
+            ui::text_font(11.5),
+            theme.sub,
+        );
+        if clear_resp.clicked() {
+            if let Ok(mut h) = self.history.lock() {
+                h.clear_queries();
+            }
+            self.learn_for.clear(); // 强制徽标缓存刷新
+            self.toast(ctx, "已清空按词学习(保留使用历史)".to_string());
+        }
+
+        // 表头 + 滚动明细
+        let list_top = toggle_y + 38.0;
+        let list_rect = Rect::from_min_max(
+            egui::pos2(area.left(), list_top),
+            egui::pos2(area.right(), area.bottom()),
+        );
+        let w = list_rect.width();
+        let time_w = 72.0;
+        let hits_w = 48.0;
+        let del_w = 24.0;
+        let gap = 8.0;
+        let mono = ui::mono_font(11.0);
+        let head_font = ui::mono_font(10.5);
+
+        // 列宽:按词学习 = 查询词|选中条目|次数|最近|删;常用排行 = 条目|类型|次数|最近|删
+        let (c0_w, c1_w, c0_title, c1_title) = if self.learning_view_frecency {
+            let kind_w = 52.0;
+            (w - kind_w - hits_w - time_w - del_w - gap * 4.0, kind_w, "条目", "类型")
+        } else {
+            let q_w = 96.0;
+            (q_w, w - q_w - hits_w - time_w - del_w - gap * 4.0, "查询词", "选中条目")
+        };
+        let x0 = list_rect.left();
+        let x1 = x0 + c0_w + gap;
+        let x2 = x1 + c1_w + gap;
+        let x3 = x2 + hits_w + gap;
+        let x4 = x3 + time_w + gap;
+        // 表头
+        painter.text(egui::pos2(x0, list_top), Align2::LEFT_TOP, c0_title, head_font.clone(), theme.dim);
+        painter.text(egui::pos2(x1, list_top), Align2::LEFT_TOP, c1_title, head_font.clone(), theme.dim);
+        painter.text(egui::pos2(x2, list_top), Align2::LEFT_TOP, "次数", head_font.clone(), theme.dim);
+        painter.text(egui::pos2(x3, list_top), Align2::LEFT_TOP, "最近", head_font, theme.dim);
+
+        let rows_top = list_top + 20.0;
+        let rows_rect = Rect::from_min_max(
+            egui::pos2(list_rect.left(), rows_top),
+            egui::pos2(list_rect.right(), list_rect.bottom()),
+        );
+        let row_h = 22.0;
+        let frecency = self.learning_view_frecency;
+        let qrows = if frecency {
+            Vec::new()
+        } else {
+            self.history.lock().map(|h| h.query_hit_rows(300)).unwrap_or_default()
+        };
+        let frows = if frecency {
+            self.history.lock().map(|h| h.frecency_rows(300)).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let empty = (frecency && frows.is_empty()) || (!frecency && qrows.is_empty());
+        if empty {
+            painter.text(
+                egui::pos2(x0, rows_top + 8.0),
+                Align2::LEFT_TOP,
+                "暂无记录——打开/选中结果后自动学习",
+                ui::mono_font(11.0),
+                theme.dim,
+            );
+            return;
+        }
+        // 单条删除请求:循环里只记录,循环后统一写库(避免边借边改)。
+        let mut del_qh: Option<(String, String)> = None;
+        let mut del_freq: Option<String> = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rows_rect), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("lstr-learning-rows")
+                .max_height(rows_rect.height())
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(rows_rect.width());
+                    // 单元格:显式左对齐(默认会继承父布局对齐导致右偏)。
+                    let cell = |ui: &mut egui::Ui, x: f32, width: f32, text: String, color: Color32| {
+                        let r = Rect::from_min_size(egui::pos2(x, ui.cursor().top()), egui::vec2(width, row_h));
+                        ui.put(
+                            r,
+                            egui::Label::new(egui::RichText::new(text).font(mono.clone()).color(color))
+                                .truncate()
+                                .halign(egui::Align::LEFT),
+                        );
+                    };
+                    let del_btn = |ui: &mut egui::Ui, x: f32, id: Id| -> bool {
+                        let r = Rect::from_min_size(egui::pos2(x, ui.cursor().top()), egui::vec2(del_w, row_h));
+                        let resp = ui.interact(r, id, Sense::click());
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        let color = if resp.hovered() { theme.text } else { theme.dim };
+                        ui.painter().text(r.center(), Align2::CENTER_CENTER, "×", ui::text_font(13.0), color);
+                        resp.clicked()
+                    };
+                    if frecency {
+                        for (idx, (id, name, kind, count, last)) in frows.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.set_height(row_h);
+                                let kind_label = match kind {
+                                    Kind::File => "文件",
+                                    Kind::Folder => "文件夹",
+                                    Kind::Program => "程序",
+                                    Kind::App => "应用",
+                                    Kind::Command => "命令",
+                                };
+                                cell(ui, x0, c0_w, name.clone(), theme.text);
+                                cell(ui, x1, c1_w, kind_label.to_string(), theme.sub);
+                                cell(ui, x2, hits_w, count.to_string(), theme.sub);
+                                cell(ui, x3, time_w, ui::format_relative_time(*last), theme.dim);
+                                if del_btn(ui, x4, Id::new(("lstr-learn-del-f", idx))) {
+                                    del_freq = Some(id.clone());
+                                }
+                            });
+                        }
+                    } else {
+                        for (idx, (q, entry, hits, last)) in qrows.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.set_height(row_h);
+                                let name = std::path::Path::new(entry)
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| entry.clone());
+                                cell(ui, x0, c0_w, q.clone(), theme.text);
+                                cell(ui, x1, c1_w, name, theme.sub);
+                                cell(ui, x2, hits_w, hits.to_string(), theme.sub);
+                                cell(ui, x3, time_w, ui::format_relative_time(*last), theme.dim);
+                                if del_btn(ui, x4, Id::new(("lstr-learn-del-q", idx))) {
+                                    del_qh = Some((q.clone(), entry.clone()));
+                                }
+                            });
+                        }
+                    }
+                });
+        });
+        // 应用单条删除(并刷新徽标缓存)。
+        if let Some((q, e)) = del_qh {
+            if let Ok(mut h) = self.history.lock() {
+                h.remove_query_hit(&q, &e);
+            }
+            self.learn_for.clear();
+        }
+        if let Some(id) = del_freq {
+            if let Ok(mut h) = self.history.lock() {
+                h.remove(&id);
+            }
+            self.learn_for.clear();
         }
     }
 
@@ -5927,68 +6172,6 @@ impl LstrApp {
             }
         }
 
-        // —— 学习数据(自学习可视化:按词学习 + 常用 Top)——
-        y += ROW;
-        Self::settings_label(painter, &theme, area.left(), y, "学习数据");
-        y += 22.0;
-        let (qh, freq) = self
-            .history
-            .lock()
-            .map(|h| (h.top_query_hits(3), h.top_frecency(3)))
-            .unwrap_or_default();
-        let trunc = |s: String| -> String {
-            if s.chars().count() > 58 {
-                s.chars().take(57).collect::<String>() + "…"
-            } else {
-                s
-            }
-        };
-        if qh.is_empty() && freq.is_empty() {
-            painter.text(
-                egui::pos2(area.left() + 130.0, y),
-                Align2::LEFT_TOP,
-                "暂无(打开/选中结果后自动学习)",
-                ui::mono_font(10.5),
-                theme.dim,
-            );
-        } else {
-            if !qh.is_empty() {
-                let line = qh
-                    .iter()
-                    .map(|(q, e, n)| {
-                        let name = std::path::Path::new(e)
-                            .file_name()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| e.clone());
-                        format!("{q}→{name}×{n}")
-                    })
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                painter.text(
-                    egui::pos2(area.left() + 130.0, y),
-                    Align2::LEFT_TOP,
-                    trunc(format!("按词: {line}")),
-                    ui::mono_font(10.5),
-                    theme.sub,
-                );
-                y += 18.0;
-            }
-            if !freq.is_empty() {
-                let line = freq
-                    .iter()
-                    .map(|(n, c)| format!("{n}×{c}"))
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                painter.text(
-                    egui::pos2(area.left() + 130.0, y),
-                    Align2::LEFT_TOP,
-                    trunc(format!("常用: {line}")),
-                    ui::mono_font(10.5),
-                    theme.sub,
-                );
-            }
-        }
-
         painter.text(
             egui::pos2(area.left(), area.bottom() - 46.0),
             Align2::LEFT_TOP,
@@ -6156,6 +6339,7 @@ enum SettingsTab {
     Noise = 4,
     Maintenance = 5,
     Assets = 6,
+    Learning = 7,
 }
 
 /// 设置页「唤起热键」录制状态。

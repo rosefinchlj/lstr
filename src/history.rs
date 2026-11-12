@@ -1,4 +1,4 @@
-use crate::model::Entry;
+use crate::model::{Entry, Kind};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -344,46 +344,6 @@ impl History {
         out
     }
 
-    /// 学习明细(设置页可视化):按词学习 Top N(query → entry_id → hits)。
-    pub fn top_query_hits(&self, limit: usize) -> Vec<(String, String, i64)> {
-        let mut out = Vec::new();
-        if let Ok(mut stmt) = self.db.prepare(
-            "SELECT query, entry_id, hits FROM query_hits ORDER BY hits DESC, last DESC LIMIT ?1",
-        ) {
-            if let Ok(rows) = stmt.query_map(params![limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            }) {
-                out.extend(rows.flatten());
-            }
-        }
-        out
-    }
-
-    /// 常用 Top N(name, count),从 history.entry JSON 取名字。
-    pub fn top_frecency(&self, limit: usize) -> Vec<(String, u32)> {
-        let mut out = Vec::new();
-        if let Ok(mut stmt) = self
-            .db
-            .prepare("SELECT entry, count FROM history ORDER BY count DESC, last DESC LIMIT ?1")
-        {
-            if let Ok(rows) = stmt.query_map(params![limit as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
-            }) {
-                for (json, count) in rows.flatten() {
-                    let name = serde_json::from_str::<Entry>(&json)
-                        .map(|e| e.name)
-                        .unwrap_or_else(|_| json.clone());
-                    out.push((name, count));
-                }
-            }
-        }
-        out
-    }
-
     /// 按最后使用时间倒序返回历史条目快照。
     pub fn recent_entries(&self, limit: usize) -> Vec<Entry> {
         let Ok(mut stmt) = self.db.prepare(
@@ -407,10 +367,80 @@ impl History {
         let _ = self.db.execute("DELETE FROM query_hits", []);
     }
 
-    /// 清空查询词学习数据，保留打开历史（测试用）。
-    #[cfg(test)]
+    /// 清空查询词学习数据，保留打开历史。
     pub fn clear_queries(&mut self) {
         let _ = self.db.execute("DELETE FROM query_hits", []);
+    }
+
+    /// 删除单条按词学习记录(某查询词下某条目的选择)。
+    pub fn remove_query_hit(&mut self, query: &str, entry_id: &str) {
+        let _ = self.db.execute(
+            "DELETE FROM query_hits WHERE query = ?1 AND entry_id = ?2",
+            params![query, entry_id],
+        );
+    }
+
+    /// 学习概览统计:( distinct 查询词数, 选择记录总数, 常用条目数 )。
+    pub fn learning_stats(&self) -> (usize, usize, usize) {
+        let q = self
+            .db
+            .query_row("SELECT COUNT(DISTINCT query) FROM query_hits", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or(0) as usize;
+        let p = self
+            .db
+            .query_row("SELECT COUNT(*) FROM query_hits", [], |r| r.get::<_, i64>(0))
+            .unwrap_or(0) as usize;
+        let i = self
+            .db
+            .query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, i64>(0))
+            .unwrap_or(0) as usize;
+        (q, p, i)
+    }
+
+    /// 按词学习明细行(query, entry_id, hits, last),按次数/最近降序。
+    pub fn query_hit_rows(&self, limit: usize) -> Vec<(String, String, i64, i64)> {
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = self.db.prepare(
+            "SELECT query, entry_id, hits, last FROM query_hits ORDER BY hits DESC, last DESC LIMIT ?1",
+        ) {
+            if let Ok(rows) = stmt.query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            }) {
+                out.extend(rows.flatten());
+            }
+        }
+        out
+    }
+
+    /// 常用排行明细行(id, name, kind, count, last),按次数/最近降序。
+    pub fn frecency_rows(&self, limit: usize) -> Vec<(String, String, Kind, u32, i64)> {
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = self.db.prepare(
+            "SELECT id, entry, count, last FROM history ORDER BY count DESC, last DESC LIMIT ?1",
+        ) {
+            if let Ok(rows) = stmt.query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            }) {
+                for (id, json, count, last) in rows.flatten() {
+                    if let Ok(e) = serde_json::from_str::<Entry>(&json) {
+                        out.push((id, e.name, e.kind, count, last));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// 从历史里移除单条（结果动作菜单「从最近使用中移除」用）。
@@ -669,11 +699,11 @@ mod tests {
         history.record_query("re", &a);
         history.record_query("re", &a);
         history.record_query("re", &b);
-        let qh = history.top_query_hits(10);
+        let qh = history.query_hit_rows(10);
         assert_eq!(qh[0].0, "re");
         assert_eq!(qh[0].1, "alpha"); // hits 2 > beta 1
         assert_eq!(qh[0].2, 2);
-        let freq = history.top_frecency(10);
-        assert_eq!(freq[0].1, 10); // alpha count 10 排首
+        let freq = history.frecency_rows(10);
+        assert_eq!(freq[0].3, 10); // alpha count 10 排首
     }
 }
