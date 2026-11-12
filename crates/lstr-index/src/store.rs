@@ -16,6 +16,10 @@ use std::collections::HashMap;
 
 use crate::usn::Rec;
 
+/// 可暂停的 compact（4ms 分片），供引擎空闲维护使用。
+mod compact;
+pub(crate) use compact::CompactTask;
+
 /// 内部位:已删除(等待 compact 回收)。
 pub const ATTR_DEAD: u16 = 0x8000;
 /// 内部位:命中噪声排除规则(等待 compact 回收)。
@@ -365,6 +369,11 @@ pub struct VolumeStore {
     scan_mode: bool,
     /// 自上次 compact 以来的就地改名次数(>0 时 base offs 名序失效,需整体重排)。
     renames: u32,
+    /// 祖先链可能已变化的脏标记:目录改名/移动时置位;快照加载后也置位
+    /// (锚点不落盘,首次 compact 需重建)。只有它(或刚解析到父链、scan
+    /// 模式)为真时,compact 才需要全量重判噪声 —— 否则 insert 已逐条判过,
+    /// 重判纯属浪费(实测占整卷 compact 的 74%)。
+    ancestry_dirty: bool,
     /// compact 后新增的 slot(base_len..)。
     delta: Vec<u32>,
     /// delta slot 的 FRN 索引(有界,受 COMPACT_DELTA 约束)。
@@ -472,6 +481,7 @@ impl VolumeStore {
             delta_frn: HashMap::new(),
             dead_count: 0,
             renames: 0,
+            ancestry_dirty: false,
             unresolved: HashMap::new(),
             noise_anchors: std::collections::HashSet::new(),
             exclude,
@@ -532,6 +542,9 @@ impl VolumeStore {
             delta_frn: HashMap::new(),
             dead_count: 0,
             renames: 0,
+            // 锚点不落盘:加载后为空,迟到子项(父槽已不在)只能靠下一次
+            // compact 的全量判噪重建锚点。首次 compact 强制重判一次。
+            ancestry_dirty: true,
             // 旧快照里根父条目也被登记过(旧实现),加载时直接丢弃:卷根就是 NO_PARENT,
         // 没有可解析的目标,留着只会白占内存。
         unresolved: unresolved
@@ -1047,12 +1060,18 @@ impl VolumeStore {
                 // (NTFS 目录改名不级联发子记录,死槽+新槽会让子项永远指向旧身份)。
                 // 名字变化 = 名字区追加新字节 + name_off 重指 + off_index 追加;
                 // 旧字节成为幽灵,由 slot_at_offset 的「偏移==当前 name_off」校验过滤。
+                // 目录改名/移动:子项的祖先链没变指针,但路径与噪声归属可能变了,
+                // 下一次 compact 必须全量重判(实测这条比每次盲判省 74% 时间)。
+                if self.attrs[old as usize] & 0x10 != 0 && (!same_name || old_parent != new_p) {
+                    self.ancestry_dirty = true;
+                }
                 if !same_name {
                     self.renames += 1;
+                    let name_lc = fold_case(name);
                     self.name_off[old as usize] = self.names.len() as u32;
                     self.names.extend_from_slice(name);
                     self.names.push(0);
-                    self.names_lc.extend_from_slice(&fold_case(name));
+                    self.names_lc.extend_from_slice(&name_lc);
                     self.names_lc.push(0);
                     self.off_index.push((self.name_off[old as usize], old));
                     self.char_mask[old as usize] = mask_of_bytes(name);
@@ -1062,6 +1081,14 @@ impl VolumeStore {
                         self.mark_reindexed(old);
                         self.reindex.push(old);
                     }
+                }
+                // 段名噪声目录:自身可见、子孙剔除。锚点必须在目录出现时登记,
+                // 否则被 compact 剔除的父链断裂后,迟到子项无法立即判噪。
+                if !self.exclude.is_empty()
+                    && self.attrs[old as usize] & 0x10 != 0
+                    && self.exclude.is_segment(self.name_lc(old))
+                {
+                    self.noise_anchors.insert(self.frn[old as usize]);
                 }
                 if self.children_built {
                     self.move_child(old, old_parent, new_p);
@@ -1082,11 +1109,12 @@ impl VolumeStore {
         }
         let slot = self.name_off.len() as u32;
         let off = self.names.len() as u32;
+        let name_lc = fold_case(name);
         self.name_off.push(off);
         self.off_index.push((off, slot));
         self.names.extend_from_slice(name);
         self.names.push(0);
-        self.names_lc.extend_from_slice(&fold_case(name));
+        self.names_lc.extend_from_slice(&name_lc);
         self.names_lc.push(0);
         self.frn.push(frn);
         let anchored = !self.exclude.is_empty() && self.noise_anchors.contains(&parent_frn);
@@ -1133,6 +1161,14 @@ impl VolumeStore {
                 self.attrs[slot as usize] |= ATTR_NOISE;
             } else {
                 self.classify_chain(slot);
+            }
+            // 段名噪声目录:锚点随插入登记(自身可见、子孙剔除)。
+            // 注意:新增锚点本身不置 ancestry_dirty —— 新目录不可能已有子孙;
+            // 祖先链变化只有「目录改名/移动」和「父链迟到解析」两种,分别由
+            // 就地更新路径和 resolved_any 覆盖。若在这里置脏,构建产物目录
+            // 每新增一个子目录都会触发下一次全量重判(实测 1.3s/次)。
+            if self.exclude.is_segment(&name_lc) && self.attrs[slot as usize] & 0x10 != 0 {
+                self.noise_anchors.insert(frn);
             }
         }
         true
@@ -1286,13 +1322,24 @@ impl VolumeStore {
         {
             return;
         }
+        let t_all = std::time::Instant::now();
+        let mut phase_ms: Vec<(&str, u128)> = Vec::new();
+        let mut t_phase = std::time::Instant::now();
+        macro_rules! mark {
+            ($name:expr) => {{
+                phase_ms.push(($name, t_phase.elapsed().as_millis()));
+                t_phase = std::time::Instant::now();
+            }};
+        }
         // 0. 重试解析 journal 期未解析的父链,再补一次分类
+        let mut resolved_any = false;
         if !self.unresolved.is_empty() {
             let pairs: Vec<(u32, u64)> = self.unresolved.iter().map(|(&s, &f)| (s, f)).collect();
             let mut still: HashMap<u32, u64> = HashMap::new();
             for (slot, pfrn) in pairs {
                 match self.find_slot(pfrn) {
                     Some(p) => {
+                        resolved_any = true;
                         self.parent[slot as usize] = p;
                         if !self.exclude.is_empty() {
                             self.classify_chain(slot);
@@ -1305,6 +1352,7 @@ impl VolumeStore {
             }
             self.unresolved = still;
         }
+        mark!("resolve");
         // 1. 收集活 slot(live)
         let n = self.name_off.len();
         let mut live: Vec<u32> = Vec::with_capacity(n);
@@ -1313,8 +1361,16 @@ impl VolumeStore {
                 live.push(s);
             }
         }
-        // 3. 噪声分类(全量重走;insert 时已分类的会重算,结果一致)
-        if !self.exclude.is_empty() {
+        mark!("live");
+        // 3. 噪声分类:只有祖先链可能变化时才全量重走 —— scan 首扫
+        //    (父项迟到)、有未解析父链(刚补上父)、目录改名/移动或新增锚点。
+        //    其余情况 insert 已逐条判过,重判占整卷 compact 的 74%(实测 D 卷
+        //    148 万条 1561ms),纯浪费。
+        // 注意用 resolved_any 而不是「unresolved 非空」:永久解析不到父的条目
+        // 会一直留在 unresolved 里,若据此重判,每次 compact 都会白跑 1.3s。
+        let reclassify = !self.exclude.is_empty()
+            && (self.scan_mode || resolved_any || self.ancestry_dirty);
+        if reclassify {
             for &s in &live {
                 self.classify_chain(s);
             }
@@ -1334,15 +1390,18 @@ impl VolumeStore {
             // 分类产生的 NOISE 位重新过滤 live
             live.retain(|&s| self.visible(s));
         }
+        mark!("classify");
         // 4. 新 id:按 FRN 序分配(此后 frn 列天然有序)
         let mut by_frn: Vec<(u64, u32)> = live.iter().map(|&s| (self.frn[s as usize], s)).collect();
         // base 部分已按 frn 有序,但重排序一次最简单(整型排序 845万 ~0.5s,发生在空闲/完成时)
         by_frn.sort_unstable_by_key(|&(f, _)| f);
+        mark!("sort");
         // old slot → new id 用 Vec(NO_PARENT 哨兵),比 HashMap 省 400MB 峰值
         let mut remap: Vec<u32> = vec![u32::MAX; self.name_off.len()];
         for (new_id, &(_, old)) in by_frn.iter().enumerate() {
             remap[old as usize] = new_id as u32;
         }
+        mark!("remap");
         // 5. 重建名字区(按新 id 序)
         let mut names = Vec::with_capacity(self.names.len());
         let mut name_off = Vec::with_capacity(by_frn.len());
@@ -1354,6 +1413,7 @@ impl VolumeStore {
             names.push(0);
         }
         let names_lc = fold_case(&names);
+        mark!("names");
         // 6. parent 重映射
         let mut parent = Vec::with_capacity(by_frn.len());
         for &(_, old) in &by_frn {
@@ -1371,6 +1431,7 @@ impl VolumeStore {
             mask.push(mask_of_bytes(slice_at(&self.names, self.name_off[old as usize] as usize)));
             frn.push(self.frn[old as usize]);
         }
+        mark!("columns");
         // 8. offs:发生过就地改名时 base 名序失效 → 整体重排;
         //    否则旧有序列过滤重映射 + delta 按名排序后 O(n) 归并
         let mut offs: Vec<u32> = Vec::with_capacity(by_frn.len());
@@ -1425,6 +1486,7 @@ impl VolumeStore {
         } else {
             offs = delta_sorted;
         }
+        mark!("offs");
         // 9. 换血(off_index 重建为新鲜项;幽灵与陈项清零)。
         // 噪声剔除后保留集远小于旧容量,收缩避免 names 双缓冲虚胖 3 倍。
         let mut names = names;
@@ -1459,6 +1521,8 @@ impl VolumeStore {
         self.base_len = self.name_off.len() as u32;
         self.dead_count = 0;
         self.renames = 0;
+        self.ancestry_dirty = false;
+        mark!("install");
         // 10. 列已一致有序:重建倒排,清空 overlay;scan 模式结束 —— 空卷
         //     (live 为空)同样结束,否则空卷会永远停留在 scanning。
         self.rebuild_ngram();
@@ -1468,6 +1532,21 @@ impl VolumeStore {
         // children 索引若已构建(watch 模式),slot 重排后按新 parent 列重建。
         if self.children_built {
             self.rebuild_children();
+        }
+        mark!("ngram+tail");
+        let _ = t_phase;
+        let total = t_all.elapsed().as_millis();
+        if total > 200 {
+            let detail: Vec<String> = phase_ms
+                .iter()
+                .filter(|(_, ms)| *ms > 5)
+                .map(|(n, ms)| format!("{n}={ms}ms"))
+                .collect();
+            crate::snapshot::debug_log(&format!(
+                "compact phases vol {} total={total}ms [{}]",
+                self.letter,
+                detail.join(" ")
+            ));
         }
     }
 }
