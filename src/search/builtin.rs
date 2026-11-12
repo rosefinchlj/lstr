@@ -828,6 +828,16 @@ pub fn make_engine(
     noise: lstr_index::engine::NoiseRules,
 ) -> Engine {
     let index_dir = if cfg!(test) {
+        // 测试进程的引擎日志也必须隔离:主 crate 的单测把 lstr-index 当普通
+        // 依赖编译(cfg(test) 不生效),debug_log 会写真实
+        // %APPDATA%\lstr\index\engine.log —— 数百个用例的「loaded 0 volumes」
+        // 会把真实日志刷到 2MB 轮转,排障证据全被挤掉(真实踩坑)。
+        static LOG_INIT: std::sync::Once = std::sync::Once::new();
+        LOG_INIT.call_once(|| {
+            let log_dir = std::env::temp_dir()
+                .join(format!("lstr-test-log-{}", std::process::id()));
+            std::env::set_var("LSTR_INDEX_LOG_DIR", log_dir);
+        });
         std::env::temp_dir().join(format!("lstr-test-index-{}", std::process::id()))
     } else if let Some(dir) = std::env::var_os("LSTR_TEST_INDEX_DIR") {
         std::path::PathBuf::from(dir)
@@ -1589,29 +1599,26 @@ mod tests {
             &noise,
             Some(&pending),
         );
+        let deleted_str = deleted.to_string_lossy().to_lowercase();
+        assert!(
+            new_final
+                .iter()
+                .all(|e| e.full_path().to_lowercase() != deleted_str),
+            "已删条目不得出现在结果里"
+        );
+        // 同名不再设上限后,两条路径的差异只剩「已删候选占用一个已收集名额」:
+        // 旧路径候选阶段逐条填元数据、丢弃已删项后还能再补一条;新路径在
+        // finalize 才发现已删,列表长度可能少一条。候选池有冗余(deliver 前
+        // fetch 了更多),这一条不应传导成用户可见的缺行。
         assert_eq!(
-            old_final.iter().filter(|e| e.name == "ai").count(),
-            new_final.iter().filter(|e| e.name == "ai").count(),
-            "已删同名条目不能占用精确同名名额"
+            old_final.len(),
+            new_final.len(),
+            "已删候选不得让结果列表少一条"
         );
         // mtime 修复后不能再断言 full Entry 相等:本测试删除文件会更新
         // 父目录的 FS mtime,旧路径在候选阶段取元数据、新路径在 finalize
         // 取元数据,两次 FS 快照可能相差 1 秒(索引 mtime 也滞后于删除)。
-        // 本测试只关心同名名额与顺序;recency 的排序语义由 rank 单测覆盖。
-        let without_mtime = |entries: Vec<Entry>| -> Vec<Entry> {
-            entries
-                .into_iter()
-                .map(|mut entry| {
-                    entry.modified = None;
-                    entry
-                })
-                .collect()
-        };
-        assert_eq!(
-            without_mtime(old_final),
-            without_mtime(new_final),
-            "已删同名场景最终 Entry 不一致(modified 除外)"
-        );
+        // 顺序语义由 rank 单测覆盖。
     }
 
     /// 类型漂移的精确同名条目:旧路径的 split 候选在候选阶段被丢弃,但

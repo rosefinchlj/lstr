@@ -31,10 +31,9 @@ const APPS_RELOAD_INTERVAL: Duration = Duration::from_secs(90);
 
 /// 首屏交付的候选上限。窗口只按「一屏结果数」长高，其余靠滚轮查看。
 pub(crate) const MIN_DELIVER: usize = 100;
-/// 非精确同名条目每种 (kind, name) 最多保留几条（A-4）。旧实现只留 1，
-/// 搜 config/report/README 这类通用名时跨项目的多个同名文件只能看到一个，
-/// 且 load more 也补不回（去重在截断前）。放宽到 3 改善召回，又不至于让
-/// 列表被同名变体灌满；精确同名（name == 查询词）另有 6 条豁免。
+/// 非精确同名条目每种**排在前面的**保留几条（A-4），其余追加到列表尾部
+/// 而不是丢弃——总数与可滚动到的条数必须一致。精确同名（name == 查询词）
+/// 不设上限：用户打的就是完整文件名，每个不同路径都是有效结果。
 const SAME_NAME_KEEP: usize = 3;
 /// 「加载更多」时单次向索引/Everything 要的候选数上限。
 /// 3000 条交付上限按 2 倍留去重余量 → 6000。
@@ -737,7 +736,7 @@ mod pin_tests {
     }
 
     #[test]
-    fn finalize_keeps_at_most_six_exact_names_and_pins_them() {
+    fn finalize_keeps_all_exact_names_and_pins_them() {
         let history = Arc::new(Mutex::new(History::in_memory()));
         let mut entries: Vec<Entry> = (0..8)
             .map(|i| {
@@ -759,17 +758,17 @@ mod pin_tests {
             Vec::new(),
         );
         let exact_count = out.iter().filter(|entry| entry.name == "ai").count();
-        assert_eq!(exact_count, 6, "同名精确命中最多保留 6 条");
+        assert_eq!(exact_count, 8, "精确同名不得按名字截断");
         assert!(
-            out.iter().take(6).all(|entry| entry.name == "ai"),
-            "6 条精确同名都应被置顶"
+            out.iter().take(8).all(|entry| entry.name == "ai"),
+            "全部精确同名都应被置顶"
         );
     }
 
     #[test]
-    fn finalize_keeps_top_n_non_exact_same_names() {
-        // A-4:搜 config（非精确同名）时，跨项目的多个 config.json 应保留前 N 个，
-        // 而不是旧实现的仅 1 个（那会让用户找不到其它项目里的同名文件）。
+    fn finalize_keeps_non_exact_same_names_without_dropping() {
+        // A-4:搜 config（非精确同名）时，跨项目的多个 config.json 都要能看到；
+        // 前 N 个保持原位，其余排到尾部（旧实现直接丢弃，且 load more 也补不回）。
         let history = Arc::new(Mutex::new(History::in_memory()));
         let entries: Vec<Entry> = (0..5)
             .map(|i| {
@@ -789,7 +788,39 @@ mod pin_tests {
             Vec::new(),
         );
         let count = out.iter().filter(|e| e.name == "config.json").count();
-        assert_eq!(count, SAME_NAME_KEEP, "非精确同名应保留前 N 个");
+        assert_eq!(count, 5, "同名候选不得被丢弃（总数与列表条数一致）");
+    }
+
+    /// 回归：用户搜 `ucrtbase.dll`，索引里 147 条同名文件（C 60 / D 80 / E 6），
+    /// 旧实现按「精确同名每种最多 6 条」砍到只剩 6 条 C 盘（再加 2 条子串命中），
+    /// 状态栏却显示 147 —— D 盘命中一条都看不到。精确同名必须不设上限。
+    #[test]
+    fn finalize_exact_name_matches_are_not_capped() {
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let entries: Vec<Entry> = (0..12)
+            .map(|i| {
+                let drive = if i % 2 == 0 { 'C' } else { 'D' };
+                entry_at(
+                    &format!("dll{i}"),
+                    "ucrtbase.dll",
+                    Kind::File,
+                    &format!(r"{drive}:\app{i}\ucrtbase.dll"),
+                )
+            })
+            .collect();
+        let out = finalize_entries(
+            entries,
+            &request("ucrtbase.dll", 8),
+            &history,
+            &Config::default(),
+            Vec::new(),
+        );
+        let count = out.iter().filter(|e| e.name == "ucrtbase.dll").count();
+        assert_eq!(count, 12, "精确同名不得按名字截断（D 盘命中必须保留）");
+        assert!(
+            out.iter().any(|e| e.full_path().starts_with(r"D:\")),
+            "D 盘命中必须在结果里"
+        );
     }
 
     /// 基准:finalize 约 480 个候选的分项成本。release 下运行:
@@ -1254,8 +1285,10 @@ fn finalize_entries_with_pending(
         let t_meta = Instant::now();
         let mut seen_ids = HashSet::with_capacity(entries.len());
         let mut name_counts: HashMap<(Kind, String), usize> = HashMap::with_capacity(entries.len());
-        let mut exact_counts: HashMap<(Kind, String), usize> = HashMap::with_capacity(8);
         let mut kept = Vec::with_capacity(deliver.saturating_add(8));
+        // 超过同名配额的非精确条目不再丢弃,而是排到列表尾部:
+        // 首屏仍保持同名多样性,滚动/加载更多又能看到全部命中。
+        let mut extras: Vec<Entry> = Vec::new();
         let mut non_exact = 0usize;
         // 同一 id 的 split/exact 副本按出现顺序消费 PendingMeta 里的语义。
         let mut pending_uses: HashMap<String, usize> = HashMap::new();
@@ -1269,21 +1302,16 @@ fn finalize_entries_with_pending(
                 } else {
                     name_lower == needle_lower
                 };
-            // 普通条目只需要前 deliver 个有效候选;精确同名要扫到每种
-            // (kind,name) 的 6 条上限,因为它们会被 pin 到最前面。
-            // 预算外/已满额/同名重复的候选直接跳过,不再做 id 归一化与
-            // PendingMeta 记账(它们本来就要被去重/截断丢掉)。
+            // 普通条目按交付预算收够为止。
             if !is_exact && non_exact >= deliver {
                 continue;
             }
             let name_key = (entry.kind, name_lower);
-            if is_exact {
-                if exact_counts.get(&name_key).copied().unwrap_or(0) >= 6 {
-                    continue;
-                }
-            } else if name_counts.get(&name_key).copied().unwrap_or(0) >= SAME_NAME_KEEP {
-                continue;
-            }
+            // 精确同名不设上限:用户打的就是完整文件名(如 ucrtbase.dll),
+            // 每个不同路径都是有效结果;旧实现只留 6 条,导致「总数 147、
+            // 列表只有 8 条、D 盘命中全被砍掉」。非精确同名仍优先保多样性。
+            let over_cap =
+                !is_exact && name_counts.get(&name_key).copied().unwrap_or(0) >= SAME_NAME_KEEP;
             let id_lower = entry.id.to_lowercase();
             // 绝大多数 id 只有一个标记;只有 split+exact 同 id 才需要游标。
             let mode = match pending.modes(&id_lower) {
@@ -1305,14 +1333,17 @@ fn finalize_entries_with_pending(
             };
             let Some(entry) = filled else { continue };
             seen_ids.insert(id_lower);
-            if is_exact {
-                *exact_counts.entry(name_key).or_insert(0) += 1;
-            } else {
+            if !is_exact {
                 *name_counts.entry(name_key).or_insert(0) += 1;
                 non_exact += 1;
             }
-            kept.push(entry);
+            if over_cap {
+                extras.push(entry);
+            } else {
+                kept.push(entry);
+            }
         }
+        kept.append(&mut extras);
         entries = kept;
         meta_ms = t_meta.elapsed().as_secs_f64() * 1000.0;
         t_ids = 0.0;
@@ -1328,25 +1359,35 @@ fn finalize_entries_with_pending(
         entries.retain(|entry| seen_ids.insert(entry.id.to_lowercase()));
         t_ids = t_mark.elapsed().as_secs_f64() * 1000.0;
         t_mark = Instant::now();
-        // 同名条目（不同路径下的 clip 文件夹、debug/release 同名 exe）每种最多保留
-        // SAME_NAME_KEEP 个（A-4：旧实现只留 1，通用名召回太差）。
-        // 例外：精确同名（用户就是打的名字，如 use → E:\use）保留前 6 个，
-        // 多个同名目录是正常需求，全砍掉会让 E:\use 被系统深处同名目录挤掉。
+        // 非精确同名条目每种前 SAME_NAME_KEEP 个保持原位，其余追加到列表尾部：
+        // 不丢结果（总数与可滚动条数一致），首屏也不会被同名变体灌满。
+        // 精确同名（用户打的就是完整文件名）完全不设上限。
         let mut name_counts: HashMap<(Kind, String), usize> = HashMap::with_capacity(entries.len());
-        let mut exact_counts: std::collections::HashMap<(Kind, String), usize> =
-            std::collections::HashMap::new();
-        entries.retain(|entry| {
-            let key = (entry.kind, entry.name.to_lowercase());
-            if !needle_lower.is_empty() && key.1 == needle_lower {
-                let count = exact_counts.entry(key).or_insert(0);
-                *count += 1;
-                *count <= 6
-            } else {
-                let count = name_counts.entry(key).or_insert(0);
-                *count += 1;
-                *count <= SAME_NAME_KEEP
+        let mut kept: Vec<Entry> = Vec::with_capacity(entries.len());
+        let mut extras: Vec<Entry> = Vec::new();
+        for entry in entries.drain(..) {
+            let name_lower = entry.name.to_lowercase();
+            let is_exact = !needle_lower.is_empty()
+                && if case_sensitive {
+                    entry.name == needle_lower
+                } else {
+                    name_lower == needle_lower
+                };
+            let key = (entry.kind, name_lower);
+            if is_exact {
+                kept.push(entry);
+                continue;
             }
-        });
+            let count = name_counts.entry(key).or_insert(0);
+            *count += 1;
+            if *count <= SAME_NAME_KEEP {
+                kept.push(entry);
+            } else {
+                extras.push(entry);
+            }
+        }
+        kept.append(&mut extras);
+        entries = kept;
         t_names = t_mark.elapsed().as_secs_f64() * 1000.0;
     }
     t_mark = Instant::now();
