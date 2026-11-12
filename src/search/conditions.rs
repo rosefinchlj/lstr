@@ -1,16 +1,18 @@
-//! 输入框日期条件：把 `date > 2026-11-10:` 这类短语解析成修改时间区间。
+//! 输入框日期条件：把 `date>2026-11-10:` 这类短语解析成修改时间区间。
 //!
 //! 语法（Phase 1 只支持修改时间）：
-//! - prose（冒号提交，可出现在输入任意位置）：
-//!   `date > 2026-11-10:` / `date >= 2026-11-01:` / `date < 2026-11-30:`
-//!   `date 2026-11-01..2026-11-30:` / `dm = 2026-11-10:`
-//! - compact（Everything 风格，要求后面有空白，空格后提交）：
+//! - prose（冒号提交，可出现在输入任意位置；操作符前后空格可选，默认不写）：
+//!   `date>2026-11-10:` / `date >= 2026-11-01:` / `date<2026-11-30:`
+//!   `date 2026-11-01..2026-11-30:` / `dm=2026-11-10:`
+//! - compact（要求后面有空白，空格后提交）：
 //!   `date:>2026-11-10 ` / `dm:2026-11-01..2026-11-30 `
 //! - 字段别名：date / dm / mtime / 日期 / 时间 / 修改时间。
 //! - 日期格式：`YYYY-MM-DD`，也接受 `/` 和 `.` 分隔。
+//! - 比较符也接受全角 `＞ ＜ ＝ ≥ ≤`。
 //!
 //! 解析成功才从输入里删掉片段；失败保留原文并返回错误文案，避免
-//! 「打错一个字条件就消失」。
+//! 「打错一个字条件就消失」。`is_composing` 给 UI 判断「正在输入半截
+//! 条件」，用于暂停查询（避免每敲一个字就搜一遍 `date >`）。
 
 use crate::search::filters::DateRange;
 
@@ -88,14 +90,70 @@ fn field_at(raw: &str, pos: usize) -> Option<(usize, bool)> {
         }
         let after = &rest[field.len()..];
         let compact = after.starts_with(':') || after.starts_with('：');
-        let prose = after.starts_with(char::is_whitespace);
-        // 字段后必须是空白或冒号；`datex` 不算。
+        // 操作符前后空格都可省：`date>2026-11-10:`、`date >2026-11-10:` 都算。
+        let prose = after.starts_with(char::is_whitespace)
+            || after.chars().next().is_some_and(is_op_start);
         if !compact && !prose {
             continue;
         }
         return Some((field.len(), compact));
     }
     None
+}
+
+fn is_op_start(c: char) -> bool {
+    matches!(c, '>' | '<' | '=' | '≥' | '≤' | '＞' | '＜' | '＝')
+}
+
+/// 当前输入是否正在输入一条尚未提交的日期条件（缺冒号/缺日期/缺结尾）。
+///
+/// UI 据此暂停查询：`date >`、`date>2026-11-`、`dm:>2026-11-10` 都不应该
+/// 每敲一个字就把半截条件当文件名搜一遍。已经完整提交（extract 有结果）
+/// 或已经能确定写错（errors 非空）时返回 false，交给正常查询/错误态。
+pub fn is_composing(raw: &str) -> bool {
+    let out = extract(raw);
+    if !out.conditions.is_empty() || !out.errors.is_empty() {
+        return false;
+    }
+    let Some((pos, field_len, compact)) = last_field(raw) else {
+        return false;
+    };
+    let rest = &raw[pos + field_len..];
+    if compact {
+        // `dm:` / `dm:>…` 都还在输入；空格后会由 extract 提交。
+        return true;
+    }
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        // 只打了 `date`：仍允许当普通文件名搜（否则搜 "date" 永远出不来）。
+        return false;
+    }
+    // 比较符之后必须是空白/数字/日期分隔符，才认为在输入日期；
+    // `date>report.txt` 这类普通词不能把查询永久暂停。
+    if let Some((_, op_len)) = parse_op(rest) {
+        let after_pos = skip_ws(rest, op_len);
+        let after = &rest[after_pos..];
+        return after.is_empty()
+            || after
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit() || matches!(c, '-' | '.' | '/'));
+    }
+    // 闭区间：`date 2026-11-01..` 以数字开头。
+    rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
+/// 输入里最后一个字段起点（条件通常打在末尾，也比全局扫描便宜）。
+fn last_field(raw: &str) -> Option<(usize, usize, bool)> {
+    let mut found = None;
+    for (idx, _) in raw.char_indices() {
+        if is_boundary(raw, idx) {
+            if let Some((len, compact)) = field_at(raw, idx) {
+                found = Some((idx, len, compact));
+            }
+        }
+    }
+    found
 }
 
 /// 解析从 `start`（字段起点）开始的一条条件。
@@ -533,6 +591,46 @@ mod tests {
         let out = extract("updatedate > 2026-11-10: x");
         assert!(out.conditions.is_empty());
         assert_eq!(out.cleaned, "updatedate > 2026-11-10: x");
+    }
+
+    #[test]
+    fn operators_do_not_require_spaces() {
+        for input in [
+            "date>2026-11-10: a.log",
+            "date> 2026-11-10: a.log",
+            "date >2026-11-10: a.log",
+            "日期>=2026-11-10: a.log",
+            "date≥2026-11-10: a.log",
+        ] {
+            let out = extract(input);
+            assert!(out.errors.is_empty(), "{input:?}: {:?}", out.errors);
+            assert_eq!(out.cleaned, "a.log", "{input:?}");
+            assert_eq!(out.conditions.len(), 1, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn composing_pauses_uncommitted_condition_input() {
+        for input in [
+            "date>",
+            "date>2026-11-10",
+            "date > 2026-11-",
+            "date 2026-11-01..",
+            "dm:>2026-11-10",
+            "a.log date>2026-11",
+        ] {
+            assert!(is_composing(input), "{input:?} 应视为条件输入中");
+        }
+        for input in [
+            "date",
+            "date foo",
+            "date>report.txt",
+            "a.log",
+            "date > 2026-11-10: a.log",
+            "date > 2026-13-01:",
+        ] {
+            assert!(!is_composing(input), "{input:?} 不应暂停查询");
+        }
     }
 
     #[test]

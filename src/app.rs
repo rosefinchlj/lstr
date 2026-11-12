@@ -862,6 +862,15 @@ impl LstrApp {
         } else {
             self.regex_error = None;
         }
+        // 日期条件已写错（例如 2026-13-01）：不把半截条件当文本搜，
+        // 结果区只留错误条；用户改对/删掉后由下一次 trigger 恢复。
+        if self.condition_error.is_some() {
+            self.dirty_at = None;
+            self.waiting = false;
+            self.entries.clear();
+            self.total = 0;
+            self.pending_gen = 0;
+        }
         if let Some(deadline) = self.dirty_at {
             if Instant::now() >= deadline {
                 let base_folder = if self.typing_global {
@@ -975,7 +984,22 @@ impl LstrApp {
         true
     }
 
+    /// 程序化清空输入（不清筛选）：同时清掉日期条件错误，避免错误态
+    /// 一直挡住后续查询。
+    fn clear_input_text(&mut self) {
+        self.input.clear();
+        self.condition_error = None;
+    }
+
     fn trigger(&mut self, ctx: &egui::Context) {
+        // 正在输入日期条件（`date>` / `date > 2026-11-`，还没打冒号）时不发查询：
+        // 半截条件当文件名搜只会闪出 0 结果，等冒号提交或输入被改掉再搜。
+        if crate::search::conditions::is_composing(&self.input) {
+            self.dirty_at = None;
+            self.waiting = false;
+            ctx.request_repaint();
+            return;
+        }
         // 一旦输入/筛选变化就进入「搜索中」：防抖窗口里结果还没回来，
         // 空列表不应该先闪一下「没有匹配项」。
         self.waiting = true;
@@ -1030,7 +1054,7 @@ impl LstrApp {
         self.mouse_moved = false;
         self.needle_ready = false;
         if !keep {
-            self.input.clear();
+            self.clear_input_text();
             self.selected = 0;
             self.scroll_y = 0.0;
             self.scroll_to_selection = false;
@@ -1065,7 +1089,7 @@ impl LstrApp {
         self.pending_show = true;
         self.pending_dialog = Some(info.hwnd);
         self.scope = Scope::Folder;
-        self.input.clear();
+        self.clear_input_text();
         self.entries.clear();
         self.selected = 0;
         self.scroll_y = 0.0;
@@ -1281,7 +1305,7 @@ impl LstrApp {
             if self.in_browse() {
                 // Esc 分层：先清过滤词，再退出浏览（不直接收窗）。
                 if !self.input.is_empty() {
-                    self.input.clear();
+                    self.clear_input_text();
                     Self::reset_input_cursor(ctx);
                     self.trigger(ctx);
                 } else {
@@ -1518,7 +1542,7 @@ impl LstrApp {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             if !self.input.is_empty() {
                 lstr_index::snapshot::debug_log("ui: esc_clear_input");
-                self.input.clear();
+                self.clear_input_text();
                 self.trigger(ctx);
             } else if let Some(dialog) = self.dialog.take() {
                 // Esc 交还焦点：抑制这个对话框的自动唤出。
@@ -2308,7 +2332,7 @@ impl LstrApp {
                             // 浏览模式过滤词已空：× 退出浏览。
                             self.exit_browse(ctx);
                         } else {
-                            self.input.clear();
+                            self.clear_input_text();
                             self.selected = 0;
                             self.menu_open = false;
                             self.focus_requested = true;
@@ -2683,7 +2707,7 @@ impl LstrApp {
             } else {
                 self.browse_root = Some(path);
                 self.browse_forward.clear();
-                self.input.clear();
+                self.clear_input_text();
                 self.selected = 0;
                 self.scroll_y = 0.0;
                 self.menu_open = false;
@@ -2743,7 +2767,7 @@ impl LstrApp {
                 } else {
                     self.browse_root = Some(path);
                 self.browse_forward.clear();
-                    self.input.clear();
+                    self.clear_input_text();
                     self.selected = 0;
                     self.scroll_y = 0.0;
                     Self::reset_input_cursor(ui.ctx());
@@ -3237,7 +3261,7 @@ impl LstrApp {
                         "筛选",
                         &[
                             ("ext:rs", "按扩展名"),
-                            ("日期", "date > 2026-11-10: 冒号提交"),
+                            ("日期", "date>2026-11-10: 冒号提交"),
                             ("匹配", "大小写 / 全词 / 正则"),
                         ],
                     ),
@@ -3325,6 +3349,27 @@ impl LstrApp {
                 }
                 return;
             }
+            // 正在输入日期条件：查询已暂停，给出明确反馈，别让用户以为
+            // 「打了一半就搜不到」。
+            if crate::search::conditions::is_composing(&self.input) {
+                painter.text(
+                    egui::pos2(rect.center().x, list_top + 44.0),
+                    Align2::CENTER_CENTER,
+                    "正在输入日期条件",
+                    ui::text_font(15.0),
+                    theme.text,
+                );
+                painter.text(
+                    egui::pos2(rect.center().x, list_top + 68.0),
+                    Align2::CENTER_CENTER,
+                    "冒号提交后生效，例如 date>2026-11-10:",
+                    ui::mono_font(11.5),
+                    theme.dim,
+                );
+                self.needle_target = 0.0;
+                self.scrollable = false;
+                return;
+            }
             // 查询在途（防抖/排队/执行中）时，不要立刻显示「没有匹配项」：
             // 打字瞬间结果还没回来，先显示「搜索中…」，避免一帧空列表闪成
             // 「没有匹配项」再被结果替换。
@@ -3365,7 +3410,7 @@ impl LstrApp {
             } else if self.typing_folder.is_some() && !self.typing_global {
                 "当前目录内无匹配 · Ctrl+Shift+G 全局搜索"
             } else {
-                "试试 ext:rs、date > 2026-11-10: 或 a 微信"
+                "试试 ext:rs、date>2026-11-10: 或 a 微信"
             };
             painter.text(
                 egui::pos2(rect.center().x, list_top + 68.0),
@@ -3996,7 +4041,9 @@ impl LstrApp {
             Stroke::new(1.0_f32, theme.hair),
         );
 
-        let mut default_text = if query.is_empty() && self.filters.is_empty() {
+        let mut default_text = if crate::search::conditions::is_composing(&self.input) {
+            "正在输入日期条件 · 冒号提交后生效".to_string()
+        } else if query.is_empty() && self.filters.is_empty() {
             format!(
                 "{} 项{}",
                 entries.len(),
@@ -4194,7 +4241,7 @@ impl LstrApp {
         self.browse_forward.clear();
         // 位置由面包屑决定；其它筛选（时间/类型/匹配）保留并继续生效。
         self.filters.location = None;
-        self.input.clear();
+        self.clear_input_text();
         self.selected = 0;
         self.scroll_y = 0.0;
         self.scroll_to_selection = false;
@@ -4234,7 +4281,7 @@ impl LstrApp {
         match root.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => {
                 self.browse_root = Some(parent.to_path_buf());
-                self.input.clear();
+                self.clear_input_text();
                 self.selected = 0;
                 self.scroll_y = 0.0;
                 self.menu_open = false;
@@ -4253,7 +4300,7 @@ impl LstrApp {
             return;
         };
         self.browse_root = Some(next);
-        self.input.clear();
+        self.clear_input_text();
         self.selected = 0;
         self.scroll_y = 0.0;
         self.scroll_to_selection = false;
@@ -4270,7 +4317,7 @@ impl LstrApp {
             return;
         }
         self.browse_forward.clear();
-        self.input.clear();
+        self.clear_input_text();
         self.entries.clear();
         self.selected = 0;
         self.scroll_y = 0.0;
