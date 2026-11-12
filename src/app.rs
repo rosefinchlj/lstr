@@ -5689,14 +5689,8 @@ impl LstrApp {
                             changed = true;
                         }
                         if rule.exclude {
-                            // 排除行:罚分无意义,展示生效时机
-                            ui.painter().text(
-                                egui::pos2(chip.right() + 10.0, cur_top + 11.0),
-                                Align2::LEFT_CENTER,
-                                "重建后生效",
-                                ui::mono_font(10.0),
-                                theme.dim,
-                            );
+                            // 排除行:罚分无意义,占位保持列对齐(是否待重建由
+                            // 底部「立即重建」按钮统一表达,不逐行标注)
                             ui.allocate_rect(
                                 Rect::from_min_size(
                                     egui::pos2(chip.right() + 6.0, cur_top),
@@ -5792,6 +5786,16 @@ impl LstrApp {
                 .collect();
             self.toast(ctx, "正在重建索引（后台进行，完成即生效）".to_string());
             return;
+        }
+        if needs_rebuild {
+            // 待重建提示:紧挨按钮,直接回答「怎么才算生效」
+            painter.text(
+                egui::pos2(area.left() + 232.0, area.bottom() - 16.0),
+                Align2::LEFT_CENTER,
+                "改动尚未生效：点「立即重建」后台重扫（重启 lstr 也会自动重扫）",
+                ui::mono_font(10.0),
+                theme.amber,
+            );
         }
         if mk_btn(
             ui,
