@@ -376,6 +376,13 @@ pub struct VolumeStore {
     reindex: Vec<u32>,
     /// base slot 改名去重位图(slot < ngram_base_len 才置位)。
     reindex_mark: Vec<u64>,
+    /// 父 slot → 子 slot 列表(惰性索引,仅 watch 模式用)。
+    /// [`Self::apply_children`] 首次调用时才构建([`Self::rebuild_children`]),
+    /// 之后随 insert/compact 精确维护。USN 模式不调 apply_children → 永不构建,
+    /// 零内存/零维护开销;watch 模式借此把目录刷新从 O(全表) 降为 O(子项数)。
+    children: HashMap<u32, Vec<u32>>,
+    /// children 索引是否已构建(惰性门闸)。
+    children_built: bool,
 }
 
 /// 名字里出现的 ASCII 字母位图(bit0=a .. bit25=z);非字母字节忽略。
@@ -454,6 +461,8 @@ impl VolumeStore {
             ngram_base_len: 0,
             reindex: Vec::new(),
             reindex_mark: Vec::new(),
+            children: HashMap::new(),
+            children_built: false,
         }
     }
 
@@ -509,6 +518,8 @@ impl VolumeStore {
             ngram_base_len: 0,
             reindex: Vec::new(),
             reindex_mark: Vec::new(),
+            children: HashMap::new(),
+            children_built: false,
         };
         // 加载即建倒排:快照格式不变(不持久化倒排),重建耗时有界(实测见
         // bench_wide_query_phase_profile),避免版本升级触发全量重扫。
@@ -776,19 +787,69 @@ impl VolumeStore {
         }
     }
 
+    /// 构建/重建 parent→children 索引(惰性:首次 apply_children 或 compact 后)。
+    /// 遍历 parent 列把每个非根 slot 挂到其父下;含 DEAD slot(使用端过滤),
+    /// compact 后 parent 列仅存活槽,重建即精确。
+    fn rebuild_children(&mut self) {
+        self.children.clear();
+        for slot in 0..self.parent.len() as u32 {
+            let p = self.parent[slot as usize];
+            if p != NO_PARENT {
+                self.children.entry(p).or_default().push(slot);
+            }
+        }
+        self.children_built = true;
+    }
+
+    /// slot 的父从 old_p 变为 new_p 时精确移动 children 索引(仅已构建时调用)。
+    /// 从旧父列表移除、挂到新父下,保证索引无重复/无陈旧。
+    fn move_child(&mut self, slot: u32, old_p: u32, new_p: u32) {
+        if old_p == new_p {
+            return;
+        }
+        if old_p != NO_PARENT {
+            if let Some(v) = self.children.get_mut(&old_p) {
+                v.retain(|&s| s != slot);
+            }
+        }
+        if new_p != NO_PARENT {
+            self.children.entry(new_p).or_default().push(slot);
+        }
+    }
+
     /// watcher 目录刷新:用 `recs` 替换 `parent_slot` 下的子项集合。
     /// 返回 (新增/更新数, 标死数)。
     ///
     /// 只有父 slot 可解析时才做删除;`NO_PARENT`(卷根,或父项尚未消解)
     /// 无法与其它未消解条目区分,只做 upsert —— 卷根删除交给下次启动对账。
+    ///
+    /// 非根刷新走 children 惰性索引(O(子项数) 而非 O(全表));首次调用
+    /// 构建索引,之后由 insert_meta/compact 精确维护。
     pub fn apply_children(&mut self, parent_slot: u32, recs: &[Rec]) -> (usize, usize) {
         if parent_slot == NO_PARENT {
             self.clear_seen();
-        } else {
-            for slot in 0..self.parent.len() {
-                if self.parent[slot] == parent_slot && self.attrs[slot] & ATTR_DEAD == 0 {
-                    self.attrs[slot] &= !ATTR_SEEN;
+            let mut added = 0usize;
+            for r in recs {
+                if self.insert_meta(r.frn, r.parent_frn, r.attrs, r.name.as_bytes(), r.mtime) {
+                    added += 1;
                 }
+                if let Some(slot) = self.find_slot(r.frn) {
+                    self.attrs[slot as usize] |= ATTR_SEEN;
+                }
+            }
+            self.clear_seen();
+            return (added, 0);
+        }
+        if !self.children_built {
+            self.rebuild_children();
+        }
+        // 先快照现有子项:下面 insert_meta 会改 children,不能边借边改。
+        let existing: Vec<u32> = self.children.get(&parent_slot).cloned().unwrap_or_default();
+        for &slot in &existing {
+            if self.parent[slot as usize] == parent_slot
+                && self.attrs[slot as usize] & ATTR_DEAD == 0
+            {
+                self.attrs[slot as usize] &= !ATTR_SEEN;
             }
         }
         let mut added = 0usize;
@@ -800,19 +861,17 @@ impl VolumeStore {
                 self.attrs[slot as usize] |= ATTR_SEEN;
             }
         }
-        if parent_slot == NO_PARENT {
-            self.clear_seen();
-            return (added, 0);
-        }
+        // 重新快照(可能新增子项);未 SEEN 的活子项标 DEAD。
+        let now: Vec<u32> = self.children.get(&parent_slot).cloned().unwrap_or_default();
         let mut removed = 0usize;
-        for slot in 0..self.parent.len() {
-            let a = self.attrs[slot];
-            if self.parent[slot] == parent_slot && a & ATTR_DEAD == 0 {
+        for slot in now {
+            let a = self.attrs[slot as usize];
+            if self.parent[slot as usize] == parent_slot && a & ATTR_DEAD == 0 {
                 if a & ATTR_SEEN == 0 {
-                    self.attrs[slot] = a | ATTR_DEAD;
+                    self.attrs[slot as usize] = a | ATTR_DEAD;
                     removed += 1;
                 } else {
-                    self.attrs[slot] = a & !ATTR_SEEN;
+                    self.attrs[slot as usize] = a & !ATTR_SEEN;
                 }
             }
         }
@@ -951,6 +1010,9 @@ impl VolumeStore {
                         self.reindex.push(old);
                     }
                 }
+                if self.children_built {
+                    self.move_child(old, old_parent, new_p);
+                }
                 self.parent[old as usize] = new_p;
                 self.attrs[old as usize] = (self.attrs[old as usize] & ATTR_INTERNAL)
                     | (attrs as u16 & !ATTR_INTERNAL)
@@ -981,6 +1043,9 @@ impl VolumeStore {
             self.find_slot(parent_frn).unwrap_or(NO_PARENT)
         };
         self.parent.push(p);
+        if self.children_built && p != NO_PARENT {
+            self.children.entry(p).or_default().push(slot);
+        }
         let mut a = (attrs as u16) & !ATTR_INTERNAL;
         if parent_frn == ROOT_FRN {
             a |= ATTR_ROOT_CHILD;
@@ -1301,6 +1366,10 @@ impl VolumeStore {
         self.scan_mode = false;
         // slot 已整体重排,旧的待回填编号全部失效;按新列重建一次。
         self.rebuild_mtime_pending();
+        // children 索引若已构建(watch 模式),slot 重排后按新 parent 列重建。
+        if self.children_built {
+            self.rebuild_children();
+        }
     }
 }
 
@@ -1643,5 +1712,60 @@ mod tests {
         for s in ["ÄI", "äi", "ＡＢＣ", "Привет", "ß", "报告.docx", "İstanbul", "aÄbＢc"] {
             assert_eq!(fold_case(s.as_bytes()).len(), s.len(), "长度必须不变: {s}");
         }
+    }
+
+    #[test]
+    fn apply_children_uses_index_and_tracks_moves() {
+        use crate::usn::{Op, Rec};
+        let rec = |frn: u64, parent_frn: u64, name: &str| Rec {
+            frn,
+            parent_frn,
+            attrs: 0,
+            op: Op::Upsert,
+            name: name.to_string(),
+            mtime: 0,
+        };
+        let mut s = VolumeStore::new(false);
+        s.insert(5, 0, 0x10, b"root");
+        s.insert(10, 5, 0x10, b"dirA");
+        s.insert(20, 5, 0x10, b"dirB");
+        s.compact();
+        assert!(!s.children_built, "USN 路径(未调 apply_children)不应构建索引");
+        let a = s.find_slot(10).unwrap();
+        let b = s.find_slot(20).unwrap();
+        // 首次 apply_children 构建索引并加两个子项
+        let (added, removed) =
+            s.apply_children(a, &[rec(100, 10, "c1.txt"), rec(101, 10, "c2.txt")]);
+        assert_eq!((added, removed), (2, 0));
+        assert!(s.children_built, "首次调用应构建索引");
+        let c1 = s.find_slot(100).unwrap();
+        let c2 = s.find_slot(101).unwrap();
+        assert_eq!(s.parent[c1 as usize], a);
+        assert_eq!(s.parent[c2 as usize], a);
+        // 刷新只留 c1 → c2 标死
+        let (added, removed) = s.apply_children(a, &[rec(100, 10, "c1.txt")]);
+        assert_eq!(added, 0);
+        assert_eq!(removed, 1, "c2 应被标死");
+        assert!(s.find_slot(101).is_none());
+        assert!(s.find_slot(100).is_some());
+        // 把 c1 移到 dirB(insert_meta 就地改父),索引应同步移动
+        s.insert_meta(100, 20, 0, b"c1.txt", 0);
+        assert_eq!(s.parent[c1 as usize], b);
+        // 刷新 dirA 为空:不应误删已移走的 c1
+        let (_, removed) = s.apply_children(a, &[]);
+        assert_eq!(removed, 0, "c1 已属 dirB,刷新 dirA 不应删它");
+        assert!(s.find_slot(100).is_some());
+        // 刷新 dirB 保留 c1
+        let (_, removed) = s.apply_children(b, &[rec(100, 20, "c1.txt")]);
+        assert_eq!(removed, 0);
+        assert!(s.find_slot(100).is_some());
+        // compact 重建索引后仍正确
+        s.compact();
+        let b2 = s.find_slot(20).unwrap();
+        let c1b = s.find_slot(100).unwrap();
+        assert_eq!(s.parent[c1b as usize], b2);
+        let (_, removed) = s.apply_children(b2, &[]);
+        assert_eq!(removed, 1, "compact 后索引重建,刷新 dirB 为空应删 c1");
+        assert!(s.find_slot(100).is_none());
     }
 }
