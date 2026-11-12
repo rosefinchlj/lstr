@@ -1506,6 +1506,11 @@ fn browse_response(
     let size_range = local_filters
         .then_some(request.filters.size.as_ref())
         .flatten();
+    // 盘符 chip 在浏览模式下同样生效：目录内条目都属于同一卷，
+    // 掩码不匹配时整目录为空。
+    let drive_mask = local_filters
+        .then(|| request.filters.drive_mask())
+        .flatten();
     let mut entries: Vec<Entry> = dir_cache
         .children(dir)
         .iter()
@@ -1515,6 +1520,14 @@ fn browse_response(
             Scope::Program => entry.kind == Kind::Program,
             Scope::File => entry.kind == Kind::File,
             Scope::App | Scope::Command => false,
+        })
+        .filter(|entry| {
+            drive_mask.is_none_or(|mask| {
+                entry
+                    .path
+                    .as_ref()
+                    .is_none_or(|path| filters::path_in_drive_mask(path, mask))
+            })
         })
         .filter(|entry| {
             time_after.is_none_or(|after| entry.modified.is_some_and(|mtime| mtime >= after))
@@ -2253,17 +2266,14 @@ fn run_worker(args: WorkerArgs) {
 
         // 盘符过滤兜底：内置引擎已按卷掩码查询；历史等其余来源的
         // 路径条目在这里统一裁掉（应用/命令无盘符，不受影响）。
-        if let Some(mask) = request.query.drive_mask() {
+        // 查询文本里的盘符 token 与输入框盘符 chip 求交。
+        if let Some(mask) = filters::intersect_drive_masks(
+            request.query.drive_mask(),
+            request.filters.drive_mask(),
+        ) {
             entries.retain(|e| {
                 let Some(path) = &e.path else { return true };
-                let s = path.to_string_lossy();
-                let mut chars = s.chars();
-                match (chars.next(), chars.next()) {
-                    (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => {
-                        mask & lstr_index::query::volume_bit(letter) != 0
-                    }
-                    _ => true,
-                }
+                filters::path_in_drive_mask(path, mask)
             });
         }
 

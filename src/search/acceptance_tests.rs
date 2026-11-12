@@ -22,7 +22,7 @@ use lstr_index::{Engine, EngineConfig, EngineMsg, Op, Phase, Rec};
 
 use crate::model::{Entry, Kind, Scope};
 use crate::search::builtin::BuiltinProvider;
-use crate::search::filters::{DateRange, SearchFilters, SizeRange, TimeFilter};
+use crate::search::filters::{DateRange, DriveFilter, SearchFilters, SizeRange, TimeFilter};
 use crate::search::{browse, query};
 
 const DIR_ATTR: u32 = 0x10;
@@ -384,6 +384,37 @@ fn acceptance_d_drive_filters() {
     let input = format!("{letter}: {other}: LstrAcc");
     let (_, total) = result(&fx, &input);
     assert_eq!(total, 11, "D18 多盘并集应保留 11 条");
+
+    // D19-D21：输入框盘符 chip（空输入 + filters.drives）与 `c:` 前缀等价。
+    let chip = SearchFilters {
+        drives: vec![DriveFilter {
+            letter,
+            exclude: false,
+        }],
+        ..Default::default()
+    };
+    let (_, total) = search(&fx, "LstrAcc", Scope::All, &chip);
+    assert_eq!(total, 11, "D19 盘符 chip 应等价 {letter}: 前缀");
+
+    let other_chip = SearchFilters {
+        drives: vec![DriveFilter {
+            letter: other,
+            exclude: false,
+        }],
+        ..Default::default()
+    };
+    let (_, total) = search(&fx, "LstrAcc", Scope::All, &other_chip);
+    assert_eq!(total, 0, "D20 其它盘 chip 不应命中夹具");
+
+    let exclude_chip = SearchFilters {
+        drives: vec![DriveFilter {
+            letter,
+            exclude: true,
+        }],
+        ..Default::default()
+    };
+    let (_, total) = search(&fx, "LstrAcc", Scope::All, &exclude_chip);
+    assert_eq!(total, 0, "D21 排除唯一有夹具的盘后应为 0");
 }
 
 // ---------------------------------------------------------------------------

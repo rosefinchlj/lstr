@@ -263,7 +263,7 @@ fn paint_condition_chip(
     bg: Color32,
     id: &str,
     tooltip: &str,
-) -> (f32, bool) {
+) -> (f32, bool, bool) {
     let label_galley = (!label.is_empty())
         .then(|| painter.layout_no_wrap(label.to_string(), ui::text_font(13.0), color));
     let value_galley = painter.layout_no_wrap(value.to_string(), ui::mono_font(12.0), color);
@@ -309,18 +309,83 @@ fn paint_condition_chip(
         ui::mono_font(12.0),
         color,
     );
+    let body_rect = Rect::from_min_max(
+        chip.min,
+        egui::pos2(clear.left(), chip.max.y),
+    );
+    let body = ui
+        .interact(body_rect, Id::new(("lstr-cond-chip-body", id)), Sense::click())
+        .on_hover_text(tooltip.to_string());
     let response = ui
         .interact(clear, Id::new(("lstr-cond-chip-clear", id)), Sense::click())
         .on_hover_text(tooltip.to_string());
-    (chip_w, response.clicked())
+    (chip_w, response.clicked(), body.clicked())
+}
+
+/// 条件 chip 的数据源（按键编辑/删除时用来定位 `filters` 里的数据）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConditionChipKind {
+    Date,
+    Size,
+    /// `filters.drives` 的下标。
+    Drive(usize),
+}
+
+struct ConditionChipInfo {
+    kind: ConditionChipKind,
+    label: &'static str,
+    value: String,
+    color: Color32,
+    bg: Color32,
+    id: String,
+    tooltip: String,
+    /// 还原到输入框的可编辑文本；None = 区间异常无法还原。
+    edit_text: Option<String>,
+    /// 还原后需要 `condition_hold`（盘符 `C:` 会立即再次提交）。
+    hold_after_edit: bool,
+}
+
+/// 光标左侧最近的 chip 下标。虚拟光标优先；没有虚拟光标时，文本光标在
+/// 开头（或输入为空）则 chip 全在文本左侧，最右 chip 就是左邻。
+fn left_chip_index(caret: Option<usize>, count: usize, text_at_start: bool) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    match caret {
+        Some(index) => index.checked_sub(1).filter(|&index| index < count),
+        None if text_at_start => Some(count - 1),
+        None => None,
+    }
+}
+
+/// 删除第 `removed` 个 chip 后，虚拟光标应落在的位置（chip 数变为 `new_count`）。
+fn caret_after_remove(caret: Option<usize>, removed: usize, new_count: usize) -> Option<usize> {
+    match caret {
+        Some(index) if index > removed => {
+            let next = index - 1;
+            (next < new_count).then_some(next)
+        }
+        Some(index) => (index < new_count).then_some(index),
+        None => None,
+    }
+}
+
+/// 去掉条件文本末尾的终结冒号（进入编辑态时用，避免立刻又被收成 chip）。
+fn strip_condition_terminator(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    let without = trimmed
+        .strip_suffix('：')
+        .or_else(|| trimmed.strip_suffix(':'))
+        .unwrap_or(trimmed);
+    without.trim_end()
 }
 
 /// 空查询帮助面板的内容高度（相对列表顶部）：宽窗口两列，以较高的左列
 /// 为准；窄窗口退化为单列顺排，两列内容相加。
 fn help_panel_height(width: f32) -> f32 {
     let group = |rows: f32| HELP_GROUP_HEAD_H + rows * HELP_ROW_H + HELP_GROUP_GAP;
-    // 左列：位置 3 行 / 筛选 4 行（含日期、大小）/ 范围 3 行。
-    let left = group(3.0) + group(4.0) + group(3.0);
+    // 左列：位置 3 行 / 筛选 5 行（含日期、大小、条件编辑）/ 范围 3 行。
+    let left = group(3.0) + group(5.0) + group(3.0);
     let head = HELP_TOP_PAD + HELP_TITLE_H;
     if width >= 560.0 {
         head + left
@@ -415,6 +480,17 @@ pub struct LstrApp {
     filters: SearchFilters,
     /// 打开中的筛选下拉菜单。
     filter_menu: Option<FilterMenuKind>,
+    /// 输入框条件 chip 的虚拟光标：`Some(i)` = 光标在第 i 个 chip 左侧
+    /// （0..chip 数）；None = 光标在文本里。
+    chip_caret: Option<usize>,
+    /// 编辑盘符 chip 时暂停查询：还原出的 `C:` 不能立刻又被收成 chip。
+    condition_hold: bool,
+    /// 用户 Esc 取消过的联想输入串；以该串开头时不再自动弹。
+    suggest_dismissed: Option<String>,
+    /// 联想候选的键盘选中项。
+    suggest_index: usize,
+    /// 条件编辑前的 filters/输入快照：Esc 取消时恢复。
+    condition_edit_backup: Option<(SearchFilters, String)>,
     /// 对话框事件到达但探测失败时的重试截止时间（子控件可能还没建好）。
     dialog_retry_until: Option<Instant>,
     /// 设置面板当前分页。
@@ -579,6 +655,11 @@ impl LstrApp {
             more_exhausted: false,
             filters: SearchFilters::default(),
             filter_menu: None,
+            chip_caret: None,
+            condition_hold: false,
+            suggest_dismissed: None,
+            suggest_index: 0,
+            condition_edit_backup: None,
             dialog_retry_until: None,
             settings_tab: SettingsTab::Appearance,
             ime_composing: false,
@@ -1054,11 +1135,266 @@ impl LstrApp {
             && !matches!(scope, Scope::App | Scope::Command)
     }
 
-    /// 扫描输入框里的日期/大小条件：成功的片段从文本删除并合并进 filters，
+    /// 输入框条件 chip 的描述列表（绘制与按键处理共用同一顺序）：
+    /// 时间 → 大小 → 盘符（按加入顺序）。
+    fn condition_chips(&self) -> Vec<ConditionChipInfo> {
+        let theme = self.theme;
+        let size_color = if theme.light {
+            Color32::from_rgb(46, 112, 142)
+        } else {
+            Color32::from_rgb(118, 188, 210)
+        };
+        let drive_color = if theme.light {
+            Color32::from_rgb(46, 122, 82)
+        } else {
+            Color32::from_rgb(120, 196, 154)
+        };
+        let mut chips = Vec::new();
+        if let Some(range) = self.filters.modified.as_ref().filter(|r| !r.is_empty()) {
+            chips.push(ConditionChipInfo {
+                kind: ConditionChipKind::Date,
+                label: "时间",
+                value: range.label(),
+                color: theme.amber,
+                bg: theme.amber_soft,
+                id: "date".into(),
+                tooltip: "修改时间条件（本地时间）；Shift+Ctrl+Bksp 编辑，点 × 移除".into(),
+                edit_text: crate::search::conditions::date_edit_text(range)
+                    .map(|text| strip_condition_terminator(&text).to_string()),
+                hold_after_edit: false,
+            });
+        }
+        if let Some(range) = self.filters.size.as_ref().filter(|r| !r.is_empty()) {
+            chips.push(ConditionChipInfo {
+                kind: ConditionChipKind::Size,
+                label: "大小",
+                value: range.label(),
+                color: size_color,
+                bg: Color32::from_rgba_unmultiplied(size_color.r(), size_color.g(), size_color.b(), 26),
+                id: "size".into(),
+                tooltip: "文件大小条件；Shift+Ctrl+Bksp 编辑，点 × 移除".into(),
+                edit_text: crate::search::conditions::size_edit_text(range)
+                    .map(|text| strip_condition_terminator(&text).to_string()),
+                hold_after_edit: false,
+            });
+        }
+        for (index, drive) in self.filters.drives.iter().enumerate() {
+            chips.push(ConditionChipInfo {
+                kind: ConditionChipKind::Drive(index),
+                label: "盘符",
+                value: drive.label(),
+                color: drive_color,
+                bg: Color32::from_rgba_unmultiplied(
+                    drive_color.r(),
+                    drive_color.g(),
+                    drive_color.b(),
+                    26,
+                ),
+                id: format!("drive-{index}"),
+                tooltip: if drive.exclude {
+                    format!("排除 {} 盘；Shift+Ctrl+Bksp 编辑，点 × 移除", drive.letter)
+                } else {
+                    format!("只搜 {} 盘；Shift+Ctrl+Bksp 编辑，点 × 移除", drive.letter)
+                },
+                edit_text: Some(drive.source()),
+                hold_after_edit: true,
+            });
+        }
+        chips
+    }
+
+    /// 当前应该弹出的条件联想候选；Esc 取消过的前缀不再弹。
+    fn condition_suggestions(&self) -> Vec<crate::search::conditions::Suggestion> {
+        if !self.conditions_apply(self.scope)
+            || self.ime_composing
+            || self.chip_caret.is_some()
+            || self.settings_open
+        {
+            return Vec::new();
+        }
+        let trimmed = self.input.trim();
+        if let Some(dismissed) = &self.suggest_dismissed {
+            if !dismissed.is_empty() && trimmed.starts_with(dismissed.as_str()) {
+                return Vec::new();
+            }
+        }
+        crate::search::conditions::suggestions(&self.input)
+    }
+
+    /// 接受联想候选：把输入换成 `size>` / `date>`，光标到末尾并继续暂停查询。
+    fn accept_suggestion(&mut self, ctx: &egui::Context) {
+        let suggestions = self.condition_suggestions();
+        if suggestions.is_empty() {
+            return;
+        }
+        let index = self.suggest_index.min(suggestions.len() - 1);
+        let fill = suggestions[index].fill.clone();
+        self.input = fill;
+        self.chip_caret = None;
+        self.condition_hold = false;
+        self.suggest_dismissed = None;
+        self.suggest_index = 0;
+        Self::reset_input_cursor(ctx);
+        self.focus_requested = true;
+        self.trigger(ctx);
+    }
+
+    /// Esc 取消联想：当前串不再弹，立即恢复搜索。
+    fn dismiss_suggestion(&mut self, ctx: &egui::Context) {
+        let trimmed = self.input.trim().to_string();
+        if !trimmed.is_empty() {
+            self.suggest_dismissed = Some(trimmed);
+        }
+        self.suggest_index = 0;
+        self.trigger(ctx);
+    }
+
+    /// 文本光标是否停在输入框最开头（输入为空也算）。
+    fn text_at_start(&self, ctx: &egui::Context) -> bool {
+        if self.input.is_empty() {
+            return true;
+        }
+        let id = egui::Id::new("lstr-search-input");
+        egui::widgets::text_edit::TextEditState::load(ctx, id)
+            .and_then(|state| state.cursor.char_range())
+            .is_some_and(|range| range.primary.index == 0 && range.secondary.index == 0)
+    }
+
+    /// 光标左侧最近的条件 chip 下标（编辑用：虚拟光标优先，否则最右 chip）。
+    fn condition_edit_target(&self) -> Option<usize> {
+        let count = self.condition_chips().len();
+        left_chip_index(self.chip_caret, count, true)
+    }
+
+    /// Ctrl+Backspace 的删除目标：虚拟光标左侧 chip；否则文本在开头时删最右 chip。
+    fn condition_delete_target(&self, ctx: &egui::Context) -> Option<usize> {
+        let count = self.condition_chips().len();
+        left_chip_index(self.chip_caret, count, self.text_at_start(ctx))
+    }
+
+    /// 删除第 `index` 个条件 chip，并修正虚拟光标。
+    fn remove_chip(&mut self, index: usize) -> bool {
+        let kind = self.condition_chips().get(index).map(|chip| chip.kind);
+        match kind {
+            Some(ConditionChipKind::Date) => self.filters.modified = None,
+            Some(ConditionChipKind::Size) => self.filters.size = None,
+            Some(ConditionChipKind::Drive(drive)) => {
+                if drive >= self.filters.drives.len() {
+                    return false;
+                }
+                self.filters.drives.remove(drive);
+            }
+            None => return false,
+        }
+        let new_count = self.condition_chips().len();
+        self.chip_caret = caret_after_remove(self.chip_caret, index, new_count);
+        true
+    }
+
+    /// 把第 `index` 个 chip 还原成可编辑文本，进入编辑态（Esc 可撤销）。
+    fn edit_chip(&mut self, index: usize, ctx: &egui::Context) -> bool {
+        let Some(chip) = self.condition_chips().into_iter().nth(index) else {
+            return false;
+        };
+        let Some(text) = chip.edit_text else {
+            return false;
+        };
+        if self.condition_edit_backup.is_none() {
+            self.condition_edit_backup = Some((self.filters.clone(), self.input.clone()));
+        }
+        if !self.remove_chip(index) {
+            return false;
+        }
+        let trimmed = self.input.trim_end();
+        self.input = if trimmed.is_empty() {
+            text
+        } else {
+            format!("{trimmed} {text}")
+        };
+        self.chip_caret = None;
+        self.condition_hold = chip.hold_after_edit;
+        self.suggest_dismissed = None;
+        Self::reset_input_cursor(ctx);
+        self.focus_requested = true;
+        self.trigger(ctx);
+        true
+    }
+
+    /// Esc 取消条件编辑：恢复编辑前的 chip 和输入。
+    fn cancel_condition_edit(&mut self, ctx: &egui::Context) -> bool {
+        let Some((filters, input)) = self.condition_edit_backup.take() else {
+            return false;
+        };
+        self.filters = filters;
+        self.input = input;
+        self.condition_hold = false;
+        self.chip_caret = None;
+        Self::reset_input_cursor(ctx);
+        self.focus_requested = true;
+        self.trigger(ctx);
+        true
+    }
+
+    /// 编辑态回车：时间/大小补终结冒号后提交；盘符直接提交。
+    /// 返回 true = 这次回车已被条件编辑消费（不再打开选中结果）。
+    fn finish_condition_edit(&mut self, ctx: &egui::Context) -> bool {
+        if self.condition_hold {
+            self.condition_hold = false;
+            if self.commit_conditions(ctx) {
+                self.trigger(ctx);
+            } else {
+                // 用户把盘符改没了：保持编辑态，别偷偷开始搜索。
+                self.condition_hold = true;
+                self.dirty_at = None;
+                self.waiting = false;
+                ctx.request_repaint();
+            }
+            return true;
+        }
+        let mut text = self.input.trim_end().to_string();
+        let last = text.chars().last();
+        // 只有比较符还没有值（`size>`）：不补冒号，也不搜索。
+        if last.is_none_or(|c| matches!(c, '>' | '<' | '=' | '≥' | '≤' | '＞' | '＜' | '＝')) {
+            self.dirty_at = None;
+            self.waiting = false;
+            ctx.request_repaint();
+            return true;
+        }
+        if !text.ends_with(':') && !text.ends_with('：') {
+            text.push(':');
+        }
+        self.input = text;
+        self.commit_conditions(ctx);
+        self.trigger(ctx);
+        true
+    }
+
+    /// `C:` 已收成 chip 后用户继续打 `\`：还原成 `C:\`，回到路径浏览。
+    fn restore_drive_for_path(&mut self) -> bool {
+        if !self.input.starts_with(['\\', '/']) {
+            return false;
+        }
+        let Some(drive) = self.filters.drives.pop() else {
+            return false;
+        };
+        self.input = format!("{}{}", drive.source(), self.input);
+        self.chip_caret = None;
+        true
+    }
+
+    /// 扫描输入框里的日期/大小/盘符条件：成功的片段从文本删除并合并进 filters，
     /// 非法条件保留原文、只记录错误。返回是否改动了输入。
     ///
     /// 只在 TextEdit changed 后调用；IME 组合期不调用（避免把预编辑当条件）。
     fn commit_conditions(&mut self, ctx: &egui::Context) -> bool {
+        if self.condition_hold {
+            return false;
+        }
+        // 盘符 chip 后面继续打路径分隔符：先把盘符还原成文本，交给路径模式。
+        if self.restore_drive_for_path() {
+            self.move_caret_to_end(ctx);
+            return true;
+        }
         if !self.conditions_apply(self.scope) {
             return false;
         }
@@ -1081,31 +1417,46 @@ impl LstrApp {
                 return false;
             }
         }
+        for drive in extracted.drives {
+            match self
+                .filters
+                .drives
+                .iter()
+                .position(|existing| existing.letter == drive.letter)
+            {
+                Some(pos) => self.filters.drives[pos] = drive,
+                None => self.filters.drives.push(drive),
+            }
+        }
         self.input = extracted.cleaned;
         self.filters.modified = (!dates.is_empty()).then_some(dates);
         self.filters.size = (!sizes.is_empty()).then_some(sizes);
+        self.condition_hold = false;
+        self.condition_edit_backup = None;
+        self.chip_caret = None;
         self.move_caret_to_end(ctx);
         true
     }
 
-    /// 程序化清空输入（不清筛选）：同时清掉条件错误，避免错误态
-    /// 一直挡住后续查询。
+    /// 程序化清空输入（不清筛选）：同时清掉条件错误与编辑/联想瞬态，
+    /// 避免错误态或半截编辑一直挡住后续查询。
     fn clear_input_text(&mut self) {
         self.input.clear();
         self.condition_error = None;
-    }
-
-    /// Ctrl+Backspace：输入框为空时从右往左删一个条件 chip（大小 → 日期）。
-    /// 返回是否真的删了；没有条件时不消费按键，交给 TextEdit。
-    fn remove_last_condition(&mut self) -> bool {
-        self.filters.remove_last_condition()
+        self.chip_caret = None;
+        self.condition_hold = false;
+        self.suggest_dismissed = None;
+        self.suggest_index = 0;
+        self.condition_edit_backup = None;
     }
 
     fn trigger(&mut self, ctx: &egui::Context) {
-        // 正在输入日期条件（`date>` / `date > 2026-11-`，还没打冒号）时不发查询：
+        // 条件编辑态 / 联想弹框打开 / 半截条件输入：都不发查询。
         // 半截条件当文件名搜只会闪出 0 结果，等冒号提交或输入被改掉再搜。
-        if self.conditions_apply(self.scope)
-            && crate::search::conditions::is_composing(&self.input)
+        if self.condition_hold
+            || !self.condition_suggestions().is_empty()
+            || (self.conditions_apply(self.scope)
+                && crate::search::conditions::is_composing(&self.input))
         {
             self.dirty_at = None;
             self.waiting = false;
@@ -1177,6 +1528,12 @@ impl LstrApp {
         }
         Self::reset_input_cursor(ctx);
         self.filter_menu = None;
+        // 唤出时条件编辑/联想/虚拟光标一律从头开始（输入与 chip 仍可保留）。
+        self.chip_caret = None;
+        self.condition_hold = false;
+        self.suggest_dismissed = None;
+        self.suggest_index = 0;
+        self.condition_edit_backup = None;
         // 普通唤出（双击 Space / 托盘）不携带 Explorer 目录上下文。
         self.typing_folder = None;
         self.typing_global = false;
@@ -1380,8 +1737,30 @@ impl LstrApp {
             (composing || has_ime_event, composing)
         });
         self.ime_composing = preedit;
+        // 虚拟 chip 光标在条件之间时直接打字/粘贴：自动回到输入框末尾。
+        // 必须在 IME 早退之前处理，否则中文预编辑会插到文本开头。
+        if self.chip_caret.is_some() {
+            let typing = ctx.input(|i| {
+                i.events.iter().any(|event| match event {
+                    egui::Event::Text(_) | egui::Event::Paste(_) => true,
+                    egui::Event::Ime(egui::ImeEvent::Preedit(text)) => !text.is_empty(),
+                    egui::Event::Ime(egui::ImeEvent::Commit(_)) => true,
+                    _ => false,
+                })
+            });
+            if typing {
+                self.chip_caret = None;
+                self.move_caret_to_end(ctx);
+            }
+        }
         if ime_active {
             return;
+        }
+
+        // 条件 chip 可能在别处被清掉（筛选条/时间预设）：虚拟光标及时失效。
+        let chip_count = self.condition_chips().len();
+        if self.chip_caret.is_some_and(|index| index >= chip_count) {
+            self.chip_caret = None;
         }
 
         // 设置页「唤起热键」录制中：本帧按键全部进录制器（Esc 取消），
@@ -1395,6 +1774,14 @@ impl LstrApp {
         // 设置面板 先各自收起，全部收完后再按一次才隐藏窗口。
         // 窗口不会因为失焦自动关闭。
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            // 条件联想弹框 / 条件编辑态是输入框内最上层：先取消它们。
+            if !self.condition_suggestions().is_empty() {
+                self.dismiss_suggestion(ctx);
+                return;
+            }
+            if self.cancel_condition_edit(ctx) {
+                return;
+            }
             if self.crumb_more {
                 self.crumb_more = false;
                 return;
@@ -1459,17 +1846,32 @@ impl LstrApp {
             }
         }
 
-        // 输入框为空时 Ctrl+Backspace 删除最右侧条件 chip（键盘替代鼠标 ×）。
-        // 输入框有文字时不拦截：让 TextEdit 按词删除，chip 保持不动。
-        if self.input.is_empty()
-            && (self.filters.modified.is_some() || self.filters.size.is_some())
+        // Shift+Ctrl+Backspace：把光标左侧的条件 chip 还原成文本，进入编辑态
+        // （没有虚拟光标时 chip 全在文本左侧，编辑最右 chip）。
+        if self.condition_edit_target().is_some()
+            && ctx.input_mut(|i| {
+                i.consume_key(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Backspace)
+            })
+        {
+            if let Some(index) = self.condition_edit_target() {
+                self.edit_chip(index, ctx);
+            }
+            return;
+        }
+
+        // Ctrl+Backspace：删光标左侧的条件 chip（虚拟光标优先；文本在开头时
+        // 删最右 chip）。没有 chip 可删时不拦截，让 TextEdit 按词删除。
+        if self.condition_delete_target(ctx).is_some()
             && ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backspace))
         {
-            if self.remove_last_condition() {
-                self.condition_error = None;
-                self.menu_open = false;
-                self.filter_menu = None;
-                self.trigger(ctx);
+            if let Some(index) = self.condition_delete_target(ctx) {
+                if self.remove_chip(index) {
+                    self.condition_error = None;
+                    self.menu_open = false;
+                    self.filter_menu = None;
+                    self.condition_edit_backup = None;
+                    self.trigger(ctx);
+                }
             }
             return;
         }
@@ -1617,6 +2019,30 @@ impl LstrApp {
             self.step_scope(ctx, scope_delta);
         }
 
+        // 虚拟 chip 光标：文本光标在开头时 ← 进入 chip 区；→ 逐个右移，
+        // 走出最后一个 chip 回到文本开头。
+        if self.filters.has_input_conditions() {
+            let count = self.condition_chips().len();
+            let left_should_handle = self.chip_caret.is_some() || self.text_at_start(ctx);
+            if count > 0
+                && left_should_handle
+                && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft))
+            {
+                self.chip_caret = match self.chip_caret {
+                    Some(index) => Some(index.saturating_sub(1)),
+                    None => Some(count - 1),
+                };
+                return;
+            }
+            if self.chip_caret.is_some()
+                && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowRight))
+            {
+                let next = self.chip_caret.map_or(count, |index| index + 1);
+                self.chip_caret = (next < count).then_some(next);
+                return;
+            }
+        }
+
         let plain_right = ctx.input(|i| {
             !i.modifiers.alt && !i.modifiers.ctrl && !i.modifiers.shift
         });
@@ -1629,6 +2055,20 @@ impl LstrApp {
                 self.open_menu();
             }
             return;
+        }
+
+        // 联想弹框打开时 ↑↓ 改选候选（不移动结果列表）。
+        let suggestions = self.condition_suggestions();
+        if !suggestions.is_empty() {
+            let len = suggestions.len();
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                self.suggest_index = (self.suggest_index + 1) % len;
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                self.suggest_index = (self.suggest_index + len - 1) % len;
+                return;
+            }
         }
 
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
@@ -1656,6 +2096,22 @@ impl LstrApp {
             self.step_scope(ctx, -1);
         } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
             self.step_scope(ctx, 1);
+        }
+
+        // 联想/条件编辑态：Enter 是「确认条件」，不打开选中结果。
+        if !self.condition_suggestions().is_empty()
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
+        {
+            self.accept_suggestion(ctx);
+            return;
+        }
+        if (self.condition_hold
+            || (self.conditions_apply(self.scope)
+                && crate::search::conditions::is_composing(&self.input)))
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
+        {
+            self.finish_condition_edit(ctx);
+            return;
         }
 
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Enter)) {
@@ -2206,47 +2662,15 @@ impl LstrApp {
                     hint_for(query.scope).to_string()
                 };
                 // 条件 chip：固定在输入框左侧，文本区整体右移。
-                // 标签用比例字体、值用等宽字体；日期=琥珀色，大小=冷色。
+                // 标签用比例字体、值用等宽字体；日期=琥珀色，大小=冷色，盘符=绿色。
                 let disabled = !self.conditions_apply(query.scope);
-                let size_color = if theme.light {
-                    Color32::from_rgb(46, 112, 142)
-                } else {
-                    Color32::from_rgb(118, 188, 210)
-                };
-                let size_bg = Color32::from_rgba_unmultiplied(
-                    size_color.r(),
-                    size_color.g(),
-                    size_color.b(),
-                    26,
-                );
-                let mut chips: Vec<(String, String, Color32, Color32, &'static str, &'static str)> =
-                    Vec::new();
-                if let Some(range) = self.filters.modified.as_ref().filter(|r| !r.is_empty()) {
-                    chips.push((
-                        "时间".into(),
-                        range.label(),
-                        theme.amber,
-                        theme.amber_soft,
-                        "date",
-                        "修改时间条件（本地时间）；点 × 移除",
-                    ));
-                }
-                if let Some(range) = self.filters.size.as_ref().filter(|r| !r.is_empty()) {
-                    chips.push((
-                        "大小".into(),
-                        range.label(),
-                        size_color,
-                        size_bg,
-                        "size",
-                        "文件大小条件；点 × 移除",
-                    ));
-                }
+                let chips = self.condition_chips();
                 let mut text_rect = search_rect;
                 if !chips.is_empty() {
                     // 窄窗口下先去掉标签（只留值），保证文本区至少留出 80px。
                     let with_labels: f32 = chips
                         .iter()
-                        .map(|c| condition_chip_width(&painter, &c.0, &c.1))
+                        .map(|chip| condition_chip_width(&painter, chip.label, &chip.value))
                         .sum::<f32>()
                         + 6.0 * chips.len().saturating_sub(1) as f32;
                     let compact = search_rect.width() - with_labels < 90.0;
@@ -2255,34 +2679,57 @@ impl LstrApp {
                     } else {
                         ""
                     };
+                    if self.chip_caret.is_some_and(|index| index >= chips.len()) {
+                        self.chip_caret = None;
+                    }
                     let mut x = search_rect.left();
-                    let mut removed: Option<&'static str> = None;
-                    for (label, value, color, bg, id, tip) in &chips {
-                        let label = if compact { "" } else { label.as_str() };
-                        let (w, clicked) = paint_condition_chip(
+                    let mut chip_lefts = Vec::with_capacity(chips.len());
+                    let mut removed: Option<usize> = None;
+                    let mut caret_target: Option<usize> = None;
+                    for (index, chip) in chips.iter().enumerate() {
+                        chip_lefts.push(x);
+                        let label = if compact { "" } else { chip.label };
+                        let (w, clear_clicked, body_clicked) = paint_condition_chip(
                             ui,
                             &painter,
                             x,
                             search_rect.top() + 1.0,
                             label,
-                            value,
-                            if disabled { theme.dim } else { *color },
-                            if disabled { theme.hover } else { *bg },
-                            id,
-                            &format!("{tip}{suffix}"),
+                            &chip.value,
+                            if disabled { theme.dim } else { chip.color },
+                            if disabled { theme.hover } else { chip.bg },
+                            &chip.id,
+                            &format!("{}{suffix}", chip.tooltip),
                         );
-                        if clicked {
-                            removed = Some(*id);
+                        if clear_clicked {
+                            removed = Some(index);
+                        }
+                        if body_clicked {
+                            caret_target = Some(index);
                         }
                         x += w + 6.0;
                     }
-                    if let Some(id) = removed {
-                        match id {
-                            "date" => self.filters.modified = None,
-                            "size" => self.filters.size = None,
-                            _ => {}
+                    // 虚拟 chip 光标：画在目标 chip 左侧的间隙里。
+                    if let Some(index) = self.chip_caret {
+                        let caret_x = (chip_lefts[index] - 3.0).max(search_rect.left() + 1.0);
+                        painter.line_segment(
+                            [
+                                egui::pos2(caret_x, search_rect.top() + 4.0),
+                                egui::pos2(caret_x, search_rect.bottom() - 4.0),
+                            ],
+                            Stroke::new(1.5_f32, theme.amber),
+                        );
+                    }
+                    if let Some(index) = removed {
+                        if self.remove_chip(index) {
+                            self.condition_error = None;
+                            self.menu_open = false;
+                            self.filter_menu = None;
+                            self.condition_edit_backup = None;
+                            self.trigger(ctx);
                         }
-                        self.trigger(ctx);
+                    } else if let Some(index) = caret_target {
+                        self.chip_caret = Some(index);
                     }
                     text_rect.min.x = (x + 2.0)
                         .min(search_rect.right() - 40.0)
@@ -2302,6 +2749,17 @@ impl LstrApp {
                 if response.changed() {
                     self.menu_open = false;
                     self.filter_menu = None;
+                    // 用户真的改了文本：退出条件编辑 hold 与虚拟 chip 光标；
+                    // 联想取消标记只在输入还以该串开头时保留。
+                    self.condition_hold = false;
+                    self.chip_caret = None;
+                    self.suggest_index = 0;
+                    if let Some(dismissed) = &self.suggest_dismissed {
+                        let trimmed = self.input.trim();
+                        if trimmed.is_empty() || !trimmed.starts_with(dismissed.as_str()) {
+                            self.suggest_dismissed = None;
+                        }
+                    }
                     // IME 组合期(预编辑未上屏)不触发搜索:避免拼音字母逐键闪动
                     // 结果;上屏后由 handle_keys 的组合结束检测补搜。
                     if !self.ime_composing {
@@ -2312,11 +2770,20 @@ impl LstrApp {
                         self.trigger(ctx);
                     }
                 }
+                if response.clicked() {
+                    // 点进文本区 = 退出 chip 虚拟光标。
+                    self.chip_caret = None;
+                }
                 let window_focused = ctx.input(|i| i.focused);
                 if self.focus_requested || (window_focused && !response.has_focus()) {
                     response.request_focus();
                     self.focus_requested = false;
                 }
+                // 条件联想弹层（Foreground，盖在筛选条/结果列表之上）。
+                self.paint_condition_suggest(
+                    ctx,
+                    egui::pos2(search_rect.left(), search_rect.bottom() + 4.0),
+                );
                 let focus_color = if response.has_focus() {
                     theme.amber
                 } else {
@@ -3246,6 +3713,105 @@ impl LstrApp {
         items
     }
 
+    /// 条件联想弹层：贴在搜索行下方，Foreground 盖住筛选条与结果列表。
+    fn paint_condition_suggest(&mut self, ctx: &egui::Context, anchor: egui::Pos2) {
+        let suggestions = self.condition_suggestions();
+        if suggestions.is_empty() {
+            self.suggest_index = 0;
+            return;
+        }
+        let theme = self.theme;
+        let index = self.suggest_index.min(suggestions.len() - 1);
+        let width = 340.0_f32
+            .min(ctx.screen_rect().width() - 2.0 * PAD)
+            .max(220.0);
+        let row_h = 38.0;
+        let footer_h = 22.0;
+        let mut clicked: Option<usize> = None;
+        let area = egui::Area::new(Id::new("lstr-cond-suggest"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(anchor)
+            .show(ctx, |ui| {
+                let frame = egui::Frame {
+                    fill: theme.menu,
+                    stroke: Stroke::new(1.0_f32, theme.hair2),
+                    corner_radius: CornerRadius::same(10),
+                    inner_margin: egui::Margin::same(4),
+                    shadow: egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 30,
+                        spread: 0,
+                        color: Color32::from_black_alpha(110),
+                    },
+                    ..Default::default()
+                };
+                frame.show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    for (row_index, suggestion) in suggestions.iter().enumerate() {
+                        let (row, response) = ui.allocate_exact_size(
+                            egui::vec2(width - 8.0, row_h),
+                            Sense::click(),
+                        );
+                        if row_index == index || response.hovered() {
+                            ui.painter().rect_filled(
+                                row.shrink(2.0),
+                                CornerRadius::same(6),
+                                theme.surface_hi,
+                            );
+                        }
+                        ui.painter().text(
+                            egui::pos2(row.left() + 12.0, row.center().y),
+                            Align2::LEFT_CENTER,
+                            suggestion.keyword,
+                            ui::mono_font(13.0),
+                            theme.amber,
+                        );
+                        ui.painter().text(
+                            egui::pos2(row.left() + 88.0, row.center().y),
+                            Align2::LEFT_CENTER,
+                            suggestion.description,
+                            ui::text_font(12.0),
+                            theme.sub,
+                        );
+                        ui.painter().text(
+                            egui::pos2(row.right() - 12.0, row.center().y),
+                            Align2::RIGHT_CENTER,
+                            "↵ 编辑",
+                            ui::mono_font(10.0),
+                            theme.dim,
+                        );
+                        if response.clicked() {
+                            clicked = Some(row_index);
+                        }
+                    }
+                    let (footer, _) = ui.allocate_exact_size(
+                        egui::vec2(width - 8.0, footer_h),
+                        Sense::click(),
+                    );
+                    ui.painter().text(
+                        egui::pos2(footer.left() + 12.0, footer.center().y),
+                        Align2::LEFT_CENTER,
+                        "↑↓ 选择 · Enter 进入编辑 · Esc 取消",
+                        ui::mono_font(10.0),
+                        theme.dim,
+                    );
+                });
+            });
+        if let Some(row) = clicked {
+            self.suggest_index = row;
+            self.accept_suggestion(ctx);
+            return;
+        }
+        // 点弹层外面 = 取消联想并立即恢复搜索。
+        if ctx.input(|i| i.pointer.any_click()) {
+            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                if !area.response.rect.contains(pos) {
+                    self.dismiss_suggestion(ctx);
+                }
+            }
+        }
+    }
+
     fn paint_filter_menu(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let Some(kind) = self.filter_menu else {
             return;
@@ -3346,6 +3912,10 @@ impl LstrApp {
                     FilterChoice::Group(value) => self.filters.group = *value,
                 }
                 self.filter_menu = None;
+                // 筛选条改动了 filters：条件编辑/虚拟光标不再对应原状态。
+                self.chip_caret = None;
+                self.condition_hold = false;
+                self.condition_edit_backup = None;
                 self.trigger(ui.ctx());
             }
             return;
@@ -3392,7 +3962,7 @@ impl LstrApp {
                     (
                         "位置",
                         &[
-                            ("c:  d:", "只搜这些盘，可多个"),
+                            ("c:  d:", "只搜这些盘，打 C: 即 chip"),
                             ("-c:", "排除某盘，如 ap -c:"),
                             ("path:D:\\目录", "限定到某目录"),
                         ],
@@ -3401,8 +3971,9 @@ impl LstrApp {
                         "筛选",
                         &[
                             ("ext:rs", "按扩展名"),
-                            ("日期", "date>2026-11-10: 冒号提交"),
+                            ("日期", "date>2026-11-10: 冒号/回车"),
                             ("大小", "size>10M: 按文件大小"),
+                            ("Ctrl+Bksp", "删条件；加 Shift 编辑"),
                             ("匹配", "大小写 / 全词 / 正则"),
                         ],
                     ),
@@ -3498,14 +4069,14 @@ impl LstrApp {
                 painter.text(
                     egui::pos2(rect.center().x, list_top + 44.0),
                     Align2::CENTER_CENTER,
-                    "正在输入日期/大小条件",
+                    "正在输入日期/大小/盘符条件",
                     ui::text_font(15.0),
                     theme.text,
                 );
                 painter.text(
                     egui::pos2(rect.center().x, list_top + 68.0),
                     Align2::CENTER_CENTER,
-                    "冒号提交后生效，例如 date>2026-11-10: / size>10M:",
+                    "冒号或回车提交，例如 date>2026-11-10: / size>10M: / C:",
                     ui::mono_font(11.5),
                     theme.dim,
                 );
@@ -4184,10 +4755,14 @@ impl LstrApp {
             Stroke::new(1.0_f32, theme.hair),
         );
 
-        let mut default_text = if self.conditions_apply(query.scope)
+        let mut default_text = if !self.condition_suggestions().is_empty() {
+            "条件联想 · Enter 进入编辑 · Esc 取消".to_string()
+        } else if self.condition_hold {
+            "编辑条件 · 回车确认 · Esc 取消".to_string()
+        } else if self.conditions_apply(query.scope)
             && crate::search::conditions::is_composing(&self.input)
         {
-            "正在输入日期/大小条件 · 冒号提交后生效".to_string()
+            "正在输入日期/大小/盘符条件 · 冒号或回车提交".to_string()
         } else if query.is_empty() && self.filters.is_empty() {
             format!(
                 "{} 项{}",
@@ -4279,8 +4854,7 @@ impl LstrApp {
             ]
         };
         // 输入框为空且已有条件 chip：提示键盘删除方式。
-        if self.input.is_empty() && (self.filters.modified.is_some() || self.filters.size.is_some())
-        {
+        if self.input.is_empty() && self.filters.has_input_conditions() {
             hints.push(("Ctrl+Bksp", "删条件"));
         }
         let mut right = rect.right() - PAD;
@@ -7285,5 +7859,41 @@ mod path_layout_tests {
         assert_eq!(items[0].1, std::path::PathBuf::new(), "首项用于退出浏览");
         assert_eq!(items[1].1, std::path::PathBuf::from(r"D:\"));
         assert_eq!(items[3].1, std::path::PathBuf::from(r"D:\a\b"));
+    }
+
+    #[test]
+    fn left_chip_target_prefers_virtual_caret() {
+        assert_eq!(left_chip_index(None, 0, true), None);
+        // 无虚拟光标：文本在开头时 chip 全在左侧，最右 chip 是左邻。
+        assert_eq!(left_chip_index(None, 3, true), Some(2));
+        assert_eq!(left_chip_index(None, 3, false), None);
+        // 有虚拟光标：光标左侧的 chip；最左就没有左邻。
+        assert_eq!(left_chip_index(Some(2), 3, true), Some(1));
+        assert_eq!(left_chip_index(Some(1), 3, true), Some(0));
+        assert_eq!(left_chip_index(Some(0), 3, true), None);
+    }
+
+    #[test]
+    fn caret_after_remove_keeps_logical_position() {
+        // 删光标右侧的 chip：光标左移一位。
+        assert_eq!(caret_after_remove(Some(2), 0, 2), Some(1));
+        // 删光标左侧的 chip：光标位置不变（仍指向同一个后续 chip）。
+        assert_eq!(caret_after_remove(Some(1), 1, 2), Some(1));
+        // 删到没有 chip：回到文本区。
+        assert_eq!(caret_after_remove(Some(0), 0, 0), None);
+        assert_eq!(caret_after_remove(None, 2, 2), None);
+    }
+
+    #[test]
+    fn condition_terminator_is_stripped_for_editing() {
+        assert_eq!(
+            strip_condition_terminator("date>2026-11-10:"),
+            "date>2026-11-10"
+        );
+        assert_eq!(strip_condition_terminator("size>10M： "), "size>10M");
+        assert_eq!(
+            strip_condition_terminator("size 10M..100M"),
+            "size 10M..100M"
+        );
     }
 }

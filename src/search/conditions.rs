@@ -19,7 +19,7 @@
 //! 「打错一个字条件就消失」。`is_composing` 给 UI 判断「正在输入半截
 //! 条件」，用于暂停查询（避免每敲一个字就搜一遍 `date >`）。
 
-use crate::search::filters::{DateRange, SizeRange};
+use crate::search::filters::{DateRange, DriveFilter, SizeRange};
 
 /// 一次扫描的结果。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -28,6 +28,8 @@ pub struct Extract {
     pub dates: Vec<DateRange>,
     /// 成功解析的大小条件（按出现顺序）。
     pub sizes: Vec<SizeRange>,
+    /// 成功解析的盘符条件（按出现顺序，`C:` / `-C:`）。
+    pub drives: Vec<DriveFilter>,
     /// 删除条件片段、折叠空白后的输入。
     pub cleaned: String,
     /// 面向用户的错误（只保留第一条给 UI）。
@@ -36,7 +38,7 @@ pub struct Extract {
 
 impl Extract {
     pub fn is_empty(&self) -> bool {
-        self.dates.is_empty() && self.sizes.is_empty()
+        self.dates.is_empty() && self.sizes.is_empty() && self.drives.is_empty()
     }
 }
 
@@ -46,11 +48,12 @@ enum ParsedCondition {
     Size(SizeRange),
 }
 
-/// 扫描整个输入，提取所有完整的日期/大小条件。
+/// 扫描整个输入，提取所有完整的日期/大小/盘符条件。
 pub fn extract(raw: &str) -> Extract {
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut dates = Vec::new();
     let mut sizes = Vec::new();
+    let mut drives = Vec::new();
     let mut errors = Vec::new();
     let mut i = 0usize;
     while i < raw.len() {
@@ -80,12 +83,74 @@ pub fn extract(raw: &str) -> Extract {
             }
         }
     }
+    scan_drives(raw, &mut spans, &mut drives);
+    spans.sort_unstable_by_key(|&(start, _)| start);
     Extract {
         dates,
         sizes,
+        drives,
         cleaned: remove_spans(raw, &spans),
         errors,
     }
+}
+
+/// 追加扫描盘符 token（`C:` / `-C:`）：整 token 精确匹配、词边界开始、
+/// 后面必须是空白或行尾。`C:\foo` / `C:foo` 是路径，不算条件。
+fn scan_drives(
+    raw: &str,
+    spans: &mut Vec<(usize, usize)>,
+    drives: &mut Vec<DriveFilter>,
+) {
+    let mut i = 0usize;
+    while i < raw.len() {
+        if !is_boundary(raw, i) {
+            i = next_char(raw, i);
+            continue;
+        }
+        let end = raw[i..]
+            .find(char::is_whitespace)
+            .map(|offset| i + offset)
+            .unwrap_or(raw.len());
+        if end > i {
+            if let Some(drive) = parse_drive_token(&raw[i..end]) {
+                spans.push((i, end));
+                drives.push(drive);
+            }
+        }
+        i = end;
+        while i < raw.len() {
+            let Some(c) = raw[i..].chars().next() else {
+                break;
+            };
+            if !c.is_whitespace() {
+                break;
+            }
+            i += c.len_utf8();
+        }
+    }
+}
+
+/// `C:` / `-C:` / 全角 `C：`；其它形态返回 None。
+fn parse_drive_token(token: &str) -> Option<DriveFilter> {
+    let (body, exclude) = match token.strip_prefix('-') {
+        Some(rest) => (rest, true),
+        None => (token, false),
+    };
+    let mut chars = body.chars();
+    let letter = chars.next()?;
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    if !matches!(chars.next()?, ':' | '：') {
+        return None;
+    }
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(DriveFilter {
+        letter: letter.to_ascii_uppercase(),
+        exclude,
+    })
 }
 
 /// 当前位置是否是词边界：起点，或前一个字符是空白/常见分隔符。
@@ -151,13 +216,19 @@ fn is_op_start(c: char) -> bool {
 /// 都不应该每敲一个字就把半截条件当文件名搜一遍。已经完整提交（extract
 /// 有结果）或已经能确定写错（errors 非空）时返回 false，交给正常查询/错误态。
 pub fn is_composing(raw: &str) -> bool {
-    let out = extract(raw);
-    if !out.is_empty() || !out.errors.is_empty() {
+    // 已经能确定写错（例如 2026-13-01）时不暂停，交给错误态。
+    if !extract(raw).errors.is_empty() {
         return false;
     }
-    let Some((pos, field_len, compact, _kind)) = last_field(raw) else {
+    let Some((pos, field_len, compact, kind)) = last_field(raw) else {
         return false;
     };
+    // 最后一个字段本身已经完整提交（有终结符）→ 不暂停。
+    // 不能再用「extract 是否为空」判断：输入里已有盘符/更早的完整条件时，
+    // 末尾半截条件仍应暂停查询。
+    if parse_from(raw, pos, field_len, compact, kind).is_ok() {
+        return false;
+    }
     let rest = &raw[pos + field_len..];
     if compact {
         // `dm:` / `dm:>…` 都还在输入；空格后会由 extract 提交。
@@ -194,6 +265,101 @@ fn last_field(raw: &str) -> Option<(usize, usize, bool, FieldKind)> {
         }
     }
     found
+}
+
+/// 条件联想候选（目前只有 size / date）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suggestion {
+    /// 展示用的关键字。
+    pub keyword: &'static str,
+    /// 回车后填入输入框的文本（带比较符，光标停在值前）。
+    pub fill: String,
+    pub description: &'static str,
+}
+
+const SUGGEST_KEYWORDS: [(&str, &str); 2] = [
+    ("size", "文件大小，如 size>10M:"),
+    ("date", "修改时间，如 date>2026-11-10:"),
+];
+
+/// 输入是条件关键字的严格前缀时返回候选。只在整串是纯字母、无空白时匹配，
+/// 避免把正常文件名搜索（`screenshot`）一直当条件联想。
+pub fn suggestions(raw: &str) -> Vec<Suggestion> {
+    // 有空白就说明用户已经在输入查询词（`s ` / `s foo`），不再弹联想。
+    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Vec::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for (keyword, description) in SUGGEST_KEYWORDS {
+        if lower.len() < keyword.len() && keyword.starts_with(&lower) {
+            out.push(Suggestion {
+                keyword,
+                fill: format!("{keyword}>"),
+                description,
+            });
+        }
+    }
+    out
+}
+
+/// 日期 chip 的可编辑文本：由区间反推一组精确等价的规范条件。
+/// 合并过的 chip 也用单个区间表达式还原，避免多个片段只有最后一个能
+/// 被终结冒号提交。日期按本地日粒度反查。
+pub fn date_edit_text(range: &DateRange) -> Option<String> {
+    match (range.after, range.before) {
+        (Some(after), Some(before)) => {
+            let start = local_date_text(after)?;
+            let end = local_date_text(before)?;
+            Some(format!("date {start}..{end}:"))
+        }
+        (Some(after), None) => Some(format!("date >= {}:", local_date_text(after)?)),
+        (None, Some(before)) => Some(format!("date <= {}:", local_date_text(before)?)),
+        (None, None) => None,
+    }
+}
+
+/// 大小 chip 的可编辑文本：用字节边界还原，保证重新解析后区间逐字节一致。
+pub fn size_edit_text(range: &SizeRange) -> Option<String> {
+    match (range.after, range.before) {
+        (Some(after), Some(before)) => Some(format!("size {after}B..{before}B:")),
+        (Some(after), None) => Some(format!("size >= {after}B:")),
+        (None, Some(before)) => Some(format!("size <= {before}B:")),
+        (None, None) => None,
+    }
+}
+
+/// unix 秒 → 本地日期 `YYYY-MM-DD`（用目标时刻自身的时区/DST 规则）。
+fn local_date_text(unix: i64) -> Option<String> {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+
+    const EPOCH: i128 = 116_444_736_000_000_000;
+    let ticks = EPOCH + unix as i128 * 10_000_000;
+    if !(0..=u64::MAX as i128).contains(&ticks) {
+        return None;
+    }
+    let ticks = ticks as u64;
+    let utc_file = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME::default();
+    unsafe {
+        FileTimeToSystemTime(&utc_file, &mut utc).ok()?;
+    }
+    let mut local = SYSTEMTIME::default();
+    unsafe {
+        SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
+    }
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        local.wYear, local.wMonth, local.wDay
+    ))
 }
 
 /// 解析从 `start`（字段起点）开始的一条条件。
@@ -987,5 +1153,136 @@ mod tests {
         assert_eq!(swapped.cleaned, "a.log");
         assert_eq!(swapped.dates.len(), 1);
         assert_eq!(swapped.sizes.len(), 1);
+    }
+
+    #[test]
+    fn drive_tokens_are_extracted() {
+        let out = extract("C: d: log");
+        assert_eq!(out.cleaned, "log");
+        assert_eq!(
+            out.drives,
+            vec![
+                DriveFilter {
+                    letter: 'C',
+                    exclude: false,
+                },
+                DriveFilter {
+                    letter: 'D',
+                    exclude: false,
+                },
+            ]
+        );
+        assert!(out.errors.is_empty());
+
+        let exclude = extract("ap -c:");
+        assert_eq!(exclude.cleaned, "ap");
+        assert_eq!(
+            exclude.drives,
+            vec![DriveFilter {
+                letter: 'C',
+                exclude: true,
+            }]
+        );
+
+        // 全角冒号也收；词边界防止把路径/带过滤词的 token 当条件。
+        assert_eq!(extract("C： foo").cleaned, "foo");
+        assert_eq!(extract("C： foo").drives.len(), 1);
+        for input in ["C:\\foo", "C:/foo", "c:foo", "abc:", "-cc:"] {
+            let out = extract(input);
+            assert!(out.drives.is_empty(), "{input:?}: {:?}", out.drives);
+            assert_eq!(out.cleaned, input);
+        }
+    }
+
+    #[test]
+    fn drives_mix_with_date_and_size() {
+        let out = extract("C: date>2026-11-10: size>10M: log");
+        assert_eq!(out.cleaned, "log");
+        assert_eq!(out.drives.len(), 1);
+        assert_eq!(out.dates.len(), 1);
+        assert_eq!(out.sizes.len(), 1);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn composing_is_not_confused_by_complete_drives() {
+        // 盘符条件已完整，但末尾日期还在输入 → 仍要暂停查询。
+        assert!(is_composing("C: date>2026-11"));
+        assert!(is_composing("C: size>10"));
+        assert!(!is_composing("C:"));
+        assert!(!is_composing("C: date>2026-11-10:"));
+    }
+
+    #[test]
+    fn suggestions_match_strict_keyword_prefixes() {
+        let size = suggestions("s");
+        assert_eq!(size.len(), 1);
+        assert_eq!(size[0].keyword, "size");
+        assert_eq!(size[0].fill, "size>");
+        assert_eq!(suggestions("SIZ")[0].keyword, "size");
+        let date = suggestions("d");
+        assert_eq!(date.len(), 1);
+        assert_eq!(date[0].fill, "date>");
+        assert_eq!(suggestions("da")[0].keyword, "date");
+        for input in ["size", "date", "sc", "x", "", "s d", "size>10", "大小", "s "] {
+            assert!(suggestions(input).is_empty(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn date_edit_text_roundtrips_every_shape() {
+        for input in [
+            "date>2026-11-10:",
+            "date>=2026-11-10:",
+            "date<2026-11-10:",
+            "date<=2026-11-10:",
+            "date=2026-11-10:",
+            "date 2026-11-01..2026-11-30:",
+        ] {
+            let range = extract(input).dates.remove(0);
+            let text = date_edit_text(&range).expect("date edit text");
+            let again = extract(&text).dates.remove(0);
+            assert_eq!(again.after, range.after, "{input:?} -> {text:?}");
+            assert_eq!(again.before, range.before, "{input:?} -> {text:?}");
+        }
+    }
+
+    #[test]
+    fn date_edit_text_roundtrips_merged_range() {
+        let mut range = extract("date>2026-11-01:").dates.remove(0);
+        range
+            .merge(extract("date<2026-11-30:").dates.remove(0))
+            .expect("merge");
+        let text = date_edit_text(&range).expect("date edit text");
+        let again = extract(&text).dates.remove(0);
+        assert_eq!(again.after, range.after, "{text:?}");
+        assert_eq!(again.before, range.before, "{text:?}");
+    }
+
+    #[test]
+    fn size_edit_text_roundtrips_every_shape() {
+        for input in [
+            "size>10M:",
+            "size>=10M:",
+            "size<10M:",
+            "size<=10M:",
+            "size=10M:",
+            "size 10M..100M:",
+        ] {
+            let range = extract(input).sizes.remove(0);
+            let text = size_edit_text(&range).expect("size edit text");
+            let again = extract(&text).sizes.remove(0);
+            assert_eq!(again.after, range.after, "{input:?} -> {text:?}");
+            assert_eq!(again.before, range.before, "{input:?} -> {text:?}");
+        }
+
+        let mut merged = extract("size>10M:").sizes.remove(0);
+        merged
+            .merge(extract("size<100M:").sizes.remove(0))
+            .expect("merge");
+        let text = size_edit_text(&merged).expect("size edit text");
+        let again = extract(&text).sizes.remove(0);
+        assert_eq!(again.after, merged.after, "{text:?}");
+        assert_eq!(again.before, merged.before, "{text:?}");
     }
 }

@@ -494,7 +494,11 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
         size_before: None,
         // 盘符过滤（c:/d: 限定、-c: 排除）：交给引擎在卷循环直接跳过，
         // 省掉整卷扫描；0 掩码（全排除）→ 查询结果为空。
-        vol_mask: query.drive_mask(),
+        // 输入框盘符 chip 与查询文本里的盘符 token 求交。
+        vol_mask: crate::search::filters::intersect_drive_masks(
+            query.drive_mask(),
+            filters.drive_mask(),
+        ),
         case_sensitive: filters.matches.case_sensitive,
         whole_word: filters.matches.whole_word,
         regex: (filters.matches.regex && !query.text.is_empty()).then(|| query.text.clone()),

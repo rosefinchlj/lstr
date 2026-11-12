@@ -66,6 +66,9 @@ pub struct SearchFilters {
     pub modified: Option<DateRange>,
     /// 输入框里提交的大小条件（字节，含边界）。目录不参与大小过滤。
     pub size: Option<SizeRange>,
+    /// 输入框里提交的盘符条件（`C:` / `-C:`，可多个）。
+    /// 与筛选条 `location` 独立：两者同时存在时在引擎层求交集。
+    pub drives: Vec<DriveFilter>,
     /// 文件名匹配选项。`is_empty` 刻意忽略它：开启匹配选项不应让
     /// 应用/命令/关键字结果被当成“有筛选”而消失。
     pub matches: MatchOptions,
@@ -78,15 +81,79 @@ impl SearchFilters {
             && self.group.is_none()
             && self.modified.is_none()
             && self.size.is_none()
+            && self.drives.is_empty()
     }
 
-    /// 从右往左删一个条件 chip：先大小、再日期。返回是否删了。
-    /// 与 UI 绘制顺序一致（日期 chip 在左、大小在右）。
-    pub fn remove_last_condition(&mut self) -> bool {
-        if self.size.take().is_some() {
-            return true;
+    /// 输入框里是否有条件 chip（日期 / 大小 / 盘符）。
+    pub fn has_input_conditions(&self) -> bool {
+        self.modified.is_some() || self.size.is_some() || !self.drives.is_empty()
+    }
+
+    /// 盘符 chip 的卷掩码：None=不限制；Some(0)=所有卷都排除（结果为空）。
+    pub fn drive_mask(&self) -> Option<u32> {
+        if self.drives.is_empty() {
+            return None;
         }
-        self.modified.take().is_some()
+        let mut include = 0u32;
+        let mut exclude = 0u32;
+        for drive in &self.drives {
+            if drive.exclude {
+                exclude |= drive.bit();
+            } else {
+                include |= drive.bit();
+            }
+        }
+        let base = if include == 0 {
+            (1u32 << 26) - 1
+        } else {
+            include
+        };
+        Some(base & !exclude)
+    }
+}
+
+/// 两个“可选卷掩码”求交：None=不限，与任何掩码求交都返回另一个。
+pub fn intersect_drive_masks(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a & b),
+        (Some(mask), None) | (None, Some(mask)) => Some(mask),
+        (None, None) => None,
+    }
+}
+
+/// 路径是否落在卷掩码内。非盘符路径（UNC/相对路径）不参与裁剪。
+pub fn path_in_drive_mask(path: &std::path::Path, mask: u32) -> bool {
+    let text = path.to_string_lossy();
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => {
+            let bit = 1u32 << (letter.to_ascii_uppercase() as u32 - 'A' as u32);
+            mask & bit != 0
+        }
+        _ => true,
+    }
+}
+
+/// 输入框提交的盘符条件（一个 chip 一项）。排除盘用 `-C:` 表示。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DriveFilter {
+    /// 大写盘符 A-Z。
+    pub letter: char,
+    pub exclude: bool,
+}
+
+impl DriveFilter {
+    pub fn label(&self) -> String {
+        format!("{}{}:", if self.exclude { "-" } else { "" }, self.letter)
+    }
+
+    /// 可编辑文本（还原到输入框时用）：`C:` / `-C:`。
+    pub fn source(&self) -> String {
+        self.label()
+    }
+
+    pub fn bit(&self) -> u32 {
+        1u32 << (self.letter.to_ascii_uppercase() as u32 - 'A' as u32)
     }
 }
 
@@ -489,24 +556,67 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_delete_removes_size_then_date() {
+    fn drive_filters_make_filters_non_empty_and_build_mask() {
         let mut filters = SearchFilters {
-            modified: Some(DateRange {
-                after: Some(1),
-                ..Default::default()
-            }),
-            size: Some(SizeRange {
-                after: Some(1),
-                ..Default::default()
-            }),
+            drives: vec![
+                DriveFilter {
+                    letter: 'C',
+                    exclude: false,
+                },
+                DriveFilter {
+                    letter: 'd', // 大小写都应归一
+                    exclude: false,
+                },
+            ],
             ..Default::default()
         };
-        assert!(filters.remove_last_condition());
-        assert!(filters.size.is_none(), "先删右边的 size chip");
-        assert!(filters.modified.is_some());
-        assert!(filters.remove_last_condition());
-        assert!(filters.modified.is_none());
-        assert!(!filters.remove_last_condition(), "没有条件时返回 false");
+        assert!(!filters.is_empty());
+        assert_eq!(filters.drive_mask(), Some((1 << 2) | (1 << 3)));
+
+        // 只排除：从全部卷里去掉 C。
+        filters.drives = vec![DriveFilter {
+            letter: 'C',
+            exclude: true,
+        }];
+        assert_eq!(filters.drive_mask(), Some(((1u32 << 26) - 1) & !(1 << 2)));
+
+        // include 与 exclude 冲突时排除优先（与 Query::drive_mask 一致）。
+        filters.drives = vec![
+            DriveFilter {
+                letter: 'C',
+                exclude: false,
+            },
+            DriveFilter {
+                letter: 'C',
+                exclude: true,
+            },
+        ];
+        assert_eq!(filters.drive_mask(), Some(0));
+
+        filters.drives.clear();
+        assert!(filters.drive_mask().is_none());
+        assert!(filters.is_empty());
+    }
+
+    #[test]
+    fn drive_masks_intersect_with_query_mask() {
+        assert_eq!(intersect_drive_masks(None, None), None);
+        assert_eq!(intersect_drive_masks(Some(0b110), None), Some(0b110));
+        assert_eq!(intersect_drive_masks(None, Some(0b101)), Some(0b101));
+        assert_eq!(
+            intersect_drive_masks(Some(0b110), Some(0b101)),
+            Some(0b100)
+        );
+        assert_eq!(intersect_drive_masks(Some(0b110), Some(0b001)), Some(0));
+    }
+
+    #[test]
+    fn path_drive_mask_matches_letter() {
+        use std::path::Path;
+        assert!(path_in_drive_mask(Path::new(r"C:\foo"), 1 << 2));
+        assert!(!path_in_drive_mask(Path::new(r"d:\foo"), 1 << 2));
+        // UNC/相对路径不参与盘符裁剪。
+        assert!(path_in_drive_mask(Path::new(r"\\server\share"), 0));
     }
 
     #[test]

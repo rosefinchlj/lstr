@@ -13,12 +13,13 @@ pub struct PathQuery {
     pub filter: String,
 }
 
-/// 判定输入是否处于路径模式。驱动器路径（`D:` / `D:\` / `D:/`）或 UNC（`\\server`）触发；
+/// 判定输入是否处于路径模式。驱动器路径（`D:\` / `D:/` / `D:prog`）或 UNC（`\\server`）触发；
 /// 查询语法（`path:E:\foo`）、`>`/`a `/`f ` 前缀都不会误判。
-/// 只打 `D:`（冒号后没分隔符）也算——按 Listary 习惯直接列 D:\ 根目录，
-/// 否则会落进索引被当成「D 盘全盘」查询（三百万条候选、排序无意义）。
-/// **例外**：`D: <词>`（冒号后跟空白）不按路径浏览处理——这是搜索框的
-/// 盘符过滤语法（`d: ap` = 只在 D 盘搜 ap），交给 query::parse 的 drive token。
+/// 只打 `D:` 现在交给输入框盘符条件 chip（只搜 D 盘），不再浏览根目录；
+/// 浏览根目录请打 `D:\`。`D:prog`（冒号后无分隔符但有文字）仍按
+/// 「D:\ 根目录 + 过滤词」浏览。
+/// **例外**：`D: <词>`（冒号后跟空白）同样不按路径浏览处理——这是搜索框的
+/// 盘符过滤语法（`d: ap` = 只在 D 盘搜 ap）。
 pub fn parse(raw: &str) -> Option<PathQuery> {
     let trimmed = raw.trim_start();
     let bytes = trimmed.as_bytes();
@@ -31,7 +32,11 @@ pub fn parse(raw: &str) -> Option<PathQuery> {
     if is_drive && matches!(bytes.get(2), Some(b' ' | b'\t')) {
         return None;
     }
-    // "D:" / "D:prog"：冒号后没有分隔符，统一按 D:\ 根目录处理，
+    // 裸盘符 `D:` → 盘符条件 chip（只搜 D 盘），不是目录浏览。
+    if is_drive && bytes.len() == 2 {
+        return None;
+    }
+    // "D:prog"：冒号后没有分隔符，统一按 D:\ 根目录处理，
     // 残留文字当过滤词（D:prog → D:\ 下过滤 prog）。
     if is_drive && !(bytes.len() >= 3 && matches!(bytes[2], b'\\' | b'/')) {
         return Some(PathQuery {
@@ -160,11 +165,11 @@ mod tests {
     }
 
     #[test]
-    fn bare_drive_colon_browses_root() {
-        // Listary 习惯：只打 "D:" 直接列 D:\ 根目录。
-        let pq = parse("D:").expect("裸盘符");
+    fn bare_drive_colon_is_not_browse() {
+        // 裸盘符现在是输入框盘符条件 chip（只搜该盘），浏览根目录打 "D:\"。
+        assert!(parse("D:").is_none(), "裸盘符应交给条件 chip");
+        let pq = parse(r"D:\").expect("带分隔符仍是路径浏览");
         assert_eq!(pq.dir, r"D:\");
-        assert_eq!(pq.filter, "");
         let pq = parse("d:prog").expect("盘符 + 过滤词");
         assert_eq!(pq.dir, r"d:\");
         assert_eq!(pq.filter, "prog");
