@@ -43,6 +43,16 @@ pub(crate) const COMPACT_DELTA: usize = 32_768;
 /// compact 触发阈值:死 slot 占比(分子)。
 const COMPACT_DEAD: u32 = 4096;
 
+/// 小卷跳过 n-gram 倒排的阈值(名字区字节数)。trigram 平坦表固定
+/// 94³×8B≈6.6MB/卷,小卷(如 1.7 万条)的倒排几乎全是这个固定表开销;
+/// 而小卷名字区用 memmem SIMD 扫描本就极快(<8MB 约 <3ms),不值得为它
+/// 常驻 6.6MB 表。低于阈值不建倒排,查询回落 memmem(等价性有测试保证)。
+/// 测试构建恒为 0:始终建倒排,保证「快路径≡memmem」等价性测试覆盖 ngram。
+#[cfg(not(test))]
+const NGRAM_MIN_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(test)]
+const NGRAM_MIN_BYTES: usize = 0;
+
 /// n-gram 字母表大小:可打印非空格 ASCII(0x21..=0x7E)。
 /// 空格与非 ASCII 视为分隔符(切分 run):全字母表 token 的子串出现必然
 /// 完整落在某个 run 内,因此按 run 提取 n-gram 对这类 token 精确
@@ -597,6 +607,27 @@ impl VolumeStore {
             + self.ngram_heap_bytes()
     }
 
+    /// 内存分项诊断(MB):逐列列出占用,定位最肥的列供精准瘦身。
+    /// 不含 Vec 容量余量(与 heap_bytes 同口径)。
+    pub fn memory_breakdown_mb(&self) -> String {
+        let mb = |n: usize| n as f64 / (1024.0 * 1024.0);
+        format!(
+            "names={:.1} names_lc={:.1} name_off={:.1} off_index={:.1} offs={:.1} frn={:.1} parent={:.1} attrs={:.1} mtime={:.1} char_mask={:.1} mtime_pending={:.1} ngram={:.1}",
+            mb(self.names.len()),
+            mb(self.names_lc.len()),
+            mb(self.name_off.len() * 4),
+            mb(self.off_index.len() * 8),
+            mb(self.offs.len() * 4),
+            mb(self.frn.len() * 8),
+            mb(self.parent.len() * 4),
+            mb(self.attrs.len() * 2),
+            mb(self.mtime.len() * 4),
+            mb(self.char_mask.len() * 4),
+            mb(self.mtime_pending.len() * 4),
+            mb(self.ngram_heap_bytes()),
+        )
+    }
+
     /// 倒排堆字节:postings + 链表 + overlay。
     pub fn ngram_heap_bytes(&self) -> usize {
         self.ngram.as_ref().map_or(0, NgramIndex::heap_bytes)
@@ -618,6 +649,10 @@ impl VolumeStore {
         self.reindex_mark.resize((self.name_off.len() + 63) / 64, 0);
         self.ngram = None;
         if self.name_off.is_empty() {
+            return;
+        }
+        // 小卷不建倒排:省 trigram 固定表(~6.6MB/卷),memmem 扫描已足够快。
+        if self.names_lc.len() < NGRAM_MIN_BYTES {
             return;
         }
         self.ngram = Some(NgramIndex::build(&self.names_lc, &self.name_off));

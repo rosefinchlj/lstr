@@ -3664,7 +3664,7 @@ impl LstrApp {
                     );
                 }
             } else {
-                let subtitle = match entry.kind {
+                let mut subtitle = match entry.kind {
                     Kind::App => {
                         if pinyin_hit {
                             format!("应用 · 拼音 {}", query.text)
@@ -3701,6 +3701,16 @@ impl LstrApp {
                         }
                     }
                 };
+                // 应用行也显示学习徽标(路径行已在 lead 里体现)。
+                if entry.kind == Kind::App {
+                    if let Some(b) = self.learn_badges.get(&entry.id) {
+                        if b.recent_pick {
+                            subtitle = format!("上次选中 · {subtitle}");
+                        } else if b.frequent {
+                            subtitle = format!("常用 · {subtitle}");
+                        }
+                    }
+                }
                 let mut sub_job = ui::text_job_case(
                     &subtitle,
                     if path_mode { "" } else { &query.text },
@@ -5914,6 +5924,68 @@ impl LstrApp {
             } else {
                 self.clear_armed_at = Some(Instant::now());
                 self.toast(ctx, "再点一次「确认清空？」才会删除".to_string());
+            }
+        }
+
+        // —— 学习数据(自学习可视化:按词学习 + 常用 Top)——
+        y += ROW;
+        Self::settings_label(painter, &theme, area.left(), y, "学习数据");
+        y += 22.0;
+        let (qh, freq) = self
+            .history
+            .lock()
+            .map(|h| (h.top_query_hits(3), h.top_frecency(3)))
+            .unwrap_or_default();
+        let trunc = |s: String| -> String {
+            if s.chars().count() > 58 {
+                s.chars().take(57).collect::<String>() + "…"
+            } else {
+                s
+            }
+        };
+        if qh.is_empty() && freq.is_empty() {
+            painter.text(
+                egui::pos2(area.left() + 130.0, y),
+                Align2::LEFT_TOP,
+                "暂无(打开/选中结果后自动学习)",
+                ui::mono_font(10.5),
+                theme.dim,
+            );
+        } else {
+            if !qh.is_empty() {
+                let line = qh
+                    .iter()
+                    .map(|(q, e, n)| {
+                        let name = std::path::Path::new(e)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| e.clone());
+                        format!("{q}→{name}×{n}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                painter.text(
+                    egui::pos2(area.left() + 130.0, y),
+                    Align2::LEFT_TOP,
+                    trunc(format!("按词: {line}")),
+                    ui::mono_font(10.5),
+                    theme.sub,
+                );
+                y += 18.0;
+            }
+            if !freq.is_empty() {
+                let line = freq
+                    .iter()
+                    .map(|(n, c)| format!("{n}×{c}"))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                painter.text(
+                    egui::pos2(area.left() + 130.0, y),
+                    Align2::LEFT_TOP,
+                    trunc(format!("常用: {line}")),
+                    ui::mono_font(10.5),
+                    theme.sub,
+                );
             }
         }
 

@@ -466,6 +466,15 @@ impl Engine {
                     Duration::from_secs(20)
                 };
                 self.volumes[i].save_retry_at = Some(Instant::now() + interval);
+                // 内存分项诊断:每次启动加载快照后落一次,定位最肥的列供瘦身。
+                if let Some(store) = &self.volumes[i].store {
+                    snapshot::debug_log(&format!(
+                        "mem vol {} entries={} {}",
+                        self.volumes[i].letter,
+                        store.len(),
+                        store.memory_breakdown_mb()
+                    ));
+                }
             }
         }
         self.pinyin = self
@@ -698,6 +707,15 @@ impl Engine {
                     .as_ref()
                     .map(|s| PinyinCache::rebuild(s))
                     .unwrap_or_else(PinyinCache::empty);
+                // 内存分项诊断:卷就绪时落一次日志,定位最肥的列供瘦身。
+                if let Some(store) = &self.volumes[i].store {
+                    crate::snapshot::debug_log(&format!(
+                        "mem vol {} entries={} {}",
+                        self.volumes[i].letter,
+                        store.len(),
+                        store.memory_breakdown_mb()
+                    ));
+                }
             }
             EngineMsg::DirSyncBegin { guid } => {
                 if let Some(i) = self.volume_idx(guid, true, '?') {

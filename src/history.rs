@@ -344,6 +344,46 @@ impl History {
         out
     }
 
+    /// 学习明细(设置页可视化):按词学习 Top N(query → entry_id → hits)。
+    pub fn top_query_hits(&self, limit: usize) -> Vec<(String, String, i64)> {
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = self.db.prepare(
+            "SELECT query, entry_id, hits FROM query_hits ORDER BY hits DESC, last DESC LIMIT ?1",
+        ) {
+            if let Ok(rows) = stmt.query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            }) {
+                out.extend(rows.flatten());
+            }
+        }
+        out
+    }
+
+    /// 常用 Top N(name, count),从 history.entry JSON 取名字。
+    pub fn top_frecency(&self, limit: usize) -> Vec<(String, u32)> {
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = self
+            .db
+            .prepare("SELECT entry, count FROM history ORDER BY count DESC, last DESC LIMIT ?1")
+        {
+            if let Ok(rows) = stmt.query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            }) {
+                for (json, count) in rows.flatten() {
+                    let name = serde_json::from_str::<Entry>(&json)
+                        .map(|e| e.name)
+                        .unwrap_or_else(|_| json.clone());
+                    out.push((name, count));
+                }
+            }
+        }
+        out
+    }
+
     /// 按最后使用时间倒序返回历史条目快照。
     pub fn recent_entries(&self, limit: usize) -> Vec<Entry> {
         let Ok(mut stmt) = self.db.prepare(
@@ -617,5 +657,23 @@ mod tests {
         let other = history.learn_badges("zz");
         assert!(other.get("alpha").unwrap().frequent);
         assert!(!other.get("alpha").unwrap().recent_pick);
+    }
+
+    #[test]
+    fn learning_summary_orders_by_hits_and_count() {
+        let mut history = History::in_memory();
+        let a = entry("alpha");
+        let b = entry("beta");
+        history.seed(&a, 10, now_secs());
+        history.seed(&b, 2, now_secs());
+        history.record_query("re", &a);
+        history.record_query("re", &a);
+        history.record_query("re", &b);
+        let qh = history.top_query_hits(10);
+        assert_eq!(qh[0].0, "re");
+        assert_eq!(qh[0].1, "alpha"); // hits 2 > beta 1
+        assert_eq!(qh[0].2, 2);
+        let freq = history.top_frecency(10);
+        assert_eq!(freq[0].1, 10); // alpha count 10 排首
     }
 }
