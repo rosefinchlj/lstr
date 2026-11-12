@@ -238,16 +238,16 @@ fn condition_chip_width(painter: &egui::Painter, label: &str, value: &str) -> f3
         0.0
     } else {
         painter
-            .layout_no_wrap(label.to_string(), ui::text_font(11.0), Color32::WHITE)
+            .layout_no_wrap(label.to_string(), ui::text_font(13.0), Color32::WHITE)
             .size()
             .x
-            + 6.0
+            + 7.0
     };
     let value_w = painter
-        .layout_no_wrap(value.to_string(), ui::mono_font(10.5), Color32::WHITE)
+        .layout_no_wrap(value.to_string(), ui::mono_font(12.0), Color32::WHITE)
         .size()
         .x;
-    8.0 + label_w + value_w + 6.0 + 14.0
+    10.0 + label_w + value_w + 10.0 + 16.0
 }
 
 /// 画一个条件 chip（标签比例字体 + 值等宽字体 + × 命中区），返回
@@ -265,47 +265,48 @@ fn paint_condition_chip(
     tooltip: &str,
 ) -> (f32, bool) {
     let label_galley = (!label.is_empty())
-        .then(|| painter.layout_no_wrap(label.to_string(), ui::text_font(11.0), color));
-    let value_galley = painter.layout_no_wrap(value.to_string(), ui::mono_font(10.5), color);
-    let clear_w = 14.0;
+        .then(|| painter.layout_no_wrap(label.to_string(), ui::text_font(13.0), color));
+    let value_galley = painter.layout_no_wrap(value.to_string(), ui::mono_font(12.0), color);
+    let clear_w = 16.0;
     let label_w = label_galley
         .as_ref()
-        .map(|g| g.size().x + 6.0)
+        .map(|g| g.size().x + 7.0)
         .unwrap_or(0.0);
-    let chip_w = 8.0 + label_w + value_galley.size().x + 6.0 + clear_w;
-    let chip_h = 20.0;
+    let chip_w = 10.0 + label_w + value_galley.size().x + 10.0 + clear_w;
+    let chip_h = 26.0;
     let chip = Rect::from_min_size(egui::pos2(left, top), egui::vec2(chip_w, chip_h));
-    painter.rect_filled(chip, CornerRadius::same(6), bg);
+    painter.rect_filled(chip, CornerRadius::same(7), bg);
     painter.rect_stroke(
         chip,
-        CornerRadius::same(6),
+        CornerRadius::same(7),
         Stroke::new(1.0_f32, color.gamma_multiply(0.45)),
         StrokeKind::Inside,
     );
-    if let Some(galley) = &label_galley {
-        painter.galley(
-            egui::pos2(chip.left() + 8.0, chip.center().y - galley.size().y / 2.0),
-            galley.clone(),
+    if label_galley.is_some() {
+        painter.text(
+            egui::pos2(chip.left() + 10.0, chip.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            ui::text_font(13.0),
             color,
         );
     }
-    painter.galley(
-        egui::pos2(
-            chip.left() + 8.0 + label_w,
-            chip.center().y - value_galley.size().y / 2.0,
-        ),
-        value_galley.clone(),
+    painter.text(
+        egui::pos2(chip.left() + 10.0 + label_w, chip.center().y),
+        Align2::LEFT_CENTER,
+        value,
+        ui::mono_font(12.0),
         color,
     );
     let clear = Rect::from_min_size(
-        egui::pos2(chip.right() - clear_w - 2.0, chip.top() + 3.0),
-        egui::vec2(clear_w, chip_h - 6.0),
+        egui::pos2(chip.right() - clear_w - 2.0, chip.top() + 4.0),
+        egui::vec2(clear_w, chip_h - 8.0),
     );
     painter.text(
         clear.center(),
         Align2::CENTER_CENTER,
         "×",
-        ui::mono_font(11.0),
+        ui::mono_font(12.0),
         color,
     );
     let response = ui
@@ -1094,6 +1095,20 @@ impl LstrApp {
         self.condition_error = None;
     }
 
+    /// Ctrl+Backspace：输入框为空时从右往左删一个条件 chip（大小 → 日期）。
+    /// 返回是否真的删了；没有条件时不消费按键，交给 TextEdit。
+    fn remove_last_condition(&mut self) -> bool {
+        if self.filters.size.is_some() {
+            self.filters.size = None;
+            return true;
+        }
+        if self.filters.modified.is_some() {
+            self.filters.modified = None;
+            return true;
+        }
+        false
+    }
+
     fn trigger(&mut self, ctx: &egui::Context) {
         // 正在输入日期条件（`date>` / `date > 2026-11-`，还没打冒号）时不发查询：
         // 半截条件当文件名搜只会闪出 0 结果，等冒号提交或输入被改掉再搜。
@@ -1450,6 +1465,21 @@ impl LstrApp {
             if typing {
                 self.filter_menu = None;
             }
+        }
+
+        // 输入框为空时 Ctrl+Backspace 删除最右侧条件 chip（键盘替代鼠标 ×）。
+        // 输入框有文字时不拦截：让 TextEdit 按词删除，chip 保持不动。
+        if self.input.is_empty()
+            && (self.filters.modified.is_some() || self.filters.size.is_some())
+            && ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backspace))
+        {
+            if self.remove_last_condition() {
+                self.condition_error = None;
+                self.menu_open = false;
+                self.filter_menu = None;
+                self.trigger(ctx);
+            }
+            return;
         }
 
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::P)) {
@@ -2241,7 +2271,7 @@ impl LstrApp {
                             ui,
                             &painter,
                             x,
-                            search_rect.top() + 4.0,
+                            search_rect.top() + 1.0,
                             label,
                             value,
                             if disabled { theme.dim } else { *color },
@@ -4227,35 +4257,40 @@ impl LstrApp {
             .get(self.selected)
             .map(|entry| entry.kind == Kind::Folder)
             .unwrap_or(false);
-        let hints: [(&str, &str); 4] = if self.in_browse() {
-            [
+        let mut hints: Vec<(&str, &str)> = if self.in_browse() {
+            vec![
                 ("↑↓", "选择"),
                 ("↵", "进入"),
                 ("Alt↑↓", "上/下级"),
                 ("Esc", "返回"),
             ]
         } else if path_mode {
-            [
+            vec![
                 ("↑↓", "选择"),
                 ("→", "进入"),
                 ("Alt↑", "上一级"),
                 ("Esc", "清空"),
             ]
         } else if query.is_empty() {
-            [
+            vec![
                 ("↑↓", "选择"),
                 ("↵", "打开"),
                 ("Tab", "类别"),
                 ("Esc", "关闭"),
             ]
         } else {
-            [
+            vec![
                 ("↑↓", "选择"),
                 ("↵", "打开"),
                 ("→", if selected_is_folder { "进入" } else { "动作" }),
                 ("Esc", "关闭"),
             ]
         };
+        // 输入框为空且已有条件 chip：提示键盘删除方式。
+        if self.input.is_empty() && (self.filters.modified.is_some() || self.filters.size.is_some())
+        {
+            hints.push(("Ctrl+Bksp", "删条件"));
+        }
         let mut right = rect.right() - PAD;
         for (key, label) in hints.iter().rev() {
             let key_galley = painter.layout_no_wrap(
