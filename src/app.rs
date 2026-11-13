@@ -6412,8 +6412,18 @@ impl LstrApp {
         };
         match shell::delete_to_recycle_bin(&pending.path) {
             Ok(ticket) => {
-                if let Some(index) = self.entries.iter().position(|entry| entry.id == pending.id) {
-                    self.entries.remove(index);
+                let index = self
+                    .entries
+                    .iter()
+                    .position(|entry| entry.id == pending.id)
+                    .unwrap_or(0);
+                let entry = self.entries.get(index).cloned();
+                if let Some(position) = self
+                    .entries
+                    .iter()
+                    .position(|entry| entry.id == pending.id)
+                {
+                    self.entries.remove(position);
                     if self.selected >= self.entries.len() {
                         self.selected = self.entries.len().saturating_sub(1);
                     }
@@ -6422,9 +6432,11 @@ impl LstrApp {
                 if let Ok(mut history) = self.history.lock() {
                     history.remove(&pending.id);
                 }
-                // 保留回收站票据：页脚出现「撤回」按钮（上一次删除）。
+                // 保留回收站票据与原始行：页脚出现「撤回删除」，撤回后行直接回来。
                 self.last_deleted = Some(DeletedItem {
                     name: pending.name,
+                    entry,
+                    index,
                     ticket,
                 });
                 self.focus_requested = true;
@@ -6448,8 +6460,15 @@ impl LstrApp {
         };
         match shell::restore_from_recycle_bin(&ticket) {
             Ok(()) => {
+                // 行直接插回原位：索引同步前重新搜索反而会把刚还原的行刷掉。
+                if let Some(entry) = item.entry.clone() {
+                    let index = item.index.min(self.entries.len());
+                    self.entries.insert(index, entry);
+                    self.total = self.total.saturating_add(1);
+                    self.selected = index;
+                    self.scroll_to_selection = true;
+                }
                 self.toast(ctx, format!("已撤回删除：{}", item.name));
-                self.trigger(ctx);
             }
             Err(err) => {
                 // 失败保留按钮，用户可以重试（比如先处理同名文件）。
@@ -8628,10 +8647,12 @@ struct PendingDelete {
     focus_delete: bool,
 }
 
-/// 上一次删除到回收站的条目：保留回收站票据，支持一键撤回。
+/// 上一次删除到回收站的条目：保留回收站票据与原始行，支持一键撤回。
 #[derive(Clone, Debug)]
 struct DeletedItem {
     name: String,
+    entry: Option<Entry>,
+    index: usize,
     ticket: Option<crate::win::shell::RecycleTicket>,
 }
 
