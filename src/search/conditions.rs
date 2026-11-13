@@ -231,6 +231,10 @@ pub fn is_composing(raw: &str) -> bool {
     if !extract(raw).errors.is_empty() {
         return false;
     }
+    // `path:` 空值：正在输入路径前缀，不是一整条查询。
+    if trailing_bare_path(raw) {
+        return true;
+    }
     let Some((pos, field_len, compact, kind)) = last_field(raw) else {
         return false;
     };
@@ -255,6 +259,19 @@ pub fn is_composing(raw: &str) -> bool {
         None => rest,
     };
     is_date_value_input(after)
+}
+
+/// 输入末尾只剩一个 `path:`（还没跟路径值）。
+///
+/// `path:` 是路径前缀过滤，空值等于「没有过滤」：查询会退化成空查询，由
+/// 引擎按**卷的内部加载顺序**列条目——实测只出 F 盘前 10 条（F 恰好排在
+/// `Engine::volumes` 最前）。这不是用户想要的「列出所有盘」，而且同一个
+/// 输入在不同启动顺序下结果会变，属于不确定行为，所以按「正在输入条件」
+/// 暂停查询，等路径值补上。
+pub fn trailing_bare_path(raw: &str) -> bool {
+    raw.split_whitespace()
+        .last()
+        .is_some_and(|token| token.eq_ignore_ascii_case("path:"))
 }
 
 /// 输入里最后一个字段起点（条件通常打在末尾，也比全局扫描便宜）。
@@ -360,6 +377,9 @@ pub fn date_range_text(range: &DateRange) -> Option<String> {
 
 /// 输入条件时的字段感知提示（空态面板第二行）。
 pub fn composing_hint(raw: &str) -> &'static str {
+    if trailing_bare_path(raw) {
+        return "冒号后跟路径前缀，例如 path:D:\\work；只打 path: 不搜索";
+    }
     match last_field(raw) {
         Some((_, _, _, FieldKind::Date)) => {
             "冒号或回车提交；日期可用 今天/本周/今年/近N天 或 2025"
@@ -1690,6 +1710,26 @@ mod tests {
         assert!(is_composing("C: size>10"));
         assert!(!is_composing("C:"));
         assert!(!is_composing("C: date>2026-11-10:"));
+    }
+
+    #[test]
+    fn bare_path_prefix_is_composing() {
+        // 只打了 `path:`（空值）：暂停查询。以前它被当成「没有过滤」，
+        // 退化成空查询后按卷的内部顺序列出某一整块盘的条目（实测只出 F 盘）。
+        assert!(trailing_bare_path("path:"));
+        assert!(trailing_bare_path("PATH:"));
+        assert!(trailing_bare_path("C: path:   "));
+        assert!(is_composing("path:"));
+        assert!(is_composing("PATH:"));
+        assert!(is_composing("C: path:"));
+        // 有了路径值就照常查询（哪怕只是盘符根）。
+        assert!(!trailing_bare_path("path:C:"));
+        assert!(!is_composing("path:D:\\work"));
+        assert!(!is_composing("path:C:"));
+        assert_eq!(
+            composing_hint("path:"),
+            "冒号后跟路径前缀，例如 path:D:\\work；只打 path: 不搜索"
+        );
     }
 
     #[test]

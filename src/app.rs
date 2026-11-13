@@ -6033,7 +6033,7 @@ impl LstrApp {
                 painter.text(
                     egui::pos2(rect.center().x, list_top + 44.0),
                     Align2::CENTER_CENTER,
-                    "正在输入日期/大小/盘符条件",
+                    "正在输入日期/大小/路径/盘符条件",
                     ui::text_font(15.0),
                     theme.text,
                 );
@@ -6769,7 +6769,7 @@ impl LstrApp {
         } else if self.conditions_apply(query.scope)
             && crate::search::conditions::is_composing(&self.input)
         {
-            "正在输入日期/大小/盘符条件 · 冒号或回车提交".to_string()
+            "正在输入日期/大小/路径/盘符条件 · 冒号或回车提交".to_string()
         } else if query.is_empty() && self.filters.is_empty() {
             format!(
                 "{} 项{}",
