@@ -4538,7 +4538,10 @@ impl LstrApp {
                 };
                 // 条件 chip：固定在输入框左侧，文本区整体右移。
                 // 标签用比例字体、值用等宽字体；日期=琥珀色，大小=冷色，盘符=绿色。
-                let disabled = !self.conditions_apply(query.scope);
+                // 搜索模式下筛选条件不参与查询（本地索引整个跳过），对应 chip
+                // 置灰；范围/搜索 chip 自己是模式，不随此变灰（见下）。
+                let disabled =
+                    !self.conditions_apply(query.scope) || self.filters.keyword.is_some();
                 let chips = self.condition_chips();
                 let mut text_rect = search_rect;
                 if !chips.is_empty() {
@@ -4574,14 +4577,24 @@ impl LstrApp {
                             chip_top,
                             label,
                             &chip.value,
-                            // 范围 chip 是「当前就在这一页」的状态，不随条件
-                            // 失效置灰（它是别的 chip 失效的原因）。
-                            if disabled && !matches!(chip.kind, ConditionChipKind::Scope) {
+                            // 范围/搜索 chip 是「当前模式」本身，不随条件失效
+                            // 置灰（它们是别的 chip 失效的原因）。
+                            if disabled
+                                && !matches!(
+                                    chip.kind,
+                                    ConditionChipKind::Scope | ConditionChipKind::Keyword
+                                )
+                            {
                                 theme.dim
                             } else {
                                 chip.color
                             },
-                            if disabled && !matches!(chip.kind, ConditionChipKind::Scope) {
+                            if disabled
+                                && !matches!(
+                                    chip.kind,
+                                    ConditionChipKind::Scope | ConditionChipKind::Keyword
+                                )
+                            {
                                 theme.hover
                             } else {
                                 chip.bg
@@ -4590,7 +4603,12 @@ impl LstrApp {
                             &format!(
                                 "{}{}",
                                 chip.tooltip,
-                                if disabled && !matches!(chip.kind, ConditionChipKind::Scope) {
+                                if disabled
+                                && !matches!(
+                                    chip.kind,
+                                    ConditionChipKind::Scope | ConditionChipKind::Keyword
+                                )
+                            {
                                     "；当前上下文不生效"
                                 } else {
                                     ""
@@ -6225,7 +6243,7 @@ impl LstrApp {
                             ("a 微信", "搜应用，a 收成范围 chip"),
                             ("f 文件", "只搜文件，f 收成范围 chip"),
                             ("> 命令", "命令页，> 收成范围 chip"),
-                            ("g rust", "网络搜索，g 收成搜索 chip"),
+                            ("g rust", "g 收成 chip，只出搜索行"),
                         ],
                     ),
                 ];

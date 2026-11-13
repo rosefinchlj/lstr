@@ -2133,7 +2133,12 @@ fn run_worker(args: WorkerArgs) {
             && !request.filters.matches.regex
             && match request.query.scope {
                 Scope::App => true,
-                Scope::All => !request.query.is_empty() && !in_folder_context,
+                // 搜索模式不跑本地索引，应用索引也不用跟着加载。
+                Scope::All => {
+                    request.filters.keyword.is_none()
+                        && !request.query.is_empty()
+                        && !in_folder_context
+                }
                 _ => false,
             };
         if needs_uwp && !uwp_started {
@@ -2170,6 +2175,12 @@ fn run_worker(args: WorkerArgs) {
         let mut diag_exact = 0f32;
         // 自定义关键字行（g rust → 用 Google 搜索）：之后钉在结果顶部，不参与打分。
         let mut keyword_rows: Vec<Entry> = Vec::new();
+        // 搜索 chip = 网络搜索模式：只需要「用 X 搜索…」这一行，本地索引整个跳过
+        // （每敲一个字都跑一遍全盘查询纯属白烧）。只有「全部」页有该模式；正则
+        // 是文件名语义，也不参与。
+        let keyword_only = request.filters.keyword.is_some()
+            && request.query.scope == Scope::All
+            && !request.filters.matches.regex;
         // 内置索引候选的惰性元数据标记:modified 已由候选阶段用索引 mtime
         // 填好(供 rank 零 FS 打分),size/展示用 mtime 由 finalize 只对最终
         // 展示条目逐条 find_meta(见 finalize_entries_with_pending)。
@@ -2177,14 +2188,15 @@ fn run_worker(args: WorkerArgs) {
 
         // 输入框为空但筛选/日期条件仍生效时，不能走「最近使用」分支：
         // 条件单独查询要交给引擎做全表过滤（空 token 的过滤器路径）。
-        if request.query.is_empty() && request.filters.is_empty() {
-            // 搜索 chip + 空查询：仍然给一行「用 Bing 搜索…」（否则空输入会走
-            // 最近使用，搜索模式看起来像消失了）。只有「全部」页有这个模式。
-            if request.query.scope == Scope::All {
-                if let Some(trigger) = request.filters.keyword.as_deref() {
-                    keyword_rows = keyword_entries_for(&request.keywords, trigger, "");
-                }
-            }
+        if keyword_only {
+            // 网络搜索模式：只出动作行（空输入也出「用 Bing 搜索…」）。
+            keyword_rows = keyword_entries_for(
+                &request.keywords,
+                request.filters.keyword.as_deref().unwrap_or_default(),
+                &request.query.text,
+            );
+            total = keyword_rows.len();
+        } else if request.query.is_empty() && request.filters.is_empty() {
             if request.show_history {
                 if let Ok(history) = history.lock() {
                     entries = history.recent_entries(request.limit.max(8));
@@ -2275,22 +2287,14 @@ fn run_worker(args: WorkerArgs) {
                     total = entries.len();
                 }
                 Scope::All => {
-                    // 搜索 chip 优先：chip 里的 trigger 就是用户选定的搜索模式，
-                    // 整段文本都是查询词（即使同时有筛选也照给这一行）。
-                    // 没有 chip 时退回「首词当 trigger」的老行为（只打 `b` 也能出）。
-                    if let Some(trigger) = request.filters.keyword.as_deref() {
-                        keyword_rows = keyword_entries_for(
-                            &request.keywords,
-                            trigger,
-                            &request.query.text,
-                        );
-                    } else if request.filters.is_empty()
+                    // 有筛选时只搜文件：位置/时间/类型对应用和命令没有意义，
+                    // 硬塞进来只会让人疑惑「选了 D 盘怎么还出现微信」。
+                    // （搜索 chip 模式在上面 `keyword_only` 分支已短路，不跑到这里。）
+                    if request.filters.is_empty()
                         && !in_folder_context
                         && !file_filter_active
                         && !request.filters.matches.regex
                     {
-                        // 有筛选时只搜文件：位置/时间/类型对应用和命令没有意义，
-                        // 硬塞进来只会让人疑惑「选了 D 盘怎么还出现微信」。
                         keyword_rows = keyword_entries(&request.keywords, &request.query.text);
                     }
                     let mut needs_exact = false;
@@ -2476,8 +2480,9 @@ fn run_worker(args: WorkerArgs) {
         }
 
         // 计算器:输入算式即出结果,钉在顶部(Enter 复制)。仅全部/命令范围、
-        // 非正则模式;放在 scope 匹配之后以免被 keyword_rows 重赋值覆盖。
-        if matches!(request.query.scope, Scope::All | Scope::Command)
+        // 非正则模式;搜索模式里算式是查询词（`b 1+2` 该去 Bing 搜），不给计算行。
+        if !keyword_only
+            && matches!(request.query.scope, Scope::All | Scope::Command)
             && !request.filters.matches.regex
         {
             if let Some(calc_row) = calc::calc_entry(&request.query.raw) {
@@ -3136,6 +3141,68 @@ mod tests {
         let mut uwp = uninstalled;
         uwp.id = "uwp:Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".to_string();
         assert!(!stale_history_entry(&uwp, &[]));
+    }
+
+    #[test]
+    fn keyword_chip_mode_returns_only_the_action_row() {
+        let _guard = SERVICE_TEST_LOCK.lock().unwrap();
+        fn wait(service: &SearchService, generation: u64) -> Response {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(response) = service.poll() {
+                    if response.generation == generation {
+                        return response;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "等待搜索模式响应超时");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        let config = test_config();
+        let history = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::history::History::in_memory(),
+        ));
+        let ctx = eframe::egui::Context::default();
+        let mut service = SearchService::new(config, history, ctx);
+
+        // 搜索 chip：文本是查询词，结果只该有「用 Bing 搜索：rust」这一行，
+        // 本地索引整个跳过（否则每敲一个字都白跑一次全盘查询）。
+        let filters = SearchFilters {
+            keyword: Some("b".to_string()),
+            ..Default::default()
+        };
+        let generation = service.search(
+            "rust",
+            crate::model::Scope::All,
+            false,
+            &filters,
+            &Default::default(),
+            true,
+        );
+        let response = wait(&service, generation);
+        assert_eq!(
+            response.entries.len(),
+            1,
+            "搜索模式只应交付动作行，实际: {:?}",
+            response.entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert_eq!(response.entries[0].id, "kwurl:b");
+        assert_eq!(response.entries[0].name, "用 Bing 搜索：rust");
+        assert_eq!(response.total, 1, "total 应与唯一的动作行一致");
+
+        // 空查询 + 搜索 chip：仍然给「用 Bing 搜索…」行。
+        let generation = service.search(
+            "",
+            crate::model::Scope::All,
+            false,
+            &filters,
+            &Default::default(),
+            true,
+        );
+        let response = wait(&service, generation);
+        assert_eq!(response.entries.len(), 1);
+        assert_eq!(response.entries[0].name, "用 Bing 搜索…");
     }
 
     #[test]
