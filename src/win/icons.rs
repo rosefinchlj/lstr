@@ -1,8 +1,10 @@
 use std::ffi::c_void;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use eframe::egui::ColorImage;
+use rusqlite::{Connection, OpenFlags};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::SIZE;
 use windows::Win32::Graphics::Gdi::{
@@ -53,6 +55,262 @@ pub fn edge_exe() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// 取书签对应网站的图标：读浏览器本地 favicon 缓存（Edge/Chrome 的
+/// `Favicons` SQLite、Firefox 的 `favicons.sqlite`），全程不联网。
+/// 缓存里没有这个站点时返回 None，调用方回退到 Edge 图标。
+pub fn load_favicon(url: &str) -> Option<ColorImage> {
+    let bytes = {
+        let store = favicon_store().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        store.lookup(url)?
+    };
+    decode_favicon(&bytes)
+}
+
+/// 浏览器 favicon 缓存（只读副本）。首次需要书签图标时才初始化；
+/// 浏览器运行时会锁 WAL，所以复制主库 + WAL/SHM 到临时目录再打开。
+struct FaviconStore {
+    /// Edge 优先（默认浏览器），其次是其它 Chromium，最后 Firefox。
+    sources: Vec<FaviconSource>,
+    /// 进程级临时目录：连接关闭前不能删除（Windows 不允许删打开的文件）。
+    _dir: PathBuf,
+}
+
+enum FaviconSource {
+    Chromium(Connection),
+    Firefox(Connection),
+}
+
+static FAVICONS: OnceLock<Mutex<FaviconStore>> = OnceLock::new();
+
+fn favicon_store() -> &'static Mutex<FaviconStore> {
+    FAVICONS.get_or_init(|| Mutex::new(FaviconStore::open()))
+}
+
+impl FaviconStore {
+    fn open() -> Self {
+        let dir = std::env::temp_dir().join(format!("lstr-favicons-{}", std::process::id()));
+        Self::clean_stale_dirs(&dir);
+        let mut sources = Vec::new();
+        if fs::create_dir_all(&dir).is_ok() {
+            let mut candidates: Vec<(u8, PathBuf, bool)> = Vec::new();
+            for root in super::browserdata::chromium_user_data_roots() {
+                let is_edge = root
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("microsoft\\edge");
+                for profile in super::browserdata::chromium_profile_dirs(&root) {
+                    let db = profile.join("Favicons");
+                    if db.is_file() {
+                        candidates.push((if is_edge { 0 } else { 1 }, db, false));
+                    }
+                }
+            }
+            for profile in super::browserdata::firefox_profile_dirs() {
+                let db = profile.join("favicons.sqlite");
+                if db.is_file() {
+                    candidates.push((2, db, true));
+                }
+            }
+            candidates.sort_by_key(|(priority, _, _)| *priority);
+            for (index, (_, db, firefox)) in candidates.into_iter().enumerate() {
+                let Some(conn) = Self::copy_and_open(&dir, &db, index) else {
+                    continue;
+                };
+                sources.push(if firefox {
+                    FaviconSource::Firefox(conn)
+                } else {
+                    FaviconSource::Chromium(conn)
+                });
+            }
+        }
+        Self { sources, _dir: dir }
+    }
+
+    /// 清理上次进程遗留的复制目录（单实例程序，别的 pid 目录都是垃圾）。
+    fn clean_stale_dirs(current: &Path) {
+        let Some(parent) = current.parent() else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == current {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("lstr-favicons-") {
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
+    }
+
+    fn copy_and_open(dir: &Path, db: &Path, index: usize) -> Option<Connection> {
+        let name = db.file_name()?.to_string_lossy().to_string();
+        let copy = dir.join(format!("{index}-{name}"));
+        fs::copy(db, &copy).ok()?;
+        for suffix in ["-wal", "-shm"] {
+            let mut from = db.as_os_str().to_os_string();
+            from.push(suffix);
+            let from = PathBuf::from(from);
+            if !from.is_file() {
+                continue;
+            }
+            let mut to = copy.as_os_str().to_os_string();
+            to.push(suffix);
+            let _ = fs::copy(from, PathBuf::from(to));
+        }
+        Connection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
+    }
+
+    fn lookup(&self, url: &str) -> Option<Vec<u8>> {
+        let candidates = url_candidates(url);
+        let host_pattern = host_like_pattern(url);
+        for source in &self.sources {
+            let bytes = match source {
+                FaviconSource::Chromium(conn) => {
+                    chromium_favicon(conn, &candidates, host_pattern.as_deref())
+                }
+                FaviconSource::Firefox(conn) => {
+                    firefox_favicon(conn, &candidates, host_pattern.as_deref())
+                }
+            };
+            if let Some(bytes) = bytes {
+                if !bytes.is_empty() {
+                    return Some(bytes);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// 书签 URL 的可能写法：原文、去 fragment、带/不带尾斜杠、站点根。
+fn url_candidates(url: &str) -> Vec<String> {
+    fn push(out: &mut Vec<String>, value: String) {
+        if !value.is_empty() && !out.iter().any(|existing| *existing == value) {
+            out.push(value);
+        }
+    }
+    let base = url.trim();
+    let no_fragment = base.split('#').next().unwrap_or(base);
+    let mut out = Vec::new();
+    for candidate in [base, no_fragment] {
+        push(&mut out, candidate.to_string());
+        if let Some(stripped) = candidate.strip_suffix('/') {
+            push(&mut out, stripped.to_string());
+        } else {
+            push(&mut out, format!("{candidate}/"));
+        }
+    }
+    if let Some((scheme, rest)) = base.split_once("://") {
+        if let Some(host) = rest.split(['/', '?', '#']).next() {
+            if !host.is_empty() {
+                push(&mut out, format!("{scheme}://{host}/"));
+                push(&mut out, format!("{scheme}://{host}"));
+            }
+        }
+    }
+    out
+}
+
+/// 同一站点任意页面的兜底模式（`https://host/%`），LIKE 通配符已转义。
+fn host_like_pattern(url: &str) -> Option<String> {
+    let base = url.trim();
+    let (scheme, rest) = base.split_once("://")?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    if host.is_empty() {
+        return None;
+    }
+    let escaped = host
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    Some(format!("{scheme}://{escaped}/%"))
+}
+
+fn chromium_favicon(
+    conn: &Connection,
+    candidates: &[String],
+    host_pattern: Option<&str>,
+) -> Option<Vec<u8>> {
+    const EXACT: &str = "SELECT b.image_data FROM icon_mapping m \
+         JOIN favicon_bitmaps b ON b.icon_id = m.icon_id \
+         WHERE m.page_url = ?1 AND b.image_data IS NOT NULL \
+         ORDER BY b.width DESC LIMIT 1";
+    const HOST: &str = "SELECT b.image_data FROM icon_mapping m \
+         JOIN favicon_bitmaps b ON b.icon_id = m.icon_id \
+         WHERE m.page_url LIKE ?1 ESCAPE '\\' AND b.image_data IS NOT NULL \
+         ORDER BY b.width DESC LIMIT 1";
+    if let Ok(mut stmt) = conn.prepare_cached(EXACT) {
+        for url in candidates {
+            if let Ok(bytes) = stmt.query_row([url.as_str()], |row| row.get::<_, Vec<u8>>(0)) {
+                return Some(bytes);
+            }
+        }
+    }
+    if let (Some(pattern), Ok(mut stmt)) = (host_pattern, conn.prepare_cached(HOST)) {
+        if let Ok(bytes) = stmt.query_row([pattern], |row| row.get::<_, Vec<u8>>(0)) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+fn firefox_favicon(
+    conn: &Connection,
+    candidates: &[String],
+    host_pattern: Option<&str>,
+) -> Option<Vec<u8>> {
+    const EXACT: &str = "SELECT i.data FROM moz_icons_to_pages ip \
+         JOIN moz_pages_w_icons p ON p.id = ip.page_id \
+         JOIN moz_icons i ON i.id = ip.icon_id \
+         WHERE p.page_url = ?1 AND i.data IS NOT NULL \
+         ORDER BY i.width DESC LIMIT 1";
+    const HOST: &str = "SELECT i.data FROM moz_icons_to_pages ip \
+         JOIN moz_pages_w_icons p ON p.id = ip.page_id \
+         JOIN moz_icons i ON i.id = ip.icon_id \
+         WHERE p.page_url LIKE ?1 ESCAPE '\\' AND i.data IS NOT NULL \
+         ORDER BY i.width DESC LIMIT 1";
+    if let Ok(mut stmt) = conn.prepare_cached(EXACT) {
+        for url in candidates {
+            if let Ok(bytes) = stmt.query_row([url.as_str()], |row| row.get::<_, Vec<u8>>(0)) {
+                return Some(bytes);
+            }
+        }
+    }
+    if let (Some(pattern), Ok(mut stmt)) = (host_pattern, conn.prepare_cached(HOST)) {
+        if let Ok(bytes) = stmt.query_row([pattern], |row| row.get::<_, Vec<u8>>(0)) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+/// PNG/ICO/JPEG blob → 32×32 透明底方块（非正方形图标居中）。
+fn decode_favicon(bytes: &[u8]) -> Option<ColorImage> {
+    let image = image::load_from_memory(bytes).ok()?;
+    let thumb = image.thumbnail(32, 32);
+    let rgba = thumb.to_rgba8();
+    let width = (rgba.width() as usize).min(32);
+    let height = (rgba.height() as usize).min(32);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let mut pixels = vec![0u8; 32 * 32 * 4];
+    let offset_x = (32 - width) / 2;
+    let offset_y = (32 - height) / 2;
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = rgba.get_pixel(x as u32, y as u32);
+            let at = ((offset_y + y) * 32 + offset_x + x) * 4;
+            pixels[at..at + 4].copy_from_slice(&[pixel[0], pixel[1], pixel[2], pixel[3]]);
+        }
+    }
+    Some(ColorImage::from_rgba_unmultiplied([32, 32], &pixels))
 }
 
 fn shget_icon(path: &str, size: u32, attrs: u32, use_attrs: bool) -> Option<ColorImage> {
@@ -474,5 +732,124 @@ mod tests {
         let mut rgba = [1u8, 2, 3, 0, 4, 5, 6, 0];
         set_opaque(&mut rgba);
         assert_eq!(rgba, [1, 2, 3, 255, 4, 5, 6, 255]);
+    }
+
+    fn png_bytes_with(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(width, height, image::Rgba([10, 20, 30, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .expect("encode png");
+        bytes
+    }
+
+    fn png_bytes(size: u32) -> Vec<u8> {
+        png_bytes_with(size, size)
+    }
+
+    fn temp_db_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lstr-favicon-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn url_candidates_cover_slash_and_fragment_variants() {
+        let candidates = url_candidates("https://Example.com/a/#frag");
+        assert!(candidates.iter().any(|url| url == "https://Example.com/a/#frag"));
+        assert!(candidates.iter().any(|url| url == "https://Example.com/a/"));
+        assert!(candidates.iter().any(|url| url == "https://Example.com/a"));
+        assert!(candidates.iter().any(|url| url == "https://Example.com/"));
+    }
+
+    #[test]
+    fn chromium_favicon_lookup_picks_largest_bitmap() {
+        let dir = temp_db_dir("chromium");
+        let db = dir.join("Favicons");
+        let small = png_bytes(16);
+        let large = png_bytes(32);
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE favicon_bitmaps (id INTEGER PRIMARY KEY, icon_id INTEGER,
+                     image_data BLOB, width INTEGER DEFAULT 0, height INTEGER DEFAULT 0);
+                 CREATE TABLE icon_mapping (id INTEGER PRIMARY KEY, page_url LONGVARCHAR,
+                     icon_id INTEGER);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO icon_mapping (page_url, icon_id) VALUES ('https://example.com/a', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO favicon_bitmaps (icon_id, image_data, width) VALUES (1, ?1, 16)",
+                rusqlite::params![small],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO favicon_bitmaps (icon_id, image_data, width) VALUES (1, ?1, 32)",
+                rusqlite::params![large.clone()],
+            )
+            .unwrap();
+        }
+        let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let candidates = url_candidates("https://example.com/a");
+        let bytes = chromium_favicon(&conn, &candidates, None).expect("favicon blob");
+        assert_eq!(bytes, large, "应取 width 最大的位图");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn firefox_favicon_lookup_matches_page_url() {
+        let dir = temp_db_dir("firefox");
+        let db = dir.join("favicons.sqlite");
+        let icon = png_bytes(16);
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE moz_icons (id INTEGER PRIMARY KEY, data BLOB, width INTEGER DEFAULT 0);
+                 CREATE TABLE moz_pages_w_icons (id INTEGER PRIMARY KEY, page_url TEXT NOT NULL);
+                 CREATE TABLE moz_icons_to_pages (page_id INTEGER, icon_id INTEGER);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO moz_pages_w_icons (id, page_url) VALUES (1, 'https://mozilla.org/')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO moz_icons (id, data, width) VALUES (1, ?1, 16)",
+                rusqlite::params![icon.clone()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO moz_icons_to_pages (page_id, icon_id) VALUES (1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let candidates = url_candidates("https://mozilla.org/");
+        let bytes = firefox_favicon(&conn, &candidates, None).expect("favicon blob");
+        assert_eq!(bytes, icon);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decode_favicon_fits_into_32_square_with_transparent_letterbox() {
+        let square = decode_favicon(&png_bytes(16)).expect("png");
+        assert_eq!(square.size, [32, 32]);
+        assert!(square.pixels[16 * 32 + 16].a() > 0, "中心应有图标像素");
+
+        // 非正方形图标等比缩放后居中，上下留透明边。
+        let wide = decode_favicon(&png_bytes_with(16, 8)).expect("png");
+        assert_eq!(wide.size, [32, 32]);
+        assert_eq!(wide.pixels[0].a(), 0, "顶部留白透明");
+        assert!(wide.pixels[16 * 32 + 16].a() > 0, "中间行应有图标像素");
     }
 }

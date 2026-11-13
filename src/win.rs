@@ -1,4 +1,5 @@
 pub mod autostart;
+pub mod browserdata;
 pub mod dialog;
 pub mod dialogwatch;
 pub mod dragdrop;

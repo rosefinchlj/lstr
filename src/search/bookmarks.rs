@@ -12,6 +12,7 @@
 
 use crate::model::{Entry, Kind};
 use crate::search::{apps, fuzzy, pinyin};
+use crate::win::browserdata;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -41,13 +42,19 @@ impl BookmarkIndex {
     /// 扫描全部已知浏览器并合并（同一 URL 只保留首次出现的书签）。
     pub fn load() -> Self {
         let mut raw: Vec<RawBookmark> = Vec::new();
-        for root in chromium_roots() {
-            for profile in chromium_profiles(&root) {
-                load_chromium_file(&profile.join("Bookmarks"), &mut raw);
+        for root in browserdata::chromium_user_data_roots() {
+            for profile in browserdata::chromium_profile_dirs(&root) {
+                let file = profile.join("Bookmarks");
+                if file.is_file() {
+                    load_chromium_file(&file, &mut raw);
+                }
             }
         }
-        for db in firefox_databases() {
-            load_firefox_db(&db, &mut raw);
+        for profile in browserdata::firefox_profile_dirs() {
+            let db = profile.join("places.sqlite");
+            if db.is_file() {
+                load_firefox_db(&db, &mut raw);
+            }
         }
         let marks = build_entries(raw);
         let urls = marks
@@ -125,12 +132,20 @@ impl BookmarkIndex {
 pub fn source_stamp() -> Vec<(String, u64, u64)> {
     let mut stamp = Vec::new();
     let mut files: Vec<PathBuf> = Vec::new();
-    for root in chromium_roots() {
-        for profile in chromium_profiles(&root) {
-            files.push(profile.join("Bookmarks"));
+    for root in browserdata::chromium_user_data_roots() {
+        for profile in browserdata::chromium_profile_dirs(&root) {
+            let file = profile.join("Bookmarks");
+            if file.is_file() {
+                files.push(file);
+            }
         }
     }
-    files.extend(firefox_databases());
+    for profile in browserdata::firefox_profile_dirs() {
+        let db = profile.join("places.sqlite");
+        if db.is_file() {
+            files.push(db);
+        }
+    }
     for file in files {
         let Ok(meta) = fs::metadata(&file) else { continue };
         let Ok(modified) = meta.modified() else { continue };
@@ -148,45 +163,6 @@ pub fn source_stamp() -> Vec<(String, u64, u64)> {
 struct RawBookmark {
     name: String,
     url: String,
-}
-
-fn chromium_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        let local = PathBuf::from(local);
-        for rel in [
-            r"Google\Chrome\User Data",
-            r"Microsoft\Edge\User Data",
-            r"BraveSoftware\Brave-Browser\User Data",
-            r"Vivaldi\User Data",
-            r"Chromium\User Data",
-        ] {
-            roots.push(local.join(rel));
-        }
-    }
-    if let Some(roaming) = std::env::var_os("APPDATA") {
-        roots.push(PathBuf::from(roaming).join(r"Opera Software\Opera Stable"));
-    }
-    roots
-}
-
-/// 一个浏览器根目录下所有带 `Bookmarks` 的 profile（Default / Profile N /
-/// Opera 的根目录自身）。缺失的目录静默跳过。
-fn chromium_profiles(root: &Path) -> Vec<PathBuf> {
-    let mut profiles = Vec::new();
-    if root.join("Bookmarks").is_file() {
-        profiles.push(root.to_path_buf());
-    }
-    let Ok(entries) = fs::read_dir(root) else {
-        return profiles;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() && path.join("Bookmarks").is_file() {
-            profiles.push(path);
-        }
-    }
-    profiles
 }
 
 fn load_chromium_file(path: &Path, raw: &mut Vec<RawBookmark>) {
@@ -229,24 +205,6 @@ fn walk_chromium_node(node: &Value, raw: &mut Vec<RawBookmark>) {
             }
         }
     }
-}
-
-fn firefox_databases() -> Vec<PathBuf> {
-    let Some(base) = std::env::var_os("APPDATA") else {
-        return Vec::new();
-    };
-    let dir = PathBuf::from(base).join(r"Mozilla\Firefox\Profiles");
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut dbs = Vec::new();
-    for entry in entries.flatten() {
-        let db = entry.path().join("places.sqlite");
-        if db.is_file() {
-            dbs.push(db);
-        }
-    }
-    dbs
 }
 
 /// Firefox：复制主库 + WAL/SHM 到临时目录再只读查询（直接打开运行中的

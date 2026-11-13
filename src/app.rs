@@ -30,6 +30,8 @@ struct IconJob {
     key: String,
     path: String,
     generic: Option<u32>,
+    /// 书签：网站 favicon 的 URL；取不到时回退 `path` 的 shell 图标（Edge）。
+    favicon_url: Option<String>,
 }
 
 const GENERIC_FOLDER_ICON: u32 = 0x0000_0010; // FILE_ATTRIBUTE_DIRECTORY
@@ -44,8 +46,16 @@ impl IconStore {
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
                     let image = match job.generic {
-                        Some(attrs) => crate::win::icons::load_icon_with_attrs(&job.path, 32, attrs),
-                        None => crate::win::icons::load_icon(&job.path, 32),
+                        Some(attrs) => {
+                            crate::win::icons::load_icon_with_attrs(&job.path, 32, attrs)
+                        }
+                        None => {
+                            // 书签优先网站图标；缓存里没有就回退 Edge 图标。
+                            job.favicon_url
+                                .as_deref()
+                                .and_then(crate::win::icons::load_favicon)
+                                .or_else(|| crate::win::icons::load_icon(&job.path, 32))
+                        }
                     };
                     if done_tx.send((job.key, image)).is_err() {
                         break;
@@ -72,7 +82,9 @@ impl IconStore {
             self.cache.insert(key, texture);
             loaded = true;
         }
-        if self.cache.len() > 400 {
+        // 每份书签一张 favicon（32×32 ≈ 4KB 纹理），400 条的上限会被
+        // 「书签」页滚动刷穿、反复清空重取；放宽到 1024 仍只有几 MB。
+        if self.cache.len() > 1024 {
             self.cache.clear();
             self.pending.clear();
         }
@@ -91,16 +103,15 @@ impl IconStore {
             Kind::File => Some(GENERIC_FILE_ICON),
             _ => None,
         };
-        // 书签的 path 是 URL，shell 取不到图标；统一用 Edge 的可执行文件图标。
-        let path = if entry.kind == Kind::Bookmark {
-            let Some(edge) = crate::win::icons::edge_exe() else {
-                // 没装 Edge：不请求，行绘制回退到地球图标。
-                self.pending.remove(&key);
-                return;
-            };
-            edge.to_string_lossy().into_owned()
+        // 书签优先取网站 favicon（浏览器缓存），没有则回退 Edge 的可执行文件图标；
+        // path 传 URL 的话 shell 只会给默认浏览器图标，所以显式换成 exe 路径。
+        let (path, favicon_url) = if entry.kind == Kind::Bookmark {
+            let edge = crate::win::icons::edge_exe()
+                .map(|exe| exe.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (edge, Some(entry.full_path()))
         } else {
-            entry.full_path()
+            (entry.full_path(), None)
         };
         if self
             .tx
@@ -108,6 +119,7 @@ impl IconStore {
                 key: key.clone(),
                 path,
                 generic,
+                favicon_url,
             })
             .is_err()
         {
@@ -221,8 +233,8 @@ fn icon_key(entry: &Entry) -> String {
             _ => "icon:file".to_string(),
         },
         Kind::Command => String::new(),
-        // 所有书签共用一张 Edge 图标（后台从 msedge.exe 取一次，见 IconStore::request）。
-        Kind::Bookmark => "icon:bookmark".to_string(),
+        // 每份书签按 URL 单独缓存网站 favicon（取不到时后台回退 Edge 图标）。
+        Kind::Bookmark => format!("icon:{}", entry.id),
         _ => format!("icon:{}", entry.id),
     }
 }
