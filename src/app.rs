@@ -233,23 +233,29 @@ const HELP_ROW_H: f32 = 19.0;
 const HELP_GROUP_GAP: f32 = 8.0;
 
 /// 搜索框左侧条件 chip 的宽度（不绘制）。`label` 为空 = 紧凑模式（只画值）。
-fn condition_chip_width(painter: &egui::Painter, label: &str, value: &str) -> f32 {
+/// `dense` = 多个条件时的缩小版（字号/内边距/高度都更小）。
+fn condition_chip_width(painter: &egui::Painter, label: &str, value: &str, dense: bool) -> f32 {
+    let (label_size, value_size, pad, gap, clear) = if dense {
+        (11.0, 11.0, 8.0, 5.0, 14.0)
+    } else {
+        (12.0, 12.0, 10.0, 6.0, 16.0)
+    };
     let label_w = if label.is_empty() {
         0.0
     } else {
         painter
-            .layout_no_wrap(label.to_string(), ui::text_font(13.0), Color32::WHITE)
+            .layout_no_wrap(label.to_string(), ui::text_font(label_size), Color32::WHITE)
             .size()
             .x
-            + 7.0
+            + gap
             + 1.0
-            + 7.0
+            + gap
     };
     let value_w = painter
-        .layout_no_wrap(value.to_string(), ui::mono_font(13.0), Color32::WHITE)
+        .layout_no_wrap(value.to_string(), ui::mono_font(value_size), Color32::WHITE)
         .size()
         .x;
-    10.0 + label_w + value_w + 8.0 + 16.0
+    pad + label_w + value_w + pad + clear
 }
 
 /// 画一个条件 chip（标签比例字体 + 值等宽字体 + × 命中区），返回
@@ -266,28 +272,31 @@ fn paint_condition_chip(
     bg: Color32,
     id: &str,
     tooltip: &str,
+    dense: bool,
 ) -> (f32, bool, bool, bool) {
+    let (label_size, value_size, pad, gap, clear_w, chip_h) = if dense {
+        (11.0, 11.0, 8.0, 5.0, 14.0, 24.0)
+    } else {
+        (12.0, 12.0, 10.0, 6.0, 16.0, 26.0)
+    };
     let label_galley = (!label.is_empty())
-        .then(|| painter.layout_no_wrap(label.to_string(), ui::text_font(13.0), color));
-    let value_galley = painter.layout_no_wrap(value.to_string(), ui::mono_font(13.0), color);
-    let clear_w = 16.0;
+        .then(|| painter.layout_no_wrap(label.to_string(), ui::text_font(label_size), color));
+    let value_galley = painter.layout_no_wrap(value.to_string(), ui::mono_font(value_size), color);
     let has_label = label_galley.is_some();
     let label_w = label_galley.as_ref().map(|g| g.size().x).unwrap_or(0.0);
-    let gap = 7.0;
-    let chip_w = 10.0
+    let chip_w = pad
         + if has_label {
             label_w + gap + 1.0 + gap
         } else {
             0.0
         }
         + value_galley.size().x
-        + 8.0
+        + pad
         + clear_w;
-    let chip_h = 26.0;
     let chip = Rect::from_min_size(egui::pos2(left, top), egui::vec2(chip_w, chip_h));
     let clear = Rect::from_min_size(
-        egui::pos2(chip.right() - clear_w - 8.0, chip.top() + 4.0),
-        egui::vec2(clear_w, chip_h - 8.0),
+        egui::pos2(chip.right() - clear_w - 4.0, chip.top() + 3.0),
+        egui::vec2(clear_w, chip_h - 6.0),
     );
     let body_rect = Rect::from_min_max(chip.min, egui::pos2(clear.left() - 2.0, chip.max.y));
     let pointer = ui.ctx().pointer_hover_pos();
@@ -296,12 +305,7 @@ fn paint_condition_chip(
 
     // 背景：类型色低透明度；hover 略微加深。边框很淡，靠留白和字色分层。
     let fill = if body_hover {
-        Color32::from_rgba_unmultiplied(
-            bg.r(),
-            bg.g(),
-            bg.b(),
-            bg.a().saturating_add(12),
-        )
+        Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), bg.a().saturating_add(12))
     } else {
         bg
     };
@@ -313,7 +317,7 @@ fn paint_condition_chip(
         StrokeKind::Inside,
     );
 
-    let mut x = chip.left() + 10.0;
+    let mut x = chip.left() + pad;
     if let Some(label_galley) = &label_galley {
         // 标签弱化（同色相、更低明度），值保持全色，形成主次。
         painter.galley(
@@ -322,9 +326,10 @@ fn paint_condition_chip(
             color.gamma_multiply(0.62),
         );
         x += label_w + gap;
+        let divider_h = if dense { 10.0 } else { 12.0 };
         let divider = Rect::from_min_size(
-            egui::pos2(x, chip.center().y - 6.0),
-            egui::vec2(1.0, 12.0),
+            egui::pos2(x, chip.center().y - divider_h / 2.0),
+            egui::vec2(1.0, divider_h),
         );
         painter.rect_filled(divider, CornerRadius::same(1), color.gamma_multiply(0.28));
         x += 1.0 + gap;
@@ -337,13 +342,13 @@ fn paint_condition_chip(
 
     // ×：默认弱化，hover 出现圆形底并变亮。
     if clear_hover {
-        painter.circle_filled(clear.center(), 8.0, color.gamma_multiply(0.10));
+        painter.circle_filled(clear.center(), 7.0, color.gamma_multiply(0.10));
     }
     painter.text(
         clear.center(),
         Align2::CENTER_CENTER,
         "×",
-        ui::mono_font(11.0),
+        ui::mono_font(if dense { 10.0 } else { 11.0 }),
         if clear_hover {
             color
         } else {
@@ -3591,10 +3596,14 @@ impl LstrApp {
                 let chips = self.condition_chips();
                 let mut text_rect = search_rect;
                 if !chips.is_empty() {
-                    // 窄窗口下先去掉标签（只留值），保证文本区至少留出 80px。
+                    // 多个条件时整体缩小一号（字号/内边距/高度），给输入框留空间。
+                    let dense = chips.len() > 1;
+                    // 窄窗口下再退一步：去掉标签（只留值），保证文本区至少留出 80px。
                     let with_labels: f32 = chips
                         .iter()
-                        .map(|chip| condition_chip_width(&painter, chip.label, &chip.value))
+                        .map(|chip| {
+                            condition_chip_width(&painter, chip.label, &chip.value, dense)
+                        })
                         .sum::<f32>()
                         + 6.0 * chips.len().saturating_sub(1) as f32;
                     let compact = search_rect.width() - with_labels < 90.0;
@@ -3606,6 +3615,8 @@ impl LstrApp {
                     if self.chip_caret.is_some_and(|index| index >= chips.len()) {
                         self.chip_caret = None;
                     }
+                    let chip_h = if dense { 24.0 } else { 26.0 };
+                    let chip_top = search_rect.bottom() - chip_h;
                     let mut x = search_rect.left();
                     let mut chip_lefts = Vec::with_capacity(chips.len());
                     let mut removed: Option<usize> = None;
@@ -3618,13 +3629,14 @@ impl LstrApp {
                             ui,
                             &painter,
                             x,
-                            search_rect.top() + 1.0,
+                            chip_top,
                             label,
                             &chip.value,
                             if disabled { theme.dim } else { chip.color },
                             if disabled { theme.hover } else { chip.bg },
                             &chip.id,
                             &format!("{}{suffix}", chip.tooltip),
+                            dense,
                         );
                         if clear_clicked {
                             removed = Some(index);
@@ -6027,7 +6039,7 @@ impl LstrApp {
         let galley = painter.layout_job(job);
         let text_w = galley.size().x;
         painter.galley(
-            egui::pos2(rect.left() + PAD, footer_top + 14.0 - galley.size().y / 2.0),
+            egui::pos2(rect.left() + PAD, footer_top + 18.0 - galley.size().y / 2.0),
             galley,
             left_color,
         );
@@ -6501,8 +6513,8 @@ impl LstrApp {
                     cancel = true;
                 }
             });
-        let width = 400.0_f32.min(rect.width() - 48.0);
-        let height = 152.0;
+        let width = 320.0_f32.min(rect.width() - 48.0);
+        let height = 138.0;
         let pos = egui::pos2(
             rect.center().x - width / 2.0,
             rect.center().y - height / 2.0,
@@ -6515,7 +6527,7 @@ impl LstrApp {
                     fill: theme.menu,
                     stroke: Stroke::new(1.0_f32, theme.hair2),
                     corner_radius: CornerRadius::same(12),
-                    inner_margin: egui::Margin::same(18),
+                    inner_margin: egui::Margin::same(16),
                     shadow: egui::epaint::Shadow {
                         offset: [0, 12],
                         blur: 34,
@@ -6525,35 +6537,38 @@ impl LstrApp {
                     ..Default::default()
                 };
                 frame.show(ui, |ui| {
-                    ui.set_width(width - 36.0);
+                    let content_w = width - 32.0;
+                    ui.set_width(content_w);
                     ui.label(
                         egui::RichText::new("删除到回收站？")
-                            .font(ui::text_font(16.0))
+                            .font(ui::text_font(15.0))
                             .color(theme.text),
                     );
                     ui.add_space(6.0);
-                    let name = ui::middle_ellipsis(&pending.name, 30);
+                    let name = ui::middle_ellipsis(&pending.name, 36);
                     ui.label(
                         egui::RichText::new(name)
                             .font(ui::mono_font(12.0))
                             .color(theme.sub),
                     );
-                    ui.add_space(4.0);
+                    ui.add_space(3.0);
                     ui.label(
                         egui::RichText::new("←/→ 切换 · Enter 确认 · Esc 取消")
                             .font(ui::mono_font(10.0))
                             .color(theme.dim),
                     );
                     ui.add_space(14.0);
-                    let (row, _) = ui.allocate_exact_size(
-                        egui::vec2(width - 36.0, 32.0),
-                        Sense::hover(),
-                    );
+                    let (row, _) =
+                        ui.allocate_exact_size(egui::vec2(content_w, 32.0), Sense::hover());
                     let painter = ui.painter().clone();
-                    let delete_rect = Rect::from_min_size(row.min, egui::vec2(104.0, 30.0));
+                    // 两个按钮均分整行宽度：不留右侧空白，视觉更平衡。
+                    let gap = 10.0;
+                    let button_w = (content_w - gap) / 2.0;
+                    let delete_rect =
+                        Rect::from_min_size(row.min, egui::vec2(button_w, 30.0));
                     let cancel_rect = Rect::from_min_size(
-                        egui::pos2(delete_rect.right() + 10.0, row.top()),
-                        egui::vec2(104.0, 30.0),
+                        egui::pos2(delete_rect.right() + gap, row.top()),
+                        egui::vec2(button_w, 30.0),
                     );
                     let delete_resp =
                         ui.interact(delete_rect, Id::new("lstr-delete-yes"), Sense::click());
