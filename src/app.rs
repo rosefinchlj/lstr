@@ -26,12 +26,31 @@ struct IconStore {
     rx: std::sync::mpsc::Receiver<(String, Option<egui::ColorImage>)>,
 }
 
+/// 图标要走的加载路径。显式枚举（而不是路径/URL 两个 Option）是为了让
+/// 「应用条目误用书签回退图标」这种错误在类型层面无处可藏。
+enum IconSource {
+    /// 类型图标（文件夹 / 按扩展名的文件），不访问磁盘。
+    Generic(String, u32),
+    /// 书签：网站 favicon；取不到回退 Edge 图标。
+    Favicon(String),
+    /// 应用 / 程序等普通条目：从真实路径取 shell 图标。
+    Shell(String),
+}
+
 struct IconJob {
     key: String,
-    path: String,
-    generic: Option<u32>,
-    /// 书签：网站 favicon 的 URL；取不到时回退 `path` 的 shell 图标（Edge）。
-    favicon_url: Option<String>,
+    source: IconSource,
+}
+
+/// 条目 → 图标来源。书签只用 favicon（失败回退 Edge）；其它类型一律走
+/// 自己的路径，绝不能借用浏览器图标。
+fn icon_source(entry: &Entry) -> IconSource {
+    match entry.kind {
+        Kind::Folder => IconSource::Generic(entry.full_path(), GENERIC_FOLDER_ICON),
+        Kind::File => IconSource::Generic(entry.full_path(), GENERIC_FILE_ICON),
+        Kind::Bookmark => IconSource::Favicon(entry.full_path()),
+        _ => IconSource::Shell(entry.full_path()),
+    }
 }
 
 const GENERIC_FOLDER_ICON: u32 = 0x0000_0010; // FILE_ATTRIBUTE_DIRECTORY
@@ -45,17 +64,14 @@ impl IconStore {
             .name("lstr-icons".to_string())
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
-                    let image = match job.generic {
-                        Some(attrs) => {
-                            crate::win::icons::load_icon_with_attrs(&job.path, 32, attrs)
+                    let image = match job.source {
+                        IconSource::Generic(path, attrs) => {
+                            crate::win::icons::load_icon_with_attrs(&path, 32, attrs)
                         }
-                        None => {
-                            // 书签优先网站图标；缓存里没有就回退 Edge 图标
-                            //（Edge 图标进程内只取一次，见 icons::edge_icon）。
-                            job.favicon_url
-                                .as_deref()
-                                .and_then(crate::win::icons::load_favicon)
-                                .or_else(crate::win::icons::edge_icon)
+                        IconSource::Favicon(url) => crate::win::icons::load_favicon(&url)
+                            .or_else(crate::win::icons::edge_icon),
+                        IconSource::Shell(path) => {
+                            crate::win::icons::load_icon(&path, 32)
                         }
                     };
                     if done_tx.send((job.key, image)).is_err() {
@@ -106,26 +122,12 @@ impl IconStore {
         if self.cache.contains_key(&key) || !self.pending.insert(key.clone()) {
             return;
         }
-        let generic = match entry.kind {
-            // 类型图标（文件夹/按扩展名的文件）不访问磁盘，毫秒级。
-            Kind::Folder => Some(GENERIC_FOLDER_ICON),
-            Kind::File => Some(GENERIC_FILE_ICON),
-            _ => None,
-        };
-        // 书签：favicon 由后台线程按 URL 查浏览器缓存，没有则回退缓存的
-        // Edge 图标；path 不再传 URL（shell 只会给默认浏览器图标）。
-        let (path, favicon_url) = if entry.kind == Kind::Bookmark {
-            (String::new(), Some(entry.full_path()))
-        } else {
-            (entry.full_path(), None)
-        };
+        let source = icon_source(entry);
         if self
             .tx
             .send(IconJob {
                 key: key.clone(),
-                path,
-                generic,
-                favicon_url,
+                source,
             })
             .is_err()
         {
@@ -10162,6 +10164,30 @@ mod path_layout_tests {
             initial: String::new(),
             tone: 0,
         }
+    }
+
+    /// 回归：书签图标回退只属于书签。应用条目必须走自己的路径取 shell 图标，
+    /// 否则「远程桌面连接 / UU远程」会全部显示成 Edge 浏览器图标。
+    #[test]
+    fn icon_source_keeps_apps_on_shell_icons() {
+        match icon_source(&menu_entry(Kind::App, Some(r"C:\Start Menu\远程桌面连接.lnk"))) {
+            IconSource::Shell(path) => {
+                assert!(path.ends_with("远程桌面连接.lnk"), "应用应走 shell 图标: {path}")
+            }
+            _ => panic!("应用条目不能走 favicon/类型图标"),
+        }
+        match icon_source(&menu_entry(Kind::Bookmark, Some("https://example.com/"))) {
+            IconSource::Favicon(url) => assert_eq!(url, "https://example.com/"),
+            _ => panic!("书签必须优先 favicon"),
+        }
+        assert!(matches!(
+            icon_source(&menu_entry(Kind::Folder, Some(r"D:\work"))),
+            IconSource::Generic(_, _)
+        ));
+        assert!(matches!(
+            icon_source(&menu_entry(Kind::File, Some(r"D:\a.txt"))),
+            IconSource::Generic(_, _)
+        ));
     }
 
     fn item(items: &[MenuItem], action: MenuAction) -> MenuItem {
