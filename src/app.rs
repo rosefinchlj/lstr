@@ -468,6 +468,14 @@ fn date_mask_part_width(part: usize) -> usize {
     }
 }
 
+/// 是否是比较符字符（条件字段后还没输入值时，允许先打比较符）。
+fn is_condition_op_text(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| matches!(c, '>' | '<' | '=' | '≥' | '≤' | '＞' | '＜' | '＝'))
+}
+
 impl DateMask {
     fn new(field: String, op: String, prefix_display: String) -> Self {
         Self {
@@ -492,6 +500,13 @@ impl DateMask {
         } else {
             3
         }
+    }
+
+    /// 是否还没有任何段输入（自动遮罩刚激活、值还是空的）。
+    fn all_typed_empty(&self) -> bool {
+        self.dates
+            .iter()
+            .all(|segs| segs.y.is_empty() && segs.m.is_empty() && segs.d.is_empty())
     }
 
     fn from_ymd((y, m, d): (i32, u32, u32)) -> DateMaskSegs {
@@ -990,8 +1005,14 @@ impl SizeMask {
         if self.two {
             format!("{} {}..{}", self.field, fmt(0), fmt(1))
         } else {
-            format!("{}{}{}", self.field, self.op, fmt(0))
+            // 用激活时的原样前缀（`size:` / `size >= `），紧凑写法的冒号不丢。
+            format!("{}{}", self.prefix_display, fmt(0))
         }
+    }
+
+    /// 是否还没有任何数字输入（自动遮罩刚激活）。
+    fn typed_empty(&self) -> bool {
+        self.sizes.iter().all(|segs| segs.number.is_empty())
     }
 
     fn commit_text(&self) -> String {
@@ -2194,15 +2215,21 @@ impl LstrApp {
         self.trigger(ctx);
     }
 
-    /// 遮罩内输入了不属于条件的字符。从 chip 进入编辑时：条件已经移出
-    /// filters，这里把遮罩的条件文本也一起丢掉，只保留用户输入的字符
-    /// （即「改搜普通查询」），不再留下半截条件；自动激活的遮罩则保留
-    /// 已输入片段继续自由编辑（别名/完整写法仍可用）。
+    /// 遮罩内输入了不属于条件的字符。默认按「改搜普通查询」处理：条件
+    /// 文本整体丢掉，只保留用户这次输入的字符（chip 编辑态条件已移出
+    /// filters，自动激活的遮罩也一样，不能再留下半截条件）。只有两种
+    /// 情况保留前缀继续按条件编辑：字段后还没输入值时打比较符
+    ///（`date:` + `>`），以及还没输入任何段时打别名（`date >` + `今天`）。
     fn exit_date_mask_to_free_text(&mut self, ctx: &egui::Context, text: &str) {
-        let from_chip = self
-            .date_mask
-            .as_ref()
-            .is_some_and(|mask| mask.from_chip_edit);
+        let keep_prefix = self.date_mask.as_ref().is_some_and(|mask| {
+            !mask.from_chip_edit
+                && mask.all_typed_empty()
+                && ((mask.op.is_empty() && is_condition_op_text(text))
+                    || crate::search::conditions::is_composing(&format!(
+                        "{}{}",
+                        mask.prefix_display, text
+                    )))
+        });
         let partial = self
             .date_mask
             .as_ref()
@@ -2210,12 +2237,12 @@ impl LstrApp {
             .unwrap_or_default();
         self.date_mask = None;
         self.size_mask = None;
-        if from_chip {
+        if keep_prefix {
+            self.input = format!("{partial}{text}");
+        } else {
             self.condition_edit_backup = None;
             self.condition_hold = false;
             self.input = text.to_string();
-        } else {
-            self.input = format!("{partial}{text}");
         }
         self.reset_history_recall();
         Self::reset_input_cursor(ctx);
@@ -2251,25 +2278,29 @@ impl LstrApp {
         self.trigger(ctx);
     }
 
-    /// 大小遮罩内输入了不属于条件的字符：从 chip 进入编辑时按「改搜
-    /// 普通查询」处理（条件文本整体丢弃）；自动激活时保留已输入数字。
+    /// 大小遮罩内输入了不属于条件的字符（非数字、非单位字母、非比较符）：
+    /// 按「改搜普通查询」处理——条件文本整体丢弃，只留这次输入的字符，
+    /// 不再留下 `size>10yyyy` 这种半截条件。字段后还没输入值时打的比较符
+    ///（`size:` + `>`）保留前缀继续按条件编辑。
     fn exit_size_mask_to_free_text(&mut self, ctx: &egui::Context, text: &str) {
-        let from_chip = self
-            .size_mask
-            .as_ref()
-            .is_some_and(|mask| mask.from_chip_edit);
+        let keep_prefix = self.size_mask.as_ref().is_some_and(|mask| {
+            !mask.from_chip_edit
+                && mask.typed_empty()
+                && mask.op.is_empty()
+                && is_condition_op_text(text)
+        });
         let partial = self
             .size_mask
             .as_ref()
             .map(|mask| mask.partial_text_for_exit(text))
             .unwrap_or_default();
         self.size_mask = None;
-        if from_chip {
+        if keep_prefix {
+            self.input = format!("{partial}{text}");
+        } else {
             self.condition_edit_backup = None;
             self.condition_hold = false;
             self.input = text.to_string();
-        } else {
-            self.input = format!("{partial}{text}");
         }
         self.reset_history_recall();
         Self::reset_input_cursor(ctx);
@@ -2308,7 +2339,9 @@ impl LstrApp {
                     {
                         units.extend(text.chars());
                     } else {
-                        exit_text.get_or_insert_with(|| text.clone());
+                        exit_text
+                            .get_or_insert_with(String::new)
+                            .push_str(text);
                     }
                     false
                 }
@@ -2439,7 +2472,9 @@ impl LstrApp {
                     } else if matches!(text.as_str(), ":" | "：") {
                         commit = true;
                     } else {
-                        exit_text.get_or_insert_with(|| text.clone());
+                        exit_text
+                            .get_or_insert_with(String::new)
+                            .push_str(text);
                     }
                     false
                 }
@@ -10402,5 +10437,28 @@ mod path_layout_tests {
         auto.retreat();
         auto.feed_digit('5');
         assert_eq!(auto.number().as_str(), "105");
+    }
+
+    #[test]
+    fn condition_op_text_and_empty_mask_state() {
+        for op in [">", "<", "=", "≥", "≤", "＞", "＜", "＝"] {
+            assert!(is_condition_op_text(op), "{op:?}");
+        }
+        for text in ["", "y", "10", ">y", "今天"] {
+            assert!(!is_condition_op_text(text), "{text:?}");
+        }
+
+        // 自动激活的遮罩：值没输入 → 允许继续打比较符/别名（保留前缀）。
+        let date = DateMask::new("date".into(), ">".into(), "date > ".into());
+        assert!(date.all_typed_empty() && !date.from_chip_edit);
+        let size = SizeMask::new("size".into(), ">".into(), "size>".into());
+        assert!(size.typed_empty() && !size.from_chip_edit);
+
+        // 紧凑写法的冒号在退出文本里要保留（`size:` + `>` → `size:>`）。
+        let mut compact = SizeMask::new("size".into(), String::new(), "size:".into());
+        assert_eq!(compact.partial_text_for_exit(">"), "size:");
+        compact.feed_digit('1');
+        assert_eq!(compact.partial_text_for_exit(">"), "size:1MB");
+        assert!(!compact.typed_empty());
     }
 }
