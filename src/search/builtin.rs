@@ -175,7 +175,7 @@ impl BuiltinProvider {
         spec.kind = KindFilter::All;
         // 精确同名补集与时间/日期条件同查：候选仍要过 mtime 过滤，不会把
         // 区间外的同名项带回来。
-        let exact_needle = (!filters.matches.regex).then(|| {
+        let exact_needle = (!filters.matches.regex && !query.text.is_empty()).then(|| {
             if filters.matches.case_sensitive {
                 query.text.clone()
             } else {
@@ -468,9 +468,28 @@ fn scope_kind_filter(scope: Scope) -> KindFilter {
 
 /// Query + SearchFilters → 引擎查询规格。
 pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
+    // 相对路径分段（`DeepSeek\xxx`）：不是正则时最后一段仍是名字锚点
+    // （走 n-gram/memmem 候选），段链由引擎在候选封顶前逐级校验；
+    // 尾部带分隔符（`DeepSeek\`）没有名字锚点，交给过滤器全量列举。
+    let path_components: Vec<String> = query
+        .path_components
+        .as_ref()
+        .map(|path| path.components.clone())
+        .unwrap_or_default();
+    let path_trailing = query
+        .path_components
+        .as_ref()
+        .is_some_and(|path| path.trailing);
     let mut spec = QuerySpec {
         tokens: if filters.matches.regex {
             Vec::new()
+        } else if !path_components.is_empty() {
+            if path_trailing {
+                Vec::new()
+            } else {
+                // 最后一段（名字锚点）参与 n-gram/memmem 候选生成。
+                vec![query.path_anchor().unwrap_or_default().to_string()]
+            }
         } else {
             query.text.split_whitespace().map(String::from).collect()
         },
@@ -486,6 +505,8 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
             .as_ref()
             .map(|e| e.trim_start_matches('.').to_ascii_lowercase()),
         path_prefix: query.path_filter.as_deref().map(str::to_lowercase),
+        path_components,
+        path_trailing,
         group_exts: Vec::new(),
         exact: None,
         mtime_after: None,
@@ -1315,7 +1336,10 @@ mod tests {
             let query = parse(text, Scope::All);
             let mut spec = build_spec(&query, &filters);
             spec.kind = KindFilter::All;
-            let needle = filters.time.is_none().then(|| query.text.to_lowercase());
+            // 与 search_split_once 的 exact_needle 同口径：空文本（纯过滤器 /
+            // 尾分隔符路径）不再走「全量列举」的 exact 补集。
+            let needle =
+                (filters.time.is_none() && !query.text.is_empty()).then(|| query.text.to_lowercase());
             let outcome = fx
                 .provider
                 .engine
@@ -1335,6 +1359,68 @@ mod tests {
                 .fill_exact_entries_per_entry(&outcome.exact_hits, &query, 50, &mut per_entry);
             assert_eq!(lazy, per_entry, "exact 补齐不一致: {text}");
         }
+    }
+
+    /// 真实索引上的相对路径分段查询：`前缀\目录` 命中该目录，`前缀\目录\`
+    /// 列出它下面的所有后代；名字同名但父目录不同的条目不能被带进来。
+    #[test]
+    fn path_components_query_on_real_index() {
+        let Some(fx) = real_index(60, 4, "path-parts") else { return };
+        let tag = format!("lstr-prov-path-parts-{}", std::process::id());
+        let filters = SearchFilters::default();
+
+        // `tag\ai_dir_0001`：父目录是 tag、名字是 ai_dir_0001 的文件夹。
+        let query = parse(&format!(r"{tag}\ai_dir_0001"), Scope::All);
+        assert!(query.path_components.is_some());
+        let result = fx
+            .provider
+            .search_split_once(&query, &filters, 30, 60)
+            .unwrap();
+        let names: Vec<&str> = result.folders.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"ai_dir_0001"), "{names:?}");
+        assert!(
+            result
+                .folders
+                .iter()
+                .all(|e| e.full_path().to_lowercase().contains(&tag.to_lowercase())),
+            "父目录必须匹配"
+        );
+
+        // 大小写不敏感（ASCII）。
+        let upper = parse(&format!(r"{tag}\AI_DIR_0001"), Scope::All);
+        let result = fx
+            .provider
+            .search_split_once(&upper, &filters, 30, 60)
+            .unwrap();
+        assert!(result.folders.iter().any(|e| e.name == "ai_dir_0001"));
+
+        // `tag\ai_dir_0001\`：该目录下所有后代（文件），目录自身不算。
+        let query = parse(&format!(r"{tag}\ai_dir_0001\"), Scope::All);
+        assert!(query.path_components.as_ref().is_some_and(|p| p.trailing));
+        let result = fx
+            .provider
+            .search_split_once(&query, &filters, 30, 60)
+            .unwrap();
+        assert!(!result.files.is_empty(), "应列出目录内文件");
+        assert!(
+            result
+                .files
+                .iter()
+                .all(|e| e.full_path().to_lowercase().contains("ai_dir_0001")),
+            "只应包含该目录下的条目"
+        );
+        assert!(
+            !result.folders.iter().any(|e| e.name == "ai_dir_0001"),
+            "尾分隔符查询不把目录自身列出来"
+        );
+
+        // 不存在的父目录链：0 结果（不能退化成名字搜索把别的 ai_dir 带出来）。
+        let missing = parse(&format!(r"{tag}\no_such_dir\ai_dir_0001"), Scope::All);
+        let result = fx
+            .provider
+            .search_split_once(&missing, &filters, 30, 60)
+            .unwrap();
+        assert!(result.folders.is_empty() && result.files.is_empty());
     }
 
     /// 硬性验收(端到端):同一份真实临时索引(>800 候选)上,旧路径

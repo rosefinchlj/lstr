@@ -293,8 +293,80 @@ fn token_matches(name: &[u8], token: &[u8], whole_word: bool) -> bool {
 /// 语义与 [`path_in_prefix`] 一致：候选必须是前缀目录的**后代**（目录自身
 /// 不算），路径从卷根开始逐段完全一致。
 pub(crate) struct PathMatcher {
-    /// 前缀去掉盘符后的段（小写 ASCII；中文按原字节比较）。
-    segments: Vec<Vec<u8>>,
+    /// 前缀约束（`path:`/深路径）：前缀去掉盘符后的段（小写 ASCII）。
+    prefix: Option<Vec<Vec<u8>>>,
+    /// 相对路径分段约束（`DeepSeek\xxx`）：末尾连续分段。
+    chain: Option<SuffixChain>,
+}
+
+/// 相对路径分段约束：组件按输入顺序，从路径**末尾**往前连续匹配。
+/// `trailing=false` 时最后一段绑定条目名（`DeepSeek\xxx` 只命中名字含
+/// xxx 且父目录含 DeepSeek 的条目）；`trailing=true` 时最后一段绑定父
+/// 目录，条目本身可以是它下面任意深度的后代（`DeepSeek\`）。
+struct SuffixChain {
+    components: Vec<Vec<u8>>,
+    trailing: bool,
+}
+
+impl SuffixChain {
+    fn new(components: &[String], trailing: bool) -> Option<Self> {
+        let components: Vec<Vec<u8>> = components
+            .iter()
+            .filter(|c| !c.is_empty())
+            .map(|c| c.as_bytes().to_ascii_lowercase())
+            .collect();
+        (!components.is_empty()).then_some(Self {
+            components,
+            trailing,
+        })
+    }
+
+    /// 从末尾往前逐段比对：每段必须是该级路径名字的**子串**（大小写不敏感，
+    /// 与名字搜索一致），不再要求锚定卷根（祖先可以更多）。
+    ///
+    /// - `trailing=false`（`DeepSeek\xxx`）：严格绑定「非空分段结尾在名字上」，
+    ///   即名字含 xxx、父目录含 DeepSeek、祖父含链上一段……
+    /// - `trailing=true`（`DeepSeek\`）：链只要出现在祖先链的任意连续位置即可
+    ///   （`…\DeepSeek\sub\file` 也命中）。
+    fn matches(&self, store: &VolumeStore, slot: u32) -> bool {
+        if !self.trailing {
+            let mut cur = slot;
+            for component in self.components.iter().rev() {
+                if cur == NO_PARENT || cur as usize >= store.name_off.len() {
+                    return false;
+                }
+                if memchr::memmem::find(store.name_lc(cur), component).is_none() {
+                    return false;
+                }
+                cur = store.parent[cur as usize];
+            }
+            return true;
+        }
+        // 祖先链任意位置连续匹配（与 PathMatcher 同款状态机，换成子串比较）。
+        let last = self.components[self.components.len() - 1].as_slice();
+        let mut cur = store.parent[slot as usize];
+        let mut matched = 0usize;
+        let mut hops = 0u32;
+        while cur != NO_PARENT && (cur as usize) < store.name_off.len() && hops < 64 {
+            let name = store.name_lc(cur);
+            let expected = &self.components[self.components.len() - 1 - matched];
+            if matched < self.components.len() && memchr::memmem::find(name, expected).is_some() {
+                matched += 1;
+                if matched == self.components.len() {
+                    return true;
+                }
+            } else if matched > 0 {
+                // 断链：当前节点可能重新成为链尾。
+                matched = usize::from(memchr::memmem::find(name, last).is_some());
+                if matched == self.components.len() {
+                    return true;
+                }
+            }
+            cur = store.parent[cur as usize];
+            hops += 1;
+        }
+        false
+    }
 }
 
 impl PathMatcher {
@@ -313,13 +385,49 @@ impl PathMatcher {
             .filter(|s| !s.is_empty())
             .map(|s| s.as_bytes().to_ascii_lowercase())
             .collect();
-        Some(Self { segments })
+        Some(Self {
+            prefix: Some(segments),
+            chain: None,
+        })
+    }
+
+    /// 按 QuerySpec 汇总路径约束：前缀（path:/深路径）与相对分段链可同时存在
+    /// （Explorer 目录上下文 + 用户输入 `子目录\文件`），两者都满足才通过。
+    pub(crate) fn for_spec(spec: &QuerySpec) -> Option<Self> {
+        let prefix = spec
+            .path_prefix
+            .as_deref()
+            .and_then(Self::new)
+            .and_then(|matcher| matcher.prefix);
+        let chain = (!spec.path_components.is_empty())
+            .then(|| SuffixChain::new(&spec.path_components, spec.path_trailing))
+            .flatten();
+        (prefix.is_some() || chain.is_some()).then_some(Self { prefix, chain })
+    }
+
+    /// 是否带有可用的前缀约束（UNC/相对前缀会退化为 None → 引擎走逐条后置过滤）。
+    pub(crate) fn has_prefix(&self) -> bool {
+        self.prefix.is_some()
+    }
+
+    pub(crate) fn matches(&self, store: &VolumeStore, slot: u32) -> bool {
+        if let Some(segments) = &self.prefix {
+            if !Self::matches_prefix(store, slot, segments) {
+                return false;
+            }
+        }
+        if let Some(chain) = &self.chain {
+            if !chain.matches(store, slot) {
+                return false;
+            }
+        }
+        true
     }
 
     /// slot 是否位于前缀目录之下。从父链向上按「最后一段→第一段」连续匹配，
     /// 全部匹配后再确认前缀目录是卷根的直接子项（否则只是路径后缀碰巧相同）。
-    pub(crate) fn matches(&self, store: &VolumeStore, slot: u32) -> bool {
-        if self.segments.is_empty() {
+    fn matches_prefix(store: &VolumeStore, slot: u32, segments: &[Vec<u8>]) -> bool {
+        if segments.is_empty() {
             return true; // 盘符根：卷内所有条目都在前缀下
         }
         let mut cur = store.parent[slot as usize];
@@ -327,18 +435,18 @@ impl PathMatcher {
         let mut hops = 0u32;
         while cur != NO_PARENT && hops < 64 {
             let name = store.name(cur);
-            let last = self.segments[self.segments.len() - 1].as_slice();
-            if matched < self.segments.len()
-                && name.eq_ignore_ascii_case(&self.segments[self.segments.len() - 1 - matched])
+            let last = segments[segments.len() - 1].as_slice();
+            if matched < segments.len()
+                && name.eq_ignore_ascii_case(&segments[segments.len() - 1 - matched])
             {
                 matched += 1;
-                if matched == self.segments.len() {
+                if matched == segments.len() {
                     return store.parent[cur as usize] == NO_PARENT;
                 }
             } else if matched > 0 {
                 // 断链：当前节点可能重新成为「最后一段」（避免 a\x\b 误配 a\b）。
                 matched = usize::from(name.eq_ignore_ascii_case(last));
-                if matched == self.segments.len() {
+                if matched == segments.len() {
                     return store.parent[cur as usize] == NO_PARENT;
                 }
             }
@@ -396,6 +504,12 @@ pub struct QuerySpec {
     /// 小结果集(本卷 total 未超 cap)时 total 按过滤后实际条数修正,
     /// 超出 cap 时为近似值。
     pub path_prefix: Option<String>,
+    /// 相对路径分段查询（`DeepSeek\xxx`）：按「路径末尾连续分段」匹配。
+    /// 为空 = 不是路径分段查询。最后一段（trailing=false）绑定条目名，
+    /// 所以 `tokens` 里放的就是它（保持名字锚点与 n-gram 预筛）。
+    pub path_components: Vec<String>,
+    /// 路径分段查询的末尾是否带分隔符（`DeepSeek\` = 该目录下所有后代）。
+    pub path_trailing: bool,
     /// 类型组的扩展名集合(小写、无点)。
     pub group_exts: Vec<String>,
     /// 精确匹配(名字完全一致,小写比较;wfn: 语义)。设置后只返回精确名。
@@ -686,7 +800,7 @@ pub(crate) fn query_volume_cancel(
     cap: usize,
     cancel: Option<u64>,
 ) -> (Vec<u32>, usize, bool, bool) {
-    let matcher = spec.path_prefix.as_deref().and_then(PathMatcher::new);
+    let matcher = PathMatcher::for_spec(spec);
     if let Some(pattern) = spec.regex.as_deref() {
         let Some(regex) = compiled_regex(spec) else {
             return (Vec::new(), 0, false, false);
@@ -764,7 +878,7 @@ pub(crate) fn query_volume_split_cancel(
     cancel: Option<u64>,
 ) -> (Vec<u32>, Vec<u32>, usize, usize, bool) {
     debug_assert!(spec.exact.is_none(), "split 查询不使用 exact 模式");
-    let matcher = spec.path_prefix.as_deref().and_then(PathMatcher::new);
+    let matcher = PathMatcher::for_spec(spec);
     if let Some(pattern) = spec.regex.as_deref() {
         let Some(regex) = compiled_regex(spec) else {
             return (Vec::new(), Vec::new(), 0, 0, false);
@@ -1145,7 +1259,7 @@ pub(crate) fn query_volume_memmem_scan(
     let mut total = 0usize;
     let mut capped = false;
     let mut last_slot: Option<u32> = None; // 同一条目内多次命中只算一次
-    let matcher = spec.path_prefix.as_deref().and_then(PathMatcher::new);
+    let matcher = PathMatcher::for_spec(spec);
 
     let finder = memchr::memmem::Finder::new(gen);
     let mut seen = 0usize;
@@ -1310,6 +1424,108 @@ mod tests {
         let matcher = PathMatcher::new(r"d:\a\b").expect("盘符前缀");
         assert!(matcher.matches(&ok, ok.find_slot(22).unwrap()));
         assert!(!matcher.matches(&ok, ok.find_slot(21).unwrap()), "前缀目录自身不算");
+    }
+
+    /// `e:\aa\aa\DeepSeek\xxx` 这类结构，用于相对路径分段测试。
+    fn path_chain_store() -> VolumeStore {
+        let mut s = VolumeStore::new(Default::default(), 'E');
+        s.insert(10, 0, 0x10, b"aa");
+        s.insert(11, 10, 0x10, b"aa");
+        s.insert(12, 11, 0x10, b"DeepSeek");
+        s.insert(13, 12, 0x10, b"xxx");
+        s.insert(14, 13, 0, b"report.txt");
+        s.insert(15, 12, 0, b"yyy.txt");
+        s.insert(20, 0, 0x10, b"other");
+        s.insert(21, 20, 0x10, b"DeepSeek");
+        s.insert(22, 21, 0x10, b"zzz");
+        s.compact();
+        s
+    }
+
+    fn chain_spec(components: &[&str], trailing: bool) -> QuerySpec {
+        QuerySpec {
+            // 不带尾分隔符时最后一段绑定名字 → 名字锚点就是它。
+            tokens: if trailing {
+                Vec::new()
+            } else {
+                vec![components[components.len() - 1].to_string()]
+            },
+            path_components: components.iter().map(|c| c.to_string()).collect(),
+            path_trailing: trailing,
+            ..Default::default()
+        }
+    }
+
+    fn names_of(store: &VolumeStore, slots: &[u32]) -> Vec<String> {
+        let mut names: Vec<String> = slots
+            .iter()
+            .map(|&slot| String::from_utf8_lossy(store.name(slot)).into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn path_chain_binds_last_component_to_name() {
+        let s = path_chain_store();
+        // DeepSeek\xxx：名字含 xxx，且父目录含 DeepSeek（可在任意祖先层）。
+        let (slots, total, _) = query_volume(&s, &chain_spec(&["DeepSeek", "xxx"], false), 100);
+        assert_eq!(total, 1, "{:?}", names_of(&s, &slots));
+        assert_eq!(names_of(&s, &slots), vec!["xxx"]);
+
+        // 多段从末尾往前连续：aa\DeepSeek\xxx 命中；other\DeepSeek\zzz 不会误配
+        // aa\aa\DeepSeek\zzz（那个目录不存在）。
+        let (slots, _, _) = query_volume(&s, &chain_spec(&["aa", "DeepSeek", "xxx"], false), 100);
+        assert_eq!(names_of(&s, &slots), vec!["xxx"]);
+        let (slots, _, _) = query_volume(
+            &s,
+            &chain_spec(&["aa", "aa", "DeepSeek", "zzz"], false),
+            100,
+        );
+        assert!(slots.is_empty(), "{:?}", names_of(&s, &slots));
+
+        // 段内按子串匹配（Deep 命中 DeepSeek），与名字搜索一致。
+        let (slots, _, _) = query_volume(&s, &chain_spec(&["Deep", "xxx"], false), 100);
+        assert_eq!(names_of(&s, &slots), vec!["xxx"]);
+        // 最后一段绑定名字：report.txt 不在 xxx 里，不会被 DeepSeek\xxx 带出。
+        assert!(!names_of(&s, &slots).contains(&"report.txt".to_string()));
+
+        // 大小写不敏感。
+        let (slots, _, _) = query_volume(&s, &chain_spec(&["deepseek", "XXX"], false), 100);
+        assert_eq!(names_of(&s, &slots), vec!["xxx"]);
+    }
+
+    #[test]
+    fn path_chain_trailing_matches_descendants() {
+        let s = path_chain_store();
+        // DeepSeek\：任意 DeepSeek 目录下所有后代（两个卷内 DeepSeek 都算）。
+        let (slots, total, _) = query_volume(&s, &chain_spec(&["DeepSeek"], true), 100);
+        assert_eq!(total, 4, "{:?}", names_of(&s, &slots));
+        assert_eq!(
+            names_of(&s, &slots),
+            vec!["report.txt", "xxx", "yyy.txt", "zzz"]
+        );
+        // 带盘符同款语义不存在时，用多段限定到 aa\DeepSeek\。
+        let (slots, total, _) = query_volume(&s, &chain_spec(&["aa", "DeepSeek"], true), 100);
+        assert_eq!(total, 3, "{:?}", names_of(&s, &slots));
+        assert_eq!(names_of(&s, &slots), vec!["report.txt", "xxx", "yyy.txt"]);
+    }
+
+    #[test]
+    fn path_chain_combines_with_prefix_constraint() {
+        let s = path_chain_store();
+        // 目录上下文（other）里的 DeepSeek\zzz：前缀与分段链同时生效。
+        let mut spec = chain_spec(&["DeepSeek", "zzz"], false);
+        spec.path_prefix = Some(r"e:\other".into());
+        let (slots, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 1, "{:?}", names_of(&s, &slots));
+        assert_eq!(names_of(&s, &slots), vec!["zzz"]);
+
+        // 前缀指向 aa 时，other\DeepSeek\zzz 必须被排除。
+        let mut spec = chain_spec(&["DeepSeek", "zzz"], false);
+        spec.path_prefix = Some(r"e:\aa".into());
+        let (slots, total, _) = query_volume(&s, &spec, 100);
+        assert_eq!(total, 0, "{:?}", names_of(&s, &slots));
     }
 
     #[test]

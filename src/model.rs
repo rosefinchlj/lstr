@@ -81,6 +81,15 @@ impl Entry {
     }
 }
 
+/// 相对路径分段查询（`DeepSeek\xxx` / `DeepSeek\`）：按路径末尾连续分段匹配。
+/// `components` 是输入按分隔符拆开的非空段（原样大小写）；
+/// `trailing` = 输入末尾带分隔符（`DeepSeek\` = 该目录下所有后代）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathComponents {
+    pub components: Vec<String>,
+    pub trailing: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Query {
     pub raw: String,
@@ -96,6 +105,8 @@ pub struct Query {
     pub prefix: Option<String>,
     /// 通配后缀：`*abc`（小写，匹配名字结尾）。
     pub suffix: Option<String>,
+    /// 相对路径分段查询（`DeepSeek\xxx`）。None = 普通查询。
+    pub path_components: Option<PathComponents>,
 }
 
 impl Query {
@@ -107,6 +118,16 @@ impl Query {
             && self.drives_exclude == 0
             && self.prefix.is_none()
             && self.suffix.is_none()
+            && self.path_components.is_none()
+    }
+
+    /// 相对路径分段查询的名字锚点（最后一段）；尾部带分隔符时没有锚点。
+    pub fn path_anchor(&self) -> Option<&str> {
+        let path = self.path_components.as_ref()?;
+        if path.trailing {
+            return None;
+        }
+        path.components.last().map(String::as_str)
     }
 
     /// 盘符约束的最终卷掩码：None=不限制，Some(mask)=只查这些卷（可能为空）。

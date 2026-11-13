@@ -1828,7 +1828,11 @@ impl LstrApp {
                 };
                 // 这批结果对应的查询词（条件已剥离）。结果行标注/高亮用它，
                 // 避免条件编辑期间把 `size >= …` 半截条件当拼音查询词。
-                self.results_query_text = self.input.clone();
+                // 相对路径分段查询（`目录\名字`）用名字锚点做高亮。
+                self.results_query_text = crate::search::query::parse(&self.input, self.scope)
+                    .path_anchor()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.input.clone());
                 // 输入历史：只记真正发出去的查询（浏览目录/路径模式不算）。
                 if self.browse_root.is_none() && !self.path_mode() {
                     if let Ok(mut history) = self.history.lock() {
@@ -5877,6 +5881,7 @@ impl LstrApp {
                             ("c:  d:", "只搜这些盘，打 C: 即 chip"),
                             ("-c:", "排除某盘，如 ap -c:"),
                             ("path:D:\\目录", "限定到某目录"),
+                            ("目录\\名字", "按路径分段精确查找"),
                         ],
                     ),
                     (

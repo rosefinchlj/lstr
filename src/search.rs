@@ -711,6 +711,7 @@ mod pin_tests {
                 drives_exclude: 0,
                 prefix: None,
                 suffix: None,
+                path_components: None,
             },
             limit,
             deliver: MIN_DELIVER,
@@ -2113,12 +2114,14 @@ fn run_worker(args: WorkerArgs) {
         let path_scoped = request.browse_root.is_some()
             || request.base_folder.is_some()
             || request.query.path_filter.is_some()
+            || request.query.path_components.is_some()
             || browse::parse(&request.query.raw).is_some();
         let file_filter_active = path_scoped
             || request.query.ext.is_some()
             || request.query.prefix.is_some()
             || request.query.suffix.is_some()
             || request.query.path_filter.is_some()
+            || request.query.path_components.is_some()
             || request.query.drive_mask().is_some()
             || !request.filters.is_empty();
         let needs_uwp = !file_filter_active
@@ -2527,7 +2530,8 @@ fn fetch_count(query: &Query, limit: usize, deliver: usize) -> usize {
         && query.ext.is_none()
         && query.path_filter.is_none()
         && query.prefix.is_none()
-        && query.suffix.is_none();
+        && query.suffix.is_none()
+        && query.path_components.is_none();
     let base = if short {
         80
     } else {
@@ -2832,6 +2836,7 @@ mod tests {
                 drives_exclude: 0,
                 prefix: None,
                 suffix: None,
+                path_components: None,
             },
             limit: 10,
             deliver: MIN_DELIVER,
@@ -2878,6 +2883,7 @@ mod tests {
                 drives_exclude: 0,
                 prefix: None,
                 suffix: None,
+                path_components: None,
             },
             limit: 10,
             deliver: MIN_DELIVER,

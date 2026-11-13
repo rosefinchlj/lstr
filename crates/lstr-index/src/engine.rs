@@ -1319,10 +1319,7 @@ impl Engine {
         // 代次变化即中止(旧查询如单字符 "a" 命中 200 万条要 600ms+,
         // 不中止会把后续击键堵在队列里)。
         let cancel_my = crate::query::CANCEL_GEN.load(std::sync::atomic::Ordering::Relaxed);
-        let path_matcher = spec
-            .path_prefix
-            .as_deref()
-            .and_then(crate::query::PathMatcher::new);
+        let path_matcher = crate::query::PathMatcher::for_spec(spec);
         for (i, v) in self.volumes.iter().enumerate() {
             if crate::query::CANCEL_GEN.load(std::sync::atomic::Ordering::Relaxed) != cancel_my {
                 out.aborted = true;
@@ -1401,7 +1398,8 @@ impl Engine {
             // 深路径前缀后置过滤:仅 UNC 等 PathMatcher 无法处理的前缀需要
             // （本地盘符前缀已在 emit 内与拼音补集里用 PathMatcher 过滤，
             // 再走一遍 path_of+to_lowercase 是冗余的父链拼接+分配）。
-            if let (Some(prefix), None) = (&spec.path_prefix, &path_matcher) {
+            let prefix_handled = path_matcher.as_ref().is_some_and(|m| m.has_prefix());
+            if let (Some(prefix), false) = (&spec.path_prefix, prefix_handled) {
                 hits.retain(|h| {
                     self.path_of(h)
                         .is_some_and(|p| crate::query::path_in_prefix(&p.to_lowercase(), prefix))
@@ -1444,10 +1442,7 @@ impl Engine {
         self.last_query_at.set(Instant::now());
         let mut out = SplitOutcome::default();
         let cancel_my = crate::query::CANCEL_GEN.load(std::sync::atomic::Ordering::Relaxed);
-        let path_matcher = spec
-            .path_prefix
-            .as_deref()
-            .and_then(crate::query::PathMatcher::new);
+        let path_matcher = crate::query::PathMatcher::for_spec(spec);
         // 与 Engine::query 相同的收集上限:仅过滤器查询(无 name token)放大 8 倍,
         // 否则 candidate_cap。两条前缀各用这个上限(旧双路各自也是这个上限)。
         let cap = if spec.tokens.is_empty() {
@@ -1600,6 +1595,13 @@ impl Engine {
                 folder_hits.retain(|h| in_prefix(h));
                 exact_hits.retain(|h| in_prefix(h));
                 prefix_hits.retain(|h| in_prefix(h));
+            }
+            // 精确同名补集绕过了 emit 的路径过滤；相对路径分段（`A\B`）必须
+            // 在这里补一次，否则同名的链外条目会混进结果。
+            if !spec.path_components.is_empty() {
+                if let Some(matcher) = &path_matcher {
+                    exact_hits.retain(|h| matcher.matches(store, h.slot));
+                }
             }
             // total 精确化(与 Engine::query 同规则):本卷过滤前计数未超 cap
             // 时 hit 已全部收集,用过滤后实际保留数修正;超 cap 保持近似。

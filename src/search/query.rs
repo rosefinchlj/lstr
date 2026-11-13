@@ -1,4 +1,4 @@
-use crate::model::{Query, Scope};
+use crate::model::{PathComponents, Query, Scope};
 
 /// 正则模式：整串原样作为 pattern，不解析 `ext:` / `path:` / 盘符 / 作用域
 /// 前缀（正则里的这些文本是模式的一部分）。作用域仍由当前 Tab 决定。
@@ -13,6 +13,7 @@ pub fn parse_regex(raw: &str, scope: Scope) -> Query {
         drives_exclude: 0,
         prefix: None,
         suffix: None,
+        path_components: None,
     }
 }
 
@@ -29,7 +30,44 @@ pub fn parse_plain(raw: &str, scope: Scope) -> Query {
         drives_exclude: 0,
         prefix: None,
         suffix: None,
+        path_components: None,
     }
+}
+
+/// 相对路径分段（`DeepSeek\xxx` / `aa\aa\DeepSeek\`）：按分隔符拆段，
+/// 交给引擎按「路径末尾连续分段」匹配。绝对路径（`C:\...` / `\\server`）
+/// 由 browse 的路径浏览模式处理，这里不接管；带 `:` 的串（`path:`/`ext:`/
+/// URL/盘符）一律不当作相对路径。
+fn parse_path_components(text: &str) -> Option<PathComponents> {
+    const SEPS: [char; 4] = ['\\', '/', '＼', '／'];
+    if text.is_empty() || text.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if text.contains([':', '：']) {
+        return None;
+    }
+    // 盘符 / UNC 留给路径浏览。
+    let bytes = text.as_bytes();
+    if text.starts_with("\\\\")
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+    {
+        return None;
+    }
+    if !text.contains(SEPS) {
+        return None;
+    }
+    let components: Vec<String> = text
+        .split(SEPS)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+    if components.is_empty() {
+        return None;
+    }
+    Some(PathComponents {
+        components,
+        trailing: text.ends_with(SEPS),
+    })
 }
 
 pub fn parse(raw: &str, scope: Scope) -> Query {
@@ -44,6 +82,31 @@ pub fn parse(raw: &str, scope: Scope) -> Query {
     } else {
         (scope, trimmed)
     };
+
+    // 相对路径分段：最后一段是名字锚点（`DeepSeek\xxx` → text=xxx），
+    // 尾部分隔符表示「该目录下所有后代」（text 为空，交给引擎全量过滤）。
+    // 应用/命令行作用域下 `\` 没有路径含义，保持普通词。
+    if matches!(scope, Scope::All | Scope::File | Scope::Folder | Scope::Program) {
+        if let Some(path) = parse_path_components(text) {
+            let anchor = if path.trailing {
+                String::new()
+            } else {
+                path.components.last().cloned().unwrap_or_default()
+            };
+            return Query {
+                raw: raw.to_string(),
+                scope,
+                text: anchor,
+                ext: None,
+                path_filter: None,
+                drives_include: 0,
+                drives_exclude: 0,
+                prefix: None,
+                suffix: None,
+                path_components: Some(path),
+            };
+        }
+    }
 
     let mut ext = None;
     let mut path_filter = None;
@@ -103,6 +166,7 @@ pub fn parse(raw: &str, scope: Scope) -> Query {
         drives_exclude,
         prefix,
         suffix,
+        path_components: None,
     }
 }
 
@@ -237,6 +301,75 @@ mod tests {
         let query = parse("apple", Scope::All);
         assert_eq!(query.scope, Scope::All);
         assert_eq!(query.text, "apple");
+    }
+
+    #[test]
+    fn relative_path_components_bind_last_segment_to_name() {
+        let query = parse(r"DeepSeek\xxx", Scope::All);
+        {
+            let path = query.path_components.as_ref().expect("路径分段");
+            assert_eq!(path.components, vec!["DeepSeek", "xxx"]);
+            assert!(!path.trailing);
+        }
+        assert_eq!(query.text, "xxx", "最后一段是名字锚点");
+        assert!(!query.is_empty());
+        assert_eq!(query.path_anchor(), Some("xxx"));
+
+        // 多段、正斜杠、全角分隔符都支持。
+        let multi = parse(r"aa\aa\DeepSeek\xxx", Scope::All);
+        assert_eq!(
+            multi
+                .path_components
+                .as_ref()
+                .expect("多段")
+                .components,
+            vec!["aa", "aa", "DeepSeek", "xxx"]
+        );
+        let slash = parse("aa/DeepSeek/xxx", Scope::All);
+        assert_eq!(
+            slash
+                .path_components
+                .as_ref()
+                .expect("斜杠")
+                .components,
+            vec!["aa", "DeepSeek", "xxx"]
+        );
+        let fullwidth = parse("所有DeepSeek＼xxx", Scope::All);
+        let path = fullwidth.path_components.as_ref().expect("全角分隔符");
+        assert_eq!(path.components, vec!["所有DeepSeek", "xxx"]);
+    }
+
+    #[test]
+    fn relative_path_trailing_separator_means_descendants() {
+        let query = parse(r"DeepSeek\", Scope::All);
+        {
+            let path = query.path_components.as_ref().expect("路径分段");
+            assert!(path.trailing);
+            assert_eq!(path.components, vec!["DeepSeek"]);
+        }
+        assert_eq!(query.text, "", "尾部分隔符没有名字锚点");
+        assert!(query.path_anchor().is_none());
+        assert!(!query.is_empty(), "只有路径也是有效查询");
+    }
+
+    #[test]
+    fn absolute_paths_stay_out_of_relative_path_mode() {
+        // 盘符路径与 UNC 由 browse 的路径浏览处理。
+        assert!(parse(r"C:\Windows\System32", Scope::All)
+            .path_components
+            .is_none());
+        assert!(parse(r"\\server\share\x", Scope::All)
+            .path_components
+            .is_none());
+        // 含空白不是路径表达式（多词查询）。
+        assert!(parse(r"DeepSeek\xxx foo", Scope::All)
+            .path_components
+            .is_none());
+        // 普通查询/文件名不受影响。
+        assert!(parse("report.txt", Scope::All).path_components.is_none());
+        assert!(parse(r"date>2026-11-10:", Scope::All)
+            .path_components
+            .is_none());
     }
 
     #[test]
