@@ -451,15 +451,15 @@ fn left_chip_index(caret: Option<usize>, count: usize, text_at_start: bool) -> O
 }
 
 /// 删除第 `removed` 个 chip 后，虚拟光标应落在的位置（chip 数变为 `new_count`）。
+/// 边界下标合法范围是 `0..=new_count`（`new_count` = 最后一个 chip 右侧）。
 fn caret_after_remove(caret: Option<usize>, removed: usize, new_count: usize) -> Option<usize> {
-    match caret {
-        Some(index) if index > removed => {
-            let next = index - 1;
-            (next < new_count).then_some(next)
-        }
-        Some(index) => (index < new_count).then_some(index),
-        None => None,
+    if new_count == 0 {
+        return None;
     }
+    let index = caret?;
+    let next = if index > removed { index - 1 } else { index };
+    // 边界 0（第一个 chip 左侧）没有可编辑/删除的左邻，光标至少停在 1。
+    Some(next.min(new_count).max(1))
 }
 
 /// 编辑 chip 后回车要提交的文本：只差终结符的路径条件补一个冒号。
@@ -4095,8 +4095,8 @@ impl LstrApp {
             self.step_scope(ctx, scope_delta);
         }
 
-        // 虚拟 chip 光标：文本光标在开头时 ← 进入 chip 区；→ 逐个右移，
-        // 走出最后一个 chip 回到文本开头。
+        // 虚拟 chip 光标：文本光标在开头时 ← 进入 chip 区（先落在最后一个
+        // chip 右侧，再逐个左移）；→ 逐个右移，走出最后一个 chip 回到文本开头。
         if self.has_input_chips() {
             let count = self.condition_chips().len();
             let left_should_handle = self.chip_caret.is_some() || self.text_at_start(ctx);
@@ -4105,16 +4105,19 @@ impl LstrApp {
                 && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft))
             {
                 self.chip_caret = match self.chip_caret {
-                    Some(index) => Some(index.saturating_sub(1)),
-                    None => Some(count - 1),
+                    // 边界 0（第一个 chip 左侧）没有可编辑/删除的左邻，停在 1。
+                    Some(index) => Some(index.saturating_sub(1).max(1)),
+                    None => Some(count),
                 };
                 return;
             }
             if self.chip_caret.is_some()
                 && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowRight))
             {
-                let next = self.chip_caret.map_or(count, |index| index + 1);
-                self.chip_caret = (next < count).then_some(next);
+                self.chip_caret = self
+                    .chip_caret
+                    .and_then(|index| index.checked_add(1))
+                    .filter(|&index| index < count);
                 return;
             }
         }
@@ -4832,19 +4835,19 @@ impl LstrApp {
                         .sum::<f32>()
                         + 6.0 * chips.len().saturating_sub(1) as f32;
                     let compact = search_rect.width() - with_labels < 90.0;
-                    if self.chip_caret.is_some_and(|index| index >= chips.len()) {
+                    // 光标边界：0 = 最左，count = 最后一个 chip 右侧。
+                    if self.chip_caret.is_some_and(|index| index > chips.len()) {
                         self.chip_caret = None;
                     }
                     let chip_h = if dense { 22.0 } else { 24.0 };
                     // 输入文字视觉上贴底：chip 再往下压 2px（仍在分隔线上方）。
                     let chip_top = search_rect.bottom() - chip_h + 2.0;
                     let mut x = search_rect.left();
-                    let mut chip_lefts = Vec::with_capacity(chips.len());
+                    let mut chip_rights = Vec::with_capacity(chips.len());
                     let mut removed: Option<usize> = None;
                     let mut caret_target: Option<usize> = None;
                     let mut edit_target: Option<usize> = None;
                     for (index, chip) in chips.iter().enumerate() {
-                        chip_lefts.push(x);
                         let label = if compact { "" } else { chip.label };
                         let (w, clear_clicked, body_clicked, body_double) = paint_condition_chip(
                             ui,
@@ -4898,20 +4901,25 @@ impl LstrApp {
                         if body_double {
                             edit_target = Some(index);
                         } else if body_clicked {
-                            caret_target = Some(index);
+                            // 点 chip = 选中它：光标放在它右侧，编辑/删除才对得上。
+                            caret_target = Some(index + 1);
                         }
+                        chip_rights.push(x + w);
                         x += w + 6.0;
                     }
-                    // 虚拟 chip 光标：画在目标 chip 左侧的间隙里。
+                    // 虚拟 chip 光标：画在边界处的 6px 间隙里（0 = 最左，
+                    // count = 最后一个 chip 右侧），高度与 chip 对齐。
                     if let Some(index) = self.chip_caret {
-                        let caret_x = (chip_lefts[index] - 3.0).max(search_rect.left() + 1.0);
-                        painter.line_segment(
-                            [
-                                egui::pos2(caret_x, search_rect.top() + 4.0),
-                                egui::pos2(caret_x, search_rect.bottom() - 4.0),
-                            ],
-                            Stroke::new(1.5_f32, theme.amber),
+                        // 边界 0 理论上到不了（见 caret 更新处），兜底贴最左。
+                        let caret_x = index
+                            .checked_sub(1)
+                            .and_then(|prev| chip_rights.get(prev))
+                            .map_or(search_rect.left() + 1.0, |right| right + 3.0);
+                        let caret = Rect::from_min_size(
+                            egui::pos2(caret_x - 1.0, chip_top + 1.5),
+                            egui::vec2(2.0, chip_h - 3.0),
                         );
+                        painter.rect_filled(caret, CornerRadius::same(1), theme.amber);
                     }
                     if let Some(index) = removed {
                         self.record_condition_undo();
@@ -10944,6 +10952,17 @@ mod path_layout_tests {
         assert_eq!(left_chip_index(Some(2), 3, true), Some(1));
         assert_eq!(left_chip_index(Some(1), 3, true), Some(0));
         assert_eq!(left_chip_index(Some(0), 3, true), None);
+        // ← 从文本开头进 chip 区落在最后一个 chip 右侧（边界 = count）：
+        // 编辑/删除命中的是最后一个 chip，和没光标时一致。
+        assert_eq!(left_chip_index(Some(3), 3, true), Some(2));
+    }
+
+    #[test]
+    fn clicking_chip_selects_that_chip() {
+        // 点第 i 个 chip → 光标放在它右侧（i + 1），编辑/删除都命中它自己。
+        for i in 0..4 {
+            assert_eq!(left_chip_index(Some(i + 1), 4, true), Some(i));
+        }
     }
 
     #[test]
@@ -10952,6 +10971,10 @@ mod path_layout_tests {
         assert_eq!(caret_after_remove(Some(2), 0, 2), Some(1));
         // 删光标左侧的 chip：光标位置不变（仍指向同一个后续 chip）。
         assert_eq!(caret_after_remove(Some(1), 1, 2), Some(1));
+        // 光标在最后一个 chip 右侧时删第一个：仍停在新的最后右侧。
+        assert_eq!(caret_after_remove(Some(3), 0, 2), Some(2));
+        // 第一个 chip 左侧没有左邻：光标夹到 1。
+        assert_eq!(caret_after_remove(Some(1), 0, 1), Some(1));
         // 删到没有 chip：回到文本区。
         assert_eq!(caret_after_remove(Some(0), 0, 0), None);
         assert_eq!(caret_after_remove(None, 2, 2), None);
