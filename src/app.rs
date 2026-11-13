@@ -242,12 +242,14 @@ fn condition_chip_width(painter: &egui::Painter, label: &str, value: &str) -> f3
             .size()
             .x
             + 7.0
+            + 1.0
+            + 7.0
     };
     let value_w = painter
-        .layout_no_wrap(value.to_string(), ui::mono_font(12.0), Color32::WHITE)
+        .layout_no_wrap(value.to_string(), ui::mono_font(13.0), Color32::WHITE)
         .size()
         .x;
-    10.0 + label_w + value_w + 10.0 + 16.0
+    10.0 + label_w + value_w + 8.0 + 16.0
 }
 
 /// 画一个条件 chip（标签比例字体 + 值等宽字体 + × 命中区），返回
@@ -267,59 +269,97 @@ fn paint_condition_chip(
 ) -> (f32, bool, bool, bool) {
     let label_galley = (!label.is_empty())
         .then(|| painter.layout_no_wrap(label.to_string(), ui::text_font(13.0), color));
-    let value_galley = painter.layout_no_wrap(value.to_string(), ui::mono_font(12.0), color);
+    let value_galley = painter.layout_no_wrap(value.to_string(), ui::mono_font(13.0), color);
     let clear_w = 16.0;
-    let label_w = label_galley
-        .as_ref()
-        .map(|g| g.size().x + 7.0)
-        .unwrap_or(0.0);
-    let chip_w = 10.0 + label_w + value_galley.size().x + 10.0 + clear_w;
+    let has_label = label_galley.is_some();
+    let label_w = label_galley.as_ref().map(|g| g.size().x).unwrap_or(0.0);
+    let gap = 7.0;
+    let chip_w = 10.0
+        + if has_label {
+            label_w + gap + 1.0 + gap
+        } else {
+            0.0
+        }
+        + value_galley.size().x
+        + 8.0
+        + clear_w;
     let chip_h = 26.0;
     let chip = Rect::from_min_size(egui::pos2(left, top), egui::vec2(chip_w, chip_h));
-    painter.rect_filled(chip, CornerRadius::same(7), bg);
-    painter.rect_stroke(
-        chip,
-        CornerRadius::same(7),
-        Stroke::new(1.0_f32, color.gamma_multiply(0.45)),
-        StrokeKind::Inside,
-    );
-    if label_galley.is_some() {
-        painter.text(
-            egui::pos2(chip.left() + 10.0, chip.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            ui::text_font(13.0),
-            color,
-        );
-    }
-    painter.text(
-        egui::pos2(chip.left() + 10.0 + label_w, chip.center().y),
-        Align2::LEFT_CENTER,
-        value,
-        ui::mono_font(12.0),
-        color,
-    );
     let clear = Rect::from_min_size(
-        egui::pos2(chip.right() - clear_w - 2.0, chip.top() + 4.0),
+        egui::pos2(chip.right() - clear_w - 8.0, chip.top() + 4.0),
         egui::vec2(clear_w, chip_h - 8.0),
     );
+    let body_rect = Rect::from_min_max(chip.min, egui::pos2(clear.left() - 2.0, chip.max.y));
+    let pointer = ui.ctx().pointer_hover_pos();
+    let body_hover = pointer.is_some_and(|pos| body_rect.contains(pos));
+    let clear_hover = pointer.is_some_and(|pos| clear.contains(pos));
+
+    // 背景：类型色低透明度；hover 略微加深。边框很淡，靠留白和字色分层。
+    let fill = if body_hover {
+        Color32::from_rgba_unmultiplied(
+            bg.r(),
+            bg.g(),
+            bg.b(),
+            bg.a().saturating_add(12),
+        )
+    } else {
+        bg
+    };
+    painter.rect_filled(chip, CornerRadius::same(8), fill);
+    painter.rect_stroke(
+        chip,
+        CornerRadius::same(8),
+        Stroke::new(1.0_f32, color.gamma_multiply(0.22)),
+        StrokeKind::Inside,
+    );
+
+    let mut x = chip.left() + 10.0;
+    if let Some(label_galley) = &label_galley {
+        // 标签弱化（同色相、更低明度），值保持全色，形成主次。
+        painter.galley(
+            egui::pos2(x, chip.center().y - label_galley.size().y / 2.0),
+            label_galley.clone(),
+            color.gamma_multiply(0.62),
+        );
+        x += label_w + gap;
+        let divider = Rect::from_min_size(
+            egui::pos2(x, chip.center().y - 6.0),
+            egui::vec2(1.0, 12.0),
+        );
+        painter.rect_filled(divider, CornerRadius::same(1), color.gamma_multiply(0.28));
+        x += 1.0 + gap;
+    }
+    painter.galley(
+        egui::pos2(x, chip.center().y - value_galley.size().y / 2.0),
+        value_galley,
+        color,
+    );
+
+    // ×：默认弱化，hover 出现圆形底并变亮。
+    if clear_hover {
+        painter.circle_filled(clear.center(), 8.0, color.gamma_multiply(0.10));
+    }
     painter.text(
         clear.center(),
         Align2::CENTER_CENTER,
         "×",
-        ui::mono_font(12.0),
-        color,
+        ui::mono_font(11.0),
+        if clear_hover {
+            color
+        } else {
+            color.gamma_multiply(0.55)
+        },
     );
-    let body_rect = Rect::from_min_max(
-        chip.min,
-        egui::pos2(clear.left(), chip.max.y),
-    );
+
     let body = ui
         .interact(body_rect, Id::new(("lstr-cond-chip-body", id)), Sense::click())
         .on_hover_text(tooltip.to_string());
     let response = ui
         .interact(clear, Id::new(("lstr-cond-chip-clear", id)), Sense::click())
         .on_hover_text(tooltip.to_string());
+    if body_hover || clear_hover {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     (
         chip_w,
         response.clicked(),
@@ -760,7 +800,7 @@ fn help_panel_height(width: f32) -> f32 {
     if width >= 560.0 {
         head + left
     } else {
-        head + left + group(4.0) + group(4.0)
+        head + left + group(4.0) + group(5.0)
     }
 }
 
@@ -871,6 +911,8 @@ pub struct LstrApp {
     history_draft: String,
     /// 删除确认（结果菜单「删除到回收站」）。
     pending_delete: Option<PendingDelete>,
+    /// 上一次删除（可一键撤回）。
+    last_deleted: Option<DeletedItem>,
     /// 当前打开的菜单里，选中条目是否在「最近使用」历史中。
     menu_in_history: bool,
     /// 对话框事件到达但探测失败时的重试截止时间（子控件可能还没建好）。
@@ -1052,6 +1094,7 @@ impl LstrApp {
             history_cursor: None,
             history_draft: String::new(),
             pending_delete: None,
+            last_deleted: None,
             menu_in_history: false,
             dialog_retry_until: None,
             settings_tab: SettingsTab::Appearance,
@@ -1565,7 +1608,12 @@ impl LstrApp {
                 label: "时间",
                 value: range.label(),
                 color: theme.amber,
-                bg: theme.amber_soft,
+                bg: Color32::from_rgba_unmultiplied(
+                    theme.amber.r(),
+                    theme.amber.g(),
+                    theme.amber.b(),
+                    34,
+                ),
                 id: "date".into(),
                 tooltip,
                 edit_text: crate::search::conditions::date_edit_text(range)
@@ -1579,7 +1627,7 @@ impl LstrApp {
                 label: "大小",
                 value: range.label(),
                 color: size_color,
-                bg: Color32::from_rgba_unmultiplied(size_color.r(), size_color.g(), size_color.b(), 26),
+                bg: Color32::from_rgba_unmultiplied(size_color.r(), size_color.g(), size_color.b(), 34),
                 id: "size".into(),
                 tooltip: "文件大小条件；双击编辑，点 × 移除".into(),
                 edit_text: crate::search::conditions::size_edit_text(range)
@@ -1598,7 +1646,7 @@ impl LstrApp {
                     drive_color.r(),
                     drive_color.g(),
                     drive_color.b(),
-                    26,
+                    34,
                 ),
                 id: format!("drive-{index}"),
                 tooltip: if drive.exclude {
@@ -2516,14 +2564,34 @@ impl LstrApp {
             return;
         }
 
-        // 删除确认是模态弹层：只接受 Enter 确认 / Esc 取消，其它按键不穿透。
+        // 删除确认是模态弹层：焦点在「删除/取消」之间切换，Enter 执行
+        // 当前焦点，Esc 取消，其它按键不穿透到输入框。
         if self.pending_delete.is_some() {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-                self.pending_delete = None;
+                self.cancel_pending_delete(ctx);
+                return;
+            }
+            let toggle = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft))
+                || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowRight))
+                || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab))
+                || ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab));
+            if toggle {
+                if let Some(pending) = self.pending_delete.as_mut() {
+                    pending.focus_delete = !pending.focus_delete;
+                }
+                ctx.request_repaint();
                 return;
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
-                self.confirm_pending_delete(ctx);
+                let focus_delete = self
+                    .pending_delete
+                    .as_ref()
+                    .is_none_or(|pending| pending.focus_delete);
+                if focus_delete {
+                    self.confirm_pending_delete(ctx);
+                } else {
+                    self.cancel_pending_delete(ctx);
+                }
                 return;
             }
             return;
@@ -2684,6 +2752,26 @@ impl LstrApp {
             return;
         }
 
+        // 选中结果按 Del：和菜单「删除到回收站」走同一个二次确认流程。
+        // 输入框有文字时只在光标位于末尾且没有选区时抢——否则 Del 仍是
+        // TextEdit 的前向删除。
+        if self
+            .entries
+            .get(self.selected)
+            .is_some_and(|entry| {
+                entry.path.is_some()
+                    && matches!(entry.kind, Kind::File | Kind::Folder | Kind::Program)
+            })
+            && (self.input.is_empty() || self.caret_at_end(ctx))
+            && !Self::text_has_selection(ctx)
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete))
+        {
+            if let Some(entry) = self.entries.get(self.selected).cloned() {
+                self.start_delete_confirm(entry, ctx);
+            }
+            return;
+        }
+
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::P)) {
             self.preview_open = !self.preview_open;
             self.cfg.preview = self.preview_open;
@@ -2769,13 +2857,7 @@ impl LstrApp {
         }
 
         // 路径/浏览模式回退：Alt+↑ 或（过滤词为空时）Backspace 一次退一整级。
-        let has_selection = {
-            let id = egui::Id::new("lstr-search-input");
-            egui::widgets::text_edit::TextEditState::load(ctx, id)
-                .and_then(|state| state.cursor.char_range())
-                .map(|range| range.primary.index != range.secondary.index)
-                .unwrap_or(false)
-        };
+        let has_selection = Self::text_has_selection(ctx);
         if self.in_browse() {
             if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowUp)) {
                 self.browse_up(ctx);
@@ -3984,7 +4066,7 @@ impl LstrApp {
                     );
                 }
 
-                self.paint_footer(&painter, rect, &entries, &query);
+                self.paint_footer(ui, &painter, rect, &entries, &query);
                 self.paint_menu(ctx, list_rect);
                 self.paint_confirm_delete(ctx, rect);
                 self.paint_drag_resize(ui, &painter, rect);
@@ -5007,6 +5089,7 @@ impl LstrApp {
                             ("Esc", "收起（再唤出保留输入）"),
                             ("Ctrl+G", "对话框搜索并填入"),
                             ("Shift+F10", "动作菜单（文件夹也可）"),
+                            ("Del", "删除到回收站（需确认）"),
                             ("双击 Ctrl", "唤出"),
                         ],
                     ),
@@ -5749,7 +5832,8 @@ impl LstrApp {
     }
 
     fn paint_footer(
-        &self,
+        &mut self,
+        ui: &mut egui::Ui,
         painter: &egui::Painter,
         rect: Rect,
         entries: &[Entry],
@@ -5821,7 +5905,17 @@ impl LstrApp {
             Some((message, until)) if now < *until => Some(message.clone()),
             _ => None,
         };
-        let left_text = active_toast.clone().unwrap_or(default_text);
+        // 上一次删除还在：页脚优先显示「已移入回收站：xxx + 撤回」按钮。
+        let undo_name = self
+            .last_deleted
+            .as_ref()
+            .filter(|_| active_toast.is_none())
+            .map(|item| item.name.clone());
+        let left_text = if let Some(name) = &undo_name {
+            format!("已移入回收站：{}", ui::middle_ellipsis(name, 28))
+        } else {
+            active_toast.clone().unwrap_or(default_text)
+        };
         let left_color = if active_toast.is_some() {
             theme.amber
         } else {
@@ -5913,7 +6007,9 @@ impl LstrApp {
         }
 
         // 左侧文案按右侧提示剩余宽度截断（toast 可能很长，以前会盖住快捷键提示）。
-        let max_w = (right + 12.0 - (rect.left() + PAD)).max(80.0);
+        // 有撤回按钮时再预留 72px，避免文案把按钮挤出可视区。
+        let undo_w = if undo_name.is_some() { 72.0 } else { 0.0 };
+        let max_w = (right + 12.0 - (rect.left() + PAD) - undo_w).max(80.0);
         let mut job = egui::text::LayoutJob::default();
         job.append(
             &left_text,
@@ -5929,11 +6025,50 @@ impl LstrApp {
         job.wrap.overflow_character = Some('…');
         job.wrap.break_anywhere = true;
         let galley = painter.layout_job(job);
+        let text_w = galley.size().x;
         painter.galley(
             egui::pos2(rect.left() + PAD, footer_top + 14.0 - galley.size().y / 2.0),
             galley,
             left_color,
         );
+        if let Some(name) = undo_name {
+            let x = rect.left() + PAD + text_w + 8.0;
+            let pill = Rect::from_min_size(
+                egui::pos2(x, footer_top + 8.0),
+                egui::vec2(68.0, 20.0),
+            );
+            let response = ui
+                .interact(pill, Id::new("lstr-undo-delete"), Sense::click())
+                .on_hover_text(format!("把 {name} 从回收站还原"));
+            painter.rect_filled(
+                pill,
+                CornerRadius::same(6),
+                if response.hovered() {
+                    theme.amber_soft
+                } else {
+                    theme.surface_hi
+                },
+            );
+            painter.rect_stroke(
+                pill,
+                CornerRadius::same(6),
+                Stroke::new(1.0_f32, theme.amber.gamma_multiply(0.35)),
+                StrokeKind::Inside,
+            );
+            painter.text(
+                pill.center(),
+                Align2::CENTER_CENTER,
+                "撤回删除",
+                ui::text_font(11.0),
+                theme.amber,
+            );
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if response.clicked() {
+                self.undo_last_delete(ui.ctx());
+            }
+        }
     }
 
     fn caret_at_end(&self, ctx: &egui::Context) -> bool {
@@ -6080,6 +6215,15 @@ impl LstrApp {
         self.move_caret_to_end(ctx);
         self.apply_size(ctx);
         self.trigger(ctx);
+    }
+
+    /// 输入框当前是否有选区。
+    fn text_has_selection(ctx: &egui::Context) -> bool {
+        let id = egui::Id::new("lstr-search-input");
+        egui::widgets::text_edit::TextEditState::load(ctx, id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index != range.secondary.index)
+            .unwrap_or(false)
     }
 
     fn move_caret_to_end(&self, ctx: &egui::Context) {
@@ -6233,17 +6377,33 @@ impl LstrApp {
                 let Some(entry) = self.entries.get(self.selected).cloned() else {
                     return;
                 };
-                let Some(path) = entry.path.clone() else {
-                    return;
-                };
                 // 不立即删：先弹二次确认，确认后才进回收站。
-                self.pending_delete = Some(PendingDelete {
-                    id: entry.id,
-                    name: entry.name,
-                    path,
-                });
+                self.start_delete_confirm(entry, ctx);
             }
         }
+    }
+
+    /// 打开删除确认弹层，并把键盘焦点从输入框收走。
+    fn start_delete_confirm(&mut self, entry: Entry, ctx: &egui::Context) {
+        let Some(path) = entry.path.clone() else {
+            return;
+        };
+        // 焦点交给弹层：否则输入框光标还在闪，方向键看起来「没反应」。
+        let input_id = egui::Id::new("lstr-search-input");
+        ctx.memory_mut(|memory| memory.surrender_focus(input_id));
+        self.pending_delete = Some(PendingDelete {
+            id: entry.id,
+            name: entry.name,
+            path,
+            focus_delete: true,
+        });
+        ctx.request_repaint();
+    }
+
+    fn cancel_pending_delete(&mut self, ctx: &egui::Context) {
+        self.pending_delete = None;
+        self.focus_requested = true;
+        ctx.request_repaint();
     }
 
     fn confirm_pending_delete(&mut self, ctx: &egui::Context) {
@@ -6251,7 +6411,7 @@ impl LstrApp {
             return;
         };
         match shell::delete_to_recycle_bin(&pending.path) {
-            Ok(()) => {
+            Ok(ticket) => {
                 if let Some(index) = self.entries.iter().position(|entry| entry.id == pending.id) {
                     self.entries.remove(index);
                     if self.selected >= self.entries.len() {
@@ -6262,10 +6422,40 @@ impl LstrApp {
                 if let Ok(mut history) = self.history.lock() {
                     history.remove(&pending.id);
                 }
-                self.toast(ctx, "已移入回收站".to_string());
+                // 保留回收站票据：页脚出现「撤回」按钮（上一次删除）。
+                self.last_deleted = Some(DeletedItem {
+                    name: pending.name,
+                    ticket,
+                });
+                self.focus_requested = true;
                 ctx.request_repaint();
             }
-            Err(err) => self.toast(ctx, format!("删除失败：{err}")),
+            Err(err) => {
+                self.focus_requested = true;
+                self.toast(ctx, format!("删除失败：{err}"));
+            }
+        }
+    }
+
+    /// 一键撤回上一次删除：把回收站里的条目移回原位置。
+    fn undo_last_delete(&mut self, ctx: &egui::Context) {
+        let Some(item) = self.last_deleted.take() else {
+            return;
+        };
+        let Some(ticket) = item.ticket.clone() else {
+            self.toast(ctx, "这次删除没有拿到回收站票据，无法一键撤回".to_string());
+            return;
+        };
+        match shell::restore_from_recycle_bin(&ticket) {
+            Ok(()) => {
+                self.toast(ctx, format!("已撤回删除：{}", item.name));
+                self.trigger(ctx);
+            }
+            Err(err) => {
+                // 失败保留按钮，用户可以重试（比如先处理同名文件）。
+                self.last_deleted = Some(item);
+                self.toast(ctx, err);
+            }
         }
     }
 
@@ -6275,6 +6465,7 @@ impl LstrApp {
             return;
         };
         let theme = self.theme;
+        let focus_delete = pending.focus_delete;
         let mut cancel = false;
         let mut confirm = false;
         egui::Area::new(Id::new("lstr-delete-dim"))
@@ -6330,7 +6521,7 @@ impl LstrApp {
                     );
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new("Enter 确认 · Esc 取消")
+                        egui::RichText::new("←/→ 切换 · Enter 确认 · Esc 取消")
                             .font(ui::mono_font(10.0))
                             .color(theme.dim),
                     );
@@ -6370,6 +6561,14 @@ impl LstrApp {
                         ui::text_font(13.0),
                         Color32::WHITE,
                     );
+                    if focus_delete {
+                        painter.rect_stroke(
+                            delete_rect.expand(1.5),
+                            CornerRadius::same(8),
+                            Stroke::new(2.0_f32, theme.amber),
+                            StrokeKind::Inside,
+                        );
+                    }
                     painter.rect_filled(
                         cancel_rect,
                         CornerRadius::same(7),
@@ -6386,6 +6585,14 @@ impl LstrApp {
                         ui::text_font(13.0),
                         theme.text,
                     );
+                    if !focus_delete {
+                        painter.rect_stroke(
+                            cancel_rect.expand(1.5),
+                            CornerRadius::same(8),
+                            Stroke::new(2.0_f32, theme.amber),
+                            StrokeKind::Inside,
+                        );
+                    }
                     if delete_resp.hovered() || cancel_resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
@@ -8411,12 +8618,21 @@ enum MenuAction {
     CustomAction(usize),
 }
 
-/// 删除确认弹层的数据（菜单「删除到回收站」二次确认）。
+/// 删除确认弹层的数据（菜单「删除到回收站」/ Del 键二次确认）。
 #[derive(Clone, Debug)]
 struct PendingDelete {
     id: String,
     name: String,
     path: std::path::PathBuf,
+    /// true = 焦点在「删除」，false = 焦点在「取消」；←/→/Tab 切换。
+    focus_delete: bool,
+}
+
+/// 上一次删除到回收站的条目：保留回收站票据，支持一键撤回。
+#[derive(Clone, Debug)]
+struct DeletedItem {
+    name: String,
+    ticket: Option<crate::win::shell::RecycleTicket>,
 }
 
 /// 设置面板的分页。

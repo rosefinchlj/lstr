@@ -222,11 +222,21 @@ pub fn open_config() -> Result<(), String> {
         .map_err(|e| format!("打开配置失败: {e}"))
 }
 
-/// 删除到回收站（结果菜单「删除到回收站」用，UI 已做二次确认）。
+/// 删除到回收站后拿到的「撤回票据」：回收站里的 `$I` 元数据 + `$R` 数据
+/// 路径 + 原路径。撤销时把 `$R` 移回原位置并清掉 `$I`。
+#[derive(Clone, Debug)]
+pub struct RecycleTicket {
+    pub metadata: PathBuf,
+    pub payload: PathBuf,
+    pub original: PathBuf,
+}
+
+/// 删除到回收站（结果菜单 / Del 键用，UI 已做二次确认）。
 ///
 /// 只允许固定本地盘：网络盘/可移动盘没有可靠的回收站，`FOF_ALLOWUNDO`
 /// 失败时可能变成永久删除，宁可拒绝也不冒数据丢失的风险。
-pub fn delete_to_recycle_bin(path: &Path) -> Result<(), String> {
+/// 返回的票据用于「一键撤回」；拿不到票据时删除仍算成功（只是不可撤回）。
+pub fn delete_to_recycle_bin(path: &Path) -> Result<Option<RecycleTicket>, String> {
     use windows::Win32::Storage::FileSystem::GetDriveTypeW;
     use windows::Win32::UI::Shell::{
         SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
@@ -251,6 +261,13 @@ pub fn delete_to_recycle_bin(path: &Path) -> Result<(), String> {
         return Err("该位置不支持回收站删除".to_string());
     }
 
+    // 删除前先记下回收站里已有的 $I 文件，事后差集找到本次新建的那个。
+    let bin = recycle_bin_dir(path);
+    let before = bin
+        .as_deref()
+        .map(recycle_metadata_names)
+        .unwrap_or_default();
+
     // SHFileOperationW 要求 pFrom 以双 NUL 结尾。
     let mut from: Vec<u16> = text.encode_utf16().collect();
     from.push(0);
@@ -271,7 +288,178 @@ pub fn delete_to_recycle_bin(path: &Path) -> Result<(), String> {
     if op.fAnyOperationsAborted.as_bool() {
         return Err("删除已取消".to_string());
     }
+
+    let ticket = bin.and_then(|dir| recycle_ticket(&dir, &before, path));
+    Ok(ticket)
+}
+
+/// 把回收站里的条目移回原位置（一键撤回）。
+pub fn restore_from_recycle_bin(ticket: &RecycleTicket) -> Result<(), String> {
+    if !ticket.payload.exists() {
+        return Err("回收站里找不到原文件（可能已被清空）".to_string());
+    }
+    if ticket.original.exists() {
+        return Err("原位置已有同名文件，无法撤回".to_string());
+    }
+    if let Some(parent) = ticket.original.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err("原目录已不存在，无法撤回".to_string());
+        }
+    }
+    // $R 与目标在同一卷，rename 只是改目录项，很快。
+    std::fs::rename(&ticket.payload, &ticket.original)
+        .map_err(|err| format!("撤回失败：{err}"))?;
+    // 元数据清理失败不影响文件已还原。
+    let _ = std::fs::remove_file(&ticket.metadata);
     Ok(())
+}
+
+/// 当前用户 SID 对应的回收站目录：`<盘符>:\$Recycle.Bin\<SID>`。
+fn recycle_bin_dir(path: &Path) -> Option<PathBuf> {
+    let letter = path
+        .display()
+        .to_string()
+        .chars()
+        .next()?
+        .to_ascii_uppercase();
+    let sid = current_sid_string()?;
+    let dir = PathBuf::from(format!("{letter}:\\$Recycle.Bin\\{sid}"));
+    dir.is_dir().then_some(dir)
+}
+
+fn recycle_metadata_names(dir: &Path) -> std::collections::HashSet<String> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Default::default();
+    };
+    read.filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| name.to_string())
+        })
+        .filter(|name| name.starts_with("$I"))
+        .collect()
+}
+
+/// 用删除前后的 `$I` 文件差集定位本次删除，解析出原路径并拼出 `$R` 路径。
+fn recycle_ticket(
+    dir: &Path,
+    before: &std::collections::HashSet<String>,
+    deleted: &Path,
+) -> Option<RecycleTicket> {
+    let after = recycle_metadata_names(dir);
+    let name = after.difference(before).next()?.clone();
+    let metadata = dir.join(&name);
+    let original = std::fs::read(&metadata)
+        .ok()
+        .and_then(|bytes| parse_recycle_metadata(&bytes))
+        .filter(|path| {
+            path.to_string_lossy()
+                .eq_ignore_ascii_case(&deleted.to_string_lossy())
+        })
+        .unwrap_or_else(|| deleted.to_path_buf());
+    let suffix = name.strip_prefix("$I").unwrap_or(&name);
+    let payload = dir.join(format!("$R{suffix}"));
+    payload.exists().then_some(RecycleTicket {
+        metadata,
+        payload,
+        original,
+    })
+}
+
+/// 解析 `$I` 回收站元数据里的原路径。
+/// V2：version(u64)/size(u64)/time(u64)/len(u32)/UTF-16LE 路径；
+/// V1（Vista）：version/size/time + 固定 260 个 WCHAR。
+fn parse_recycle_metadata(bytes: &[u8]) -> Option<PathBuf> {
+    if bytes.len() < 24 {
+        return None;
+    }
+    let version = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+    let (offset, units) = if version >= 2 {
+        if bytes.len() < 28 {
+            return None;
+        }
+        let units = u32::from_le_bytes(bytes[24..28].try_into().ok()?) as usize;
+        (28usize, units)
+    } else if version == 1 {
+        (24usize, 260usize)
+    } else {
+        return None;
+    };
+    // 路径长度通常不含结尾 NUL；多读一个单元也无妨，下面统一按 NUL 截断。
+    let end = offset.checked_add(units.saturating_mul(2))?;
+    if bytes.len() < end {
+        return None;
+    }
+    let mut utf16: Vec<u16> = bytes[offset..end]
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    if let Some(pos) = utf16.iter().position(|&unit| unit == 0) {
+        utf16.truncate(pos);
+    }
+    if utf16.is_empty() {
+        return None;
+    }
+    String::from_utf16(&utf16).ok().map(PathBuf::from)
+}
+
+/// 当前进程用户 SID 的字符串形式（`S-1-5-21-...`）。
+fn current_sid_string() -> Option<String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        if len == 0 {
+            let _ = CloseHandle(token);
+            return None;
+        }
+        let mut buffer = vec![0u8; len as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            len,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        if !ok {
+            return None;
+        }
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        sid_to_string(user.User.Sid.0)
+    }
+}
+
+fn sid_to_string(sid_ptr: *mut core::ffi::c_void) -> Option<String> {
+    use windows::Win32::Security::SID;
+    if sid_ptr.is_null() {
+        return None;
+    }
+    unsafe {
+        let sid = &*(sid_ptr as *const SID);
+        let count = sid.SubAuthorityCount as usize;
+        let authority = sid
+            .IdentifierAuthority
+            .Value
+            .iter()
+            .fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte));
+        let subs = std::slice::from_raw_parts(sid.SubAuthority.as_ptr(), count);
+        let mut text = format!("S-{}-{}", sid.Revision, authority);
+        for sub in subs {
+            text.push_str(&format!("-{sub}"));
+        }
+        Some(text)
+    }
 }
 
 /// 打开 http(s) 链接（关键字网络搜索），交给系统默认浏览器。
@@ -375,5 +563,62 @@ mod tests {
     fn open_with_requires_a_path() {
         // 无路径的命令/结果不进 shell，直接给出错误（不弹系统对话框）。
         assert!(open_with(&entry(Kind::File, None)).is_err());
+    }
+
+    /// V2 回收站元数据：version/size/time/len + UTF-16LE 原路径。
+    #[test]
+    fn parses_recycle_metadata_v2() {
+        let original = r"E:\use\ai\deepseek\Rust\lstr\test.log";
+        let utf16: Vec<u16> = original.encode_utf16().collect();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&123u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&(utf16.len() as u32).to_le_bytes());
+        for unit in &utf16 {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // 结尾 NUL（len 不含它）
+        assert_eq!(
+            parse_recycle_metadata(&bytes).as_deref(),
+            Some(Path::new(original))
+        );
+    }
+
+    /// V1 元数据：固定 260 个 WCHAR 路径缓冲区。
+    #[test]
+    fn parses_recycle_metadata_v1() {
+        let original = r"C:\Temp\old.txt";
+        let utf16: Vec<u16> = original.encode_utf16().collect();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let mut buffer = [0u16; 260];
+        buffer[..utf16.len()].copy_from_slice(&utf16);
+        for unit in buffer {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(
+            parse_recycle_metadata(&bytes).as_deref(),
+            Some(Path::new(original))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_recycle_metadata() {
+        assert!(parse_recycle_metadata(&[]).is_none());
+        assert!(parse_recycle_metadata(&[0u8; 23]).is_none());
+        // 未知版本。
+        let mut bytes = vec![3u8; 64];
+        bytes[0..8].copy_from_slice(&3u64.to_le_bytes());
+        assert!(parse_recycle_metadata(&bytes).is_none());
+        // V2 声明长度超过实际数据。
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        assert!(parse_recycle_metadata(&bytes).is_none());
     }
 }
