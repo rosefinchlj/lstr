@@ -75,6 +75,10 @@ fn shell_execute_with(
 }
 
 pub fn open_entry(entry: &Entry) -> Result<(), String> {
+    // 书签的 path 是 URL，不是磁盘路径：交给默认浏览器。
+    if entry.kind == Kind::Bookmark {
+        return open_url(&entry.full_path());
+    }
     let path = entry
         .path
         .as_ref()

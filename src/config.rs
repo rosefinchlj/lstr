@@ -103,6 +103,10 @@ pub struct IndexConfig {
     /// USN journal 轮询间隔(毫秒),最小 100,默认 500。incremental="usn" 使用。
     #[serde(default = "default_journal_poll_ms")]
     pub journal_poll_ms: u64,
+    /// 索引浏览器收藏夹（Chrome/Edge/Brave/Vivaldi/Chromium/Firefox）：
+    /// 书签进入「全部」搜索结果，Enter 用默认浏览器打开。设置页即时生效。
+    #[serde(default = "default_true")]
+    pub bookmarks: bool,
 }
 
 fn default_incremental() -> String {
@@ -125,6 +129,7 @@ impl Default for IndexConfig {
             volumes: Vec::new(),
             scan_throttle_ms: 0,
             journal_poll_ms: default_journal_poll_ms(),
+            bookmarks: true,
         }
     }
 }

@@ -653,6 +653,25 @@ pub fn paint_file_icon(painter: &egui::Painter, rect: egui::Rect, kind: Kind, co
                 stroke,
             );
         }
+        Kind::Bookmark => {
+            // 地球仪：圆形 + 横线 + 竖线（不依赖字体里的 emoji 字形）。
+            let center = rect.center();
+            painter.circle_stroke(center, 7.0, stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 7.0, center.y),
+                    egui::pos2(center.x + 7.0, center.y),
+                ],
+                Stroke::new(1.0_f32, color.gamma_multiply(0.8)),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x, center.y - 7.0),
+                    egui::pos2(center.x, center.y + 7.0),
+                ],
+                Stroke::new(1.0_f32, color.gamma_multiply(0.55)),
+            );
+        }
         Kind::Command => {
             painter.text(
                 rect.center(),

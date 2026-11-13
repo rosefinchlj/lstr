@@ -8,6 +8,8 @@ pub enum Kind {
     Program,
     App,
     Command,
+    /// 浏览器收藏夹条目：`path` 存 URL，Enter 交给默认浏览器打开。
+    Bookmark,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

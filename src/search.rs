@@ -1,4 +1,5 @@
 pub mod apps;
+pub mod bookmarks;
 pub mod browse;
 pub mod calc;
 #[cfg(test)]
@@ -29,6 +30,10 @@ use std::time::{Duration, Instant};
 /// 应用索引的刷新周期：新装/卸载应用后最多等这么久就能搜到/消失。
 /// 重建成本是枚举开始菜单 + App Paths（本机 200+ 应用，几十 ms），放 worker 线程无感。
 const APPS_RELOAD_INTERVAL: Duration = Duration::from_secs(90);
+
+/// 浏览器书签的刷新周期。书签文件由浏览器原子写入，重载只是解析 JSON /
+/// 复制 places.sqlite（本机 500 条量级 <10ms），比应用索引更宽松即可。
+const BOOKMARKS_RELOAD_INTERVAL: Duration = Duration::from_secs(120);
 
 /// 首屏交付的候选上限。窗口只按「一屏结果数」长高，其余靠滚轮查看。
 pub(crate) const MIN_DELIVER: usize = 100;
@@ -155,6 +160,9 @@ pub struct SearchService {
     favorites: Vec<crate::assets::Favorite>,
     /// 「重新加载」命令置位，worker 下一请求立即重建应用索引。
     apps_dirty: Arc<AtomicBool>,
+    /// 浏览器书签索引开关（设置页即时生效）：worker 每轮维护读取，
+    /// 关闭时清空索引并且不再把书签并入结果。
+    bookmarks_enabled: Arc<AtomicBool>,
     /// 自研索引状态(设置页/状态行用);worker 线程随时刷新。
     pub index_status: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
     /// 「参与索引的卷」掩码(lstr_index::volmask 位掩码,bit i='A'+i),
@@ -181,6 +189,8 @@ impl SearchService {
         let worker_config = config.clone();
         let apps_dirty = Arc::new(AtomicBool::new(false));
         let worker_apps_dirty = Arc::clone(&apps_dirty);
+        let bookmarks_enabled = Arc::new(AtomicBool::new(config.index.bookmarks));
+        let worker_bookmarks_enabled = Arc::clone(&bookmarks_enabled);
         let status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>> = Arc::new(Mutex::new(None));
         let worker_status = Arc::clone(&status_slot);
         // 卷选择:启动时从配置取快照(空列表 = 全部盘),之后设置页改掩码即可
@@ -214,6 +224,7 @@ impl SearchService {
                     config: worker_config,
                     ctx,
                     apps_dirty: worker_apps_dirty,
+                    bookmarks_enabled: worker_bookmarks_enabled,
                     status_slot: worker_status,
                     index_cmd_rx,
                     index_cmd_tx: worker_index_cmd_tx,
@@ -239,6 +250,7 @@ impl SearchService {
             keywords: config.keywords,
             favorites: config.favorites,
             apps_dirty,
+            bookmarks_enabled,
             index_status: status_slot,
             volume_mask,
             index_cmd: index_cmd_tx,
@@ -474,6 +486,11 @@ impl SearchService {
     /// 应用索引立刻重建：新装/卸载应用后不想等 TTL 就执行「重新加载」命令。
     pub fn invalidate_apps(&self) {
         self.apps_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// 设置页「浏览器书签」开关：worker 下一轮维护立即清空/重建（不等 TTL）。
+    pub fn set_bookmarks_enabled(&self, on: bool) {
+        self.bookmarks_enabled.store(on, Ordering::Relaxed);
     }
 
     pub fn poll(&self) -> Option<Response> {
@@ -822,6 +839,36 @@ mod pin_tests {
             out.iter().any(|e| e.full_path().starts_with(r"D:\")),
             "D 盘命中必须在结果里"
         );
+    }
+
+    #[test]
+    fn bookmark_urls_are_not_dropped_by_path_exclude_rules() {
+        // 排除规则按文件系统路径分段匹配；书签的 path 是 URL，
+        // `https://example.com/cache/x` 不应因为段名 cache 被当文件排除。
+        let history = Arc::new(Mutex::new(History::in_memory()));
+        let mut bookmark = entry_at(
+            "bm:https://example.com/cache/x",
+            "Cache 使用说明",
+            Kind::Bookmark,
+            "https://example.com/cache/x",
+        );
+        bookmark.pinyin = Some("cache shiyongshuoming".to_string());
+        let file = entry_at("file:cache", "cache.txt", Kind::File, r"D:\work\cache\cache.txt");
+        let mut config = Config::default();
+        config.rank.noise_rules.push(crate::config::NoiseRule {
+            pattern: "cache".to_string(),
+            penalty: 100,
+            exclude: true,
+        });
+        let out = finalize_entries(
+            vec![bookmark, file],
+            &request("cache", 8),
+            &history,
+            &config,
+            Vec::new(),
+        );
+        assert_eq!(out.len(), 1, "文件应被排除、书签必须保留: {out:?}");
+        assert_eq!(out[0].kind, Kind::Bookmark);
     }
 
     /// 基准:finalize 约 480 个候选的分项成本。release 下运行:
@@ -1247,6 +1294,9 @@ fn finalize_entries_with_pending(
     let exclude = noise.rules();
     if !exclude.is_empty() {
         entries.retain(|e| match &e.path {
+            // 书签/命令的 path 是 URL/URI，不是文件系统路径：`/cache/`、
+            // `-target/` 这类噪声片段会误伤 `https://…/cache/…`。
+            Some(_) if matches!(e.kind, Kind::Bookmark | Kind::Command) => true,
             Some(p) => !exclude
                 .path_excluded(&p.to_string_lossy().to_lowercase().replace('\\', "/")),
             None => true,
@@ -1470,6 +1520,7 @@ struct WorkerArgs {
     config: Config,
     ctx: egui::Context,
     apps_dirty: Arc<AtomicBool>,
+    bookmarks_enabled: Arc<AtomicBool>,
     status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
     index_cmd_rx: Receiver<ClientCommand>,
     /// 控制指令发送端(run_worker 的排除规则变更检测用它发 Rescan 掩码)。
@@ -1607,6 +1658,7 @@ fn run_worker(args: WorkerArgs) {
         config,
         ctx,
         apps_dirty,
+        bookmarks_enabled,
         status_slot,
         index_cmd_rx,
         index_cmd_tx,
@@ -1665,6 +1717,21 @@ fn run_worker(args: WorkerArgs) {
     publish_status(builtin.as_ref(), &status_slot);
     let mut apps = apps::AppIndex::load();
     let mut apps_loaded = Instant::now();
+    // 浏览器书签：启动即加载（本机 500 条量级，JSON 解析毫秒级）。
+    // 关闭时保持空索引，搜索路径也不会再查询它。
+    let mut bookmarks = if bookmarks_enabled.load(Ordering::Relaxed) {
+        bookmarks::BookmarkIndex::load()
+    } else {
+        bookmarks::BookmarkIndex::empty()
+    };
+    let mut bookmarks_loaded = Instant::now();
+    let mut bookmarks_stamp = bookmarks::source_stamp();
+    if bookmarks_enabled.load(Ordering::Relaxed) {
+        lstr_index::snapshot::debug_log(&format!(
+            "bookmarks: loaded {} entries",
+            bookmarks.count()
+        ));
+    }
     let mut dir_cache = browse::DirCache::new();
     let (uwp_tx, uwp_rx) = mpsc::channel::<Vec<Entry>>();
     // UWP 枚举要走 PowerShell（Get-StartApps，冷启动 ~2s）。
@@ -1857,12 +1924,33 @@ fn run_worker(args: WorkerArgs) {
         }
         // 应用索引时效：TTL 到点或「重新加载」信号到了就重建。
         // 重载后 UWP 懒加载标志复位，下次需要应用结果时重新枚举。
-        if apps_dirty.swap(false, Ordering::Relaxed)
-            || apps_loaded.elapsed() > APPS_RELOAD_INTERVAL
-        {
+        let forced = apps_dirty.swap(false, Ordering::Relaxed);
+        if forced || apps_loaded.elapsed() > APPS_RELOAD_INTERVAL {
             apps = apps::AppIndex::load();
             uwp_started = false;
             apps_loaded = Instant::now();
+        }
+        // 书签索引：「重新加载」立即重建；平时按 TTL + 源文件 mtime 判断，
+        // 浏览器没改书签就不重复解析。
+        if forced || bookmarks_loaded.elapsed() > BOOKMARKS_RELOAD_INTERVAL {
+            let enabled = bookmarks_enabled.load(Ordering::Relaxed);
+            let stamp = bookmarks::source_stamp();
+            if !enabled {
+                // 开关刚被关掉（或配置里就是关的）：清空，结果里不再出现书签。
+                bookmarks = bookmarks::BookmarkIndex::empty();
+                bookmarks_stamp.clear();
+                bookmarks_loaded = Instant::now();
+            } else if forced || stamp != bookmarks_stamp {
+                bookmarks = bookmarks::BookmarkIndex::load();
+                bookmarks_stamp = stamp;
+                bookmarks_loaded = Instant::now();
+                lstr_index::snapshot::debug_log(&format!(
+                    "bookmarks: reloaded {} entries",
+                    bookmarks.count()
+                ));
+            } else {
+                bookmarks_loaded = Instant::now();
+            }
         }
         while let Ok(next) = rx.try_recv() {
             // 只保留最新请求(取消语义),每个出队的都要回退等待计数
@@ -2039,6 +2127,7 @@ fn run_worker(args: WorkerArgs) {
         // finalize 合并打分排序。>15ms 的慢查询落 engine.log。
         let mut diag_split = 0f32;
         let mut diag_apps = 0f32;
+        let mut diag_bookmarks = 0f32;
         let mut diag_exact = 0f32;
         // 自定义关键字行（g rust → 用 Google 搜索）：之后钉在结果顶部，不参与打分。
         let mut keyword_rows: Vec<Entry> = Vec::new();
@@ -2199,6 +2288,24 @@ fn run_worker(args: WorkerArgs) {
                         let mut command_hits = commands(&request.query.text, &config.commands);
                         total += command_hits.len();
                         entries.append(&mut command_hits);
+                        // 浏览器书签：与「应用」同语义（筛选/路径上下文时不混入）。
+                        if bookmarks_enabled.load(Ordering::Relaxed) {
+                            let t_bookmarks = Instant::now();
+                            let mut bookmark_hits =
+                                bookmarks.search(&request.query.text, request.limit);
+                            // 严格匹配（大小写/全词）同样约束书签：拼音/模糊/
+                            // 纯 URL 命中都要按名字复核，否则「区分大小写」失效。
+                            bookmark_hits.retain(|entry| {
+                                app_matches_options(
+                                    &entry.name,
+                                    &request.query.text,
+                                    &request.filters,
+                                )
+                            });
+                            diag_bookmarks = t_bookmarks.elapsed().as_secs_f32() * 1000.0;
+                            total += bookmark_hits.len();
+                            entries.append(&mut bookmark_hits);
+                        }
                     }
                     // M7:应用/命令命中也要计入总数,
                     // 否则会出现「显示 0 个结果但列表里有内容」。
@@ -2305,10 +2412,11 @@ fn run_worker(args: WorkerArgs) {
         let diag_total = started.elapsed().as_secs_f32() * 1000.0;
         if (diag_total > 15.0 || profile_queries()) && !request.query.text.is_empty() {
             lstr_index::snapshot::debug_log(&format!(
-                "search: stage gen={} split={:.1}ms apps={:.1}ms exact={:.1}ms finalize={:.1}ms meta={:.1}ms total={:.1}ms text={:?}",
+                "search: stage gen={} split={:.1}ms apps={:.1}ms bm={:.1}ms exact={:.1}ms finalize={:.1}ms meta={:.1}ms total={:.1}ms text={:?}",
                 request.generation,
                 diag_split,
                 diag_apps,
+                diag_bookmarks,
                 diag_exact,
                 diag_finalize,
                 diag_meta,
@@ -2417,6 +2525,9 @@ pub fn stale_history_entry(entry: &Entry, apps: &[Entry]) -> bool {
         Kind::App => {
             !entry.id.starts_with("uwp:") && !apps.iter().any(|app| app.id == entry.id)
         }
+        // 书签是 URL：浏览器的收藏夹文件可能暂时读不到（未安装/被占用），
+        // 此时把历史条目杀掉反而像是丢了；URL 本身永远可尝试打开。
+        Kind::Bookmark => false,
         Kind::Command => false,
     }
 }
@@ -2587,6 +2698,26 @@ mod tests {
 
         index.scan_mode = "usn".to_string();
         assert!(!builtin_index_has_mtime(&index), "纯 USN 首扫无 mtime");
+    }
+
+    /// 书签进「全部」范围、不进应用页；历史里的书签不因浏览器文件暂时
+    /// 读不到而被杀掉（URL 本身仍可打开）。
+    #[test]
+    fn bookmark_kind_scope_and_history_semantics() {
+        let bookmark = Entry {
+            id: "bm:https://github.com/".to_string(),
+            kind: Kind::Bookmark,
+            name: "GitHub".to_string(),
+            path: Some(PathBuf::from("https://github.com/")),
+            size: None,
+            modified: None,
+            pinyin: Some("github".to_string()),
+            initial: "G".to_string(),
+            tone: 0xE0A040,
+        };
+        assert!(scope_matches(Scope::All, &bookmark), "书签应出现在「全部」");
+        assert!(!scope_matches(Scope::App, &bookmark), "书签不属于应用页");
+        assert!(!stale_history_entry(&bookmark, &[]), "书签历史不按磁盘存在性判断");
     }
 
     /// 测试隔离:测试进程不会拉起提权 worker(cfg(test) 下 spawn_client_thread

@@ -15,6 +15,9 @@ const FOLDER_TIE_BONUS: i32 = 5;
 // 命令的别名精确命中（如「设置」）要压过最近用过的同名应用，但不能
 // 让「打开设置」这类命令在搜索 settings 时盖过应用本身。
 const COMMAND_BOOST: i32 = 300;
+// 浏览器书签同分时略微抬升：搜 github 时用户多半想开网页，而不是打开
+// 某个恰好叫 github 的文件/目录（只在同一匹配档位内起作用，不跨档）。
+const BOOKMARK_BOOST: i32 = 100;
 // 精确同名时按路径深浅再排一次：E:\use 应压过
 // C:\...\perl5\core_perl\Test\use 这种深埋的同名目录（home 加权会反过来）。
 const EXACT_SHALLOW_DEPTH: i32 = 12;
@@ -145,6 +148,7 @@ pub fn score_entry_planned(
     let launch_points = match entry.kind {
         Kind::App | Kind::Program => app_boost.max(0) * APP_BOOST_UNIT,
         Kind::Command => COMMAND_BOOST,
+        Kind::Bookmark => BOOKMARK_BOOST,
         _ => 0,
     };
     let folder_points = if entry.kind == Kind::Folder {
@@ -170,7 +174,7 @@ pub fn score_entry_planned(
         0
     };
     // 拉丁字母查询命中中文应用/程序拼音时，启动目标应排到普通文件前面。
-    let pinyin_app_points = if matches!(entry.kind, Kind::App | Kind::Program)
+    let pinyin_app_points = if matches!(entry.kind, Kind::App | Kind::Program | Kind::Bookmark)
         && !name_lc.contains(needle)
     {
         let mut hit = false;
@@ -301,6 +305,11 @@ fn noise_penalty_prepared(
     cfg: &RankConfig,
     rules: &[(String, i32)],
 ) -> i32 {
+    // 书签的「路径」是 URL：噪声规则（/cache/、/target/…）按文件路径设计，
+    // 拿来罚 `https://…/cache/…` 只会让正常网页莫名沉底。
+    if kind == Kind::Bookmark {
+        return 0;
+    }
     let mut worst = 0;
     for (pattern, penalty) in rules {
         if !normalized_path.contains(pattern) {
@@ -455,9 +464,12 @@ fn match_tier(
         return cfg.pinyin_substring;
     }
 
-    // 子序列模糊只作用于本地索引能新产出结果的类别（应用/命令/程序）；
+    // 子序列模糊只作用于本地索引能新产出结果的类别（应用/命令/书签/程序）；
     // 文件类由引擎按子串过滤，模糊档加不出新结果只会带来噪声。
-    if matches!(entry.kind, Kind::App | Kind::Command | Kind::Program) {
+    if matches!(
+        entry.kind,
+        Kind::App | Kind::Command | Kind::Program | Kind::Bookmark
+    ) {
         let mut best = crate::search::fuzzy::score_dense(&entry.name, needle);
         if best.is_none() {
             if let Some(pinyin) = &entry.pinyin {
@@ -489,6 +501,7 @@ fn kind_preference(kind: Kind) -> i32 {
         Kind::Folder => 10,
         Kind::Program => 8,
         Kind::File => 5,
+        Kind::Bookmark => 12,
         Kind::Command => 0,
     }
 }

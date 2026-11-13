@@ -264,7 +264,7 @@ fn is_excluded(name: &str) -> bool {
         .any(|keyword| lower.contains(keyword))
 }
 
-fn initial_for(name: &str) -> String {
+pub(crate) fn initial_for(name: &str) -> String {
     let mut words = name.split_whitespace().filter(|word| !word.is_empty());
     let Some(first_word) = words.next() else {
         return "?".to_string();
@@ -293,7 +293,7 @@ fn initial_for(name: &str) -> String {
     initial
 }
 
-fn tone_for(name: &str) -> u32 {
+pub(crate) fn tone_for(name: &str) -> u32 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in name.to_lowercase().bytes() {
         hash ^= u64::from(byte);
