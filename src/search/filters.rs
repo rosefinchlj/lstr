@@ -69,6 +69,10 @@ pub struct SearchFilters {
     /// 输入框里提交的盘符条件（`C:` / `-C:`，可多个）。
     /// 与筛选条 `location` 独立：两者同时存在时在引擎层求交集。
     pub drives: Vec<DriveFilter>,
+    /// 输入框里提交的路径条件（`path:D:\work`），引擎里递归搜子树。
+    /// 与筛选条 `location` 是同一语义的两个入口：提交时后写覆盖（UI 侧
+    /// 清另一方），避免出现「位置显示桌面、实际搜的是 D:\work」这种错觉。
+    pub path: Option<PathBuf>,
     /// 文件名匹配选项。`is_empty` 刻意忽略它：开启匹配选项不应让
     /// 应用/命令/关键字结果被当成“有筛选”而消失。
     pub matches: MatchOptions,
@@ -82,11 +86,15 @@ impl SearchFilters {
             && self.modified.is_none()
             && self.size.is_none()
             && self.drives.is_empty()
+            && self.path.is_none()
     }
 
-    /// 输入框里是否有条件 chip（日期 / 大小 / 盘符）。
+    /// 输入框里是否有条件 chip（日期 / 大小 / 路径 / 盘符）。
     pub fn has_input_conditions(&self) -> bool {
-        self.modified.is_some() || self.size.is_some() || !self.drives.is_empty()
+        self.modified.is_some()
+            || self.size.is_some()
+            || self.path.is_some()
+            || !self.drives.is_empty()
     }
 
     /// 盘符 chip 的卷掩码：None=不限制；Some(0)=所有卷都排除（结果为空）。
@@ -584,6 +592,15 @@ mod tests {
             ..Default::default()
         });
         assert!(!filters.is_empty());
+    }
+
+    #[test]
+    fn path_condition_makes_filters_non_empty() {
+        let mut filters = SearchFilters::default();
+        assert!(!filters.has_input_conditions());
+        filters.path = Some(PathBuf::from(r"D:\work"));
+        assert!(!filters.is_empty());
+        assert!(filters.has_input_conditions());
     }
 
     #[test]

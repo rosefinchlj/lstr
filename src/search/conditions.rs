@@ -9,6 +9,9 @@
 //!   `size>10M:` / `size >= 1.5GB:` / `size<10KB:` / `size 10M..100M:`
 //! - compact（要求后面有空白，空格后提交）：
 //!   `date:>2026-11-10 ` / `dm:2026-11-01..2026-11-30 ` / `size:>10M `
+//! - 路径（收成路径 chip，走索引递归搜子树）：
+//!   `path:D:\work ` / `path:D:\work:`（空格或冒号提交）、
+//!   `path:"C:\Program Files"`（带空格用引号，右引号即提交）。
 //! - 字段别名：date / dm / mtime / 日期 / 时间 / 修改时间；
 //!   size / 大小 / 文件大小。
 //! - 日期格式：`YYYY-MM-DD`（也接受 `/`、`.` 分隔）；大小单位
@@ -18,6 +21,8 @@
 //! 解析成功才从输入里删掉片段；失败保留原文并返回错误文案，避免
 //! 「打错一个字条件就消失」。`is_composing` 给 UI 判断「正在输入半截
 //! 条件」，用于暂停查询（避免每敲一个字就搜一遍 `date >`）。
+
+use std::path::PathBuf;
 
 use crate::search::filters::{DateRange, DriveFilter, SizeRange};
 
@@ -30,6 +35,8 @@ pub struct Extract {
     pub sizes: Vec<SizeRange>,
     /// 成功解析的盘符条件（按出现顺序，`C:` / `-C:`）。
     pub drives: Vec<DriveFilter>,
+    /// 成功解析的路径条件（按出现顺序；只有最后一个生效）。
+    pub paths: Vec<PathBuf>,
     /// 删除条件片段、折叠空白后的输入。
     pub cleaned: String,
     /// 面向用户的错误（只保留第一条给 UI）。
@@ -38,14 +45,18 @@ pub struct Extract {
 
 impl Extract {
     pub fn is_empty(&self) -> bool {
-        self.dates.is_empty() && self.sizes.is_empty() && self.drives.is_empty()
+        self.dates.is_empty()
+            && self.sizes.is_empty()
+            && self.drives.is_empty()
+            && self.paths.is_empty()
     }
 }
 
-/// 单条已解析的条件（日期/大小两类共用一次扫描）。
+/// 单条已解析的条件（日期/大小/路径共用一次扫描）。
 enum ParsedCondition {
     Date(DateRange),
     Size(SizeRange),
+    Path(PathBuf),
 }
 
 /// 扫描整个输入，提取所有完整的日期/大小/盘符条件。
@@ -54,6 +65,7 @@ pub fn extract(raw: &str) -> Extract {
     let mut dates = Vec::new();
     let mut sizes = Vec::new();
     let mut drives = Vec::new();
+    let mut paths = Vec::new();
     let mut errors = Vec::new();
     let mut i = 0usize;
     while i < raw.len() {
@@ -78,6 +90,7 @@ pub fn extract(raw: &str) -> Extract {
                         range.sources.push(source);
                         sizes.push(range);
                     }
+                    ParsedCondition::Path(path) => paths.push(path),
                 }
                 i = end;
             }
@@ -96,6 +109,7 @@ pub fn extract(raw: &str) -> Extract {
         dates,
         sizes,
         drives,
+        paths,
         cleaned: remove_spans(raw, &spans),
         errors,
     }
@@ -180,18 +194,20 @@ fn is_boundary(raw: &str, pos: usize) -> bool {
 enum FieldKind {
     Date,
     Size,
+    Path,
 }
 
 /// 字段名长度 + 是否 compact（字段后紧跟冒号）+ 条件类型。
 fn field_at(raw: &str, pos: usize) -> Option<(usize, bool, FieldKind)> {
     // 长的在前，避免「修改时间」被「时间」抢先匹配。
-    const FIELDS: [(&str, FieldKind); 9] = [
+    const FIELDS: [(&str, FieldKind); 10] = [
         ("修改时间", FieldKind::Date),
         ("文件大小", FieldKind::Size),
         ("日期", FieldKind::Date),
         ("时间", FieldKind::Date),
         ("大小", FieldKind::Size),
         ("mtime", FieldKind::Date),
+        ("path", FieldKind::Path),
         ("date", FieldKind::Date),
         ("size", FieldKind::Size),
         ("dm", FieldKind::Date),
@@ -231,10 +247,6 @@ pub fn is_composing(raw: &str) -> bool {
     if !extract(raw).errors.is_empty() {
         return false;
     }
-    // `path:` 空值：正在输入路径前缀，不是一整条查询。
-    if trailing_bare_path(raw) {
-        return true;
-    }
     let Some((pos, field_len, compact, kind)) = last_field(raw) else {
         return false;
     };
@@ -261,19 +273,6 @@ pub fn is_composing(raw: &str) -> bool {
     is_date_value_input(after)
 }
 
-/// 输入末尾只剩一个 `path:`（还没跟路径值）。
-///
-/// `path:` 是路径前缀过滤，空值等于「没有过滤」：查询会退化成空查询，由
-/// 引擎按**卷的内部加载顺序**列条目——实测只出 F 盘前 10 条（F 恰好排在
-/// `Engine::volumes` 最前）。这不是用户想要的「列出所有盘」，而且同一个
-/// 输入在不同启动顺序下结果会变，属于不确定行为，所以按「正在输入条件」
-/// 暂停查询，等路径值补上。
-pub fn trailing_bare_path(raw: &str) -> bool {
-    raw.split_whitespace()
-        .last()
-        .is_some_and(|token| token.eq_ignore_ascii_case("path:"))
-}
-
 /// 输入里最后一个字段起点（条件通常打在末尾，也比全局扫描便宜）。
 fn last_field(raw: &str) -> Option<(usize, usize, bool, FieldKind)> {
     let mut found = None;
@@ -297,9 +296,12 @@ pub struct Suggestion {
     pub description: &'static str,
 }
 
-const SUGGEST_KEYWORDS: [(&str, &str); 2] = [
-    ("size", "文件大小，如 size>10M:"),
-    ("date", "修改时间，如 date>2026-11-10:"),
+/// (关键字, 描述, 回车后填入的文本)：后两项决定「按 Enter 进入编辑」的形态。
+/// `path` 填 `path:`（不带比较符），与路径语法一致。
+const SUGGEST_KEYWORDS: [(&str, &str, &str); 3] = [
+    ("size", "文件大小，如 size>10M:", "size>"),
+    ("date", "修改时间，如 date>2026-11-10:", "date>"),
+    ("path", "限定到某目录，如 path:D:\\work", "path:"),
 ];
 
 /// 输入是条件关键字的严格前缀时返回候选。只在整串是纯字母、无空白时匹配，
@@ -315,11 +317,11 @@ pub fn suggestions(raw: &str) -> Vec<Suggestion> {
     }
     let lower = trimmed.to_ascii_lowercase();
     let mut out = Vec::new();
-    for (keyword, description) in SUGGEST_KEYWORDS {
+    for (keyword, description, fill) in SUGGEST_KEYWORDS {
         if lower.len() < keyword.len() && keyword.starts_with(&lower) {
             out.push(Suggestion {
                 keyword,
-                fill: format!("{keyword}>"),
+                fill: fill.to_string(),
                 description,
             });
         }
@@ -377,14 +379,14 @@ pub fn date_range_text(range: &DateRange) -> Option<String> {
 
 /// 输入条件时的字段感知提示（空态面板第二行）。
 pub fn composing_hint(raw: &str) -> &'static str {
-    if trailing_bare_path(raw) {
-        return "冒号后跟路径前缀，例如 path:D:\\work；只打 path: 不搜索";
-    }
     match last_field(raw) {
         Some((_, _, _, FieldKind::Date)) => {
             "冒号或回车提交；日期可用 今天/本周/今年/近N天 或 2025"
         }
         Some((_, _, _, FieldKind::Size)) => "冒号或回车提交；单位 B/KB/MB/GB/TB，如 10M、1.5GB",
+        Some((_, _, _, FieldKind::Path)) => {
+            "空格或回车提交；路径可写成 path:D:\\work，带空格用 path:\"C:\\Program Files\""
+        }
         None => "冒号或回车提交，例如 date>2026-11-10: / size>10M: / C:",
     }
 }
@@ -443,7 +445,93 @@ fn parse_from(
             .map(|(end, range)| (end, ParsedCondition::Date(range))),
         FieldKind::Size => parse_size_from(raw, start, field_len, compact)
             .map(|(end, range)| (end, ParsedCondition::Size(range))),
+        FieldKind::Path => {
+            parse_path_from(raw, start, field_len, compact).map(|(end, path)| (end, ParsedCondition::Path(path)))
+        }
     }
+}
+
+/// 解析一条路径条件：`path:D:\work` / `path:D:\work:` / `path:"C:\Program Files"`。
+///
+/// 提交规则（与日期/大小的“打到一半不收”一致）：
+/// - 裸路径：后面必须跟空白或终结冒号才提交，行尾不提交（用户可能还在补字）；
+/// - 引号路径：右引号本身就是终结符（可再跟空白/冒号），行尾直接提交。
+///
+/// 空值/未闭合引号返回 `Err(None)`（= 仍在输入，配合 `is_composing` 暂停查询）；
+/// 非空但不是本地路径/UNC 的值返回 `Err(Some(..))`，在结果区给错误提示。
+fn parse_path_from(
+    raw: &str,
+    start: usize,
+    field_len: usize,
+    compact: bool,
+) -> Result<(usize, PathBuf), Option<String>> {
+    // 只支持 `path:` 形式；`path D:\work` 里的 path 仍是普通搜索词。
+    if !compact {
+        return Err(None);
+    }
+    let mut i = start + field_len;
+    let Some(colon) = colon_len(raw, i) else {
+        return Err(None);
+    };
+    i += colon;
+
+    let (value, mut end, mut terminated) = if let Some(rest) = raw[i..].strip_prefix('"') {
+        let Some(close) = rest.find('"') else {
+            // 引号还没闭合：继续输入。
+            return Err(None);
+        };
+        // 右引号本身就是终结符，行尾也直接提交。
+        (rest[..close].to_string(), i + 1 + close + 1, true)
+    } else {
+        // 裸值：到空白为止（冒号不能截断——盘符 `D:` 里也有冒号）。
+        let stop = raw[i..]
+            .find(char::is_whitespace)
+            .map(|offset| i + offset)
+            .unwrap_or(raw.len());
+        if stop == i {
+            // `path:` 后直接是空白/行尾：还没给值。
+            return Err(None);
+        }
+        let token = &raw[i..stop];
+        // 行尾的终结冒号：`path:D:\work:`；`path:C:` 的冒号是盘符本身，不剥。
+        match token.strip_suffix([':', '：']) {
+            Some(stripped) if stripped.len() >= 2 => (stripped.to_string(), stop, true),
+            _ => (token.to_string(), stop, false),
+        }
+    };
+
+    // 还没终结：后面必须是空白或终结冒号（冒号并入片段）；行尾仍算输入中。
+    if !terminated {
+        match raw[end..].chars().next() {
+            Some(c) if c.is_whitespace() => terminated = true,
+            Some(':') | Some('：') => {
+                end += colon_len(raw, end).unwrap_or(0);
+                terminated = true;
+            }
+            _ => {}
+        }
+    } else if matches!(raw[end..].chars().next(), Some(':' | '：')) {
+        // 引号闭合/行尾冒号之后再跟一个终结冒号（回车提交会补）一并吃掉。
+        end += colon_len(raw, end).unwrap_or(0);
+    }
+    if !terminated {
+        return Err(None);
+    }
+
+    if !is_path_value(&value) {
+        return Err(Some(format!(
+            "路径无效：{value}（示例：path:D:\\work / path:\"C:\\Program Files\"）"
+        )));
+    }
+    Ok((end, PathBuf::from(value)))
+}
+
+/// 路径条件只收本地盘符路径（`D:` / `D:\...`）与 UNC（`\\server\share`）：
+/// 相对路径索引里匹配不到，提前报错比静默 0 结果好。
+fn is_path_value(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || value.starts_with("\\\\")
 }
 
 /// 解析一条日期条件。
@@ -1265,7 +1353,8 @@ fn weekday(date: (i32, u32, u32)) -> u32 {
     (days_from_civil(date.0, date.1, date.2) + 3).rem_euclid(7) as u32
 }
 
-fn colon_len(raw: &str, pos: usize) -> Option<usize> {    if raw[pos..].starts_with(':') {
+fn colon_len(raw: &str, pos: usize) -> Option<usize> {
+    if raw[pos..].starts_with(':') {
         Some(1)
     } else if raw[pos..].starts_with('：') {
         Some('：'.len_utf8())
@@ -1713,22 +1802,64 @@ mod tests {
     }
 
     #[test]
-    fn bare_path_prefix_is_composing() {
-        // 只打了 `path:`（空值）：暂停查询。以前它被当成「没有过滤」，
-        // 退化成空查询后按卷的内部顺序列出某一整块盘的条目（实测只出 F 盘）。
-        assert!(trailing_bare_path("path:"));
-        assert!(trailing_bare_path("PATH:"));
-        assert!(trailing_bare_path("C: path:   "));
-        assert!(is_composing("path:"));
-        assert!(is_composing("PATH:"));
-        assert!(is_composing("C: path:"));
-        // 有了路径值就照常查询（哪怕只是盘符根）。
-        assert!(!trailing_bare_path("path:C:"));
-        assert!(!is_composing("path:D:\\work"));
-        assert!(!is_composing("path:C:"));
+    fn path_condition_parses_with_terminator() {
+        // 空格 / 终结冒号都提交；片段从输入里删除。
+        let out = extract("path:D:\\work ");
+        assert_eq!(out.paths, vec![PathBuf::from("D:\\work")]);
+        assert_eq!(out.cleaned, "");
+        assert!(out.errors.is_empty());
+
+        let out = extract("path:D:\\work:");
+        assert_eq!(out.paths, vec![PathBuf::from("D:\\work")]);
+        assert_eq!(out.cleaned, "");
+
+        // 引号路径：右引号即终结符，允许空格。
+        let out = extract("path:\"C:\\Program Files\"");
+        assert_eq!(out.paths, vec![PathBuf::from("C:\\Program Files")]);
+        assert_eq!(out.cleaned, "");
+
+        // 引号后再跟冒号（回车提交会补）也认。
+        let out = extract("path:\"C:\\Program Files\":");
+        assert_eq!(out.paths, vec![PathBuf::from("C:\\Program Files")]);
+
+        // 与其它查询词共存：只删自己的片段（ext: 由 query::parse 负责，不动）。
+        let out = extract("report path:D:\\work ext:rs");
+        assert_eq!(out.paths, vec![PathBuf::from("D:\\work")]);
+        assert_eq!(out.cleaned, "report ext:rs");
+
+        // 多个 path：按出现顺序全部收下，由 UI 取最后一个（后者覆盖）。
+        let out = extract("path:D:\\a path:E:\\b ");
+        assert_eq!(
+            out.paths,
+            vec![PathBuf::from("D:\\a"), PathBuf::from("E:\\b")]
+        );
+    }
+
+    #[test]
+    fn path_condition_is_composing_until_terminated() {
+        // 还在输入（无终结符）→ 暂停查询，不产生 chip。
+        for input in ["path:", "PATH:", "C: path:", "path:D:\\work", "path:\"C:\\Program"] {
+            assert!(is_composing(input), "{input:?} 应暂停查询");
+            assert!(extract(input).paths.is_empty(), "{input:?} 不应提交");
+        }
+        // 提交后不再暂停。
+        for input in ["path:D:\\work ", "path:D:\\work:", "path:\"C:\\Program Files\""] {
+            assert!(!is_composing(input), "{input:?} 不应暂停");
+        }
+        // 没给终结符时值不完整也不报错（可能还在打）。
+        let out = extract("path:work");
+        assert!(out.paths.is_empty());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(is_composing("path:work"));
+        // 明确写错（已终结但不是本地路径/UNC）→ 错误态，原文保留。
+        let out = extract("path:work ");
+        assert!(out.paths.is_empty());
+        assert!(out.errors[0].contains("路径无效"), "{:?}", out.errors);
+        assert!(!is_composing("path:work "));
+
         assert_eq!(
             composing_hint("path:"),
-            "冒号后跟路径前缀，例如 path:D:\\work；只打 path: 不搜索"
+            "空格或回车提交；路径可写成 path:D:\\work，带空格用 path:\"C:\\Program Files\""
         );
     }
 
@@ -1755,7 +1886,13 @@ mod tests {
         assert_eq!(date.len(), 1);
         assert_eq!(date[0].fill, "date>");
         assert_eq!(suggestions("da")[0].keyword, "date");
-        for input in ["size", "date", "sc", "x", "", "s d", "size>10", "大小", "s "] {
+        // `p` → path（填 `path:`，不是 `path>`）。
+        let path = suggestions("p");
+        assert_eq!(path.len(), 1);
+        assert_eq!(path[0].keyword, "path");
+        assert_eq!(path[0].fill, "path:");
+        assert_eq!(suggestions("PAT")[0].keyword, "path");
+        for input in ["size", "date", "path", "sc", "x", "", "s d", "size>10", "大小", "s "] {
             assert!(suggestions(input).is_empty(), "{input:?}");
         }
     }

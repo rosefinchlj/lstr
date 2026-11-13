@@ -409,8 +409,12 @@ fn paint_condition_chip(
 /// 条件 chip 的数据源（按键编辑/删除时用来定位 `filters` 里的数据）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConditionChipKind {
+    /// 当前类别（`self.scope`），与 Tab 是同一状态的两个视图。
+    Scope,
     Date,
     Size,
+    /// `filters.path`（`path:D:\work` 提交的目录 chip）。
+    Path,
     /// `filters.drives` 的下标。
     Drive(usize),
 }
@@ -425,8 +429,10 @@ struct ConditionChipInfo {
     tooltip: String,
     /// 还原到输入框的可编辑文本；None = 区间异常无法还原。
     edit_text: Option<String>,
-    /// 还原后需要 `condition_hold`（盘符 `C:` 会立即再次提交）。
+    /// 还原后需要 `condition_hold`（盘符 `C:` / 范围前缀 / 路径都会立即再次提交）。
     hold_after_edit: bool,
+    /// 还原时是否插到输入文本前面（范围前缀必须在前；其它 chip 追加在末尾）。
+    prepend_edit: bool,
 }
 
 /// 光标左侧最近的 chip 下标。虚拟光标优先；没有虚拟光标时，文本光标在
@@ -451,6 +457,65 @@ fn caret_after_remove(caret: Option<usize>, removed: usize, new_count: usize) ->
         }
         Some(index) => (index < new_count).then_some(index),
         None => None,
+    }
+}
+
+/// 编辑 chip 后回车要提交的文本：只差终结符的路径条件补一个冒号。
+///
+/// 用解析器本身判断（补冒号后能否多解析出一条路径条件），这样裸路径、
+/// 引号路径、以及「查询词 + 路径 chip」都能覆盖；盘符 `C:` 已带终结符、
+/// 范围 `a ` 没有路径条件，都原样返回。`path:` 这种还没给值的也不会
+/// 被补成 `path::`（补了同样解析不出来）。
+fn condition_enter_text(input: &str) -> String {
+    let trimmed = input.trim_end();
+    if trimmed.ends_with(':') || trimmed.ends_with('：') {
+        return input.to_string();
+    }
+    let probe = format!("{trimmed}:");
+    let before = crate::search::conditions::extract(trimmed).paths.len();
+    let after = crate::search::conditions::extract(&probe).paths.len();
+    if after > before {
+        probe
+    } else {
+        input.to_string()
+    }
+}
+
+/// 范围 chip 还原成文本时的前缀（`a ` / `f ` / `>`）；「全部」没有文本形式。
+fn scope_prefix_text(scope: Scope) -> &'static str {
+    match scope {
+        Scope::App => "a ",
+        Scope::File => "f ",
+        Scope::Command => ">",
+        _ => "",
+    }
+}
+
+/// 路径 chip 值的最大字符数：超长路径只留末尾（tooltip 才显示完整路径，
+/// 否则深路径会把输入行挤满）。
+const PATH_CHIP_MAX_CHARS: usize = 26;
+
+/// 路径 chip 的显示值：从末尾按字符取预算，尽量在分隔符处下刀。
+fn shorten_path_for_chip(path: &str, max_chars: usize) -> String {
+    let count = path.chars().count();
+    if count <= max_chars {
+        return path.to_string();
+    }
+    let tail: String = path.chars().skip(count - max_chars).collect();
+    let display = match tail.find(['\\', '/']) {
+        Some(pos) if pos + 1 < tail.len() => tail[pos + 1..].to_string(),
+        _ => tail,
+    };
+    format!("…\\{display}")
+}
+
+/// 路径 chip 还原成可编辑文本：带空格的路径加引号，保证重新解析一致。
+fn path_edit_text(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    if text.contains([' ', '\t']) {
+        format!("path:\"{text}\"")
+    } else {
+        format!("path:{text}")
     }
 }
 
@@ -1059,6 +1124,8 @@ struct ConditionSnapshot {
     filters: SearchFilters,
     input: String,
     chip_caret: Option<usize>,
+    /// 范围也是 chip 的一种（可删/可改），撤回时要一起还原。
+    scope: Scope,
 }
 
 /// 条件操作的 undo/redo 栈：提交/删除/编辑 chip、盘符还原路径、清空筛选
@@ -1112,12 +1179,10 @@ impl ConditionHistory {
 
     /// 用户主动取消编辑时，把刚压入的「进入编辑」快照撤掉，
     /// 避免 Ctrl+Z 又回到同一个编辑态。
-    fn forget_last(&mut self, filters: &SearchFilters, input: &str) {
-        if self
-            .undo
-            .last()
-            .is_some_and(|snapshot| &snapshot.filters == filters && snapshot.input == input)
-        {
+    fn forget_last(&mut self, filters: &SearchFilters, input: &str, scope: Scope) {
+        if self.undo.last().is_some_and(|snapshot| {
+            &snapshot.filters == filters && snapshot.input == input && snapshot.scope == scope
+        }) {
             self.undo.pop();
         }
     }
@@ -1132,8 +1197,9 @@ impl ConditionHistory {
 /// 为准；窄窗口退化为单列顺排，两列内容相加。
 fn help_panel_height(width: f32) -> f32 {
     let group = |rows: f32| HELP_GROUP_HEAD_H + rows * HELP_ROW_H + HELP_GROUP_GAP;
-    // 左列：位置 3 行 / 筛选 6 行（含日期、大小、条件编辑、撤回）/ 范围 3 行。
-    let left = group(3.0) + group(6.0) + group(3.0);
+    // 左列：位置 5 行（盘符 2 + 路径 2 + 分段）/ 筛选 6 行（日期、大小、
+    // 条件编辑、撤回…）/ 范围 3 行。行数必须与 `syntax` 表一致，否则末行被裁。
+    let left = group(5.0) + group(6.0) + group(3.0);
     let head = HELP_TOP_PAD + HELP_TITLE_H;
     if width >= 560.0 {
         head + left
@@ -1239,8 +1305,8 @@ pub struct LstrApp {
     suggest_dismissed: Option<String>,
     /// 联想候选的键盘选中项。
     suggest_index: usize,
-    /// 条件编辑前的 filters/输入快照：Esc 取消时恢复。
-    condition_edit_backup: Option<(SearchFilters, String)>,
+    /// 条件编辑前的 filters/输入/范围快照：Esc 取消时恢复。
+    condition_edit_backup: Option<(SearchFilters, String, Scope)>,
     /// 条件操作的撤销/重做栈（Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z）。
     condition_history: ConditionHistory,
     /// 日期分段输入遮罩（date 条件的年/月/日结构化编辑）。
@@ -1976,10 +2042,20 @@ impl LstrApp {
     /// 时间 → 大小 → 盘符（按加入顺序）。
     fn condition_chips(&self) -> Vec<ConditionChipInfo> {
         let theme = self.theme;
+        let scope_color = if theme.light {
+            Color32::from_rgb(86, 96, 150)
+        } else {
+            Color32::from_rgb(168, 180, 232)
+        };
         let size_color = if theme.light {
             Color32::from_rgb(46, 112, 142)
         } else {
             Color32::from_rgb(118, 188, 210)
+        };
+        let path_color = if theme.light {
+            Color32::from_rgb(108, 84, 160)
+        } else {
+            Color32::from_rgb(196, 172, 240)
         };
         let drive_color = if theme.light {
             Color32::from_rgb(46, 122, 82)
@@ -1987,6 +2063,29 @@ impl LstrApp {
             Color32::from_rgb(120, 196, 154)
         };
         let mut chips = Vec::new();
+        // 范围 chip：与 Tab 是同一状态（self.scope）的两个视图；「全部」不显示。
+        if self.scope != Scope::All {
+            chips.push(ConditionChipInfo {
+                kind: ConditionChipKind::Scope,
+                label: "范围",
+                value: self.scope.label().to_string(),
+                color: scope_color,
+                bg: Color32::from_rgba_unmultiplied(
+                    scope_color.r(),
+                    scope_color.g(),
+                    scope_color.b(),
+                    34,
+                ),
+                id: "scope".into(),
+                tooltip: format!(
+                    "当前类别：{}；双击改回文本，点 × 回到全部",
+                    self.scope.label()
+                ),
+                edit_text: Some(scope_prefix_text(self.scope).to_string()),
+                hold_after_edit: true,
+                prepend_edit: true,
+            });
+        }
         if let Some(range) = self.filters.modified.as_ref().filter(|r| !r.is_empty()) {
             // tooltip 附带换算后的绝对日期：别名条件（今天/本周/近7天）
             // 能直接看到真实区间。
@@ -2013,6 +2112,7 @@ impl LstrApp {
                             .map(|text| strip_condition_terminator(&text).to_string())
                     }),
                 hold_after_edit: false,
+                prepend_edit: false,
             });
         }
         if let Some(range) = self.filters.size.as_ref().filter(|r| !r.is_empty()) {
@@ -2030,6 +2130,28 @@ impl LstrApp {
                             .map(|text| strip_condition_terminator(&text).to_string())
                     }),
                 hold_after_edit: false,
+                prepend_edit: false,
+            });
+        }
+        // 路径 chip：输入框提交的目录条件（引擎递归搜子树）。
+        if let Some(path) = &self.filters.path {
+            let full = path.display().to_string();
+            chips.push(ConditionChipInfo {
+                kind: ConditionChipKind::Path,
+                label: "路径",
+                value: shorten_path_for_chip(&full, PATH_CHIP_MAX_CHARS),
+                color: path_color,
+                bg: Color32::from_rgba_unmultiplied(
+                    path_color.r(),
+                    path_color.g(),
+                    path_color.b(),
+                    34,
+                ),
+                id: "path".into(),
+                tooltip: format!("目录：{full}；双击编辑，点 × 移除"),
+                edit_text: Some(path_edit_text(path)),
+                hold_after_edit: true,
+                prepend_edit: false,
             });
         }
         for (index, drive) in self.filters.drives.iter().enumerate() {
@@ -2053,9 +2175,15 @@ impl LstrApp {
                 },
                 edit_text: Some(drive.source()),
                 hold_after_edit: true,
+                prepend_edit: false,
             });
         }
         chips
+    }
+
+    /// 输入框里是否有任何 chip（范围也算；← 进 chip 区、页脚提示都用它）。
+    fn has_input_chips(&self) -> bool {
+        self.scope != Scope::All || self.filters.has_input_conditions()
     }
 
     /// 当前应该弹出的条件联想候选；Esc 取消过的前缀不再弹。
@@ -2134,8 +2262,11 @@ impl LstrApp {
     fn remove_chip(&mut self, index: usize) -> bool {
         let kind = self.condition_chips().get(index).map(|chip| chip.kind);
         match kind {
+            // 移除范围 chip = 回到「全部」页。
+            Some(ConditionChipKind::Scope) => self.scope = Scope::All,
             Some(ConditionChipKind::Date) => self.filters.modified = None,
             Some(ConditionChipKind::Size) => self.filters.size = None,
+            Some(ConditionChipKind::Path) => self.filters.path = None,
             Some(ConditionChipKind::Drive(drive)) => {
                 if drive >= self.filters.drives.len() {
                     return false;
@@ -2160,7 +2291,8 @@ impl LstrApp {
             return false;
         };
         if self.condition_edit_backup.is_none() {
-            self.condition_edit_backup = Some((self.filters.clone(), self.input.clone()));
+            self.condition_edit_backup =
+                Some((self.filters.clone(), self.input.clone(), self.scope));
         }
         self.record_condition_undo();
         if !self.remove_chip(index) {
@@ -2227,6 +2359,9 @@ impl LstrApp {
         let trimmed = self.input.trim_end();
         self.input = if trimmed.is_empty() {
             text
+        } else if chip.prepend_edit {
+            // 范围前缀必须回到最前面，否则 `f ` 会被当成普通词。
+            format!("{text}{trimmed}")
         } else {
             format!("{trimmed} {text}")
         };
@@ -2242,13 +2377,14 @@ impl LstrApp {
 
     /// Esc 取消条件编辑：恢复编辑前的 chip 和输入。
     fn cancel_condition_edit(&mut self, ctx: &egui::Context) -> bool {
-        let Some((filters, input)) = self.condition_edit_backup.take() else {
+        let Some((filters, input, scope)) = self.condition_edit_backup.take() else {
             return false;
         };
         // 进入编辑时压过一条 undo 快照；用户主动取消 = 撤销这次编辑。
-        self.condition_history.forget_last(&filters, &input);
+        self.condition_history.forget_last(&filters, &input, scope);
         self.filters = filters;
         self.input = input;
+        self.scope = scope;
         self.condition_hold = false;
         self.chip_caret = None;
         self.date_mask = None;
@@ -2259,12 +2395,13 @@ impl LstrApp {
         true
     }
 
-    /// 当前条件状态的快照（filters + 输入 + 虚拟光标）。
+    /// 当前条件状态的快照（filters + 输入 + 虚拟光标 + 范围）。
     fn condition_snapshot(&self) -> ConditionSnapshot {
         ConditionSnapshot {
             filters: self.filters.clone(),
             input: self.input.clone(),
             chip_caret: self.chip_caret,
+            scope: self.scope,
         }
     }
 
@@ -2664,6 +2801,7 @@ impl LstrApp {
     fn restore_condition_snapshot(&mut self, ctx: &egui::Context, snapshot: ConditionSnapshot) {
         self.filters = snapshot.filters;
         self.input = snapshot.input;
+        self.scope = snapshot.scope;
         self.chip_caret = snapshot.chip_caret;
         self.condition_edit_backup = None;
         self.suggest_dismissed = None;
@@ -2761,6 +2899,9 @@ impl LstrApp {
     fn finish_condition_edit(&mut self, ctx: &egui::Context) -> bool {
         if self.condition_hold {
             self.condition_hold = false;
+            // 路径 chip 还原的文本没有终结符（`path:D:\work`），回车时补冒号；
+            // 盘符 `C:` 已带终结符、范围 `a ` 不需要，原样提交。
+            self.input = condition_enter_text(&self.input);
             if self.commit_conditions(ctx) {
                 self.trigger(ctx);
             } else {
@@ -2805,8 +2946,9 @@ impl LstrApp {
         true
     }
 
-    /// 扫描输入框里的日期/大小/盘符条件：成功的片段从文本删除并合并进 filters，
-    /// 非法条件保留原文、只记录错误。返回是否改动了输入。
+    /// 扫描输入框里的条件并收成 chip：范围前缀（`a `/`f `/>`）→ scope，
+    /// 日期 / 大小 / 路径 / 盘符 → filters。成功的片段从文本删除，非法条件
+    /// 保留原文、只记录错误。返回是否改动了输入。
     ///
     /// 只在 TextEdit changed 后调用；IME 组合期不调用（避免把预编辑当条件）。
     fn commit_conditions(&mut self, ctx: &egui::Context) -> bool {
@@ -2818,45 +2960,87 @@ impl LstrApp {
             self.move_caret_to_end(ctx);
             return true;
         }
-        if !self.conditions_apply(self.scope) {
+
+        // 范围前缀：只在普通搜索里收 chip；正则/浏览模式下前缀就是普通文本。
+        let scope_change = if self.filters.matches.regex || self.in_browse() {
+            None
+        } else {
+            crate::search::query::split_scope_prefix(&self.input)
+                .map(|(scope, rest)| (scope, rest.trim_start().to_string()))
+        };
+
+        // 条件提取在剥掉范围前缀之后的文本上做（`f date>…` 的 date 不能被
+        // 前缀影响）；scope 用提交后的值判断条件是否生效。
+        let text = match &scope_change {
+            Some((_, rest)) => rest.clone(),
+            None => self.input.clone(),
+        };
+        let effective_scope = scope_change
+            .as_ref()
+            .map_or(self.scope, |(scope, _)| *scope);
+        let extracted = if self.conditions_apply(effective_scope) {
+            let out = crate::search::conditions::extract(&text);
+            self.condition_error = out.errors.first().cloned();
+            (!out.is_empty()).then_some(out)
+        } else {
+            // 范围切到条件不生效的页（应用/命令/书签）时，旧错误也要清掉。
+            self.condition_error = None;
+            None
+        };
+        if scope_change.is_none() && extracted.is_none() {
             return false;
         }
-        let extracted = crate::search::conditions::extract(&self.input);
-        self.condition_error = extracted.errors.first().cloned();
-        if extracted.is_empty() {
-            return false;
-        }
+
+        // 先全部合并校验（失败不动任何状态），通过后再一次性写回。
         let mut dates = self.filters.modified.clone().unwrap_or_default();
-        for range in extracted.dates {
-            if let Err(err) = dates.merge(range) {
-                self.condition_error = Some(err);
-                return false;
-            }
-        }
         let mut sizes = self.filters.size.clone().unwrap_or_default();
-        for range in extracted.sizes {
-            if let Err(err) = sizes.merge(range) {
-                self.condition_error = Some(err);
-                return false;
-            }
-        }
         let mut drives = self.filters.drives.clone();
-        for drive in extracted.drives {
-            match drives
-                .iter()
-                .position(|existing| existing.letter == drive.letter)
-            {
-                Some(pos) => drives[pos] = drive,
-                None => drives.push(drive),
+        let mut path = self.filters.path.clone();
+        let mut location = self.filters.location.clone();
+        let mut cleaned = text;
+        if let Some(out) = &extracted {
+            for range in &out.dates {
+                if let Err(err) = dates.merge(range.clone()) {
+                    self.condition_error = Some(err);
+                    return false;
+                }
             }
+            for range in &out.sizes {
+                if let Err(err) = sizes.merge(range.clone()) {
+                    self.condition_error = Some(err);
+                    return false;
+                }
+            }
+            for drive in &out.drives {
+                match drives
+                    .iter()
+                    .position(|existing| existing.letter == drive.letter)
+                {
+                    Some(pos) => drives[pos] = drive.clone(),
+                    None => drives.push(drive.clone()),
+                }
+            }
+            // 路径只保留最后一个（同一查询里写两次 = 后者覆盖），并且与
+            // 「位置」筛选是同一语义：路径 chip 覆盖掉位置选择。
+            if let Some(last) = out.paths.last() {
+                path = Some(last.clone());
+                location = None;
+            }
+            cleaned = out.cleaned.clone();
         }
+
         // 所有合并都通过后再记录快照：撤回会恢复条件原文（chip 撤掉），
         // 重做再收成 chip。
         self.record_condition_undo();
-        self.input = extracted.cleaned;
+        if let Some((scope, _)) = scope_change {
+            self.scope = scope;
+        }
+        self.input = cleaned;
         self.filters.modified = (!dates.is_empty()).then_some(dates);
         self.filters.size = (!sizes.is_empty()).then_some(sizes);
         self.filters.drives = drives;
+        self.filters.path = path;
+        self.filters.location = location;
         self.condition_hold = false;
         self.condition_edit_backup = None;
         self.chip_caret = None;
@@ -3084,7 +3268,10 @@ impl LstrApp {
     /// 窗口定高（apply_size）与底部提示条定位（paint）必须用同一判断，
     /// 否则提示条会叠在帮助内容中间。
     fn help_tips_active(&self, query_empty: bool) -> bool {
-        query_empty
+        // 「全部」页才显示技巧面板：范围 chip 指向应用/命令页时，空查询
+        // 应该显示那些页自己的列表（apps.top / 全部命令 / 全部书签）。
+        self.scope == Scope::All
+            && query_empty
             && self.filters.is_empty()
             && self.entries.is_empty()
             && self.browse_root.is_none()
@@ -3589,7 +3776,7 @@ impl LstrApp {
 
         // 虚拟 chip 光标：文本光标在开头时 ← 进入 chip 区；→ 逐个右移，
         // 走出最后一个 chip 回到文本开头。
-        if self.filters.has_input_conditions() {
+        if self.has_input_chips() {
             let count = self.condition_chips().len();
             let left_should_handle = self.chip_caret.is_some() || self.text_at_start(ctx);
             if count > 0
@@ -3810,11 +3997,13 @@ impl LstrApp {
         }
     }
 
+    /// Tab / Shift+Tab / Alt+←→：在当前类别上步进。
+    ///
+    /// 范围现在只有一个来源（`self.scope`）：文本前缀在同一帧已被
+    /// `commit_conditions` 收成 chip，这里不再从输入里推导，也不改写文本。
     fn step_scope(&mut self, ctx: &egui::Context, delta: i32) {
-        let effective = search::query::parse(&self.input, self.scope).scope;
-        strip_prefix(&mut self.input);
-        self.scope = effective.step(delta);
-        self.trigger(ctx);
+        let next = self.scope.step(delta);
+        self.set_scope(ctx, next);
     }
 
     fn set_scope(&mut self, ctx: &egui::Context, scope: Scope) {
@@ -3830,10 +4019,20 @@ impl LstrApp {
             self.toast(ctx, "浏览模式只支持文件夹 / 程序 / 文件".to_string());
             return;
         }
-        if !self.in_browse() {
-            strip_prefix(&mut self.input);
+        if self.scope != scope {
+            // 范围也是 chip（可删/可改），切换同样进撤销栈。
+            self.record_condition_undo();
+            self.scope = scope;
         }
-        self.scope = scope;
+        // 正在编辑范围 chip 时点 Tab：退出编辑态，以点击结果为准——
+        // 还原出来的 `a `/`f `/>` 文本要收回，否则下一次击键又把点击结果顶掉。
+        if self.condition_hold {
+            self.condition_hold = false;
+            if let Some((_, rest)) = search::query::split_scope_prefix(&self.input) {
+                self.input = rest.trim_start().to_string();
+                Self::reset_input_cursor(ctx);
+            }
+        }
         self.trigger(ctx);
     }
 
@@ -4300,11 +4499,6 @@ impl LstrApp {
                         .sum::<f32>()
                         + 6.0 * chips.len().saturating_sub(1) as f32;
                     let compact = search_rect.width() - with_labels < 90.0;
-                    let suffix = if disabled {
-                        "；当前上下文不生效"
-                    } else {
-                        ""
-                    };
                     if self.chip_caret.is_some_and(|index| index >= chips.len()) {
                         self.chip_caret = None;
                     }
@@ -4326,10 +4520,28 @@ impl LstrApp {
                             chip_top,
                             label,
                             &chip.value,
-                            if disabled { theme.dim } else { chip.color },
-                            if disabled { theme.hover } else { chip.bg },
+                            // 范围 chip 是「当前就在这一页」的状态，不随条件
+                            // 失效置灰（它是别的 chip 失效的原因）。
+                            if disabled && !matches!(chip.kind, ConditionChipKind::Scope) {
+                                theme.dim
+                            } else {
+                                chip.color
+                            },
+                            if disabled && !matches!(chip.kind, ConditionChipKind::Scope) {
+                                theme.hover
+                            } else {
+                                chip.bg
+                            },
                             &chip.id,
-                            &format!("{}{suffix}", chip.tooltip),
+                            &format!(
+                                "{}{}",
+                                chip.tooltip,
+                                if disabled && !matches!(chip.kind, ConditionChipKind::Scope) {
+                                    "；当前上下文不生效"
+                                } else {
+                                    ""
+                                }
+                            ),
                             dense,
                         );
                         if clear_clicked {
@@ -4641,7 +4853,7 @@ impl LstrApp {
                     }
                 }
 
-                self.paint_tabs(ui, &painter, rect, &query);
+                self.paint_tabs(ui, &painter, rect);
                 self.paint_filters(ui, &painter, rect);
                 let crumb_h = if let Some(root) = self.browse_root.clone() {
                     self.paint_breadcrumb(ui, &painter, rect, &root);
@@ -4801,19 +5013,15 @@ impl LstrApp {
             });
     }
 
-    fn paint_tabs(
-        &mut self,
-        ui: &mut egui::Ui,
-        painter: &egui::Painter,
-        rect: Rect,
-        query: &crate::model::Query,
-    ) {
+    fn paint_tabs(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
         let theme = self.theme;
         let y = rect.top() + SEARCH_H + 6.0;
         let mut x = rect.left() + PAD;
         let mut clicked = None;
         for scope in Scope::ALL {
-            let active = query.scope == scope;
+            // 与范围 chip 共用同一状态：Tab 高亮不能再看文本解析结果，
+            // 否则「chip 显示文件、Tab 高亮全部」会同时出现。
+            let active = self.scope == scope;
             let color = if active { theme.text } else { theme.sub };
             let galley = painter.layout_no_wrap(
                 scope.label().to_string(),
@@ -5011,6 +5219,9 @@ impl LstrApp {
             } else {
                 self.browse_root = Some(path);
                 self.browse_forward.clear();
+                // 浏览模式下位置由面包屑决定：位置筛选/路径 chip 都让位。
+                self.filters.location = None;
+                self.filters.path = None;
                 self.clear_input_text();
                 self.selected = 0;
                 self.scroll_y = 0.0;
@@ -5070,7 +5281,10 @@ impl LstrApp {
                     self.exit_browse(ui.ctx());
                 } else {
                     self.browse_root = Some(path);
-                self.browse_forward.clear();
+                    self.browse_forward.clear();
+                    // 浏览模式下位置由面包屑决定：位置筛选/路径 chip 都让位。
+                    self.filters.location = None;
+                    self.filters.path = None;
                     self.clear_input_text();
                     self.selected = 0;
                     self.scroll_y = 0.0;
@@ -5855,7 +6069,15 @@ impl LstrApp {
                         self.trigger(ui.ctx());
                         return;
                     }
-                    FilterChoice::Location(value) => self.filters.location = value.clone(),
+                    FilterChoice::Location(value) => {
+                        // 位置与路径 chip 是同一语义：选位置就清掉路径 chip
+                        //（后写覆盖），避免两个位置源同时生效。
+                        if self.filters.path.is_some() {
+                            self.record_condition_undo();
+                            self.filters.path = None;
+                        }
+                        self.filters.location = value.clone();
+                    }
                     FilterChoice::Time(value) => {
                         // 预设与输入框自定义区间是「替换」而非叠加：选了预设
                         // 就清掉自定义 chip，避免用户看到两个时间条件同时生效。
@@ -5924,7 +6146,8 @@ impl LstrApp {
                         &[
                             ("c:  d:", "只搜这些盘，打 C: 即 chip"),
                             ("-c:", "排除某盘，如 ap -c:"),
-                            ("path:D:\\目录", "限定到某目录"),
+                            ("path:D:\\目录", "空格/回车收成路径 chip"),
+                            ("path:\"带 空格\"", "路径含空格时加引号"),
                             ("目录\\名字", "按路径分段精确查找"),
                         ],
                     ),
@@ -5941,7 +6164,11 @@ impl LstrApp {
                     ),
                     (
                         "范围",
-                        &[("a 微信", "搜应用"), ("f 文件", "只搜文件"), ("> 命令", "命令页")],
+                        &[
+                            ("a 微信", "搜应用，a 收成范围 chip"),
+                            ("f 文件", "只搜文件，f 收成范围 chip"),
+                            ("> 命令", "命令页，> 收成范围 chip"),
+                        ],
                     ),
                 ];
                 let misc: [(&str, &[(&str, &str)]); 2] = [
@@ -6871,7 +7098,7 @@ impl LstrApp {
             ]
         };
         // 输入框为空且已有条件 chip：提示键盘删除方式。
-        if self.input.is_empty() && self.filters.has_input_conditions() {
+        if self.input.is_empty() && self.has_input_chips() {
             hints.push(("Ctrl+Bksp", "删条件"));
         }
         let mut right = rect.right() - PAD;
@@ -7021,8 +7248,10 @@ impl LstrApp {
         }
         self.browse_root = Some(std::path::PathBuf::from(entry.full_path()));
         self.browse_forward.clear();
-        // 位置由面包屑决定；其它筛选（时间/类型/匹配）保留并继续生效。
+        // 位置由面包屑决定（位置筛选与路径 chip 都让位）；其它筛选
+        //（时间/类型/匹配）保留并继续生效。
         self.filters.location = None;
+        self.filters.path = None;
         self.clear_input_text();
         self.selected = 0;
         self.scroll_y = 0.0;
@@ -10072,18 +10301,6 @@ fn hint_for(scope: Scope) -> &'static str {
     }
 }
 
-fn strip_prefix(input: &mut String) {
-    let value = input.trim_start().to_string();
-    if let Some(rest) = value.strip_prefix('>') {
-        *input = rest.trim_start().to_string();
-        return;
-    }
-    let lower = value.to_lowercase();
-    if lower.starts_with("a ") || lower.starts_with("f ") {
-        *input = value[2..].trim_start().to_string();
-    }
-}
-
 #[cfg(test)]
 mod path_layout_tests {
     use super::*;
@@ -10364,11 +10581,61 @@ mod path_layout_tests {
         );
     }
 
+    #[test]
+    fn condition_enter_text_terminates_only_paths() {
+        // 路径 chip 还原文本没有终结符 → 回车补冒号。
+        assert_eq!(condition_enter_text(r"path:D:\work"), r"path:D:\work:");
+        // 引号路径右引号本身就是终结符，不需要再补。
+        assert_eq!(
+            condition_enter_text(r#"path:"C:\Program Files""#),
+            r#"path:"C:\Program Files""#
+        );
+        // 已有终结符 / 不需要终结符的 chip 原样提交。
+        assert_eq!(condition_enter_text("C:"), "C:");
+        assert_eq!(condition_enter_text("a "), "a ");
+        assert_eq!(condition_enter_text(">"), ">");
+        // 半截路径（只打了 `path:`）保持原样，交给 composing 继续等。
+        assert_eq!(condition_enter_text("path:"), "path:");
+        // 查询词 + 路径 chip：路径在末尾，同样补终结符。
+        assert_eq!(
+            condition_enter_text(r"report path:D:\work"),
+            r"report path:D:\work:"
+        );
+    }
+
+    #[test]
+    fn path_chip_display_and_edit_text_roundtrip() {
+        // 短路径原样显示；长路径只留末尾，前面加省略号。
+        assert_eq!(shorten_path_for_chip(r"D:\work", 26), r"D:\work");
+        let long = r"D:\a\very\deep\nested\folder\project";
+        let short = shorten_path_for_chip(long, 26);
+        assert!(short.starts_with('…'), "{short}");
+        assert!(long.ends_with(short.trim_start_matches("…\\")), "{short}");
+        assert!(short.chars().count() <= 26 + 2, "{short}");
+
+        // 编辑文本：无空格直接还原；有空格自动加引号（重新解析一致）。
+        assert_eq!(
+            path_edit_text(std::path::Path::new(r"D:\work")),
+            r"path:D:\work"
+        );
+        assert_eq!(
+            path_edit_text(std::path::Path::new(r"C:\Program Files")),
+            r#"path:"C:\Program Files""#
+        );
+
+        // 范围前缀文本（范围 chip 还原用）。
+        assert_eq!(scope_prefix_text(Scope::App), "a ");
+        assert_eq!(scope_prefix_text(Scope::File), "f ");
+        assert_eq!(scope_prefix_text(Scope::Command), ">");
+        assert_eq!(scope_prefix_text(Scope::All), "");
+    }
+
     fn condition_snap(input: &str) -> ConditionSnapshot {
         ConditionSnapshot {
             filters: SearchFilters::default(),
             input: input.to_string(),
             chip_caret: None,
+            scope: Scope::All,
         }
     }
 
@@ -10411,7 +10678,7 @@ mod path_layout_tests {
         let mut history = ConditionHistory::default();
         let before = condition_snap("a");
         history.record(before.clone());
-        history.forget_last(&before.filters, "a");
+        history.forget_last(&before.filters, "a", Scope::All);
         assert!(!history.can_undo(), "取消编辑应撤掉进入编辑的快照");
     }
 

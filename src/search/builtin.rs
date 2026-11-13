@@ -526,6 +526,16 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
         prefix: query.prefix.clone(),
         suffix: query.suffix.clone(),
     };
+    // 路径约束的优先级（三者是同一个语义，只取一个）：
+    //   1. `query.path_filter`：浏览根 / Explorer 目录上下文 / 兼容文本 `path:`
+    //   2. `filters.path`：输入框路径 chip
+    //   3. `filters.location`：筛选条「位置」
+    // chip 与位置在 UI 侧是「后写覆盖」，这里只需按序回退。
+    if spec.path_prefix.is_none() {
+        if let Some(path) = &filters.path {
+            spec.path_prefix = Some(path.display().to_string().to_lowercase());
+        }
+    }
     if let Some(location) = &filters.location {
         let p = location.path().display().to_string().to_lowercase();
         if spec.path_prefix.is_none() {
@@ -879,6 +889,7 @@ mod tests {
     use crate::history::History;
     use crate::search::query::parse;
     use lstr_index::{Op, Phase, Rec};
+    use std::path::PathBuf;
     use std::time::Instant;
 
     struct RealIndex {
@@ -1974,6 +1985,31 @@ mod tests {
         assert_eq!(spec.ext.as_deref(), Some("rs"));
         let spec = build_spec(&parse("ext:.arj", Scope::All), &filters);
         assert_eq!(spec.ext.as_deref(), Some("arj"));
+    }
+
+    #[test]
+    fn path_chip_feeds_path_prefix_with_documented_precedence() {
+        // 1) 路径 chip → QuerySpec.path_prefix（小写，与引擎 PathMatcher 对齐）。
+        let mut filters = SearchFilters {
+            path: Some(PathBuf::from(r"D:\Work")),
+            ..Default::default()
+        };
+        let spec = build_spec(&parse("", Scope::All), &filters);
+        assert_eq!(spec.path_prefix.as_deref(), Some(r"d:\work"));
+
+        // 2) 手输/浏览根的 query.path_filter 优先于 chip。
+        let spec = build_spec(&parse(r"path:E:\foo", Scope::All), &filters);
+        assert_eq!(spec.path_prefix.as_deref(), Some(r"e:\foo"));
+
+        // 3) chip 优先于筛选条「位置」。
+        filters.location = Some(crate::search::filters::LocationFilter::Drive('C'));
+        let spec = build_spec(&parse("", Scope::All), &filters);
+        assert_eq!(spec.path_prefix.as_deref(), Some(r"d:\work"));
+
+        // 4) 没有 chip 时回退到位置。
+        filters.path = None;
+        let spec = build_spec(&parse("", Scope::All), &filters);
+        assert_eq!(spec.path_prefix.as_deref(), Some(r"c:\"));
     }
 
     #[test]

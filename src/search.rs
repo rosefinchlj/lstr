@@ -2054,7 +2054,12 @@ fn run_worker(args: WorkerArgs) {
             && request.browse_root.is_none()
             && !request.filters.matches.regex
             && browse::parse(&request.query.raw).is_none();
-        if in_folder_context && request.query.path_filter.is_none() {
+        // 输入框路径 chip 同样以用户为准：它和目录上下文是同一语义，
+        // 不能让 Explorer 的当前目录把用户显式选的目录盖掉。
+        if in_folder_context
+            && request.query.path_filter.is_none()
+            && request.filters.path.is_none()
+        {
             if let Some(folder) = &request.base_folder {
                 let dir = folder.to_string_lossy().into_owned();
                 if !dir.is_empty() {

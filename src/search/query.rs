@@ -70,17 +70,30 @@ fn parse_path_components(text: &str) -> Option<PathComponents> {
     })
 }
 
+/// 识别开头的范围前缀：`>`（不需要空格）、`a ` / `f `（必须有空格）。
+///
+/// UI 也用它把前缀收成范围 chip（`commit_conditions`），保证「文本前缀」与
+/// 「chip」两处共用同一份规则，不会各写一套。
+pub fn split_scope_prefix(raw: &str) -> Option<(Scope, &str)> {
+    let trimmed = raw.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('>') {
+        return Some((Scope::Command, rest.trim_start()));
+    }
+    if let Some(rest) = strip_prefix_ci(trimmed, "a ") {
+        return Some((Scope::App, rest.trim_start()));
+    }
+    if let Some(rest) = strip_prefix_ci(trimmed, "f ") {
+        return Some((Scope::File, rest.trim_start()));
+    }
+    None
+}
+
 pub fn parse(raw: &str, scope: Scope) -> Query {
     let trimmed = raw.trim();
 
-    let (scope, text) = if let Some(rest) = trimmed.strip_prefix('>') {
-        (Scope::Command, rest.trim())
-    } else if let Some(rest) = strip_prefix_ci(trimmed, "a ") {
-        (Scope::App, rest.trim())
-    } else if let Some(rest) = strip_prefix_ci(trimmed, "f ") {
-        (Scope::File, rest.trim())
-    } else {
-        (scope, trimmed)
+    let (scope, text) = match split_scope_prefix(trimmed) {
+        Some((prefix_scope, rest)) => (prefix_scope, rest.trim()),
+        None => (scope, trimmed),
     };
 
     // 相对路径分段：最后一段是名字锚点（`DeepSeek\xxx` → text=xxx），
@@ -301,6 +314,30 @@ mod tests {
         let query = parse("apple", Scope::All);
         assert_eq!(query.scope, Scope::All);
         assert_eq!(query.text, "apple");
+    }
+
+    #[test]
+    fn split_scope_prefix_matches_parse_rules() {
+        // `>` 不要求空格；`a `/`f ` 必须有空格；只认开头。
+        assert_eq!(split_scope_prefix(">quit"), Some((Scope::Command, "quit")));
+        assert_eq!(split_scope_prefix("> quit"), Some((Scope::Command, "quit")));
+        assert_eq!(split_scope_prefix("a 微信"), Some((Scope::App, "微信")));
+        assert_eq!(split_scope_prefix("F x"), Some((Scope::File, "x")));
+        assert_eq!(split_scope_prefix("  f   x  "), Some((Scope::File, "x  ")));
+        assert_eq!(split_scope_prefix("a"), None);
+        assert_eq!(split_scope_prefix("apple"), None);
+        assert_eq!(split_scope_prefix("x a foo"), None);
+        assert_eq!(split_scope_prefix(""), None);
+        // 与 parse 的结果保持一致（同一份规则的两种用法）。
+        for raw in [">x", "a x", "F  y", "apple", "> a foo"] {
+            let (scope, text) = match split_scope_prefix(raw) {
+                Some((scope, rest)) => (scope, rest.trim()),
+                None => (Scope::All, raw.trim()),
+            };
+            let parsed = parse(raw, Scope::All);
+            assert_eq!(parsed.scope, scope, "{raw:?}");
+            assert_eq!(parsed.text, text, "{raw:?}");
+        }
     }
 
     #[test]

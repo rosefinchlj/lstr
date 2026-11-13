@@ -357,6 +357,29 @@ fn acceptance_c_ext_and_path_filters() {
     let (names, total) = result(&fx, &input);
     assert_eq!(total, 1, "C14 path + ext 组合应只剩拖尾 txt");
     assert_eq!(names[0], "LstrAcc-拖尾-2026.txt");
+
+    // C15/C16：路径 chip（filters.path）与 `path:` 文本等价——chip 也走
+    // path_prefix，目录自身不算命中；空查询 + chip 列出该目录子树。
+    let chip = SearchFilters {
+        path: Some(doc.clone()),
+        ..Default::default()
+    };
+    let (entries, total) = search(&fx, "LstrAcc", Scope::All, &chip);
+    let names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+    assert_eq!(total, 4, "C15 路径 chip 应等价 path: 前缀，实际: {names:?}");
+    assert!(
+        names.iter().all(|n| n != "LstrAcc-文档"),
+        "C15 路径 chip 不应把目录自身算作命中"
+    );
+
+    let (entries, total) = search(&fx, "", Scope::All, &chip);
+    assert_eq!(total, 4, "C16 空查询 + 路径 chip 应列出该目录下 4 个文件");
+    assert_eq!(entries.len(), 4, "C16 列表条数应与 total 一致");
+    assert!(
+        entries.iter().all(|e| e.full_path().to_lowercase().contains("lstracc-文档")),
+        "C16 结果都应位于路径 chip 目录下: {:?}",
+        entries.iter().map(|e| e.full_path()).collect::<Vec<_>>()
+    );
 }
 
 // ---------------------------------------------------------------------------
