@@ -936,6 +936,50 @@ fn parse_op(input: &str) -> Option<(Op, usize)> {
     None
 }
 
+/// 单个字符是否是比较符字符（遮罩编辑态里直接改比较符用；与
+/// `parse_op` 接受的全集一致）。
+pub fn is_op_char(c: char) -> bool {
+    matches!(c, '>' | '<' | '=' | '≥' | '≤' | '＞' | '＜' | '＝')
+}
+
+/// 遮罩内 ↑↓ 切换的比较符循环表（从「大于」到「小于」逐档放宽）。
+pub const OP_CYCLE: [&str; 5] = [">", ">=", "=", "<=", "<"];
+
+/// 比较符文本规范成循环表里的写法（`≥` / `＞=` / `==` 都归一）；
+/// 不是完整比较符返回 None。
+pub fn canonical_op(text: &str) -> Option<&'static str> {
+    let (op, len) = parse_op(text)?;
+    if len != text.len() {
+        return None;
+    }
+    Some(match op {
+        Op::Gt => ">",
+        Op::Ge => ">=",
+        Op::Eq => "=",
+        Op::Le => "<=",
+        Op::Lt => "<",
+    })
+}
+
+/// 遮罩内逐字输入比较符：已输入的串能拼成更长比较符时合并
+/// （`>` 后再打 `=` → `>=`），否则只留这一字符。返回新的比较符文本。
+pub fn extend_op_text(typing: &str, c: char) -> Option<String> {
+    let candidate = format!("{typing}{c}");
+    if let Some(op) = canonical_op(&candidate) {
+        return Some(op.to_string());
+    }
+    canonical_op(&c.to_string()).map(|op| op.to_string())
+}
+
+/// ↑↓ 循环切换比较符（step = ±1）。
+pub fn cycle_op(current: &str, step: i32) -> &'static str {
+    let index = canonical_op(current)
+        .and_then(|op| OP_CYCLE.iter().position(|text| *text == op))
+        .unwrap_or(0) as i32;
+    let len = OP_CYCLE.len() as i32;
+    OP_CYCLE[(index + step).rem_euclid(len) as usize]
+}
+
 /// 输入框大小遮罩的单位显示顺序（与 `size_unit` 的解析保持一致）。
 pub const SIZE_UNIT_LABELS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
 
@@ -1940,6 +1984,33 @@ mod tests {
         assert_eq!(second, Some(("100".to_string(), 2)));
 
         assert!(parse_size_edit_parts("date 2026-11-13").is_none());
+    }
+
+    #[test]
+    fn operator_typing_helpers_for_masks() {
+        assert!(is_op_char('>') && is_op_char('=') && is_op_char('≥') && is_op_char('＜'));
+        assert!(!is_op_char('1') && !is_op_char('M') && !is_op_char('-'));
+
+        // 全角/别名都归一成循环表写法；半截/非法不算完整比较符。
+        assert_eq!(canonical_op(">"), Some(">"));
+        assert_eq!(canonical_op("≥"), Some(">="));
+        assert_eq!(canonical_op("＞="), Some(">="));
+        assert_eq!(canonical_op("=="), Some("="));
+        assert_eq!(canonical_op(""), None);
+        assert_eq!(canonical_op(">>"), None);
+
+        // 逐字拼：`>` 后再 `=` → `>=`；拼不成更长的就用这一字符。
+        assert_eq!(extend_op_text("", '=').as_deref(), Some("="));
+        assert_eq!(extend_op_text(">", '=').as_deref(), Some(">="));
+        assert_eq!(extend_op_text("<", '=').as_deref(), Some("<="));
+        assert_eq!(extend_op_text(">", '<').as_deref(), Some("<"));
+        assert_eq!(extend_op_text(">=", '=').as_deref(), Some("="));
+
+        // ↑↓ 循环：> ↔ >= ↔ = ↔ <= ↔ <，两头回绕。
+        assert_eq!(cycle_op(">", 1), ">=");
+        assert_eq!(cycle_op(">=", -1), ">");
+        assert_eq!(cycle_op("<", 1), ">");
+        assert_eq!(cycle_op(">", -1), "<");
     }
 
     #[test]

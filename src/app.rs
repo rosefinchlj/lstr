@@ -526,8 +526,9 @@ fn strip_condition_terminator(text: &str) -> &str {
     crate::search::conditions::strip_terminator(text)
 }
 
-/// 日期分段输入遮罩（date 条件编辑态）：年/月/日三段，
+/// 日期分段输入遮罩（date 条件编辑态）：比较符 + 年/月/日三段，
 /// 未输入的段用激活时的「今天」补足并以暗色显示；Tab/←→ 跳段、
+/// ← 到比较符段（↑↓ 或直接打 `>`/`<`/`=` 改比较符）、
 /// ↑↓ 加减、数字从左覆盖、打满自动跳下一段、回车提交。
 #[derive(Clone, Debug)]
 struct DateMask {
@@ -535,8 +536,10 @@ struct DateMask {
     field: String,
     /// 操作符文本（`>` / `>=` / `=`…；空 = 裸值，默认等于）。
     op: String,
-    /// 激活时用户输入的原样前缀，回退自由文本时保留。
-    prefix_display: String,
+    /// 激活时用户输入的原样前缀里比较符之前的部分（`date ` / `date: `）。
+    head: String,
+    /// 前缀里比较符之后的原样空白（`date > ` 的那个空格）。
+    tail: String,
     /// 两个日期的段输入；第二个仅闭区间（`A..B`）使用。
     dates: [DateMaskSegs; 2],
     two: bool,
@@ -549,6 +552,10 @@ struct DateMask {
     /// 焦点：(日期下标, 段下标 0=年 1=月 2=日)。
     date_idx: usize,
     part: usize,
+    /// 焦点在比较符段（第一个值段再往左一步）。
+    op_focused: bool,
+    /// 连续输入的比较符字符（`>` + `=` → `>=`）；其它按键清零。
+    op_typing: String,
     /// 默认日期（激活时的今天）。
     default: (i32, u32, u32),
 }
@@ -576,12 +583,113 @@ fn is_condition_op_text(text: &str) -> bool {
             .all(|c| matches!(c, '>' | '<' | '=' | '≥' | '≤' | '＞' | '＜' | '＝'))
 }
 
+/// 把「字段 + 比较符」的原样前缀拆成比较符前/后两段：比较符永远贴着
+/// 前缀末尾（后面只剩空白），拆开后遮罩才能单独绘制并编辑比较符。
+fn split_op_prefix(prefix: &str, op: &str) -> (String, String) {
+    if op.is_empty() {
+        return (prefix.to_string(), String::new());
+    }
+    match prefix.trim_end().strip_suffix(op) {
+        Some(head) => (
+            head.to_string(),
+            prefix[head.len() + op.len()..].to_string(),
+        ),
+        None => (prefix.to_string(), String::new()),
+    }
+}
+
+/// 遮罩值段的统一高度（下划线/点击热区用）。
+const MASK_SEG_H: f32 = 24.0;
+
+/// 遮罩前缀绘制：字段原文 + 比较符 + 比较符后的空白。比较符是可选中的
+/// 一段（← 到达后 ↑↓ 换档，或直接打 `>`/`<`/`=`），聚焦时琥珀色下划线。
+/// 返回 (前缀结束的 x, 比较符是否被点击)。
+fn paint_condition_prefix(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    center_y: f32,
+    start_x: f32,
+    head: &str,
+    op: &str,
+    tail: &str,
+    op_focused: bool,
+    id: egui::Id,
+    font: &egui::FontId,
+    theme: Theme,
+) -> (f32, bool) {
+    let galley_w = |text: &str| {
+        if text.is_empty() {
+            return 0.0;
+        }
+        painter
+            .layout_no_wrap(text.to_string(), font.clone(), theme.text)
+            .size()
+            .x
+    };
+    let mut x = start_x;
+    if !head.is_empty() {
+        painter.text(
+            egui::pos2(x, center_y),
+            Align2::LEFT_CENTER,
+            head,
+            font.clone(),
+            theme.text,
+        );
+        x += galley_w(head);
+    }
+    let mut clicked = false;
+    if !op.is_empty() {
+        let op_w = galley_w(op);
+        painter.text(
+            egui::pos2(x, center_y),
+            Align2::LEFT_CENTER,
+            op,
+            font.clone(),
+            if op_focused { theme.amber } else { theme.text },
+        );
+        if op_focused {
+            let underline_y = center_y + MASK_SEG_H / 2.0 + 2.0;
+            painter.line_segment(
+                [
+                    egui::pos2(x - 2.0, underline_y),
+                    egui::pos2(x + op_w + 2.0, underline_y),
+                ],
+                Stroke::new(1.5_f32, theme.amber),
+            );
+        }
+        clicked = ui
+            .interact(
+                Rect::from_min_size(
+                    egui::pos2(x, center_y - MASK_SEG_H / 2.0),
+                    egui::vec2(op_w, MASK_SEG_H),
+                ),
+                id,
+                Sense::click(),
+            )
+            .clicked();
+        x += op_w;
+    }
+    if !tail.is_empty() {
+        painter.text(
+            egui::pos2(x, center_y),
+            Align2::LEFT_CENTER,
+            tail,
+            font.clone(),
+            theme.text,
+        );
+        x += galley_w(tail);
+    }
+    (x, clicked)
+}
+
 impl DateMask {
     fn new(field: String, op: String, prefix_display: String) -> Self {
+        let (head, tail) = split_op_prefix(&prefix_display, &op);
         Self {
             field,
             op,
-            prefix_display,
+            head,
+            tail,
             dates: Default::default(),
             two: false,
             year_only: [false; 2],
@@ -589,8 +697,15 @@ impl DateMask {
             replace_digit: true,
             date_idx: 0,
             part: 0,
+            op_focused: false,
+            op_typing: String::new(),
             default: crate::search::conditions::today_ymd(),
         }
+    }
+
+    /// 原始前缀（字段 + 比较符 + 比较符后的空白），比较符改动后跟着变。
+    fn prefix(&self) -> String {
+        format!("{}{}{}", self.head, self.op, self.tail)
     }
 
     /// 这一侧要渲染/跳段的段数：年份条件只有年段。
@@ -699,6 +814,8 @@ impl DateMask {
     /// 第二位非法则拒绝（保持等待）。chip 带入的旧值在焦点段第一次
     /// 输入数字时整体覆盖，不用先退格。
     fn feed_digit(&mut self, c: char) {
+        self.op_focused = false;
+        self.op_typing.clear();
         let part = self.part;
         let width = date_mask_part_width(part);
         if self.replace_digit {
@@ -741,7 +858,28 @@ impl DateMask {
         }
     }
 
+    /// 遮罩内直接打比较符（`<` / `=` / `≥`…）：不离开遮罩，就地改比较符。
+    /// 闭区间（`A..B` 没有比较符）不接受，调用方按普通查询处理。
+    fn feed_op_char(&mut self, c: char) -> bool {
+        if self.two {
+            return false;
+        }
+        match crate::search::conditions::extend_op_text(&self.op_typing, c) {
+            Some(op) => {
+                self.op = op.clone();
+                self.op_typing = op;
+                true
+            }
+            None => false,
+        }
+    }
+
     fn feed_backspace(&mut self) {
+        self.op_typing.clear();
+        if self.op_focused {
+            // 比较符段没有可删的内容：吞掉按键，不动值。
+            return;
+        }
         if !self.typed_str(self.date_idx, self.part).is_empty() {
             self.typed_mut().pop();
             return;
@@ -750,6 +888,14 @@ impl DateMask {
     }
 
     fn advance(&mut self) {
+        self.op_typing.clear();
+        if self.op_focused {
+            // 比较符 → 第一个值段。
+            self.op_focused = false;
+            self.date_idx = 0;
+            self.part = 0;
+            return;
+        }
         let last_date = if self.two { 1 } else { 0 };
         if self.part + 1 < self.part_count(self.date_idx) {
             self.part += 1;
@@ -763,6 +909,15 @@ impl DateMask {
     }
 
     fn retreat(&mut self) {
+        self.op_typing.clear();
+        if self.op_focused {
+            return;
+        }
+        // 第一个值段再往左 = 比较符段（闭区间没有比较符，跳过）。
+        if self.date_idx == 0 && self.part == 0 && !self.two && !self.op.is_empty() {
+            self.op_focused = true;
+            return;
+        }
         if self.part > 0 {
             self.part -= 1;
         } else if self.date_idx > 0 {
@@ -774,8 +929,15 @@ impl DateMask {
         self.replace_digit = self.from_chip_edit;
     }
 
-    /// ↑↓：段值 ±1（年夹紧、月回绕、日夹紧到当月天数）。
+    /// ↑↓：段值 ±1（年夹紧、月回绕、日夹紧到当月天数）；比较符段上
+    /// 则是切换比较符。
     fn spin(&mut self, delta: i32) {
+        if self.op_focused {
+            self.op = crate::search::conditions::cycle_op(&self.op, delta).to_string();
+            self.op_typing.clear();
+            return;
+        }
+        self.op_typing.clear();
         let (date_idx, part) = (self.date_idx, self.part);
         let current = self.effective_part(date_idx, part) as i32;
         let next = match part {
@@ -811,7 +973,7 @@ impl DateMask {
         } else {
             self.fmt_date(0)
         };
-        format!("{}{}", self.prefix_display, value)
+        format!("{}{}", self.prefix(), value)
     }
 
     /// 回退自由文本：只保留用户真正输入过的段（默认补尾不带入）。
@@ -839,7 +1001,7 @@ impl DateMask {
         } else {
             fmt(0)
         };
-        format!("{}{}", self.prefix_display, value)
+        format!("{}{}", self.prefix(), value)
     }
 
     /// 提交文本：未输完的段先夹紧固化，再拼规范条件（终结冒号由调用方
@@ -890,13 +1052,18 @@ fn apply_date_edit_value(
     }
 }
 
-/// 大小分段输入遮罩：数字段 + 单位段（B/KB/MB/GB/TB），交互与日期遮罩一致：
-/// Tab/←→ 跳段、↑↓ 加减（数字 ±1、单位换档）、数字从左覆盖默认值、回车提交。
+/// 大小分段输入遮罩：比较符 + 数字段 + 单位段（B/KB/MB/GB/TB），
+/// 交互与日期遮罩一致：Tab/←→ 跳段、← 到比较符段（↑↓ 或直接打
+/// `>`/`<`/`=` 改比较符）、↑↓ 加减（数字 ±1、单位换档）、数字从左覆盖
+/// 默认值、回车提交。
 #[derive(Clone, Debug)]
 struct SizeMask {
     field: String,
     op: String,
-    prefix_display: String,
+    /// 激活时用户输入的原样前缀里比较符之前的部分（`size` / `size:`）。
+    head: String,
+    /// 前缀里比较符之后的原样空白（`size > ` 的那个空格）。
+    tail: String,
     sizes: [SizeSegs; 2],
     two: bool,
     idx: usize,
@@ -908,6 +1075,10 @@ struct SizeMask {
     replace_digit: bool,
     /// 连续输入的单位字母（`G` → GB、`GB` → GB）。
     unit_typing: String,
+    /// 焦点在比较符段（第一个数字段再往左一步）。
+    op_focused: bool,
+    /// 连续输入的比较符字符（`>` + `=` → `>=`）；其它按键清零。
+    op_typing: String,
 }
 
 #[derive(Clone, Debug)]
@@ -926,10 +1097,12 @@ fn default_size_segs() -> SizeSegs {
 
 impl SizeMask {
     fn new(field: String, op: String, prefix_display: String) -> Self {
+        let (head, tail) = split_op_prefix(&prefix_display, &op);
         Self {
             field,
             op,
-            prefix_display,
+            head,
+            tail,
             sizes: [default_size_segs(), default_size_segs()],
             two: false,
             idx: 0,
@@ -937,7 +1110,14 @@ impl SizeMask {
             from_chip_edit: false,
             replace_digit: true,
             unit_typing: String::new(),
+            op_focused: false,
+            op_typing: String::new(),
         }
+    }
+
+    /// 原始前缀（字段 + 比较符 + 比较符后的空白），比较符改动后跟着变。
+    fn prefix(&self) -> String {
+        format!("{}{}{}", self.head, self.op, self.tail)
     }
 
     fn from_parts((number, unit): (String, usize)) -> SizeSegs {
@@ -973,11 +1153,13 @@ impl SizeMask {
     }
 
     fn feed_digit(&mut self, c: char) {
+        self.op_focused = false;
+        self.unit_typing.clear();
+        self.op_typing.clear();
         if self.part == 1 {
             // 焦点在单位时输入数字：自动回到数字段。
             self.part = 0;
         }
-        self.unit_typing.clear();
         if self.replace_digit {
             self.number_mut().clear();
             self.replace_digit = false;
@@ -990,9 +1172,27 @@ impl SizeMask {
         }
     }
 
+    /// 遮罩内直接打比较符（`<` / `=` / `≥`…）：不离开遮罩，就地改比较符。
+    /// 闭区间（`A..B` 没有比较符）不接受，调用方按普通查询处理。
+    fn feed_op_char(&mut self, c: char) -> bool {
+        if self.two {
+            return false;
+        }
+        match crate::search::conditions::extend_op_text(&self.op_typing, c) {
+            Some(op) => {
+                self.op = op.clone();
+                self.op_typing = op;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// 单位段输入字母：`G` → GB、`GB` → GB；不认识的字母返回 false，
     /// 由调用方转成普通查询（编辑态不接受任意字符）。
     fn feed_unit_letter(&mut self, c: char) -> bool {
+        self.op_focused = false;
+        self.op_typing.clear();
         let lower = c.to_ascii_lowercase();
         let candidate = format!("{}{}", self.unit_typing, lower);
         if let Some(unit) = crate::search::conditions::size_unit_index(&candidate) {
@@ -1012,6 +1212,11 @@ impl SizeMask {
 
     fn feed_backspace(&mut self) {
         self.unit_typing.clear();
+        self.op_typing.clear();
+        if self.op_focused {
+            // 比较符段没有可删的内容：吞掉按键，不动值。
+            return;
+        }
         if !self.number().is_empty() {
             self.number_mut().pop();
             return;
@@ -1020,6 +1225,14 @@ impl SizeMask {
     }
 
     fn advance(&mut self) {
+        self.op_typing.clear();
+        if self.op_focused {
+            // 比较符 → 数字段。
+            self.op_focused = false;
+            self.idx = 0;
+            self.part = 0;
+            return;
+        }
         let last = if self.two { 3 } else { 1 };
         let pos = self.idx * 2 + self.part;
         if pos < last {
@@ -1032,6 +1245,15 @@ impl SizeMask {
     }
 
     fn retreat(&mut self) {
+        self.op_typing.clear();
+        if self.op_focused {
+            return;
+        }
+        // 第一个数字段再往左 = 比较符段（闭区间没有比较符，跳过）。
+        if self.idx == 0 && self.part == 0 && !self.two && !self.op.is_empty() {
+            self.op_focused = true;
+            return;
+        }
         let pos = self.idx * 2 + self.part;
         if pos > 0 {
             let prev = pos - 1;
@@ -1043,8 +1265,13 @@ impl SizeMask {
     }
 
     fn spin(&mut self, delta: i32) {
-        self.replace_digit = true;
         self.unit_typing.clear();
+        self.op_typing.clear();
+        if self.op_focused {
+            self.op = crate::search::conditions::cycle_op(&self.op, delta).to_string();
+            return;
+        }
+        self.replace_digit = true;
         if self.part == 1 {
             let unit = self.sizes[self.idx].unit as i32 + delta;
             self.sizes[self.idx].unit = unit.clamp(0, 4) as usize;
@@ -1071,14 +1298,9 @@ impl SizeMask {
 
     fn mirror_text(&self) -> String {
         if self.two {
-            format!(
-                "{} {}..{}",
-                self.field,
-                self.part_text(0),
-                self.part_text(1)
-            )
+            format!("{}{}..{}", self.prefix(), self.part_text(0), self.part_text(1))
         } else {
-            format!("{}{}{}", self.field, self.op, self.part_text(0))
+            format!("{}{}", self.prefix(), self.part_text(0))
         }
     }
 
@@ -1105,8 +1327,9 @@ impl SizeMask {
         if self.two {
             format!("{} {}..{}", self.field, fmt(0), fmt(1))
         } else {
-            // 用激活时的原样前缀（`size:` / `size >= `），紧凑写法的冒号不丢。
-            format!("{}{}", self.prefix_display, fmt(0))
+            // 用激活时的原样前缀（`size:` / `size >= `），比较符改动和
+            // 紧凑写法的冒号都不丢。
+            format!("{}{}", self.prefix(), fmt(0))
         }
     }
 
@@ -2487,7 +2710,8 @@ impl LstrApp {
                 && ((mask.op.is_empty() && is_condition_op_text(text))
                     || crate::search::conditions::is_composing(&format!(
                         "{}{}",
-                        mask.prefix_display, text
+                        mask.prefix(),
+                        text
                     )))
         });
         let partial = self
@@ -2574,10 +2798,12 @@ impl LstrApp {
             return false;
         }
         // 数字/小数点进段；`:` 提交；字母当单位输入（`G`→GB、`GB`→GB）；
-        // 空格不属于条件，直接忽略；其它字符 = 用户改搜普通查询。
+        // 比较符（`>`/`<`/`=`…）就地改比较符、不离开遮罩；空格不属于条件，
+        // 直接忽略；其它字符 = 用户改搜普通查询。
         // 从 chip 进入编辑时条件整体丢弃；自动激活时保留已输入片段继续打条件。
         let mut feed: Vec<char> = Vec::new();
         let mut units: Vec<char> = Vec::new();
+        let mut ops: Vec<char> = Vec::new();
         let mut exit_text: Option<String> = None;
         let mut commit = false;
         ctx.input_mut(|i| {
@@ -2592,6 +2818,8 @@ impl LstrApp {
                     }
                     if text.chars().all(|c| c.is_ascii_digit() || c == '.') {
                         feed.extend(text.chars());
+                    } else if text.chars().all(crate::search::conditions::is_op_char) {
+                        ops.extend(text.chars());
                     } else if matches!(text.as_str(), ":" | "：") {
                         commit = true;
                     } else if text.chars().count() == 1
@@ -2616,10 +2844,21 @@ impl LstrApp {
             self.commit_size_mask(ctx);
             return true;
         }
-        let fed = !feed.is_empty() || !units.is_empty();
+        let fed = !feed.is_empty() || !units.is_empty() || !ops.is_empty();
         for c in feed {
             if let Some(mask) = self.size_mask.as_mut() {
                 mask.feed_digit(c);
+            }
+        }
+        for c in ops {
+            let accepted = self
+                .size_mask
+                .as_mut()
+                .is_some_and(|mask| mask.feed_op_char(c));
+            if !accepted {
+                // 闭区间没有比较符可改：比较符字符就是查询内容。
+                self.exit_size_mask_to_free_text(ctx, &c.to_string());
+                return true;
             }
         }
         for c in units {
@@ -2709,9 +2948,11 @@ impl LstrApp {
         }
         // 文本事件：数字进段；`-`/`/`/`.` 当分隔符（当前段已有数字才跳段，
         // 否则忽略——避免 `2026` 自动跳段后再打 `-` 把月跳过去）；
+        // 比较符（`>`/`<`/`=`…）就地改比较符、不离开遮罩；
         // `:` 提交；空格不属于条件，直接忽略；其它字符 = 改搜普通查询
         //（从 chip 进入编辑时条件整体丢弃，自动激活时保留前缀继续打别名）。
         let mut feed: Vec<char> = Vec::new();
+        let mut ops: Vec<char> = Vec::new();
         let mut exit_text: Option<String> = None;
         let mut commit = false;
         ctx.input_mut(|i| {
@@ -2729,6 +2970,8 @@ impl LstrApp {
                         .all(|c| c.is_ascii_digit() || matches!(c, '-' | '/' | '.'))
                     {
                         feed.extend(text.chars());
+                    } else if text.chars().all(crate::search::conditions::is_op_char) {
+                        ops.extend(text.chars());
                     } else if matches!(text.as_str(), ":" | "：") {
                         commit = true;
                     } else {
@@ -2761,7 +3004,19 @@ impl LstrApp {
                 }
             }
         }
-        let mut handled = !feed.is_empty();
+        let ops_fed = !ops.is_empty();
+        for c in ops {
+            let accepted = self
+                .date_mask
+                .as_mut()
+                .is_some_and(|mask| mask.feed_op_char(c));
+            if !accepted {
+                // 闭区间没有比较符可改：比较符字符就是查询内容。
+                self.exit_date_mask_to_free_text(ctx, &c.to_string());
+                return true;
+            }
+        }
+        let mut handled = !feed.is_empty() || ops_fed;
         // Backspace：删段内数字；段已空且在最后一段时不消费（留给 chip 删除）。
         let ctrl_bksp = ctx.input(|i| i.modifiers.ctrl)
             && ctx.input(|i| i.key_pressed(Key::Backspace));
@@ -3530,8 +3785,9 @@ impl LstrApp {
             self.chip_caret = None;
         }
 
-        // 日期分段遮罩：数字进段、Tab/←→ 跳段、↑↓ 加减、回车提交，
-        // 非数字字符退出遮罩转自由文本（别名仍可用）。
+        // 日期分段遮罩：数字进段、Tab/←→ 跳段、← 到比较符段（↑↓ 或直接
+        // 打比较符换档）、↑↓ 加减、回车提交；其余字符退出遮罩转自由文本
+        //（别名仍可用）。
         if self.date_mask.is_some() && self.handle_date_mask_keys(ctx) {
             return;
         }
@@ -5719,8 +5975,9 @@ impl LstrApp {
         items
     }
 
-    /// 日期分段遮罩渲染：前缀原样 + 年-月-日三段（未输入部分暗色默认值），
-    /// 焦点段下划线 + 光标，点击段切换焦点。输入框 TextEdit 在遮罩期间不渲染。
+    /// 日期分段遮罩渲染：前缀（字段 + 可编辑比较符）+ 年-月-日三段
+    /// （未输入部分暗色默认值），焦点段下划线 + 光标，点击段切换焦点。
+    /// 输入框 TextEdit 在遮罩期间不渲染。
     fn paint_date_mask(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, text_rect: Rect) {
         let Some(mask) = self.date_mask.clone() else {
             return;
@@ -5728,22 +5985,26 @@ impl LstrApp {
         let theme = self.theme;
         let font = ui::text_font(22.0);
         let center_y = text_rect.center().y;
-        let seg_h = 24.0;
+        let seg_h = MASK_SEG_H;
         let galley_w = |text: &str| {
             painter
                 .layout_no_wrap(text.to_string(), font.clone(), theme.text)
                 .size()
                 .x
         };
-        let mut x = text_rect.left();
-        painter.text(
-            egui::pos2(x, center_y),
-            Align2::LEFT_CENTER,
-            &mask.prefix_display,
-            font.clone(),
-            theme.text,
+        let (mut x, op_clicked) = paint_condition_prefix(
+            ui,
+            painter,
+            center_y,
+            text_rect.left(),
+            &mask.head,
+            &mask.op,
+            &mask.tail,
+            mask.op_focused,
+            Id::new("date-mask-op"),
+            &font,
+            theme,
         );
-        x += galley_w(&mask.prefix_display);
         let date_count = if mask.two { 2 } else { 1 };
         let mut focus_request: Option<(usize, usize)> = None;
         for date_idx in 0..date_count {
@@ -5824,17 +6085,25 @@ impl LstrApp {
                 x += width;
             }
         }
+        if op_clicked {
+            if let Some(mask) = self.date_mask.as_mut() {
+                mask.op_focused = true;
+                mask.op_typing.clear();
+            }
+        }
         if let Some((date_idx, part)) = focus_request {
             if let Some(mask) = self.date_mask.as_mut() {
                 mask.date_idx = date_idx;
                 mask.part = part;
+                mask.op_focused = false;
+                mask.op_typing.clear();
                 mask.replace_digit = true;
             }
         }
     }
 
-    /// 大小分段遮罩渲染：前缀 + 数字段 + 单位段（默认 10 MB 暗色），
-    /// 焦点段下划线 + 光标，点击段切换焦点。
+    /// 大小分段遮罩渲染：前缀（字段 + 可编辑比较符）+ 数字段 + 单位段
+    /// （默认 10 MB 暗色），焦点段下划线 + 光标，点击段切换焦点。
     fn paint_size_mask(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, text_rect: Rect) {
         let Some(mask) = self.size_mask.clone() else {
             return;
@@ -5842,22 +6111,26 @@ impl LstrApp {
         let theme = self.theme;
         let font = ui::text_font(22.0);
         let center_y = text_rect.center().y;
-        let seg_h = 24.0;
+        let seg_h = MASK_SEG_H;
         let galley_w = |text: &str| {
             painter
                 .layout_no_wrap(text.to_string(), font.clone(), theme.text)
                 .size()
                 .x
         };
-        let mut x = text_rect.left();
-        painter.text(
-            egui::pos2(x, center_y),
-            Align2::LEFT_CENTER,
-            &mask.prefix_display,
-            font.clone(),
-            theme.text,
+        let (mut x, op_clicked) = paint_condition_prefix(
+            ui,
+            painter,
+            center_y,
+            text_rect.left(),
+            &mask.head,
+            &mask.op,
+            &mask.tail,
+            mask.op_focused,
+            Id::new("size-mask-op"),
+            &font,
+            theme,
         );
-        x += galley_w(&mask.prefix_display);
         let count = if mask.two { 2 } else { 1 };
         let mut focus_request: Option<(usize, usize)> = None;
         for idx in 0..count {
@@ -5961,10 +6234,18 @@ impl LstrApp {
             }
             x += unit_w;
         }
+        if op_clicked {
+            if let Some(mask) = self.size_mask.as_mut() {
+                mask.op_focused = true;
+                mask.op_typing.clear();
+            }
+        }
         if let Some((idx, part)) = focus_request {
             if let Some(mask) = self.size_mask.as_mut() {
                 mask.idx = idx;
                 mask.part = part;
+                mask.op_focused = false;
+                mask.op_typing.clear();
                 mask.replace_digit = true;
                 mask.unit_typing.clear();
             }
@@ -7085,7 +7366,10 @@ impl LstrApp {
             Stroke::new(1.0_f32, theme.hair),
         );
 
-        let mut default_text = if !self.condition_suggestions().is_empty() {
+        let mut default_text = if self.date_mask.is_some() || self.size_mask.is_some() {
+            // 遮罩编辑态：比较符也能改（← 到比较符段，↑↓ 或直接打 > < =）。
+            "编辑条件 · 比较符可改 · 回车确认".to_string()
+        } else if !self.condition_suggestions().is_empty() {
             "条件联想 · Enter 进入编辑 · Esc 取消".to_string()
         } else if self.condition_hold {
             "编辑条件 · 回车确认 · Esc 取消".to_string()
@@ -7164,7 +7448,14 @@ impl LstrApp {
             .get(self.selected)
             .map(|entry| entry.kind == Kind::Folder)
             .unwrap_or(false);
-        let mut hints: Vec<(&str, &str)> = if self.in_browse() {
+        let mut hints: Vec<(&str, &str)> = if self.date_mask.is_some() || self.size_mask.is_some() {
+            vec![
+                ("Tab", "跳段"),
+                ("←", "比较符"),
+                ("↑↓", "调整"),
+                ("↵", "确认"),
+            ]
+        } else if self.in_browse() {
             vec![
                 ("↑↓", "选择"),
                 ("↵", "进入"),
@@ -11019,6 +11310,131 @@ mod path_layout_tests {
         auto.retreat();
         auto.feed_digit('5');
         assert_eq!(auto.number().as_str(), "105");
+    }
+
+    #[test]
+    fn mask_prefix_splits_operator_for_painting() {
+        assert_eq!(
+            split_op_prefix("size>", ">"),
+            ("size".to_string(), String::new())
+        );
+        assert_eq!(
+            split_op_prefix("size > ", ">"),
+            ("size ".to_string(), " ".to_string())
+        );
+        assert_eq!(
+            split_op_prefix("date:", ""),
+            ("date:".to_string(), String::new())
+        );
+        assert_eq!(
+            split_op_prefix("date>=", ">="),
+            ("date".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn date_mask_operator_can_be_edited() {
+        let today = date_mask_fmt(crate::search::conditions::today_ymd());
+
+        // 自动激活的 `date>`：不退出遮罩，直接打 `<` 就地改比较符。
+        let mut mask = date_mask_op(">");
+        assert!(mask.feed_op_char('<'));
+        assert_eq!(mask.op, "<");
+        assert_eq!(mask.mirror_text(), format!("date<{today}"));
+        assert_eq!(mask.commit_text(), format!("date<{today}:"));
+
+        // 连续输入比较符合并成更长的写法：`>` 再 `=` → `>=`。
+        let mut mask = date_mask_op(">");
+        assert!(mask.feed_op_char('>'));
+        assert!(mask.feed_op_char('='));
+        assert_eq!(mask.op, ">=");
+
+        // ← 从第一个值段到比较符段，↑↓ 换档，→ 回到值段。
+        let mut mask = date_mask_op(">");
+        mask.retreat();
+        assert!(mask.op_focused, "第一个值段往左 = 比较符段");
+        mask.spin(1);
+        assert_eq!(mask.op, ">=");
+        mask.spin(-1);
+        assert_eq!(mask.op, ">");
+        mask.advance();
+        assert!(!mask.op_focused);
+        assert_eq!((mask.date_idx, mask.part), (0, 0));
+
+        // 比较符段上直接输数字：焦点回到值段，比较符不动。
+        mask.retreat();
+        assert!(mask.op_focused);
+        mask.feed_digit('2');
+        assert!(!mask.op_focused);
+        assert_eq!(mask.dates[0].y, "2");
+        assert_eq!(mask.op, ">");
+
+        // 闭区间（`A..B` 没有比较符）不接受比较符输入。
+        let mut range = date_mask_op("");
+        range.two = true;
+        assert!(!range.feed_op_char('<'));
+    }
+
+    #[test]
+    fn size_mask_operator_can_be_edited() {
+        let mut mask = SizeMask::new("size".into(), ">".into(), "size>".into());
+        assert!(mask.feed_op_char('<'));
+        assert_eq!(mask.mirror_text(), "size<10MB");
+        assert_eq!(mask.commit_text(), "size<10MB:");
+
+        // 带空格的原始前缀：改比较符后格式原样保留。
+        let mut spaced = SizeMask::new("size".into(), ">".into(), "size > ".into());
+        assert!(spaced.feed_op_char('='));
+        assert_eq!(spaced.mirror_text(), "size = 10MB");
+
+        // 紧凑写法的冒号留在前缀里（以前镜像会丢成 `size10MB`）。
+        let mut compact = SizeMask::new("size".into(), String::new(), "size:".into());
+        assert!(compact.feed_op_char('>'));
+        assert_eq!(compact.mirror_text(), "size:>10MB");
+
+        // ← 进入比较符段，↑↓ 换档，→ 回到数字段。
+        let mut mask = SizeMask::new("size".into(), ">".into(), "size>".into());
+        mask.retreat();
+        assert!(mask.op_focused);
+        mask.spin(-1);
+        assert_eq!(mask.op, "<");
+        mask.advance();
+        assert!(!mask.op_focused);
+        assert_eq!((mask.idx, mask.part), (0, 0));
+
+        // 闭区间不接受比较符输入。
+        let mut range = SizeMask::new("size".into(), String::new(), "size ".into());
+        range.two = true;
+        assert!(!range.feed_op_char('<'));
+    }
+
+    #[test]
+    fn mask_commit_text_parses_after_operator_change() {
+        use crate::search::conditions::extract;
+
+        // 日期：改成 `<` 后提交文本仍是一条合法条件（只设 before）。
+        let mut date = date_mask_op(">");
+        assert!(date.feed_op_char('<'));
+        let text = date.commit_text();
+        let out = extract(&text);
+        assert_eq!(out.dates.len(), 1, "{text:?}");
+        assert!(out.dates[0].after.is_none(), "{text:?}");
+        assert!(out.dates[0].before.is_some(), "{text:?}");
+
+        // 大小：改成 `=` 后提交文本解析成等值区间。
+        let mut size = SizeMask::new("size".into(), ">".into(), "size>".into());
+        assert!(size.feed_op_char('='));
+        let text = size.commit_text();
+        let out = extract(&text);
+        assert_eq!(out.sizes.len(), 1, "{text:?}");
+        assert_eq!(out.sizes[0].after, out.sizes[0].before, "{text:?}");
+
+        // chip 编辑文本（sources 原文）也要能再进遮罩，比较符不丢。
+        let parts = crate::search::conditions::parse_size_edit_parts(
+            crate::search::conditions::strip_terminator(&text),
+        )
+        .expect("edit parts");
+        assert_eq!(parts.0, "=");
     }
 
     #[test]
