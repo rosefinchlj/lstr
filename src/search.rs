@@ -1570,7 +1570,7 @@ fn browse_response(
             Scope::Folder => entry.kind == Kind::Folder,
             Scope::Program => entry.kind == Kind::Program,
             Scope::File => entry.kind == Kind::File,
-            Scope::App | Scope::Command => false,
+            Scope::App | Scope::Bookmark | Scope::Command => false,
         })
         .filter(|entry| {
             drive_mask.is_none_or(|mask| {
@@ -2177,8 +2177,23 @@ fn run_worker(args: WorkerArgs) {
                 }
             } else if request.query.scope == Scope::Command {
                 entries = commands("", &config.commands);
+            } else if request.query.scope == Scope::Bookmark {
+                // 书签页空输入 = 按名称列出全部书签（与应用页「空输入列应用」一致）；
+                // 取 deliver 而不是 limit：几百条书签也能滚到底「加载更多」。
+                entries = if bookmarks_enabled.load(Ordering::Relaxed) {
+                    bookmarks.top(request.deliver.max(request.limit))
+                } else {
+                    Vec::new()
+                };
             }
             total = entries.len();
+            // 书签页空输入的 total 用真实总数：UI 只在 entries.len() < total
+            // 时才发「加载更多」，否则 482 条书签只能看到首屏 100 条。
+            if request.query.scope == Scope::Bookmark
+                && bookmarks_enabled.load(Ordering::Relaxed)
+            {
+                total = bookmarks.count();
+            }
         } else {
             match request.query.scope {
                 Scope::App => {
@@ -2186,6 +2201,27 @@ fn run_worker(args: WorkerArgs) {
                     entries.retain(|entry| {
                         app_matches_options(&entry.name, &request.query.text, &request.filters)
                     });
+                    total = entries.len();
+                }
+                Scope::Bookmark => {
+                    let take = request.deliver.max(request.limit);
+                    entries = if bookmarks_enabled.load(Ordering::Relaxed) {
+                        if request.query.text.is_empty() {
+                            bookmarks.top(take)
+                        } else {
+                            let mut hits = bookmarks.search(&request.query.text, take);
+                            hits.retain(|entry| {
+                                app_matches_options(
+                                    &entry.name,
+                                    &request.query.text,
+                                    &request.filters,
+                                )
+                            });
+                            hits
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     total = entries.len();
                 }
                 Scope::Command => {
@@ -2502,6 +2538,7 @@ fn scope_matches(scope: Scope, entry: &Entry) -> bool {
         Scope::Program => entry.kind == Kind::Program,
         Scope::File => entry.kind == Kind::File,
         Scope::App => entry.kind == Kind::App,
+        Scope::Bookmark => entry.kind == Kind::Bookmark,
         Scope::Command => entry.kind == Kind::Command,
     }
 }
@@ -2716,7 +2753,15 @@ mod tests {
             tone: 0xE0A040,
         };
         assert!(scope_matches(Scope::All, &bookmark), "书签应出现在「全部」");
+        assert!(
+            scope_matches(Scope::Bookmark, &bookmark),
+            "书签应属于「书签」页"
+        );
         assert!(!scope_matches(Scope::App, &bookmark), "书签不属于应用页");
+        assert!(
+            !scope_matches(Scope::Bookmark, &Entry { kind: Kind::File, ..bookmark.clone() }),
+            "文件不属于「书签」页"
+        );
         assert!(!stale_history_entry(&bookmark, &[]), "书签历史不按磁盘存在性判断");
     }
 

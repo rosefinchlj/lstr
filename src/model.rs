@@ -19,17 +19,20 @@ pub enum Scope {
     Program,
     File,
     App,
+    Bookmark,
     Command,
 }
 
 impl Scope {
     /// 标签栏显示顺序：应用放第一列；默认选中「全部」由启动时 scope 决定。
-    pub const ALL: [Scope; 6] = [
+    /// 书签与命令同为「非文件系统」来源，并排放在最后两列。
+    pub const ALL: [Scope; 7] = [
         Scope::App,
         Scope::All,
         Scope::Folder,
         Scope::Program,
         Scope::File,
+        Scope::Bookmark,
         Scope::Command,
     ];
 
@@ -40,6 +43,7 @@ impl Scope {
             Scope::Program => "程序",
             Scope::File => "文件",
             Scope::App => "应用",
+            Scope::Bookmark => "书签",
             Scope::Command => "命令",
         }
     }

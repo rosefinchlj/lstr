@@ -1881,12 +1881,12 @@ impl LstrApp {
         }
     }
 
-    /// 日期/大小条件是否在当前上下文生效：正则、PathTyping、应用/命令页不解析；
+    /// 日期/大小条件是否在当前上下文生效：正则、PathTyping、应用/命令/书签页不解析；
     /// 浏览模式生效（与时间/类型筛选一致）。
     fn conditions_apply(&self, scope: Scope) -> bool {
         !self.filters.matches.regex
             && !self.path_mode()
-            && !matches!(scope, Scope::App | Scope::Command)
+            && !matches!(scope, Scope::App | Scope::Bookmark | Scope::Command)
     }
 
     /// 输入框条件 chip 的描述列表（绘制与按键处理共用同一顺序）：
@@ -3735,13 +3735,15 @@ impl LstrApp {
     }
 
     fn set_scope(&mut self, ctx: &egui::Context, scope: Scope) {
-        // 正则是文件名语义，应用/命令页没有可执行的正则匹配。
-        if self.filters.matches.regex && matches!(scope, Scope::App | Scope::Command) {
+        // 正则是文件名语义，应用/命令/书签页没有可执行的正则匹配。
+        if self.filters.matches.regex
+            && matches!(scope, Scope::App | Scope::Bookmark | Scope::Command)
+        {
             self.toast(ctx, "正则模式只搜文件 / 文件夹 / 程序".to_string());
             return;
         }
-        // 浏览模式只列文件系统条目，应用/命令页没有意义。
-        if self.in_browse() && matches!(scope, Scope::App | Scope::Command) {
+        // 浏览模式只列文件系统条目，应用/命令/书签页没有意义。
+        if self.in_browse() && matches!(scope, Scope::App | Scope::Bookmark | Scope::Command) {
             self.toast(ctx, "浏览模式只支持文件夹 / 程序 / 文件".to_string());
             return;
         }
@@ -5754,7 +5756,10 @@ impl LstrApp {
                         let next = !self.filters.matches.get(*toggle);
                         self.filters.matches.set(*toggle, next);
                         if self.filters.matches.regex
-                            && matches!(self.scope, Scope::App | Scope::Command)
+                            && matches!(
+                                self.scope,
+                                Scope::App | Scope::Bookmark | Scope::Command
+                            )
                         {
                             self.scope = Scope::All;
                         }
@@ -9939,17 +9944,18 @@ fn dialog_hint(scope: Scope) -> &'static str {
         Scope::Folder => "搜索文件夹并跳转…",
         Scope::File | Scope::Program => "搜索文件并填入…",
         Scope::All => "搜索并填入当前对话框…",
-        Scope::App | Scope::Command => "对话框模式…",
+        Scope::App | Scope::Bookmark | Scope::Command => "对话框模式…",
     }
 }
 
 fn hint_for(scope: Scope) -> &'static str {
     match scope {
-        Scope::All => "搜索文件、应用或命令…",
+        Scope::All => "搜索文件、应用、书签或命令…",
         Scope::Folder => "搜索文件夹…",
         Scope::Program => "搜索可执行程序…",
         Scope::File => "搜索文件…",
         Scope::App => "搜索应用…",
+        Scope::Bookmark => "搜索书签…",
         Scope::Command => "搜索命令…",
     }
 }

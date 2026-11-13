@@ -61,6 +61,12 @@ impl BookmarkIndex {
         self.marks.len()
     }
 
+    /// 书签页空输入：按名称列出前 `limit` 条（加载时已按名称排序）。
+    /// 与「应用」页的空输入语义一致，不掺历史/常用排序。
+    pub fn top(&self, limit: usize) -> Vec<Entry> {
+        self.marks.iter().take(limit).cloned().collect()
+    }
+
     /// 名称/拼音/模糊/URL 匹配。空查询返回空（空输入展示「最近使用」）。
     pub fn search(&self, q: &str, limit: usize) -> Vec<Entry> {
         let needle = q.trim().to_lowercase();
@@ -400,19 +406,36 @@ mod tests {
         assert_eq!(marks[0].name, "Rust");
     }
 
-    #[test]
-    fn search_hits_name_pinyin_and_url() {
-        let raw = vec![
-            RawBookmark { name: "GitHub".into(), url: "https://github.com/".into() },
-            RawBookmark { name: "掘金".into(), url: "https://juejin.cn/".into() },
-            RawBookmark { name: "文档".into(), url: "https://doc.rust-lang.org/book/".into() },
-        ];
+    fn index_from(raw: Vec<RawBookmark>) -> BookmarkIndex {
         let marks = build_entries(raw);
         let urls = marks
             .iter()
             .map(|entry| entry.full_path().to_lowercase())
             .collect();
-        let index = BookmarkIndex { marks, urls };
+        BookmarkIndex { marks, urls }
+    }
+
+    #[test]
+    fn top_is_name_sorted_and_limited() {
+        // 「书签」页空输入 = 按名称列出全部书签；limit 只取一屏。
+        let index = index_from(vec![
+            RawBookmark { name: "beta".into(), url: "https://b.example/".into() },
+            RawBookmark { name: "Alpha".into(), url: "https://a.example/".into() },
+            RawBookmark { name: "gamma".into(), url: "https://c.example/".into() },
+        ]);
+        let top = index.top(2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].name, "Alpha", "按名称升序（大小写不敏感）");
+        assert_eq!(top[1].name, "beta");
+    }
+
+    #[test]
+    fn search_hits_name_pinyin_and_url() {
+        let index = index_from(vec![
+            RawBookmark { name: "GitHub".into(), url: "https://github.com/".into() },
+            RawBookmark { name: "掘金".into(), url: "https://juejin.cn/".into() },
+            RawBookmark { name: "文档".into(), url: "https://doc.rust-lang.org/book/".into() },
+        ]);
         assert_eq!(index.search("git", 10)[0].name, "GitHub", "名称前缀优先");
         assert_eq!(index.search("juejin", 10)[0].name, "掘金", "拼音/URL 命中");
         assert_eq!(index.search("github.com", 10)[0].name, "GitHub", "URL 命中");
