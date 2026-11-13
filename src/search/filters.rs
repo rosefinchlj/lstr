@@ -143,13 +143,18 @@ pub struct DriveFilter {
 }
 
 impl DriveFilter {
+    /// chip 显示文案：`C盘` / `排除C盘`。
     pub fn label(&self) -> String {
-        format!("{}{}:", if self.exclude { "-" } else { "" }, self.letter)
+        if self.exclude {
+            format!("排除{}盘", self.letter)
+        } else {
+            format!("{}盘", self.letter)
+        }
     }
 
     /// 可编辑文本（还原到输入框时用）：`C:` / `-C:`。
     pub fn source(&self) -> String {
-        self.label()
+        format!("{}{}:", if self.exclude { "-" } else { "" }, self.letter)
     }
 
     pub fn bit(&self) -> u32 {

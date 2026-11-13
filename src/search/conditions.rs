@@ -331,7 +331,7 @@ pub fn date_range_text(range: &DateRange) -> Option<String> {
 pub fn composing_hint(raw: &str) -> &'static str {
     match last_field(raw) {
         Some((_, _, _, FieldKind::Date)) => {
-            "冒号或回车提交；日期可用 今天/昨天/本周/上周/本月/上月/近N天"
+            "冒号或回车提交；日期可用 今天/本周/今年/近N天 或 2025"
         }
         Some((_, _, _, FieldKind::Size)) => "冒号或回车提交；单位 B/KB/MB/GB/TB，如 10M、1.5GB",
         None => "冒号或回车提交，例如 date>2026-11-10: / size>10M: / C:",
@@ -806,6 +806,8 @@ enum AliasKind {
     LastWeek,
     ThisMonth,
     LastMonth,
+    ThisYear,
+    LastYear,
 }
 
 const DATE_ALIASES: &[(&str, AliasKind)] = &[
@@ -824,10 +826,16 @@ const DATE_ALIASES: &[(&str, AliasKind)] = &[
     ("上月", AliasKind::LastMonth),
     ("上个月", AliasKind::LastMonth),
     ("lastmonth", AliasKind::LastMonth),
+    ("今年", AliasKind::ThisYear),
+    ("thisyear", AliasKind::ThisYear),
+    ("去年", AliasKind::LastYear),
+    ("lastyear", AliasKind::LastYear),
 ];
 
 /// 把日期值 token 解析成闭区间 `(首日, 末日)`。
-/// 显式日期 → 单天；别名/近N天 → 按本地今天换算的区间。
+/// 显式日期 → 单天；别名/近N天 → 按本地今天换算的区间；
+/// `2025` / `2025年` → 整年；`2023..2025` → 年区间；
+/// `A..B`（完整日期）→ 日期区间（`date >= A..B:` 这类带操作符的区间用）。
 fn resolve_date_value(token: &str) -> Option<((i32, u32, u32), (i32, u32, u32))> {
     let today = local_today();
     for (name, kind) in DATE_ALIASES {
@@ -835,7 +843,36 @@ fn resolve_date_value(token: &str) -> Option<((i32, u32, u32), (i32, u32, u32))>
             return Some(alias_range(*kind, today));
         }
     }
+    if let Some((a, b)) = token.split_once("..") {
+        let av = resolve_single_or_year(a)?;
+        let bv = resolve_single_or_year(b)?;
+        if av.0 > bv.1 {
+            return None;
+        }
+        return Some((av.0, bv.1));
+    }
+    if let Some(range) = resolve_single_or_year(token) {
+        return Some(range);
+    }
     relative_days_range(token, today)
+}
+
+/// 单个值：完整日期（单天）或 4 位年份（整年）。
+fn resolve_single_or_year(text: &str) -> Option<((i32, u32, u32), (i32, u32, u32))> {
+    let t = text.trim();
+    if t.len() == 10 && date_len(t).is_some() {
+        let day = parse_ymd(t)?;
+        return Some((day, day));
+    }
+    let year_text = t.strip_suffix('年').unwrap_or(t);
+    if year_text.len() == 4 && year_text.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(year) = year_text.parse::<i32>() {
+            if (1970..=9999).contains(&year) {
+                return Some(((year, 1, 1), (year, 12, 31)));
+            }
+        }
+    }
+    None
 }
 
 fn alias_range(kind: AliasKind, today: (i32, u32, u32)) -> ((i32, u32, u32), (i32, u32, u32)) {
@@ -865,6 +902,8 @@ fn alias_range(kind: AliasKind, today: (i32, u32, u32)) -> ((i32, u32, u32), (i3
             };
             ((year, month, 1), (year, month, days_in_month(year, month)))
         }
+        AliasKind::ThisYear => ((today.0, 1, 1), (today.0, 12, 31)),
+        AliasKind::LastYear => ((today.0 - 1, 1, 1), (today.0 - 1, 12, 31)),
     }
 }
 
@@ -926,6 +965,68 @@ fn is_relative_days_prefix(token: &str) -> bool {
         "" => digits > 0 || had_prefix,
         "天" | "天内" => digits > 0,
         _ => false,
+    }
+}
+
+/// 当前本地日期（今天），供相对别名换算。
+pub fn today_ymd() -> (i32, u32, u32) {
+    local_today()
+}
+
+/// 某年某月的天数（输入框日期分段遮罩用）。
+pub fn days_in_month_of(year: i32, month: u32) -> u32 {
+    days_in_month(year, month)
+}
+
+/// 输入是否整串就是「日期字段 + 操作符」且值还没开始输入：
+/// 是则返回 (字段, 操作符文本)，供输入框日期分段遮罩激活。
+/// 裸字段（`date` / `date `，无操作符）返回 None——那仍是普通文件名搜索。
+pub fn date_mask_prefix(input: &str) -> Option<(String, String)> {
+    let (field_len, compact, kind) = field_at(input, 0)?;
+    if kind != FieldKind::Date {
+        return None;
+    }
+    let mut i = field_len;
+    let mut op = String::new();
+    if compact {
+        i += colon_len(input, i)?;
+        i = skip_ws(input, i);
+    } else {
+        i = skip_ws(input, i);
+        // prose 裸字段（`date`/`date `，无操作符）不进遮罩。
+        if parse_op(&input[i..]).is_none() {
+            return None;
+        }
+    }
+    if let Some((_, op_len)) = parse_op(&input[i..]) {
+        op = input[i..i + op_len].to_string();
+        i += op_len;
+        i = skip_ws(input, i);
+    }
+    if i != input.len() {
+        return None;
+    }
+    Some((input[..field_len].to_string(), op))
+}
+
+/// 解析 `date_edit_text` 生成的规范文本（无终结冒号）：
+/// 返回 (操作符文本, 第一日期, 第二日期 Option)。
+pub fn parse_date_edit_parts(
+    text: &str,
+) -> Option<(String, (i32, u32, u32), Option<(i32, u32, u32)>)> {
+    let rest = text.trim_start().strip_prefix("date")?;
+    let rest = rest.trim_start();
+    let (op, value_start) = match parse_op(rest) {
+        Some((_, op_len)) => (rest[..op_len].to_string(), skip_ws(rest, op_len)),
+        None => (String::new(), 0),
+    };
+    let value = rest[value_start..].trim();
+    if let Some((a, b)) = value.split_once("..") {
+        let first = parse_ymd(a.trim())?;
+        let second = parse_ymd(b.trim())?;
+        Some((op, first, Some(second)))
+    } else {
+        Some((op, parse_ymd(value)?, None))
     }
 }
 
@@ -1636,7 +1737,7 @@ mod tests {
 
     #[test]
     fn composing_hint_is_field_aware() {
-        assert!(composing_hint("date>今").contains("今天"));
+        assert!(composing_hint("date>今").contains("今年"));
         assert!(composing_hint("size>10").contains("B/KB"));
         assert!(composing_hint("C").contains("C:"));
         assert!(composing_hint("").contains("date"));
@@ -1657,5 +1758,91 @@ mod tests {
         let single = extract("date>今天:").dates.remove(0);
         assert!(date_range_text(&single).unwrap().starts_with("≥ "));
         assert!(date_range_text(&DateRange::default()).is_none());
+    }
+
+    #[test]
+    fn year_values_filter_whole_years() {
+        let y = extract("date 2025:").dates.remove(0);
+        assert_eq!(y.after, Some(midnight(2025, 1, 1)));
+        assert_eq!(y.before, Some(midnight(2026, 1, 1) - 1));
+        assert_eq!(y.label(), "= 2025");
+
+        let gt = extract("date>2025:").dates.remove(0);
+        assert_eq!(gt.after, Some(midnight(2026, 1, 1)), "> 2025 = 2026 年起");
+        assert_eq!(gt.label(), "> 2025");
+
+        let cn = extract("date 2024年:").dates.remove(0);
+        assert_eq!(cn.after, Some(midnight(2024, 1, 1)));
+
+        let span = extract("date 2023..2025:").dates.remove(0);
+        assert_eq!(span.after, Some(midnight(2023, 1, 1)));
+        assert_eq!(span.before, Some(midnight(2026, 1, 1) - 1));
+
+        // 带操作符的日期区间（date >= A..B）按区间语义取边界。
+        let op_range = extract("date >= 2026-11-07..2026-11-13:").dates.remove(0);
+        assert_eq!(op_range.after, Some(midnight(2026, 11, 7)));
+        assert_eq!(op_range.before, None);
+
+        let this_year = local_today().0;
+        let this = extract("date 今年:").dates.remove(0);
+        assert_eq!(this.after, Some(midnight(this_year, 1, 1)));
+        assert_eq!(this.label(), "= 今年");
+        let last = extract("date 去年:").dates.remove(0);
+        assert_eq!(last.after, Some(midnight(this_year - 1, 1, 1)));
+        let le = extract("date<=今年:").dates.remove(0);
+        assert_eq!(le.before, Some(midnight(this_year + 1, 1, 1) - 1));
+
+        // 越界年份：裸值不算条件，带操作符报错。
+        let out_of_range = extract("date 1969:");
+        assert!(out_of_range.dates.is_empty() && out_of_range.errors.is_empty());
+        let bad = extract("date>1969:");
+        assert!(bad.dates.is_empty() && !bad.errors.is_empty());
+
+        // 年 chip 的规范编辑文本往返一致。
+        let text = date_edit_text(&y).expect("edit text");
+        let again = extract(&text).dates.remove(0);
+        assert_eq!(again.after, y.after, "{text:?}");
+        assert_eq!(again.before, y.before, "{text:?}");
+    }
+
+    #[test]
+    fn date_mask_prefix_activation() {
+        assert_eq!(
+            date_mask_prefix("date>"),
+            Some(("date".to_string(), ">".to_string()))
+        );
+        assert_eq!(
+            date_mask_prefix("date >= "),
+            Some(("date".to_string(), ">=".to_string()))
+        );
+        assert_eq!(
+            date_mask_prefix("日期≥"),
+            Some(("日期".to_string(), "≥".to_string()))
+        );
+        assert_eq!(
+            date_mask_prefix("date:"),
+            Some(("date".to_string(), String::new()))
+        );
+        // 裸字段仍是文件名搜索；有值/其它字段不激活。
+        assert!(date_mask_prefix("date").is_none());
+        assert!(date_mask_prefix("date ").is_none());
+        assert!(date_mask_prefix("date>2026").is_none());
+        assert!(date_mask_prefix("size>").is_none());
+        assert!(date_mask_prefix("").is_none());
+    }
+
+    #[test]
+    fn date_edit_parts_parse_canonical_text() {
+        let (op, first, second) =
+            parse_date_edit_parts("date 2026-11-07..2026-11-13").expect("range");
+        assert!(op.is_empty());
+        assert_eq!(first, (2026, 11, 7));
+        assert_eq!(second, Some((2026, 11, 13)));
+
+        let (op, first, second) = parse_date_edit_parts("date >= 2026-11-11").expect("ge");
+        assert_eq!(op, ">=");
+        assert_eq!(first, (2026, 11, 11));
+        assert_eq!(second, None);
+        assert!(parse_date_edit_parts("size >= 10M").is_none());
     }
 }

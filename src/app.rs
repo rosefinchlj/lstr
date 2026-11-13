@@ -386,6 +386,295 @@ fn strip_condition_terminator(text: &str) -> &str {
     without.trim_end()
 }
 
+/// 日期分段输入遮罩（date 条件编辑态）：年/月/日三段，
+/// 未输入的段用激活时的「今天」补足并以暗色显示；Tab/←→ 跳段、
+/// ↑↓ 加减、数字从左覆盖、打满自动跳下一段、回车提交。
+#[derive(Clone, Debug)]
+struct DateMask {
+    /// 字段名（`date` / `日期` / `dm`…），提交时重建条件文本。
+    field: String,
+    /// 操作符文本（`>` / `>=` / `=`…；空 = 裸值，默认等于）。
+    op: String,
+    /// 激活时用户输入的原样前缀，回退自由文本时保留。
+    prefix_display: String,
+    /// 两个日期的段输入；第二个仅闭区间（`A..B`）使用。
+    dates: [DateMaskSegs; 2],
+    two: bool,
+    /// 焦点：(日期下标, 段下标 0=年 1=月 2=日)。
+    date_idx: usize,
+    part: usize,
+    /// 默认日期（激活时的今天）。
+    default: (i32, u32, u32),
+}
+
+#[derive(Clone, Default, Debug)]
+struct DateMaskSegs {
+    y: String,
+    m: String,
+    d: String,
+}
+
+fn date_mask_part_width(part: usize) -> usize {
+    if part == 0 {
+        4
+    } else {
+        2
+    }
+}
+
+impl DateMask {
+    fn new(field: String, op: String, prefix_display: String) -> Self {
+        Self {
+            field,
+            op,
+            prefix_display,
+            dates: Default::default(),
+            two: false,
+            date_idx: 0,
+            part: 0,
+            default: crate::search::conditions::today_ymd(),
+        }
+    }
+
+    fn from_ymd((y, m, d): (i32, u32, u32)) -> DateMaskSegs {
+        DateMaskSegs {
+            y: format!("{y:04}"),
+            m: format!("{m:02}"),
+            d: format!("{d:02}"),
+        }
+    }
+
+    fn typed_str(&self, date_idx: usize, part: usize) -> &String {
+        let segs = &self.dates[date_idx];
+        match part {
+            0 => &segs.y,
+            1 => &segs.m,
+            _ => &segs.d,
+        }
+    }
+
+    fn typed_mut(&mut self) -> &mut String {
+        let (date_idx, part) = (self.date_idx, self.part);
+        match part {
+            0 => &mut self.dates[date_idx].y,
+            1 => &mut self.dates[date_idx].m,
+            _ => &mut self.dates[date_idx].d,
+        }
+    }
+
+    fn default_digits(&self, part: usize) -> String {
+        match part {
+            0 => format!("{:04}", self.default.0),
+            1 => format!("{:02}", self.default.1),
+            _ => format!("{:02}", self.default.2),
+        }
+    }
+
+    fn part_valid(part: usize, digits: &str) -> bool {
+        let Ok(v) = digits.parse::<u32>() else {
+            return false;
+        };
+        match part {
+            0 => (1970..=9999).contains(&v),
+            1 => (1..=12).contains(&v),
+            _ => (1..=31).contains(&v),
+        }
+    }
+
+    /// 段显示文本：已输入部分（正常色）+ 默认值补尾（暗色）。
+    /// 补尾先用默认值对应位，非法时退化为补 0，仍非法（瞬态）用默认整段。
+    fn display_part(&self, date_idx: usize, part: usize) -> String {
+        let typed = self.typed_str(date_idx, part);
+        if typed.is_empty() {
+            return self.default_digits(part);
+        }
+        let width = date_mask_part_width(part);
+        if typed.len() >= width {
+            return typed.clone();
+        }
+        let def = self.default_digits(part);
+        let mut display = format!("{typed}{}", &def[typed.len()..]);
+        if !Self::part_valid(part, &display) {
+            display = format!("{typed}{}", &"0".repeat(width - typed.len()));
+        }
+        if !Self::part_valid(part, &display) {
+            display = def;
+        }
+        display
+    }
+
+    /// 段有效值（显示文本解析并夹紧到合法范围）。
+    fn effective_part(&self, date_idx: usize, part: usize) -> u32 {
+        let v: u32 = self.display_part(date_idx, part).parse().unwrap_or(0);
+        match part {
+            0 => v.clamp(1970, 9999),
+            1 => v.clamp(1, 12),
+            _ => v.clamp(1, 31),
+        }
+    }
+
+    fn effective_date(&self, date_idx: usize) -> (i32, u32, u32) {
+        let year = self.effective_part(date_idx, 0) as i32;
+        let month = self.effective_part(date_idx, 1);
+        let day = self
+            .effective_part(date_idx, 2)
+            .min(crate::search::conditions::days_in_month_of(year, month));
+        (year, month, day)
+    }
+
+    /// 输入一位数字：年累加到 4 位自动跳段；月/日首位 ≥2/≥4 直接补 0 跳段，
+    /// 第二位非法则拒绝（保持等待）。
+    fn feed_digit(&mut self, c: char) {
+        let part = self.part;
+        let width = date_mask_part_width(part);
+        if self.typed_str(self.date_idx, part).len() >= width {
+            return;
+        }
+        match part {
+            0 => {
+                self.typed_mut().push(c);
+                if self.typed_str(self.date_idx, 0).len() == 4 {
+                    self.advance();
+                }
+            }
+            _ => {
+                if self.typed_str(self.date_idx, part).is_empty() {
+                    let d = c.to_digit(10).unwrap_or(0);
+                    // 月 2..9 / 日 4..9：只可能是 0X，补 0 立即跳段。
+                    let lone_advance = match part {
+                        1 => d >= 2,
+                        _ => d >= 4,
+                    };
+                    if lone_advance {
+                        *self.typed_mut() = format!("0{c}");
+                        self.advance();
+                        return;
+                    }
+                    self.typed_mut().push(c);
+                } else {
+                    let candidate = format!("{}{}", self.typed_str(self.date_idx, part), c);
+                    if Self::part_valid(part, &candidate) {
+                        *self.typed_mut() = candidate;
+                        self.advance();
+                    }
+                    // 非法第二位：拒绝，保持等待
+                }
+            }
+        }
+    }
+
+    fn feed_backspace(&mut self) {
+        if !self.typed_str(self.date_idx, self.part).is_empty() {
+            self.typed_mut().pop();
+            return;
+        }
+        self.retreat();
+    }
+
+    fn advance(&mut self) {
+        let last_date = if self.two { 1 } else { 0 };
+        if self.part < 2 {
+            self.part += 1;
+        } else if self.date_idx < last_date {
+            self.date_idx += 1;
+            self.part = 0;
+        }
+    }
+
+    fn retreat(&mut self) {
+        if self.part > 0 {
+            self.part -= 1;
+        } else if self.date_idx > 0 {
+            self.date_idx -= 1;
+            self.part = 2;
+        }
+    }
+
+    /// ↑↓：段值 ±1（年夹紧、月回绕、日夹紧到当月天数）。
+    fn spin(&mut self, delta: i32) {
+        let (date_idx, part) = (self.date_idx, self.part);
+        let current = self.effective_part(date_idx, part) as i32;
+        let next = match part {
+            0 => (current + delta).clamp(1970, 9999),
+            1 => (current - 1 + delta).rem_euclid(12) + 1,
+            _ => {
+                let (year, month, _) = self.effective_date(date_idx);
+                let dim = crate::search::conditions::days_in_month_of(year, month) as i32;
+                (current + delta).clamp(1, dim)
+            }
+        };
+        let width = date_mask_part_width(part);
+        *self.typed_mut() = format!("{:0width$}", next, width = width);
+    }
+
+    fn fmt_date(&self, date_idx: usize) -> String {
+        format!(
+            "{}-{}-{}",
+            self.display_part(date_idx, 0),
+            self.display_part(date_idx, 1),
+            self.display_part(date_idx, 2)
+        )
+    }
+
+    /// 镜像到输入框的文本（与遮罩显示一致，无终结冒号 → 查询保持暂停）。
+    fn mirror_text(&self) -> String {
+        let value = if self.two {
+            format!("{}..{}", self.fmt_date(0), self.fmt_date(1))
+        } else {
+            self.fmt_date(0)
+        };
+        format!("{}{}", self.prefix_display, value)
+    }
+
+    /// 回退自由文本：只保留用户真正输入过的段（默认补尾不带入）。
+    fn partial_text(&self) -> String {
+        let fmt = |date_idx: usize| {
+            let segs = &self.dates[date_idx];
+            let mut out = String::new();
+            if !segs.y.is_empty() {
+                out.push_str(&segs.y);
+                if !segs.m.is_empty() {
+                    out.push('-');
+                    out.push_str(&segs.m);
+                    if !segs.d.is_empty() {
+                        out.push('-');
+                        out.push_str(&segs.d);
+                    }
+                }
+            } else if !segs.m.is_empty() {
+                out.push_str(&segs.m);
+            }
+            out
+        };
+        let value = if self.two {
+            format!("{}..{}", fmt(0), fmt(1))
+        } else {
+            fmt(0)
+        };
+        format!("{}{}", self.prefix_display, value)
+    }
+
+    /// 提交文本：未输完的段先夹紧固化，再拼规范条件（终结冒号由调用方
+    /// 通过 commit_conditions 消费）。
+    fn commit_text(&mut self) -> String {
+        let first = self.effective_date(0);
+        let value = if self.two {
+            format!("{}..{}", date_mask_fmt(first), date_mask_fmt(self.effective_date(1)))
+        } else {
+            date_mask_fmt(first)
+        };
+        if self.op.is_empty() {
+            format!("{} {}:", self.field, value)
+        } else {
+            format!("{}{}{}:", self.field, self.op, value)
+        }
+    }
+}
+
+fn date_mask_fmt((y, m, d): (i32, u32, u32)) -> String {
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// 条件操作撤销/重做用的一份状态快照。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConditionSnapshot {
@@ -574,6 +863,8 @@ pub struct LstrApp {
     condition_edit_backup: Option<(SearchFilters, String)>,
     /// 条件操作的撤销/重做栈（Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z）。
     condition_history: ConditionHistory,
+    /// 日期分段输入遮罩（date 条件的年/月/日结构化编辑）。
+    date_mask: Option<DateMask>,
     /// 对话框事件到达但探测失败时的重试截止时间（子控件可能还没建好）。
     dialog_retry_until: Option<Instant>,
     /// 设置面板当前分页。
@@ -748,6 +1039,7 @@ impl LstrApp {
             suggest_index: 0,
             condition_edit_backup: None,
             condition_history: ConditionHistory::default(),
+            date_mask: None,
             dialog_retry_until: None,
             settings_tab: SettingsTab::Appearance,
             ime_composing: false,
@@ -1279,7 +1571,8 @@ impl LstrApp {
         for (index, drive) in self.filters.drives.iter().enumerate() {
             chips.push(ConditionChipInfo {
                 kind: ConditionChipKind::Drive(index),
-                label: "盘符",
+                // 盘符 chip 直接显示「C盘 / 排除C盘」，不再带「盘符」标签。
+                label: "",
                 value: drive.label(),
                 color: drive_color,
                 bg: Color32::from_rgba_unmultiplied(
@@ -1390,6 +1683,8 @@ impl LstrApp {
     }
 
     /// 把第 `index` 个 chip 还原成可编辑文本，进入编辑态（Esc 可撤销）。
+    /// 日期 chip 走分段遮罩（年/月/日，输入框为空时）；其它 chip 还原为
+    /// 等价文本自由编辑。
     fn edit_chip(&mut self, index: usize, ctx: &egui::Context) -> bool {
         let Some(chip) = self.condition_chips().into_iter().nth(index) else {
             return false;
@@ -1403,6 +1698,32 @@ impl LstrApp {
         self.record_condition_undo();
         if !self.remove_chip(index) {
             return false;
+        }
+        // 日期 chip 且输入框没有其它文本：进入分段遮罩。
+        if matches!(chip.kind, ConditionChipKind::Date) && self.input.trim().is_empty() {
+            if let Some((op, first, second)) =
+                crate::search::conditions::parse_date_edit_parts(&text)
+            {
+                let prefix = if op.is_empty() {
+                    "date ".to_string()
+                } else {
+                    format!("date {op} ")
+                };
+                let mut mask = DateMask::new("date".into(), op, prefix);
+                mask.dates[0] = DateMask::from_ymd(first);
+                if let Some(second) = second {
+                    mask.dates[1] = DateMask::from_ymd(second);
+                    mask.two = true;
+                }
+                self.date_mask = Some(mask);
+                self.chip_caret = None;
+                self.condition_hold = false;
+                self.suggest_dismissed = None;
+                Self::reset_input_cursor(ctx);
+                self.focus_requested = true;
+                self.sync_date_mask(ctx);
+                return true;
+            }
         }
         let trimmed = self.input.trim_end();
         self.input = if trimmed.is_empty() {
@@ -1430,6 +1751,7 @@ impl LstrApp {
         self.input = input;
         self.condition_hold = false;
         self.chip_caret = None;
+        self.date_mask = None;
         Self::reset_input_cursor(ctx);
         self.focus_requested = true;
         self.trigger(ctx);
@@ -1443,6 +1765,149 @@ impl LstrApp {
             input: self.input.clone(),
             chip_caret: self.chip_caret,
         }
+    }
+
+    /// 遮罩内容镜像回输入框并保持查询暂停。
+    fn sync_date_mask(&mut self, ctx: &egui::Context) {
+        let text = self
+            .date_mask
+            .as_ref()
+            .map(|mask| mask.mirror_text())
+            .unwrap_or_default();
+        if self.input != text {
+            self.input = text;
+        }
+        self.chip_caret = None;
+        self.trigger(ctx);
+    }
+
+    /// 遮罩回车：固化各段（未输完的夹紧），拼规范条件文本提交成 chip。
+    fn commit_date_mask(&mut self, ctx: &egui::Context) {
+        let Some(mut mask) = self.date_mask.take() else {
+            return;
+        };
+        self.input = mask.commit_text();
+        self.date_mask = None;
+        self.condition_edit_backup = None;
+        self.condition_hold = false;
+        self.focus_requested = true;
+        Self::reset_input_cursor(ctx);
+        self.commit_conditions(ctx);
+        self.trigger(ctx);
+    }
+
+    /// 遮罩内输入了非数字字符（别名/中文段名）：退出遮罩转自由文本，
+    /// 已输入的段原样保留，输入的字符追加到末尾。
+    fn exit_date_mask_to_free_text(&mut self, ctx: &egui::Context, text: &str) {
+        let partial = self
+            .date_mask
+            .as_ref()
+            .map(|mask| mask.partial_text())
+            .unwrap_or_default();
+        self.date_mask = None;
+        self.input = format!("{partial}{text}");
+        Self::reset_input_cursor(ctx);
+        self.trigger(ctx);
+    }
+
+    /// 遮罩按键处理。返回 true = 本帧按键已被遮罩消费。
+    fn handle_date_mask_keys(&mut self, ctx: &egui::Context) -> bool {
+        if self.date_mask.is_none() {
+            return false;
+        }
+        // 文本事件：纯数字进段；其它字符退出遮罩转自由文本。
+        let mut digits = String::new();
+        let mut exit_text: Option<String> = None;
+        ctx.input_mut(|i| {
+            i.events.retain(|event| match event {
+                egui::Event::Text(text) => {
+                    if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) {
+                        digits.push_str(text);
+                        false
+                    } else {
+                        exit_text.get_or_insert_with(|| text.clone());
+                        false
+                    }
+                }
+                _ => true,
+            })
+        });
+        if let Some(text) = exit_text {
+            self.exit_date_mask_to_free_text(ctx, &text);
+            return true;
+        }
+        for c in digits.chars() {
+            if let Some(mask) = self.date_mask.as_mut() {
+                mask.feed_digit(c);
+            }
+        }
+        let mut handled = !digits.is_empty();
+        // Backspace：删段内数字；段已空且在最后一段时不消费（留给 chip 删除）。
+        let ctrl_bksp = ctx.input(|i| i.modifiers.ctrl)
+            && ctx.input(|i| i.key_pressed(Key::Backspace));
+        let seg_typed_empty = self
+            .date_mask
+            .as_ref()
+            .is_some_and(|mask| mask.typed_str(mask.date_idx, mask.part).is_empty());
+        if ctrl_bksp && !seg_typed_empty {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backspace)) {
+                if let Some(mask) = self.date_mask.as_mut() {
+                    mask.feed_backspace();
+                }
+                handled = true;
+            }
+        } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace))
+            || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete))
+        {
+            if let Some(mask) = self.date_mask.as_mut() {
+                mask.feed_backspace();
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
+            if let Some(mask) = self.date_mask.as_mut() {
+                mask.advance();
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) {
+            if let Some(mask) = self.date_mask.as_mut() {
+                mask.retreat();
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowRight)) {
+            if let Some(mask) = self.date_mask.as_mut() {
+                mask.advance();
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft)) {
+            if let Some(mask) = self.date_mask.as_mut() {
+                mask.retreat();
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+            if let Some(mask) = self.date_mask.as_mut() {
+                mask.spin(1);
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+            if let Some(mask) = self.date_mask.as_mut() {
+                mask.spin(-1);
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+            self.commit_date_mask(ctx);
+            return true;
+        }
+        if handled {
+            self.sync_date_mask(ctx);
+        }
+        handled
     }
 
     /// 在任何会改变条件/chip 的操作前记录一份快照。
@@ -1463,6 +1928,7 @@ impl LstrApp {
         self.condition_error = None;
         self.menu_open = false;
         self.filter_menu = None;
+        self.date_mask = None;
         self.condition_hold = self.conditions_apply(self.scope)
             && !crate::search::conditions::extract(&self.input).is_empty();
         Self::reset_input_cursor(ctx);
@@ -1609,7 +2075,7 @@ impl LstrApp {
         }
     }
 
-    /// 程序化清空输入（不清筛选）：同时清掉条件错误与编辑/联想瞬态，
+    /// 程序化清空输入（不清筛选）：同时清掉条件错误与编辑/联想/遮罩瞬态，
     /// 避免错误态或半截编辑一直挡住后续查询。
     fn clear_input_text(&mut self) {
         self.input.clear();
@@ -1619,6 +2085,7 @@ impl LstrApp {
         self.suggest_dismissed = None;
         self.suggest_index = 0;
         self.condition_edit_backup = None;
+        self.date_mask = None;
     }
 
     fn trigger(&mut self, ctx: &egui::Context) {
@@ -1697,6 +2164,7 @@ impl LstrApp {
             self.browse_root = None;
             self.browse_forward.clear();
             self.condition_history.clear();
+            self.date_mask = None;
         }
         Self::reset_input_cursor(ctx);
         self.filter_menu = None;
@@ -1934,6 +2402,12 @@ impl LstrApp {
         let chip_count = self.condition_chips().len();
         if self.chip_caret.is_some_and(|index| index >= chip_count) {
             self.chip_caret = None;
+        }
+
+        // 日期分段遮罩：数字进段、Tab/←→ 跳段、↑↓ 加减、回车提交，
+        // 非数字字符退出遮罩转自由文本（别名仍可用）。
+        if self.date_mask.is_some() && self.handle_date_mask_keys(ctx) {
+            return;
         }
 
         // 设置页「唤起热键」录制中：本帧按键全部进录制器（Esc 取消），
@@ -2944,60 +3418,94 @@ impl LstrApp {
                         .min(search_rect.right() - 40.0)
                         .max(search_rect.left());
                 }
-                let response = ui.put(
-                    text_rect,
-                    egui::TextEdit::singleline(&mut self.input)
-                        .frame(false)
-                        .margin(egui::Margin::same(0))
-                        .font(ui::text_font(22.0))
-                        .text_color(theme.text)
-                        .hint_text(hint.as_str())
-                        .desired_width(f32::INFINITY)
-                        .id(egui::Id::new("lstr-search-input")),
-                );
-                if response.changed() {
-                    self.menu_open = false;
-                    self.filter_menu = None;
-                    // 用户真的改了文本：退出条件编辑 hold 与虚拟 chip 光标；
-                    // 联想取消标记只在输入还以该串开头时保留。
-                    self.condition_hold = false;
-                    self.chip_caret = None;
-                    self.suggest_index = 0;
-                    if let Some(dismissed) = &self.suggest_dismissed {
-                        let trimmed = self.input.trim();
-                        if trimmed.is_empty() || !trimmed.starts_with(dismissed.as_str()) {
-                            self.suggest_dismissed = None;
-                        }
-                    }
-                    // IME 组合期(预编辑未上屏)不触发搜索:避免拼音字母逐键闪动
-                    // 结果;上屏后由 handle_keys 的组合结束检测补搜。
-                    if !self.ime_composing {
-                        // 正则模式下整串都是 pattern，不解析日期条件。
-                        if !self.filters.matches.regex {
-                            self.commit_conditions(ctx);
-                        }
-                        self.trigger(ctx);
+                // 日期分段遮罩：先失效检查（输入与遮罩不一致 = 被外部改写），
+                // 再按「日期字段+操作符且值未输入」自动激活。
+                if self.date_mask.is_some() {
+                    let mirror = self
+                        .date_mask
+                        .as_ref()
+                        .map(|mask| mask.mirror_text())
+                        .unwrap_or_default();
+                    if mirror != self.input {
+                        self.date_mask = None;
                     }
                 }
-                if response.clicked() {
-                    // 点进文本区 = 退出 chip 虚拟光标。
-                    self.chip_caret = None;
+                if self.date_mask.is_none()
+                    && !self.ime_composing
+                    && !self.condition_hold
+                    && self.conditions_apply(query.scope)
+                {
+                    if let Some((field, op)) =
+                        crate::search::conditions::date_mask_prefix(&self.input)
+                    {
+                        let mask = DateMask::new(field, op, self.input.clone());
+                        let text = mask.mirror_text();
+                        self.date_mask = Some(mask);
+                        // 激活即镜像默认日期到输入框（查询仍由 is_composing 暂停）。
+                        self.input = text;
+                    }
                 }
-                let window_focused = ctx.input(|i| i.focused);
-                if self.focus_requested || (window_focused && !response.has_focus()) {
-                    response.request_focus();
-                    self.focus_requested = false;
+                let mask_active = self.date_mask.is_some();
+                let mut text_response = None;
+                if mask_active {
+                    self.paint_date_mask(ui, &painter, text_rect);
+                } else {
+                    let response = ui.put(
+                        text_rect,
+                        egui::TextEdit::singleline(&mut self.input)
+                            .frame(false)
+                            .margin(egui::Margin::same(0))
+                            .font(ui::text_font(22.0))
+                            .text_color(theme.text)
+                            .hint_text(hint.as_str())
+                            .desired_width(f32::INFINITY)
+                            .id(egui::Id::new("lstr-search-input")),
+                    );
+                    if response.changed() {
+                        self.menu_open = false;
+                        self.filter_menu = None;
+                        // 用户真的改了文本：退出条件编辑 hold 与虚拟 chip 光标；
+                        // 联想取消标记只在输入还以该串开头时保留。
+                        self.condition_hold = false;
+                        self.chip_caret = None;
+                        self.suggest_index = 0;
+                        if let Some(dismissed) = &self.suggest_dismissed {
+                            let trimmed = self.input.trim();
+                            if trimmed.is_empty() || !trimmed.starts_with(dismissed.as_str()) {
+                                self.suggest_dismissed = None;
+                            }
+                        }
+                        // IME 组合期(预编辑未上屏)不触发搜索:避免拼音字母逐键闪动
+                        // 结果;上屏后由 handle_keys 的组合结束检测补搜。
+                        if !self.ime_composing {
+                            // 正则模式下整串都是 pattern，不解析日期条件。
+                            if !self.filters.matches.regex {
+                                self.commit_conditions(ctx);
+                            }
+                            self.trigger(ctx);
+                        }
+                    }
+                    if response.clicked() {
+                        // 点进文本区 = 退出 chip 虚拟光标。
+                        self.chip_caret = None;
+                    }
+                    let window_focused = ctx.input(|i| i.focused);
+                    if self.focus_requested || (window_focused && !response.has_focus()) {
+                        response.request_focus();
+                        self.focus_requested = false;
+                    }
+                    text_response = Some(response);
                 }
                 // 条件联想弹层（Foreground，盖在筛选条/结果列表之上）。
                 self.paint_condition_suggest(
                     ctx,
                     egui::pos2(search_rect.left(), search_rect.bottom() + 4.0),
                 );
-                let focus_color = if response.has_focus() {
-                    theme.amber
-                } else {
-                    theme.hair
-                };
+                let focused = mask_active
+                    || text_response
+                        .as_ref()
+                        .is_some_and(|response| response.has_focus());
+                let focus_color = if focused { theme.amber } else { theme.hair };
                 painter.line_segment(
                     [
                         egui::pos2(rect.left() + PAD, rect.top() + SEARCH_H),
@@ -3926,6 +4434,119 @@ impl LstrApp {
         items
     }
 
+    /// 日期分段遮罩渲染：前缀原样 + 年-月-日三段（未输入部分暗色默认值），
+    /// 焦点段下划线 + 光标，点击段切换焦点。输入框 TextEdit 在遮罩期间不渲染。
+    fn paint_date_mask(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, text_rect: Rect) {
+        let Some(mask) = self.date_mask.clone() else {
+            return;
+        };
+        let theme = self.theme;
+        let font = ui::text_font(22.0);
+        let center_y = text_rect.center().y;
+        let seg_h = 24.0;
+        let galley_w = |text: &str| {
+            painter
+                .layout_no_wrap(text.to_string(), font.clone(), theme.text)
+                .size()
+                .x
+        };
+        let mut x = text_rect.left();
+        painter.text(
+            egui::pos2(x, center_y),
+            Align2::LEFT_CENTER,
+            &mask.prefix_display,
+            font.clone(),
+            theme.text,
+        );
+        x += galley_w(&mask.prefix_display);
+        let date_count = if mask.two { 2 } else { 1 };
+        let mut focus_request: Option<(usize, usize)> = None;
+        for date_idx in 0..date_count {
+            if date_idx == 1 {
+                painter.text(
+                    egui::pos2(x, center_y),
+                    Align2::LEFT_CENTER,
+                    "..",
+                    font.clone(),
+                    theme.dim,
+                );
+                x += galley_w("..");
+            }
+            for part in 0..3 {
+                if part > 0 {
+                    painter.text(
+                        egui::pos2(x, center_y),
+                        Align2::LEFT_CENTER,
+                        "-",
+                        font.clone(),
+                        theme.dim,
+                    );
+                    x += galley_w("-");
+                }
+                let typed = mask.typed_str(date_idx, part).clone();
+                let display = mask.display_part(date_idx, part);
+                let tail = display[typed.len()..].to_string();
+                let width = galley_w(if part == 0 { "0000" } else { "00" });
+                let typed_w = galley_w(&typed);
+                // 已输入部分（正常色）+ 默认补尾（暗色）。
+                if !typed.is_empty() {
+                    painter.text(
+                        egui::pos2(x, center_y),
+                        Align2::LEFT_CENTER,
+                        &typed,
+                        font.clone(),
+                        theme.text,
+                    );
+                }
+                if !tail.is_empty() {
+                    painter.text(
+                        egui::pos2(x + typed_w, center_y),
+                        Align2::LEFT_CENTER,
+                        &tail,
+                        font.clone(),
+                        theme.dim,
+                    );
+                }
+                let focused = mask.date_idx == date_idx && mask.part == part;
+                if focused {
+                    // 焦点段下划线 + 光标竖线（停在下一段输入位）。
+                    let underline_y = center_y + seg_h / 2.0 + 2.0;
+                    painter.line_segment(
+                        [
+                            egui::pos2(x - 2.0, underline_y),
+                            egui::pos2(x + width + 2.0, underline_y),
+                        ],
+                        Stroke::new(1.5_f32, theme.amber),
+                    );
+                    let caret_x = x + typed_w;
+                    painter.line_segment(
+                        [
+                            egui::pos2(caret_x, center_y - seg_h / 2.0),
+                            egui::pos2(caret_x, center_y + seg_h / 2.0),
+                        ],
+                        Stroke::new(1.5_f32, theme.amber),
+                    );
+                }
+                let hit_rect = Rect::from_min_size(
+                    egui::pos2(x, center_y - seg_h / 2.0),
+                    egui::vec2(width, seg_h),
+                );
+                let response =
+                    ui.interact(hit_rect, Id::new(("date-mask-seg", date_idx, part)), Sense::click());
+                if response.clicked() {
+                    focus_request = Some((date_idx, part));
+                }
+                x += width;
+            }
+        }
+        if let Some((date_idx, part)) = focus_request {
+            if let Some(mask) = self.date_mask.as_mut() {
+                mask.date_idx = date_idx;
+                mask.part = part;
+            }
+        }
+    }
+
     /// 条件联想弹层：贴在搜索行下方，Foreground 盖住筛选条与结果列表。
     fn paint_condition_suggest(&mut self, ctx: &egui::Context, anchor: egui::Pos2) {
         let suggestions = self.condition_suggestions();
@@ -4191,7 +4812,7 @@ impl LstrApp {
                         "筛选",
                         &[
                             ("ext:rs", "按扩展名"),
-                            ("日期", "date>2026-11-10: 今天/本周/近7天"),
+                            ("日期", "date>2026-11-10: 今年/2025"),
                             ("大小", "size>10M: 按文件大小"),
                             ("Ctrl+Bksp", "删条件；加 Shift 编辑"),
                             ("Ctrl+Z/Y", "撤回 / 取消撤回条件"),
@@ -8167,5 +8788,119 @@ mod path_layout_tests {
         history.record(before.clone());
         history.forget_last(&before.filters, "a");
         assert!(!history.can_undo(), "取消编辑应撤掉进入编辑的快照");
+    }
+
+    fn date_mask_op(op: &str) -> DateMask {
+        DateMask::new("date".into(), op.to_string(), format!("date{op}"))
+    }
+
+    #[test]
+    fn date_mask_year_feeds_and_advances() {
+        let mut mask = date_mask_op(">");
+        for c in "2025".chars() {
+            mask.feed_digit(c);
+        }
+        assert_eq!(mask.dates[0].y, "2025");
+        assert_eq!((mask.date_idx, mask.part), (0, 1), "年满 4 位跳到月");
+        let today = crate::search::conditions::today_ymd();
+        assert_eq!(
+            mask.mirror_text(),
+            format!("date>2025-{:02}-{:02}", today.1, today.2),
+            "月/日未输入用今天默认补足"
+        );
+    }
+
+    #[test]
+    fn date_mask_month_smart_digits() {
+        // 首位 3：补 0 立即跳段。
+        let mut mask = date_mask_op("");
+        mask.part = 1;
+        mask.feed_digit('3');
+        assert_eq!(mask.dates[0].m, "03");
+        assert_eq!(mask.part, 2);
+        // 首位 1：等待；第二位 9 非法拒绝，2 合法跳段。
+        let mut mask = date_mask_op("");
+        mask.part = 1;
+        mask.feed_digit('1');
+        assert_eq!(mask.dates[0].m, "1");
+        assert_eq!(mask.part, 1, "等待第二位");
+        mask.feed_digit('9');
+        assert_eq!(mask.dates[0].m, "1", "13 非法被拒");
+        mask.feed_digit('2');
+        assert_eq!(mask.dates[0].m, "12");
+        assert_eq!(mask.part, 2);
+        // 首位 0：等待，默认补尾显示 01..09。
+        let mut mask = date_mask_op("");
+        mask.part = 1;
+        mask.feed_digit('0');
+        let today = crate::search::conditions::today_ymd();
+        let expected = if today.1 >= 10 { "01" } else { "00" };
+        assert_eq!(mask.display_part(0, 1), expected, "首位 0 + 默认补尾");
+    }
+
+    #[test]
+    fn date_mask_spin_wraps_month_and_clamps_day() {
+        let mut mask = date_mask_op("");
+        mask.part = 1;
+        mask.dates[0].m = "12".into();
+        mask.spin(1);
+        assert_eq!(mask.dates[0].m, "01", "月回绕");
+        mask.spin(-1);
+        assert_eq!(mask.dates[0].m, "12");
+        let mut mask = date_mask_op("");
+        mask.part = 2;
+        mask.dates[0].m = "12".into();
+        mask.dates[0].d = "31".into();
+        mask.spin(1);
+        assert_eq!(mask.dates[0].d, "31", "日夹紧到当月天数（12 月有 31 天）");
+        mask.spin(-1);
+        assert_eq!(mask.dates[0].d, "30");
+        let mut mask = date_mask_op("");
+        mask.part = 0;
+        mask.dates[0].y = "1970".into();
+        mask.spin(-1);
+        assert_eq!(mask.dates[0].y, "1970", "年下界夹紧");
+    }
+
+    #[test]
+    fn date_mask_commit_builds_canonical_text() {
+        // 等值区间（裸值）：date A..B:
+        let mut mask = date_mask_op("");
+        mask.dates[0] = DateMask::from_ymd((2025, 1, 1));
+        mask.dates[1] = DateMask::from_ymd((2025, 12, 31));
+        mask.two = true;
+        assert_eq!(mask.commit_text(), "date 2025-01-01..2025-12-31:");
+        // 带操作符：date>=A:
+        let mut mask = date_mask_op(">=");
+        mask.dates[0] = DateMask::from_ymd((2026, 11, 13));
+        assert_eq!(mask.commit_text(), "date>=2026-11-13:");
+        // 未输完的段在提交时按显示文本固化（typed "1" + 默认补尾 "1" → 11 月）。
+        let mut mask = date_mask_op(">");
+        mask.dates[0].y = "2025".into();
+        mask.dates[0].m = "1".into();
+        mask.dates[0].d.clear();
+        let today = crate::search::conditions::today_ymd();
+        let text = mask.commit_text();
+        assert_eq!(text, format!("date>2025-11-{:02}:", today.2), "{text:?}");
+        // 中文段名保留。
+        let mut mask = DateMask::new("日期".into(), ">".into(), String::new());
+        mask.dates[0] = DateMask::from_ymd((2026, 1, 1));
+        assert_eq!(mask.commit_text(), "日期>2026-01-01:");
+    }
+
+    #[test]
+    fn date_mask_partial_text_keeps_typed_only() {
+        let mut mask = date_mask_op(">");
+        for c in "2026".chars() {
+            mask.feed_digit(c);
+        }
+        assert_eq!(mask.partial_text(), "date>2026", "默认段不带入自由文本");
+        mask.feed_digit('1');
+        mask.feed_digit('1');
+        assert_eq!(mask.partial_text(), "date>2026-11");
+        // 完整日期镜像 = 全量显示。
+        let mut mask = date_mask_op(">");
+        mask.dates[0] = DateMask::from_ymd((2026, 11, 13));
+        assert_eq!(mask.mirror_text(), "date>2026-11-13");
     }
 }
