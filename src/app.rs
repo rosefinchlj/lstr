@@ -1120,14 +1120,6 @@ impl SizeMask {
         format!("{}{}{}", self.head, self.op, self.tail)
     }
 
-    /// 自动激活时没写比较符（`size:`）：补默认「大于」。裸大小值没有语义
-    /// （`size:10MB:` 解析不出条件），默认档必须带比较符才能提交。
-    fn default_gt_if_bare(&mut self) {
-        if self.op.is_empty() && !self.two {
-            self.op = ">".to_string();
-        }
-    }
-
     fn from_parts((number, unit): (String, usize)) -> SizeSegs {
         SizeSegs {
             number,
@@ -4979,10 +4971,7 @@ impl LstrApp {
                     } else if let Some((field, op)) =
                         crate::search::conditions::size_mask_prefix(&self.input)
                     {
-                        let mut mask = SizeMask::new(field, op, self.input.clone());
-                        // `size:` 没写比较符：补默认「大于」。裸大小值没有语义
-                        // （`size:10MB:` 解析不出条件），默认档要能直接提交。
-                        mask.default_gt_if_bare();
+                        let mask = SizeMask::new(field, op, self.input.clone());
                         let text = mask.mirror_text();
                         self.size_mask = Some(mask);
                         // 默认 10 MB 先镜像进输入框，回车即可提交。
@@ -11449,26 +11438,24 @@ mod path_layout_tests {
     }
 
     #[test]
-    fn size_mask_bare_prefix_defaults_to_greater() {
+    fn size_mask_bare_prefix_is_equality() {
         use crate::search::conditions::extract;
 
-        // 裸大小值不是条件（`size:10MB:` 解析不出 SizeRange）。
-        assert!(extract("size:10MB:").sizes.is_empty(), "裸值不该被当成大小条件");
-
-        // `size:` 自动激活：补默认 `>`，显示/提交都能用。
+        // 只打 `size:` 进遮罩：和 `date:` 一样不显示比较符，裸值默认「等于」。
         let mut mask = SizeMask::new("size".into(), String::new(), "size:".into());
-        mask.default_gt_if_bare();
-        assert_eq!(mask.mirror_text(), "size:>10MB");
+        assert_eq!(mask.mirror_text(), "size:10MB");
         let text = mask.commit_text();
-        assert_eq!(text, "size:>10MB:");
-        assert_eq!(extract(&text).sizes.len(), 1, "{text:?}");
+        assert_eq!(text, "size:10MB:");
+        let out = extract(&text);
+        assert_eq!(out.sizes.len(), 1, "{text:?}");
+        assert_eq!(out.sizes[0].after, out.sizes[0].before, "裸值 = 精确大小");
 
         // 默认档改比较符照样生效。
         assert!(mask.feed_op_char('<'));
         assert_eq!(mask.commit_text(), "size:<10MB:");
-
-        // 日期裸值本来就有「当天」语义，不补比较符。
-        assert_eq!(extract("date:2026-11-13:").dates.len(), 1);
+        let out = extract(&mask.commit_text());
+        assert!(out.sizes[0].after.is_none(), "改 < 后只设 before");
+        assert!(out.sizes[0].before.is_some());
     }
 
     #[test]

@@ -772,7 +772,12 @@ fn parse_size_expr(
             ));
         }
     }
-    let (op, op_len) = parse_op(&raw[i..]).ok_or(None)?;
+    // 比较符可省略：裸值默认「等于」（与日期裸值一致），`size:10MB:` 就是
+    // 精确 10 MB。缺了这条，裸大小值根本解析不出条件（遮罩的默认值也提交不了）。
+    let (op, op_len) = match parse_op(&raw[i..]) {
+        Some((op, len)) => (op, len),
+        None => (Op::Eq, 0),
+    };
     i += op_len;
     i = skip_ws(raw, i);
     let (value_len, bytes, text) = parse_size_value(&raw[i..]).map_err(Some)?;
