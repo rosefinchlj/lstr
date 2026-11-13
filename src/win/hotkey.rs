@@ -13,15 +13,20 @@
 //!
 //! 可靠性约束（低级钩子回调必须在 `LowLevelHooksTimeout` 内返回，否则被系统
 //! 静默摘钩）：回调里**无 IO、无锁等待**——状态更新是纯内存操作，触发后只做
-//! channel `send` 与 `request_repaint`，唤起逻辑全部 post 到 UI 线程。
+//! channel `send`，`request_repaint` 交给 [`spawn_repaint_waker`] 专用线程
+//! （它要拿 egui 写锁，绝不能发生在钩子回调里）。
+//!
+//! 两条防线兜住「静默摘钩」：空闲 watchdog 定时重装钩子（摘钩后没有任何
+//! 系统通知可查），钩子线程意外退出则 channel 断开、由 UI 侧重启服务。
 //!
 //! 更换热键 = 丢弃本服务重新 [`HotkeyService::start`]（Drop 里干净卸载：
 //! unhook + unregister + join 线程），无需重启应用。
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui::Context;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
@@ -31,9 +36,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, PostThreadMessageW,
-    SetWindowsHookExW, UnhookWindowsHookEx, MSG, WH_KEYBOARD_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
-    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, DispatchMessageW, GetMessageW, KillTimer, KBDLLHOOKSTRUCT, PostThreadMessageW,
+    SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSG, WH_KEYBOARD_LL, WM_HOTKEY,
+    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
 };
 
 use crate::hotkey::{
@@ -46,6 +51,22 @@ const WAKE_HOTKEY_ID: i32 = 1;
 /// 'G' 的虚拟键码（Ctrl+G = 对话框搜索）。
 const G_VKEY: u16 = 0x47;
 
+/// 空闲 watchdog 周期：这么久没有任何按键就重装一次钩子。
+///
+/// 低级钩子被系统摘掉后既没有通知也没有查询接口，「按了键却没回调」在
+/// 应用侧不可观测；反过来，空闲时重装钩子代价几乎为零。于是把重装放在
+/// 空闲窗口里做：用户真正按键时，钩子至多是 30s 内新装的。
+///
+/// 阈值比周期短 5s：定时器有毫秒级抖动，相等会把第一次检查卡在边界上。
+const HOOK_IDLE_REHOOK: Duration = Duration::from_secs(25);
+const HOOK_WATCHDOG_MS: u32 = 30_000;
+/// 重装失败后的重试间隔（重起一个定时器）。
+const HOOK_RETRY_MS: u32 = 2_000;
+/// 线程定时器的**请求** id。注意：`SetTimer(None, ...)` 会忽略它并返回
+/// 系统分配的 id（实测请求 0x4C535201 得到 0x7212），消息里的 wParam 是
+/// 返回的那个 id，所以比较与 KillTimer 都必须用返回值。
+const HOOK_WATCHDOG_ID: usize = 0x4C53_5201;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotkeyEvent {
     Toggle,
@@ -55,7 +76,7 @@ pub enum HotkeyEvent {
 /// LL 钩子回调里用的事件接收端：发事件 + 唤醒 UI 线程。
 struct HookSink {
     tx: Sender<HotkeyEvent>,
-    ctx: Context,
+    wake: Sender<()>,
 }
 
 /// LL 钩子线程的观察状态（线程本地，回调同步访问，无锁）。
@@ -65,6 +86,31 @@ struct HookHandler {
     /// Ctrl+G 组合观察（对话框搜索入口）。
     ctrl_g: CtrlGState,
     sink: HookSink,
+    /// 最近一次收到按键的时刻（任意键），空闲 watchdog 据此判断要不要重装。
+    last_key: Instant,
+}
+
+/// 唤醒 UI 线程的专用线程：`request_repaint` 会取得 egui 内部写锁，
+/// 主线程那一刻若正做重活（首帧布局、批量图标解码、尺寸切换），
+/// 回调就会被拖住超过 `LowLevelHooksTimeout`，Windows 随即**静默摘钩**。
+/// 2026-11-13 实测到的故障形态正是「进程活着、窗口停在 -30000、注入双击
+/// Ctrl 毫无反应、重启才恢复」——系统已摘钩而应用毫不知情；在回调里碰
+/// egui 锁是已知的触发路径，这里彻底断开。
+///
+/// 返回的发送端只由钩子线程持有：钩子线程一退出就没人能发信号，
+/// 唤醒线程随 `recv` 失败自然结束，不需要额外的收尾句柄。
+fn spawn_repaint_waker(ctx: Context) -> Result<Sender<()>, String> {
+    let (tx, rx) = mpsc::channel::<()>();
+    thread::Builder::new()
+        .name("lstr-repaint-waker".to_string())
+        .spawn(move || {
+            // 每收到一次唤醒就申请一次重绘；发送端全部销毁后退出。
+            while rx.recv().is_ok() {
+                ctx.request_repaint();
+            }
+        })
+        .map_err(|err| format!("failed to spawn repaint waker thread: {err}"))?;
+    Ok(tx)
 }
 
 thread_local! {
@@ -99,6 +145,8 @@ impl Drop for ServiceThread {
 pub struct HotkeyService {
     rx: Receiver<HotkeyEvent>,
     threads: Vec<ServiceThread>,
+    /// 钩子线程退出（channel 断开）后置位：服务已成哑巴，调用方据此重启。
+    dead: AtomicBool,
 }
 
 impl HotkeyService {
@@ -115,27 +163,44 @@ impl HotkeyService {
         let (tx, rx) = mpsc::channel();
         let mut threads: Vec<ServiceThread> = Vec::with_capacity(2);
 
+        // 唤醒线程先起来：钩子回调只往它的 channel 里发信号。
+        let wake_tx = spawn_repaint_waker(ctx.clone())?;
+
         // —— LL 钩子线程：Ctrl+G 观察始终在，双击检测按需挂上 ——
         let tap = match wake {
             WakeHotkey::DoubleTap(key) => Some(DoubleTapDetector::new(key.vkeys())),
             WakeHotkey::Combo { .. } => None,
         };
-        threads.push(spawn_hook_thread(ctx.clone(), tx.clone(), tap)?);
+        threads.push(spawn_hook_thread(wake_tx, tx.clone(), tap)?);
 
         // —— RegisterHotKey 线程：仅组合键模式 ——
         if let WakeHotkey::Combo { mods, key } = wake {
             threads.push(spawn_combo_thread(ctx, tx, mods, key)?);
         }
 
-        Ok(Self { rx, threads })
+        lstr_index::snapshot::debug_log(&format!("hotkey: ready hotkey={hotkey}"));
+        Ok(Self {
+            rx,
+            threads,
+            dead: AtomicBool::new(false),
+        })
     }
 
     /// Returns a pending hotkey event without blocking.
     pub fn poll(&self) -> Option<HotkeyEvent> {
         match self.rx.try_recv() {
             Ok(event) => Some(event),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.dead.store(true, Ordering::Relaxed);
+                None
+            }
         }
+    }
+
+    /// 钩子线程已经退出（此后永远收不到事件）。调用方负责重新 [`Self::start`]。
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
     }
 }
 
@@ -148,14 +213,14 @@ impl Drop for HotkeyService {
 }
 
 fn spawn_hook_thread(
-    ctx: Context,
+    wake: Sender<()>,
     tx: Sender<HotkeyEvent>,
     tap: Option<DoubleTapDetector>,
 ) -> Result<ServiceThread, String> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let join = thread::Builder::new()
         .name("lstr-hotkey-hook".to_string())
-        .spawn(move || run_hook(ctx, tx, tap, ready_tx))
+        .spawn(move || run_hook(wake, tx, tap, ready_tx))
         .map_err(|err| format!("failed to spawn hotkey hook thread: {err}"))?;
 
     match ready_rx.recv() {
@@ -174,10 +239,15 @@ fn spawn_hook_thread(
     }
 }
 
-/// LL 钩子线程主体：安装钩子 → 泵消息 → 退出时反挂钩子。
-/// 低级钩子要求安装线程自己泵消息，回调才会被调用。
-fn run_hook(ctx: Context, tx: Sender<HotkeyEvent>, tap: Option<DoubleTapDetector>, ready: Sender<Result<u32, String>>) {
-    let hook = match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) } {
+/// LL 钩子线程主体：安装钩子 → 泵消息（含空闲 watchdog）→ 退出时反挂钩子。
+/// 低级钩子要求安装线程自己泵消息，回调才会被调用；重装也必须在同一线程。
+fn run_hook(
+    wake: Sender<()>,
+    tx: Sender<HotkeyEvent>,
+    tap: Option<DoubleTapDetector>,
+    ready: Sender<Result<u32, String>>,
+) {
+    let mut hook = match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) } {
         Ok(hook) => hook,
         Err(err) => {
             let _ = ready.send(Err(format!("SetWindowsHookExW 失败: {err}")));
@@ -189,16 +259,35 @@ fn run_hook(ctx: Context, tx: Sender<HotkeyEvent>, tap: Option<DoubleTapDetector
         *cell.borrow_mut() = Some(HookHandler {
             tap,
             ctrl_g: CtrlGState::default(),
-            sink: HookSink { tx, ctx },
+            sink: HookSink { tx, wake },
+            last_key: Instant::now(),
         });
     });
 
     let _ = ready.send(Ok(unsafe { GetCurrentThreadId() }));
 
+    // 线程定时器（hWnd = None）：WM_TIMER 直接投递到本线程队列。
+    let mut timer = unsafe { SetTimer(None, HOOK_WATCHDOG_ID, HOOK_WATCHDOG_MS, None) };
+    lstr_index::snapshot::debug_log(&format!(
+        "hotkey: hook ready (watchdog={}ms{})",
+        HOOK_WATCHDOG_MS,
+        if timer == 0 { ", timer failed" } else { "" }
+    ));
+
     let mut message = MSG::default();
     while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
+        if timer != 0 && message.message == WM_TIMER && message.wParam.0 == timer {
+            (hook, timer) = reinstall_if_idle(hook, timer);
+            continue;
+        }
         unsafe { DispatchMessageW(&message) };
     }
+    if timer != 0 {
+        unsafe {
+            let _ = KillTimer(None, timer);
+        }
+    }
+    lstr_index::snapshot::debug_log("hotkey: hook thread exit");
 
     // 先拆状态再反钩子：反钩子之后不会再有回调，但顺序上保持干净。
     HOOK_HANDLER.with(|cell| {
@@ -207,6 +296,53 @@ fn run_hook(ctx: Context, tx: Sender<HotkeyEvent>, tap: Option<DoubleTapDetector
     unsafe {
         let _ = UnhookWindowsHookEx(hook);
     }
+}
+
+/// 空闲 watchdog：最近 [`HOOK_IDLE_REHOOK`] 没收到任何按键就重装一次钩子。
+///
+/// 系统静默摘钩后钩子线程照样活着（只是永远收不到回调），所以重装必须由
+/// 这个线程自己在空闲时做。按键进来就说明钩子是好的，不必折腾。
+///
+/// 返回（钩子句柄, 定时器 id）：定时器每次重起都会拿到新 id，必须一路带出去。
+fn reinstall_if_idle(current: HHOOK, timer: usize) -> (HHOOK, usize) {
+    let idle = HOOK_HANDLER.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|handler| handler.last_key.elapsed())
+    });
+    let idle = idle.unwrap_or(HOOK_IDLE_REHOOK);
+    if idle < HOOK_IDLE_REHOOK {
+        return (current, timer);
+    }
+
+    // 先卸再装（不留重叠，避免同一次按键被两条同源钩子重复计数）。
+    unsafe {
+        let _ = UnhookWindowsHookEx(current);
+    }
+    match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) } {
+        Ok(hook) => {
+            lstr_index::snapshot::debug_log("hotkey: hook reinstalled (idle)");
+            (hook, arm_watchdog(timer, HOOK_WATCHDOG_MS))
+        }
+        Err(err) => {
+            // 这段时间热键失效：留证 + 2s 后重试。
+            lstr_index::snapshot::debug_log(&format!(
+                "hotkey: reinstall failed: {err}; retry in {HOOK_RETRY_MS}ms"
+            ));
+            (current, arm_watchdog(timer, HOOK_RETRY_MS))
+        }
+    }
+}
+
+/// 重起 watchdog 定时器（换周期用）：`SetTimer(None, ...)` 的返回 id 才是
+/// 消息里的 wParam，换表必须先杀掉旧 id，否则两个定时器会同时跑。
+fn arm_watchdog(current: usize, ms: u32) -> usize {
+    if current != 0 {
+        unsafe {
+            let _ = KillTimer(None, current);
+        }
+    }
+    unsafe { SetTimer(None, HOOK_WATCHDOG_ID, ms, None) }
 }
 
 /// LL 钩子回调：只观察、不吞键。
@@ -239,6 +375,8 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             let Some(handler) = guard.as_mut() else {
                 return None;
             };
+            // 任意按键都算「钩子活着」：空闲 watchdog 据此决定是否重装。
+            handler.last_key = now;
             if let Some(tap) = handler.tap.as_mut() {
                 if tap.on_key(vkey, is_down, now) {
                     return Some(HotkeyEvent::Toggle);
@@ -259,7 +397,8 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             HOOK_HANDLER.with(|cell| {
                 if let Some(handler) = cell.borrow().as_ref() {
                     let _ = handler.sink.tx.send(event);
-                    handler.sink.ctx.request_repaint();
+                    // 唤醒走专用线程：这里拿 egui 锁会拖慢回调、被系统摘钩。
+                    let _ = handler.sink.wake.send(());
                 }
             });
         }

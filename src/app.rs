@@ -1180,6 +1180,8 @@ pub struct LstrApp {
     effects_applied: bool,
     acrylic_ok: bool,
     hotkey: Option<HotkeyService>,
+    /// 热键服务为空时下次重试的时刻（钩子线程死掉/安装失败后自愈用）。
+    hotkey_retry_at: Option<Instant>,
     /// 提权 worker 的热键中继：管理员窗口在前台时，普通权限的 LL 钩子
     /// 收不到按键（UIPI），由子进程观察后 SetEvent 通知这里。
     hotkey_relay: Option<HotkeyRelay>,
@@ -1393,6 +1395,7 @@ impl LstrApp {
             effects_applied: false,
             acrylic_ok: false,
             hotkey,
+            hotkey_retry_at: None,
             hotkey_relay,
             dialog_watch,
             suppressed_dialog: None,
@@ -1554,12 +1557,18 @@ impl LstrApp {
         if self.hotkey_recording.is_some() {
             return;
         }
+        // 钩子线程意外退出后服务永久哑火（只有重启应用能恢复），这里就地重装。
+        self.revive_hotkey_if_dead(ctx);
         for event in events {
             match event {
                 HotkeyEvent::Toggle => {
                     if relay_pending {
                         relay_pending = false;
                     } else {
+                        lstr_index::snapshot::debug_log(&format!(
+                            "hotkey: toggle hidden={}",
+                            self.hidden
+                        ));
                         self.toggle(ctx);
                     }
                 }
@@ -1588,6 +1597,39 @@ impl LstrApp {
         }
         if relay_pending {
             self.toggle(ctx);
+        }
+    }
+
+    /// 热键服务自愈：钩子线程一旦退出，channel 永久断开，双击 Ctrl 再也
+    /// 收不到。发现即重装；装不上（极少见，比如瞬间资源紧张）就 5s 后再试，
+    /// 不让「一次失败」变成「重启应用才恢复」。
+    fn revive_hotkey_if_dead(&mut self, ctx: &egui::Context) {
+        if self.hotkey.as_ref().is_some_and(HotkeyService::is_dead) {
+            lstr_index::snapshot::debug_log("hotkey: service dead, restarting");
+            // 先丢掉死服务再装新的：Drop 会 join 已退出的线程，不会挂住。
+            self.hotkey = None;
+            self.hotkey_retry_at = Some(Instant::now());
+        }
+        if self.hotkey.is_some() {
+            self.hotkey_retry_at = None;
+            return;
+        }
+        let retry_due = self
+            .hotkey_retry_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(5));
+        if !retry_due {
+            return;
+        }
+        match HotkeyService::start(ctx.clone(), &self.cfg.hotkey) {
+            Ok(service) => {
+                lstr_index::snapshot::debug_log("hotkey: service restarted");
+                self.hotkey = Some(service);
+                self.hotkey_retry_at = None;
+            }
+            Err(err) => {
+                lstr_index::snapshot::debug_log(&format!("hotkey: restart failed: {err}"));
+                self.hotkey_retry_at = Some(Instant::now());
+            }
         }
     }
 
