@@ -11,14 +11,17 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, RedrawWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
 };
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, SetActiveWindow, SetFocus, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU,
 };
+use windows::Win32::UI::Shell::{ITaskbarList, TaskbarList};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
-    SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow, HWND_TOPMOST,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOW,
+    BringWindowToTop, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    SwitchToThisWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 pub fn hwnd_of_frame(frame: &eframe::Frame) -> Option<isize> {
@@ -235,6 +238,57 @@ pub fn hide(hwnd_value: isize) {
             0,
             SWP_NOSIZE | SWP_NOACTIVATE,
         );
+    }
+}
+
+/// 启动时把窗口从任务栏 / Alt+Tab 摘掉。
+///
+/// 常驻启动器的「隐藏」只是把窗口移到屏幕外（见 [`hide`]），窗口仍是 visible
+/// 状态；若保留任务栏按钮，用户会看到一个点不动的图标（点击只是激活一个
+/// -30000 位置的窗口）。WS_EX_TOOLWINDOW 是 Windows 官方用来排除任务栏与
+/// Alt+Tab 的样式；配合 SWP_FRAMECHANGED 让样式立即生效。
+pub fn detach_from_taskbar(hwnd_value: isize) {
+    if hwnd_value == 0 {
+        return;
+    }
+    let target = hwnd(hwnd_value);
+    unsafe {
+        let style = GetWindowLongPtrW(target, GWL_EXSTYLE);
+        let app_window = style & (WS_EX_APPWINDOW.0 as isize) != 0;
+        let tool_window = style & (WS_EX_TOOLWINDOW.0 as isize) != 0;
+        if !app_window && tool_window {
+            // 已经是目标状态：热路径（每帧调用）零改动。
+            return;
+        }
+        let next = (style & !(WS_EX_APPWINDOW.0 as isize)) | WS_EX_TOOLWINDOW.0 as isize;
+        SetWindowLongPtrW(target, GWL_EXSTYLE, next);
+        let _ = SetWindowPos(
+            target,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        delete_taskbar_tab(hwnd_value);
+    }
+}
+
+/// 摘掉任务栏按钮（winit 创建窗口时也做过一次，但在标志重同步后按钮会
+/// 像幽灵一样回来；配合 WS_EX_TOOLWINDOW 才彻底不再出现）。
+fn delete_taskbar_tab(hwnd_value: isize) {
+    unsafe {
+        // UI 线程通常已经初始化 COM；重复初始化返回 S_FALSE，可忽略。
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let Ok(list): Result<ITaskbarList, _> =
+            CoCreateInstance(&TaskbarList, None, CLSCTX_ALL)
+        else {
+            return;
+        };
+        if list.HrInit().is_ok() {
+            let _ = list.DeleteTab(hwnd(hwnd_value));
+        }
     }
 }
 

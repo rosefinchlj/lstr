@@ -57,6 +57,16 @@ pub fn edge_exe() -> Option<PathBuf> {
     None
 }
 
+/// Edge 的 32×32 图标：进程内只向 shell 取一次。书签页一次可能显示上百条
+/// 没有 favicon 的书签，若逐条 `SHGetFileInfoW(msedge.exe)` 会串行占住
+/// 图标锁，连文件图标都跟着慢。
+pub fn edge_icon() -> Option<ColorImage> {
+    static EDGE_ICON: OnceLock<Option<ColorImage>> = OnceLock::new();
+    EDGE_ICON
+        .get_or_init(|| edge_exe().and_then(|exe| load_icon(&exe.to_string_lossy(), 32)))
+        .clone()
+}
+
 /// 取书签对应网站的图标：读浏览器本地 favicon 缓存（Edge/Chrome 的
 /// `Favicons` SQLite、Firefox 的 `favicons.sqlite`），全程不联网。
 /// 缓存里没有这个站点时返回 None，调用方回退到 Edge 图标。

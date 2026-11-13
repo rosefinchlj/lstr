@@ -50,11 +50,12 @@ impl IconStore {
                             crate::win::icons::load_icon_with_attrs(&job.path, 32, attrs)
                         }
                         None => {
-                            // 书签优先网站图标；缓存里没有就回退 Edge 图标。
+                            // 书签优先网站图标；缓存里没有就回退 Edge 图标
+                            //（Edge 图标进程内只取一次，见 icons::edge_icon）。
                             job.favicon_url
                                 .as_deref()
                                 .and_then(crate::win::icons::load_favicon)
-                                .or_else(|| crate::win::icons::load_icon(&job.path, 32))
+                                .or_else(crate::win::icons::edge_icon)
                         }
                     };
                     if done_tx.send((job.key, image)).is_err() {
@@ -73,14 +74,22 @@ impl IconStore {
 
     /// 把后台完成的图标转成纹理；有新图标时触发重绘。
     fn drain(&mut self, ctx: &egui::Context) {
+        // 书签页一次可能有上百个图标同时到货：每帧最多上传 16 张纹理，
+        // 剩下的下一帧继续（已有 request_repaint），避免一次性上传造成卡顿。
+        const ICONS_PER_FRAME: usize = 16;
         let mut loaded = false;
-        while let Ok((key, image)) = self.rx.try_recv() {
+        let mut uploaded = 0;
+        while uploaded < ICONS_PER_FRAME {
+            let Ok((key, image)) = self.rx.try_recv() else {
+                break;
+            };
             self.pending.remove(&key);
             let texture = image.map(|img| {
                 ctx.load_texture(key.clone(), img, egui::TextureOptions::LINEAR)
             });
             self.cache.insert(key, texture);
             loaded = true;
+            uploaded += 1;
         }
         // 每份书签一张 favicon（32×32 ≈ 4KB 纹理），400 条的上限会被
         // 「书签」页滚动刷穿、反复清空重取；放宽到 1024 仍只有几 MB。
@@ -103,13 +112,10 @@ impl IconStore {
             Kind::File => Some(GENERIC_FILE_ICON),
             _ => None,
         };
-        // 书签优先取网站 favicon（浏览器缓存），没有则回退 Edge 的可执行文件图标；
-        // path 传 URL 的话 shell 只会给默认浏览器图标，所以显式换成 exe 路径。
+        // 书签：favicon 由后台线程按 URL 查浏览器缓存，没有则回退缓存的
+        // Edge 图标；path 不再传 URL（shell 只会给默认浏览器图标）。
         let (path, favicon_url) = if entry.kind == Kind::Bookmark {
-            let edge = crate::win::icons::edge_exe()
-                .map(|exe| exe.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            (edge, Some(entry.full_path()))
+            (String::new(), Some(entry.full_path()))
         } else {
             (entry.full_path(), None)
         };
@@ -9781,6 +9787,13 @@ impl eframe::App for LstrApp {
                 }
                 self.effects_applied = true;
             }
+        }
+
+        // 常驻启动器不该占任务栏：窗口「隐藏」只是移到屏幕外，留着任务栏
+        // 按钮就是一个点不动的图标。winit 在可见性等标志重同步时会把
+        // WS_EX_APPWINDOW 算回来（按钮幽灵式复活），所以每帧廉价校验一次。
+        if let Some(hwnd) = self.hwnd {
+            window::detach_from_taskbar(hwnd);
         }
 
         // 再次双击 exe / 从快捷方式启动时，第二个实例会通知这里唤出窗口。
