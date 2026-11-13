@@ -68,9 +68,16 @@ pub fn extract(raw: &str) -> Extract {
         match parse_from(raw, i, field_len, is_compact, kind) {
             Ok((end, condition)) => {
                 spans.push((i, end));
+                let source = raw[i..end].trim().to_string();
                 match condition {
-                    ParsedCondition::Date(range) => dates.push(range),
-                    ParsedCondition::Size(range) => sizes.push(range),
+                    ParsedCondition::Date(mut range) => {
+                        range.sources.push(source);
+                        dates.push(range);
+                    }
+                    ParsedCondition::Size(mut range) => {
+                        range.sources.push(source);
+                        sizes.push(range);
+                    }
                 }
                 i = end;
             }
@@ -303,6 +310,26 @@ pub fn suggestions(raw: &str) -> Vec<Suggestion> {
     out
 }
 
+/// 去掉条件文本末尾的终结冒号（进入编辑态时用）。
+pub fn strip_terminator(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    let without = trimmed
+        .strip_suffix('：')
+        .or_else(|| trimmed.strip_suffix(':'))
+        .unwrap_or(trimmed);
+    without.trim_end()
+}
+
+/// 单条条件 chip 的编辑文本：优先还原用户原始写法（去掉终结冒号），
+/// 多片段合并的 chip 返回 None，由调用方退回规范区间文本。
+pub fn source_edit_text(sources: &[String]) -> Option<String> {
+    if sources.len() != 1 {
+        return None;
+    }
+    let text = strip_terminator(sources[0].trim());
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// 日期 chip 的可编辑文本：由区间反推一组精确等价的规范条件。
 /// 合并过的 chip 也用单个区间表达式还原，避免多个片段只有最后一个能
 /// 被终结冒号提交。日期按本地日粒度反查。
@@ -489,6 +516,7 @@ fn parse_date_expr(
                     before: Some(before),
                     after_text: Some(format!("≥ {first_text}")),
                     before_text: Some(format!("≤ {second_text}")),
+                    sources: Vec::new(),
                 },
             ));
         }
@@ -530,30 +558,35 @@ fn parse_date_expr(
             before: None,
             after_text: Some(format!("> {text}")),
             before_text: None,
+            sources: Vec::new(),
         },
         Op::Ge => DateRange {
             after: Some(start_midnight),
             before: None,
             after_text: Some(format!("≥ {text}")),
             before_text: None,
+            sources: Vec::new(),
         },
         Op::Lt => DateRange {
             after: None,
             before: start_midnight.checked_sub(1),
             after_text: None,
             before_text: Some(format!("< {text}")),
+            sources: Vec::new(),
         },
         Op::Le => DateRange {
             after: None,
             before: end_exclusive.checked_sub(1),
             after_text: None,
             before_text: Some(format!("≤ {text}")),
+            sources: Vec::new(),
         },
         Op::Eq => DateRange {
             after: Some(start_midnight),
             before: end_exclusive.checked_sub(1),
             after_text: Some(format!("= {text}")),
             before_text: None,
+            sources: Vec::new(),
         },
     };
     Ok((end, condition))
@@ -626,6 +659,7 @@ fn parse_size_expr(
                     before: Some(second),
                     after_text: Some(format!("≥ {text}")),
                     before_text: Some(format!("≤ {second_text}")),
+                    sources: Vec::new(),
                 },
             ));
         }
@@ -641,12 +675,14 @@ fn parse_size_expr(
             before: None,
             after_text: Some(format!("> {text}")),
             before_text: None,
+            sources: Vec::new(),
         },
         Op::Ge => SizeRange {
             after: Some(bytes),
             before: None,
             after_text: Some(format!("≥ {text}")),
             before_text: None,
+            sources: Vec::new(),
         },
         Op::Lt => {
             // `< 0 B` 为空集：用 after=1/before=0 表示，引擎逐条比较自然 0 命中。
@@ -659,6 +695,7 @@ fn parse_size_expr(
                 before,
                 after_text: None,
                 before_text: Some(format!("< {text}")),
+                sources: Vec::new(),
             }
         }
         Op::Le => SizeRange {
@@ -666,12 +703,14 @@ fn parse_size_expr(
             before: Some(bytes),
             after_text: None,
             before_text: Some(format!("≤ {text}")),
+            sources: Vec::new(),
         },
         Op::Eq => SizeRange {
             after: Some(bytes),
             before: Some(bytes),
             after_text: Some(format!("= {text}")),
             before_text: None,
+            sources: Vec::new(),
         },
     };
     Ok((end, condition))
@@ -839,6 +878,11 @@ pub fn parse_size_edit_parts(
     text: &str,
 ) -> Option<(String, (String, usize), Option<(String, usize)>)> {
     let rest = text.trim_start().strip_prefix("size")?;
+    // 兼容紧凑写法 `size:>10M`：字段后的冒号直接跳过。
+    let rest = rest
+        .strip_prefix(':')
+        .or_else(|| rest.strip_prefix('：'))
+        .unwrap_or(rest);
     let rest = rest.trim_start();
     let (op, value_start) = match parse_op(rest) {
         Some((_, op_len)) => (rest[..op_len].to_string(), skip_ws(rest, op_len)),
@@ -1105,6 +1149,11 @@ pub fn parse_date_edit_parts(
     text: &str,
 ) -> Option<(String, (i32, u32, u32), Option<(i32, u32, u32)>)> {
     let rest = text.trim_start().strip_prefix("date")?;
+    // 兼容紧凑写法 `date:>2026-11-10`：字段后的冒号直接跳过。
+    let rest = rest
+        .strip_prefix(':')
+        .or_else(|| rest.strip_prefix('：'))
+        .unwrap_or(rest);
     let rest = rest.trim_start();
     let (op, value_start) = match parse_op(rest) {
         Some((_, op_len)) => (rest[..op_len].to_string(), skip_ws(rest, op_len)),
@@ -1994,5 +2043,45 @@ mod tests {
         assert_eq!(first, (2026, 11, 11));
         assert_eq!(second, None);
         assert!(parse_date_edit_parts("size >= 10M").is_none());
+        // 紧凑写法也能解析（字段后的冒号跳过）。
+        assert!(parse_date_edit_parts("date:>2026-11-10").is_some());
+        assert!(parse_size_edit_parts("size:>10M").is_some());
+    }
+
+    #[test]
+    fn original_sources_are_recorded_for_editing() {
+        let out = extract("size>10MB:");
+        assert_eq!(out.sizes[0].sources, vec!["size>10MB:".to_string()]);
+        assert_eq!(
+            source_edit_text(&out.sizes[0].sources).as_deref(),
+            Some("size>10MB")
+        );
+
+        let out = extract("date>2026-11-10:");
+        assert_eq!(
+            source_edit_text(&out.dates[0].sources).as_deref(),
+            Some("date>2026-11-10")
+        );
+
+        // 全角冒号 + 中文别名原样保留。
+        let out = extract("修改时间>今天：");
+        assert_eq!(
+            source_edit_text(&out.dates[0].sources).as_deref(),
+            Some("修改时间>今天")
+        );
+
+        // 多条合并：sources 累积；编辑退回规范区间文本（None）。
+        let mut merged = extract("date>2026-11-01:").dates.remove(0);
+        merged
+            .merge(extract("date<2026-11-30:").dates.remove(0))
+            .expect("merge");
+        assert_eq!(merged.sources.len(), 2);
+        assert!(source_edit_text(&merged.sources).is_none());
+
+        // 同一个源重复合并不会重复入栈。
+        let mut dup = extract("size>10M:").sizes.remove(0);
+        dup.merge(extract("size>10M:").sizes.remove(0))
+            .expect("merge");
+        assert_eq!(dup.sources.len(), 1);
     }
 }

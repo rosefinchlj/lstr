@@ -423,12 +423,7 @@ fn caret_after_remove(caret: Option<usize>, removed: usize, new_count: usize) ->
 
 /// 去掉条件文本末尾的终结冒号（进入编辑态时用，避免立刻又被收成 chip）。
 fn strip_condition_terminator(text: &str) -> &str {
-    let trimmed = text.trim_end();
-    let without = trimmed
-        .strip_suffix('：')
-        .or_else(|| trimmed.strip_suffix(':'))
-        .unwrap_or(trimmed);
-    without.trim_end()
+    crate::search::conditions::strip_terminator(text)
 }
 
 /// 日期分段输入遮罩（date 条件编辑态）：年/月/日三段，
@@ -1807,8 +1802,11 @@ impl LstrApp {
                 ),
                 id: "date".into(),
                 tooltip,
-                edit_text: crate::search::conditions::date_edit_text(range)
-                    .map(|text| strip_condition_terminator(&text).to_string()),
+                edit_text: crate::search::conditions::source_edit_text(&range.sources)
+                    .or_else(|| {
+                        crate::search::conditions::date_edit_text(range)
+                            .map(|text| strip_condition_terminator(&text).to_string())
+                    }),
                 hold_after_edit: false,
             });
         }
@@ -1821,8 +1819,11 @@ impl LstrApp {
                 bg: Color32::from_rgba_unmultiplied(size_color.r(), size_color.g(), size_color.b(), 34),
                 id: "size".into(),
                 tooltip: "文件大小条件；双击编辑，点 × 移除".into(),
-                edit_text: crate::search::conditions::size_edit_text(range)
-                    .map(|text| strip_condition_terminator(&text).to_string()),
+                edit_text: crate::search::conditions::source_edit_text(&range.sources)
+                    .or_else(|| {
+                        crate::search::conditions::size_edit_text(range)
+                            .map(|text| strip_condition_terminator(&text).to_string())
+                    }),
                 hold_after_edit: false,
             });
         }
@@ -2980,6 +2981,18 @@ impl LstrApp {
                 }
                 return;
             }
+            // 模态：其余按键/文本/IME 事件全部丢弃，不能漏到后面的输入框/遮罩。
+            ctx.input_mut(|i| {
+                i.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Key { .. }
+                            | egui::Event::Ime(_)
+                    )
+                })
+            });
             return;
         }
 
@@ -4086,6 +4099,7 @@ impl LstrApp {
                 }
                 if self.date_mask.is_none()
                     && self.size_mask.is_none()
+                    && self.pending_delete.is_none()
                     && !self.ime_composing
                     && !self.condition_hold
                     && self.conditions_apply(query.scope)

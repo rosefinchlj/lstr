@@ -237,6 +237,9 @@ pub struct DateRange {
     pub before: Option<i64>,
     pub after_text: Option<String>,
     pub before_text: Option<String>,
+    /// 原始输入片段（含终结冒号），用于编辑 chip 时还原用户写法
+    /// （`date>2026-11-10:` 而不是规范化的 `date >= 2026-11-11:`）。
+    pub sources: Vec<String>,
 }
 
 impl DateRange {
@@ -281,6 +284,11 @@ impl DateRange {
         }
         self.after = after;
         self.before = before;
+        for source in other.sources {
+            if !self.sources.contains(&source) {
+                self.sources.push(source);
+            }
+        }
         Ok(())
     }
 }
@@ -293,6 +301,9 @@ pub struct SizeRange {
     pub before: Option<u64>,
     pub after_text: Option<String>,
     pub before_text: Option<String>,
+    /// 原始输入片段（含终结冒号），编辑 chip 时优先还原用户写法
+    /// （`size>10MB:` 而不是规范化的 `size >= 10485761B:`）。
+    pub sources: Vec<String>,
 }
 
 impl SizeRange {
@@ -336,6 +347,11 @@ impl SizeRange {
         }
         self.after = after;
         self.before = before;
+        for source in other.sources {
+            if !self.sources.contains(&source) {
+                self.sources.push(source);
+            }
+        }
         Ok(())
     }
 }
@@ -443,6 +459,7 @@ mod tests {
             before: Some(300),
             after_text: Some("> 2026-11-01".into()),
             before_text: Some("< 2026-11-30".into()),
+            sources: Vec::new(),
         };
         range
             .merge(DateRange {
@@ -450,6 +467,7 @@ mod tests {
                 before: None,
                 after_text: Some("≥ 2026-11-10".into()),
                 before_text: None,
+                sources: Vec::new(),
             })
             .expect("tighter lower bound");
         assert_eq!(range.after, Some(200));
@@ -463,6 +481,7 @@ mod tests {
                 before: None,
                 after_text: Some("> 2026-10-01".into()),
                 before_text: None,
+                sources: Vec::new(),
             })
             .expect("looser lower bound is ignored");
         assert_eq!(range.after, Some(200));
@@ -476,6 +495,7 @@ mod tests {
             before: None,
             after_text: Some("≥ 2026-11-10".into()),
             before_text: None,
+            sources: Vec::new(),
         };
         let before = range.clone();
         let err = range
@@ -484,6 +504,7 @@ mod tests {
                 before: Some(100),
                 after_text: None,
                 before_text: Some("< 2026-11-01".into()),
+                sources: Vec::new(),
             })
             .expect_err("empty interval must be rejected");
         assert!(err.contains("冲突"));
@@ -504,6 +525,7 @@ mod tests {
             before: Some(10 * 1024 * 1024),
             after_text: Some("≥ 1 KB".into()),
             before_text: Some("≤ 10 MB".into()),
+            sources: Vec::new(),
         };
         range
             .merge(SizeRange {
@@ -511,6 +533,7 @@ mod tests {
                 before: None,
                 after_text: Some("≥ 2 MB".into()),
                 before_text: None,
+                sources: Vec::new(),
             })
             .expect("tighter lower bound");
         assert_eq!(range.after, Some(2 * 1024 * 1024));
@@ -524,6 +547,7 @@ mod tests {
                 before: None,
                 after_text: Some("> 1 B".into()),
                 before_text: None,
+                sources: Vec::new(),
             })
             .expect("looser lower bound is ignored");
         assert_eq!(range.after, Some(2 * 1024 * 1024));
@@ -536,6 +560,7 @@ mod tests {
             before: None,
             after_text: Some("≥ 10 MB".into()),
             before_text: None,
+            sources: Vec::new(),
         };
         let before = range.clone();
         let err = range
@@ -544,6 +569,7 @@ mod tests {
                 before: Some(1024),
                 after_text: None,
                 before_text: Some("< 1 KB".into()),
+                sources: Vec::new(),
             })
             .expect_err("empty interval must be rejected");
         assert!(err.contains("冲突"));

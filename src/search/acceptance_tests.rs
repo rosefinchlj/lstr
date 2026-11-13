@@ -546,6 +546,7 @@ fn acceptance_h_date_condition_filters_by_index_mtime() {
             before,
             after_text: after.map(|_| "条件".to_string()),
             before_text: before.map(|_| "条件".to_string()),
+            sources: Vec::new(),
         }),
         ..Default::default()
     };
@@ -622,6 +623,7 @@ fn acceptance_i_size_condition_filters_by_index_size() {
             before,
             after_text: after.map(|_| "条件".to_string()),
             before_text: before.map(|_| "条件".to_string()),
+            sources: Vec::new(),
         }),
         ..Default::default()
     };
