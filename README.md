@@ -250,7 +250,7 @@ exec = "notepad {query}"
 - **对话框自动唤出（Quick Switch）**：`SetWinEventHook` 监听前台 `#32770` 自动弹到对话框旁边（设置可关）；空查询时用 `ShellWindows` COM 列出 Explorer 已打开的文件夹置顶，Enter 一键切换；「填入成功 / Esc / 失焦」都会抑制同一对话框的循环弹窗；对话框被关闭时自动退出对话框模式
 - **真实 shell 图标**：文件/文件夹/`.lnk` 走 `SHGetFileInfoW`，UWP 走 `IShellItemImageFactory`（计算器/设置等显示真实图标），结果行与预览共用纹理缓存
 - **UWP / Store 应用**：`Get-StartApps` 懒加载（只搜文件时完全不启动 PowerShell；首次需要应用结果时才在后台枚举，不阻塞搜索），支持拼音搜索与 `ShellExecute` 启动
-- **浏览器收藏夹**：读取 Chrome / Edge / Brave / Vivaldi / Chromium / Opera 的 `Bookmarks` JSON 与 Firefox 的 `places.sqlite`，书签进入「全部」搜索与新增的「书签」类型页（空输入按名称列出全部；名称 / 拼音 / 网址匹配，`Enter` 用默认浏览器打开）；图标优先取浏览器本地缓存里的网站 favicon（`Favicons` / `favicons.sqlite`，不联网），取不到时回退 Edge 图标；收藏夹变化 2 分钟内自动重载，设置 → 搜索可开关（即时生效）
+- **浏览器收藏夹**：读取 Chrome / Edge / Brave / Vivaldi / Chromium / Opera 的 `Bookmarks` JSON 与 Firefox 的 `places.sqlite`，书签进入「全部」搜索与新增的「书签」类型页（空输入按名称列出全部；名称 / 拼音 / 网址匹配，`Enter` 用默认浏览器打开）；结果行副标题显示所属收藏夹层级（如 `收藏夹栏 › 工作 › 需求`）；图标优先取浏览器本地缓存里的网站 favicon（`Favicons` / `favicons.sqlite`，不联网），取不到时回退 Edge 图标；收藏夹变化 2 分钟内自动重载，设置 → 搜索可开关（即时生效）
 - **动作菜单**：`→`（光标在末尾，非文件夹）、`Ctrl+K`、`Shift+F10`、右键结果；键盘上下选择，Enter 执行；文件夹用 `Shift+F10` 打开菜单（`→` 保持下钻）；「删除到回收站…」（或选中结果按 `Del`）带二次确认（←/→ 切换按钮，Enter 执行、Esc 取消，仅本地文件/文件夹/程序、只允许固定本地盘），删除后页脚有「撤回删除」一键还原；「从最近使用中移除」只在条目确实在历史里时出现
 - **搜索现场保留**：定位 / 打开方式 / 在终端打开 / 管理员运行 / 打开 收起后都会保留输入与结果，再次唤出可继续上次搜索；命令执行与自定义动作按各自语义处理
 - **预览面板**：选中结果右侧显示图标、名称、类型、路径、大小、修改时间（`Ctrl+P` 开关）

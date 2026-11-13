@@ -163,6 +163,9 @@ pub struct SearchService {
     /// 浏览器书签索引开关（设置页即时生效）：worker 每轮维护读取，
     /// 关闭时清空索引并且不再把书签并入结果。
     bookmarks_enabled: Arc<AtomicBool>,
+    /// 书签 id → 收藏夹层级（「收藏夹栏 › 工作 › 需求」）。worker 每次
+    /// 重载书签索引时整体刷新，UI 用它渲染结果行副标题。
+    bookmark_folders: Arc<Mutex<HashMap<String, String>>>,
     /// 自研索引状态(设置页/状态行用);worker 线程随时刷新。
     pub index_status: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
     /// 「参与索引的卷」掩码(lstr_index::volmask 位掩码,bit i='A'+i),
@@ -191,6 +194,9 @@ impl SearchService {
         let worker_apps_dirty = Arc::clone(&apps_dirty);
         let bookmarks_enabled = Arc::new(AtomicBool::new(config.index.bookmarks));
         let worker_bookmarks_enabled = Arc::clone(&bookmarks_enabled);
+        let bookmark_folders: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let worker_bookmark_folders = Arc::clone(&bookmark_folders);
         let status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>> = Arc::new(Mutex::new(None));
         let worker_status = Arc::clone(&status_slot);
         // 卷选择:启动时从配置取快照(空列表 = 全部盘),之后设置页改掩码即可
@@ -225,6 +231,7 @@ impl SearchService {
                     ctx,
                     apps_dirty: worker_apps_dirty,
                     bookmarks_enabled: worker_bookmarks_enabled,
+                    bookmark_folders: worker_bookmark_folders,
                     status_slot: worker_status,
                     index_cmd_rx,
                     index_cmd_tx: worker_index_cmd_tx,
@@ -251,6 +258,7 @@ impl SearchService {
             favorites: config.favorites,
             apps_dirty,
             bookmarks_enabled,
+            bookmark_folders,
             index_status: status_slot,
             volume_mask,
             index_cmd: index_cmd_tx,
@@ -491,6 +499,14 @@ impl SearchService {
     /// 设置页「浏览器书签」开关：worker 下一轮维护立即清空/重建（不等 TTL）。
     pub fn set_bookmarks_enabled(&self, on: bool) {
         self.bookmarks_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// 书签 id → 收藏夹层级快照；UI 在每次拿到新响应时同步一次。
+    pub fn bookmark_folders(&self) -> HashMap<String, String> {
+        self.bookmark_folders
+            .lock()
+            .map(|map| map.clone())
+            .unwrap_or_default()
     }
 
     pub fn poll(&self) -> Option<Response> {
@@ -1521,6 +1537,7 @@ struct WorkerArgs {
     ctx: egui::Context,
     apps_dirty: Arc<AtomicBool>,
     bookmarks_enabled: Arc<AtomicBool>,
+    bookmark_folders: Arc<Mutex<HashMap<String, String>>>,
     status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
     index_cmd_rx: Receiver<ClientCommand>,
     /// 控制指令发送端(run_worker 的排除规则变更检测用它发 Rescan 掩码)。
@@ -1650,6 +1667,16 @@ fn browse_response(
     }
 }
 
+/// 书签索引重建后把「id → 收藏夹层级」整体推给 UI（行副标题用）。
+fn publish_bookmark_folders(
+    slot: &Arc<Mutex<HashMap<String, String>>>,
+    bookmarks: &bookmarks::BookmarkIndex,
+) {
+    if let Ok(mut map) = slot.lock() {
+        *map = bookmarks.folder_map();
+    }
+}
+
 fn run_worker(args: WorkerArgs) {
     let WorkerArgs {
         rx,
@@ -1659,6 +1686,7 @@ fn run_worker(args: WorkerArgs) {
         ctx,
         apps_dirty,
         bookmarks_enabled,
+        bookmark_folders,
         status_slot,
         index_cmd_rx,
         index_cmd_tx,
@@ -1726,6 +1754,7 @@ fn run_worker(args: WorkerArgs) {
     };
     let mut bookmarks_loaded = Instant::now();
     let mut bookmarks_stamp = bookmarks::source_stamp();
+    publish_bookmark_folders(&bookmark_folders, &bookmarks);
     if bookmarks_enabled.load(Ordering::Relaxed) {
         lstr_index::snapshot::debug_log(&format!(
             "bookmarks: loaded {} entries",
@@ -1940,10 +1969,12 @@ fn run_worker(args: WorkerArgs) {
                 bookmarks = bookmarks::BookmarkIndex::empty();
                 bookmarks_stamp.clear();
                 bookmarks_loaded = Instant::now();
+                publish_bookmark_folders(&bookmark_folders, &bookmarks);
             } else if forced || stamp != bookmarks_stamp {
                 bookmarks = bookmarks::BookmarkIndex::load();
                 bookmarks_stamp = stamp;
                 bookmarks_loaded = Instant::now();
+                publish_bookmark_folders(&bookmark_folders, &bookmarks);
                 lstr_index::snapshot::debug_log(&format!(
                     "bookmarks: reloaded {} entries",
                     bookmarks.count()

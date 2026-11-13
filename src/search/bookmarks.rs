@@ -15,7 +15,7 @@ use crate::search::{apps, fuzzy, pinyin};
 use crate::win::browserdata;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,15 +28,21 @@ const MAX_BOOKMARKS: usize = 20_000;
 /// 离开浏览器上下文没有意义，直接跳过。
 const WEB_SCHEMES: [&str; 4] = ["http://", "https://", "ftp://", "file://"];
 
-/// 一次加载结果：条目与一一对应的小写 URL（搜索时零分配）。
+/// 一次加载结果：条目、一一对应的小写 URL（搜索时零分配）与收藏夹路径。
 pub struct BookmarkIndex {
     marks: Vec<Entry>,
     urls: Vec<String>,
+    /// 与 `marks` 一一对应：「收藏夹栏 › 工作 › 需求」；无目录时为空串。
+    folders: Vec<String>,
 }
 
 impl BookmarkIndex {
     pub fn empty() -> Self {
-        Self { marks: Vec::new(), urls: Vec::new() }
+        Self {
+            marks: Vec::new(),
+            urls: Vec::new(),
+            folders: Vec::new(),
+        }
     }
 
     /// 扫描全部已知浏览器并合并（同一 URL 只保留首次出现的书签）。
@@ -56,16 +62,30 @@ impl BookmarkIndex {
                 load_firefox_db(&db, &mut raw);
             }
         }
-        let marks = build_entries(raw);
+        let (marks, folders) = build_entries(raw);
         let urls = marks
             .iter()
             .map(|entry| entry.full_path().to_lowercase())
             .collect();
-        Self { marks, urls }
+        Self {
+            marks,
+            urls,
+            folders,
+        }
     }
 
     pub fn count(&self) -> usize {
         self.marks.len()
+    }
+
+    /// 书签 id → 所属收藏夹路径。列表行据此显示「收藏夹栏 › 工作 › 需求」。
+    pub fn folder_map(&self) -> HashMap<String, String> {
+        self.marks
+            .iter()
+            .zip(&self.folders)
+            .filter(|(_, folder)| !folder.is_empty())
+            .map(|(entry, folder)| (entry.id.clone(), folder.clone()))
+            .collect()
     }
 
     /// 书签页空输入：按名称列出前 `limit` 条（加载时已按名称排序）。
@@ -163,6 +183,8 @@ pub fn source_stamp() -> Vec<(String, u64, u64)> {
 struct RawBookmark {
     name: String,
     url: String,
+    /// 各级收藏夹名称，用「 › 」连接（含浏览器根目录，如「收藏夹栏」）。
+    folder: String,
 }
 
 fn load_chromium_file(path: &Path, raw: &mut Vec<RawBookmark>) {
@@ -176,11 +198,11 @@ fn load_chromium_file(path: &Path, raw: &mut Vec<RawBookmark>) {
         return;
     };
     for node in roots.values() {
-        walk_chromium_node(node, raw);
+        walk_chromium_node(node, &mut Vec::new(), raw);
     }
 }
 
-fn walk_chromium_node(node: &Value, raw: &mut Vec<RawBookmark>) {
+fn walk_chromium_node(node: &Value, folders: &mut Vec<String>, raw: &mut Vec<RawBookmark>) {
     match node.get("type").and_then(Value::as_str) {
         Some("url") => {
             let url = node.get("url").and_then(Value::as_str).unwrap_or("").trim();
@@ -193,18 +215,74 @@ fn walk_chromium_node(node: &Value, raw: &mut Vec<RawBookmark>) {
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            raw.push(RawBookmark { name, url: url.to_string() });
+            raw.push(RawBookmark {
+                name,
+                url: url.to_string(),
+                folder: folders.join(" › "),
+            });
         }
-        // folder（或缺少 type 的容器）：继续下潜。书签栏/其他书签/移动设备
-        // 书签都在 roots 下，递归即可，不需要关心具体分区名。
+        // folder（或缺少 type 的容器）：把目录名压栈后继续下潜，书签节点
+        // 记录当前完整层级（收藏夹栏 › 工作 › 需求）。根目录也在 roots 下，
+        // 所以「收藏夹栏 / 其他收藏夹 / 移动收藏夹」自然成为第一级。
         _ => {
+            let name = node
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let pushed = !name.is_empty();
+            if pushed {
+                folders.push(name);
+            }
             if let Some(children) = node.get("children").and_then(Value::as_array) {
                 for child in children {
-                    walk_chromium_node(child, raw);
+                    walk_chromium_node(child, folders, raw);
                 }
+            }
+            if pushed {
+                folders.pop();
             }
         }
     }
+}
+
+/// Firefox 的根目录在库里存的是内部英文键（menu/toolbar/…），展示时换成
+/// 中文；用户自建目录原样保留。
+fn firefox_folder_name(title: &str) -> String {
+    match title {
+        "menu" => "书签菜单",
+        "toolbar" => "书签工具栏",
+        "other" | "unfiled" => "其他书签",
+        "mobile" => "移动书签",
+        "tags" => "标签",
+        other => other,
+    }
+    .to_string()
+}
+
+/// 从 parent 往上收集目录链（跳过空标题的根节点），根在前的展示顺序。
+fn firefox_folder_path(
+    parent: i64,
+    folders: &HashMap<i64, (i64, String)>,
+) -> String {
+    let mut names = Vec::new();
+    let mut current = parent;
+    for _ in 0..16 {
+        let Some((next, title)) = folders.get(&current) else {
+            break;
+        };
+        if title.is_empty() {
+            break;
+        }
+        names.push(firefox_folder_name(title));
+        if *next <= 0 {
+            break;
+        }
+        current = *next;
+    }
+    names.reverse();
+    names.join(" › ")
 }
 
 /// Firefox：复制主库 + WAL/SHM 到临时目录再只读查询（直接打开运行中的
@@ -236,16 +314,42 @@ fn load_firefox_db(db: &Path, raw: &mut Vec<RawBookmark>) {
     }
     if copied {
         if let Ok(conn) = Connection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-            let sql = "SELECT COALESCE(b.title, ''), p.url \
+            // 先把所有目录（type=2）的 parent/title 读进内存，书签逐条向上
+            // 拼层级；单表几千行，比逐条递归 SQL 快得多。
+            let mut folders: HashMap<i64, (i64, String)> = HashMap::new();
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT id, parent, COALESCE(title, '') FROM moz_bookmarks WHERE type = 2",
+            ) {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                }) {
+                    for (id, parent, title) in rows.flatten() {
+                        folders.insert(id, (parent, title));
+                    }
+                }
+            }
+            let sql = "SELECT COALESCE(b.title, ''), p.url, b.parent \
                        FROM moz_bookmarks b JOIN moz_places p ON p.id = b.fk \
                        WHERE b.type = 1 AND p.url IS NOT NULL";
             if let Ok(mut stmt) = conn.prepare(sql) {
                 if let Ok(rows) = stmt.query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
                 }) {
-                    for (name, url) in rows.flatten() {
+                    for (name, url, parent) in rows.flatten() {
                         if is_web_url(&url) {
-                            raw.push(RawBookmark { name: name.trim().to_string(), url });
+                            raw.push(RawBookmark {
+                                name: name.trim().to_string(),
+                                url,
+                                folder: firefox_folder_path(parent, &folders),
+                            });
                         }
                     }
                 }
@@ -273,9 +377,10 @@ fn url_host(url: &str) -> String {
     host.trim_start_matches("www.").to_string()
 }
 
-fn build_entries(raw: Vec<RawBookmark>) -> Vec<Entry> {
+/// 去重、构建 Entry，并保留每条书签的收藏夹路径（与 Entry 一一对应）。
+fn build_entries(raw: Vec<RawBookmark>) -> (Vec<Entry>, Vec<String>) {
     let mut seen: HashSet<String> = HashSet::new();
-    let mut marks = Vec::new();
+    let mut marks: Vec<(Entry, String)> = Vec::new();
     for item in raw {
         let url = item.url.trim().to_string();
         if !is_web_url(&url) || !seen.insert(url.to_lowercase()) {
@@ -289,28 +394,31 @@ fn build_entries(raw: Vec<RawBookmark>) -> Vec<Entry> {
         if name.is_empty() {
             continue;
         }
-        marks.push(Entry {
-            id: format!("bm:{url}"),
-            kind: Kind::Bookmark,
-            pinyin: Some(pinyin::keys(&name)),
-            initial: apps::initial_for(&name),
-            tone: apps::tone_for(&name),
-            name,
-            path: Some(PathBuf::from(url)),
-            size: None,
-            modified: None,
-        });
+        marks.push((
+            Entry {
+                id: format!("bm:{url}"),
+                kind: Kind::Bookmark,
+                pinyin: Some(pinyin::keys(&name)),
+                initial: apps::initial_for(&name),
+                tone: apps::tone_for(&name),
+                name,
+                path: Some(PathBuf::from(url)),
+                size: None,
+                modified: None,
+            },
+            item.folder,
+        ));
         if marks.len() >= MAX_BOOKMARKS {
             break;
         }
     }
-    marks.sort_by(|a, b| {
+    marks.sort_by(|(a, _), (b, _)| {
         a.name
             .to_lowercase()
             .cmp(&b.name.to_lowercase())
             .then_with(|| a.name.cmp(&b.name))
     });
-    marks
+    marks.into_iter().unzip()
 }
 
 #[cfg(test)]
@@ -321,12 +429,28 @@ mod tests {
         serde_json::json!({"type": "url", "name": name, "url": url})
     }
 
+    fn raw(name: &str, url: &str) -> RawBookmark {
+        RawBookmark {
+            name: name.into(),
+            url: url.into(),
+            folder: String::new(),
+        }
+    }
+
+    fn raw_in(name: &str, url: &str, folder: &str) -> RawBookmark {
+        RawBookmark {
+            name: name.into(),
+            url: url.into(),
+            folder: folder.into(),
+        }
+    }
+
     #[test]
-    fn walks_nested_folders_and_skips_non_web_urls() {
+    fn walks_nested_folders_and_records_full_folder_path() {
         let json = serde_json::json!({
             "roots": {
                 "bookmark_bar": {
-                    "type": "folder", "name": "书签栏",
+                    "type": "folder", "name": "收藏夹栏",
                     "children": [
                         chromium_bookmark("Rust", "https://www.rust-lang.org/"),
                         {"type": "folder", "name": "开发", "children": [
@@ -335,51 +459,59 @@ mod tests {
                         ]}
                     ]
                 },
-                "other": {"type": "folder", "name": "其他", "children": [
+                "other": {"type": "folder", "name": "其他收藏夹", "children": [
                     chromium_bookmark("", "https://example.com/a/b")
                 ]}
             }
         });
         let mut raw = Vec::new();
         for node in json["roots"].as_object().unwrap().values() {
-            walk_chromium_node(node, &mut raw);
+            walk_chromium_node(node, &mut Vec::new(), &mut raw);
         }
-        let marks = build_entries(raw);
+        let (marks, folders) = build_entries(raw);
         assert_eq!(marks.len(), 3, "javascript: 应被过滤: {marks:?}");
-        let rust = marks.iter().find(|entry| entry.name == "Rust").unwrap();
-        assert_eq!(rust.kind, Kind::Bookmark);
-        assert_eq!(rust.full_path(), "https://www.rust-lang.org/");
+        let rust = marks.iter().position(|entry| entry.name == "Rust").unwrap();
+        assert_eq!(marks[rust].kind, Kind::Bookmark);
+        assert_eq!(marks[rust].full_path(), "https://www.rust-lang.org/");
+        assert_eq!(folders[rust], "收藏夹栏", "根目录也算一级");
+        let docs = marks.iter().position(|entry| entry.name == "Docs").unwrap();
+        assert_eq!(folders[docs], "收藏夹栏 › 开发", "嵌套目录逐级保留");
         // 标题为空 → host 兜底。
         assert!(marks.iter().any(|entry| entry.name == "example.com"));
     }
 
     #[test]
-    fn duplicate_urls_are_merged() {
+    fn duplicate_urls_are_merged_and_keep_first_folder() {
         let raw = vec![
-            RawBookmark { name: "Rust".into(), url: "https://rust-lang.org/".into() },
-            RawBookmark { name: "Rust 2".into(), url: "HTTPS://rust-lang.org/".into() },
+            raw_in("Rust", "https://rust-lang.org/", "收藏夹栏 › 开发"),
+            raw_in("Rust 2", "HTTPS://rust-lang.org/", "其他收藏夹"),
         ];
-        let marks = build_entries(raw);
+        let (marks, folders) = build_entries(raw);
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].name, "Rust");
+        assert_eq!(folders[0], "收藏夹栏 › 开发");
     }
 
     fn index_from(raw: Vec<RawBookmark>) -> BookmarkIndex {
-        let marks = build_entries(raw);
+        let (marks, folders) = build_entries(raw);
         let urls = marks
             .iter()
             .map(|entry| entry.full_path().to_lowercase())
             .collect();
-        BookmarkIndex { marks, urls }
+        BookmarkIndex {
+            marks,
+            urls,
+            folders,
+        }
     }
 
     #[test]
     fn top_is_name_sorted_and_limited() {
         // 「书签」页空输入 = 按名称列出全部书签；limit 只取一屏。
         let index = index_from(vec![
-            RawBookmark { name: "beta".into(), url: "https://b.example/".into() },
-            RawBookmark { name: "Alpha".into(), url: "https://a.example/".into() },
-            RawBookmark { name: "gamma".into(), url: "https://c.example/".into() },
+            raw("beta", "https://b.example/"),
+            raw("Alpha", "https://a.example/"),
+            raw("gamma", "https://c.example/"),
         ]);
         let top = index.top(2);
         assert_eq!(top.len(), 2);
@@ -390,9 +522,9 @@ mod tests {
     #[test]
     fn search_hits_name_pinyin_and_url() {
         let index = index_from(vec![
-            RawBookmark { name: "GitHub".into(), url: "https://github.com/".into() },
-            RawBookmark { name: "掘金".into(), url: "https://juejin.cn/".into() },
-            RawBookmark { name: "文档".into(), url: "https://doc.rust-lang.org/book/".into() },
+            raw("GitHub", "https://github.com/"),
+            raw("掘金", "https://juejin.cn/"),
+            raw("文档", "https://doc.rust-lang.org/book/"),
         ]);
         assert_eq!(index.search("git", 10)[0].name, "GitHub", "名称前缀优先");
         assert_eq!(index.search("juejin", 10)[0].name, "掘金", "拼音/URL 命中");
@@ -405,7 +537,23 @@ mod tests {
     }
 
     #[test]
-    fn firefox_places_query_reads_bookmarks() {
+    fn folder_map_exposes_hierarchy_for_ui() {
+        let index = index_from(vec![
+            raw_in("GitHub", "https://github.com/", "收藏夹栏 › 开发"),
+            raw("无目录", "https://example.com/"),
+        ]);
+        let map = index.folder_map();
+        let github = index
+            .search("github", 5)
+            .into_iter()
+            .find(|entry| entry.name == "GitHub")
+            .unwrap();
+        assert_eq!(map.get(&github.id).map(String::as_str), Some("收藏夹栏 › 开发"));
+        assert_eq!(map.len(), 1, "没有目录的书签不写空值");
+    }
+
+    #[test]
+    fn firefox_places_query_reads_bookmarks_and_folder_path() {
         let dir = std::env::temp_dir().join(format!(
             "lstr-bm-test-{}",
             std::process::id()
@@ -417,18 +565,26 @@ mod tests {
             let conn = Connection::open(&db).unwrap();
             conn.execute_batch(
                 "CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT);
-                 CREATE TABLE moz_bookmarks (id INTEGER PRIMARY KEY, type INTEGER, fk INTEGER, title TEXT);
+                 CREATE TABLE moz_bookmarks (id INTEGER PRIMARY KEY, type INTEGER, fk INTEGER,
+                     title TEXT, parent INTEGER);
                  INSERT INTO moz_places (id, url) VALUES (1, 'https://mozilla.org/'), (2, 'place:sort=8');
-                 INSERT INTO moz_bookmarks (id, type, fk, title) VALUES (1, 1, 1, 'Mozilla'), (2, 1, 2, '最近');",
+                 INSERT INTO moz_bookmarks (id, type, fk, title, parent) VALUES
+                     (1, 2, NULL, '', 0),
+                     (2, 2, NULL, 'menu', 1),
+                     (3, 2, NULL, '工作', 2),
+                     (4, 1, 1, 'Mozilla', 3),
+                     (5, 1, 2, '最近', 2);",
             )
             .unwrap();
         }
         let mut raw = Vec::new();
         load_firefox_db(&db, &mut raw);
-        let marks = build_entries(raw);
+        let (marks, folders) = build_entries(raw);
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].name, "Mozilla");
         assert_eq!(marks[0].full_path(), "https://mozilla.org/");
+        // Firefox 的内部根目录键 menu → 中文「书签菜单」，用户目录原样保留。
+        assert_eq!(folders[0], "书签菜单 › 工作");
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1269,6 +1269,8 @@ pub struct LstrApp {
     /// 学习徽标缓存(按当前查询词),让自学习在结果行可见。
     learn_for: String,
     learn_badges: HashMap<String, crate::history::LearnBadge>,
+    /// 书签 id → 收藏夹层级（「收藏夹栏 › 工作 › 需求」），随每次响应刷新。
+    bookmark_folders: HashMap<String, String>,
     /// 产生当前结果列表的查询词（请求发出时的输入，条件已剥离）。
     /// 结果行的「拼音 xx / 模糊 xx / 关键词高亮」必须用它：条件编辑/联想
     /// 暂停期间输入框里是半截条件，拿它当查询词会把 `size >= …` 标成拼音命中。
@@ -1445,6 +1447,7 @@ impl LstrApp {
             previews: PreviewStore::new(),
             learn_for: String::new(),
             learn_badges: HashMap::new(),
+            bookmark_folders: HashMap::new(),
             results_query_text: String::new(),
             learning_view_frecency: false,
             noise_exclude_applied,
@@ -1882,6 +1885,7 @@ impl LstrApp {
                 let was_more = self.more_pending;
                 self.more_pending = false;
                 self.entries = response.entries;
+                self.bookmark_folders = self.service.bookmark_folders();
                 self.total = response.total;
                 self.elapsed_ms = response.elapsed_ms;
                 self.error = response.error;
@@ -6459,21 +6463,42 @@ impl LstrApp {
                         }
                     }
                     Kind::Bookmark => {
-                        // 副标题回答「这份结果是哪个网站的」：标题 + host 足够
-                        // 区分同名书签；拼音/模糊命中沿用应用行的提示方式。
+                        // 副标题回答「在哪、是哪个网站的」：收藏夹层级（含各级
+                        // 目录）+ host 足够区分同名书签；拼音/模糊命中沿用应用行
+                        // 的提示方式。
                         let host = entry
                             .path
                             .as_ref()
                             .map(|p| ui::url_host(&p.to_string_lossy()).to_string())
                             .unwrap_or_default();
+                        let folder = self
+                            .bookmark_folders
+                            .get(&entry.id)
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        let where_text = if !folder.is_empty() && !host.is_empty() {
+                            format!("{folder} · {host}")
+                        } else if !folder.is_empty() {
+                            folder.to_string()
+                        } else {
+                            host
+                        };
                         if pinyin_hit {
-                            format!("书签 · 拼音 {}", display_text)
+                            if where_text.is_empty() {
+                                format!("书签 · 拼音 {}", display_text)
+                            } else {
+                                format!("书签 · {where_text} · 拼音 {}", display_text)
+                            }
                         } else if fuzzy_hit.is_some() {
-                            format!("书签 · 模糊 {}", display_text)
-                        } else if host.is_empty() {
+                            if where_text.is_empty() {
+                                format!("书签 · 模糊 {}", display_text)
+                            } else {
+                                format!("书签 · {where_text} · 模糊 {}", display_text)
+                            }
+                        } else if where_text.is_empty() {
                             "书签 · Enter 打开浏览器".to_string()
                         } else {
-                            format!("书签 · {host} · Enter 打开浏览器")
+                            format!("书签 · {where_text} · Enter 打开浏览器")
                         }
                     }
                     Kind::Command => {
