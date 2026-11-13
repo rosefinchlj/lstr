@@ -20,6 +20,10 @@ const COMBO_EX_CLASS: &str = "ComboBoxEx32";
 const COMBO_CLASS: &str = "ComboBox";
 const EDIT_CLASS: &str = "Edit";
 const SEARCH_BOX_CLASS: &str = "SearchEditBoxWrapperClass";
+/// 文件列表视图：真正的文件对话框必有其一。只凭「#32770 + ComboBoxEx →
+/// ComboBox → Edit」会把 mstsc「远程桌面连接」这类普通对话框误认成文件
+/// 对话框（它的「计算机」下拉正好是同一条控件链）。
+const FILE_VIEW_CLASSES: [&str; 3] = ["SysListView32", "ShellView", "SHELLDLL_DefView"];
 
 #[derive(Clone, Debug)]
 pub struct DialogInfo {
@@ -104,7 +108,11 @@ unsafe fn dialog_info(hwnd: HWND) -> Option<DialogInfo> {
     let (edit, vista) = if has_descendant_class(hwnd, DIRECT_UI_CLASS) {
         let edit = find_vista_filename_edit(hwnd)?;
         (edit, true)
-    } else if let Some(edit) = find_edit_chain(hwnd).or_else(|| find_edit_fallback(hwnd)) {
+    } else if has_file_view(hwnd) {
+        // 老式文件对话框：文件名编辑框 + 文件列表视图。缺列表视图的
+        // #32770（mstsc 远程桌面连接、各类带下拉输入框的普通对话框）
+        // 一律不认，避免误触发 Quick Switch。
+        let edit = find_edit_chain(hwnd).or_else(|| find_edit_fallback(hwnd))?;
         (edit, false)
     } else {
         return None;
@@ -273,6 +281,27 @@ fn has_descendant_class(parent: HWND, class: &str) -> bool {
         .any(|child| class_eq(&class_name(*child), class))
 }
 
+/// 文件对话框的列表视图（老式对话框的结构性判据，与语言无关）。
+fn has_file_view(parent: HWND) -> bool {
+    let mut children: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumChildWindows(
+            Some(parent),
+            Some(collect_child),
+            LPARAM((&mut children as *mut Vec<HWND>) as isize),
+        );
+    }
+    children
+        .iter()
+        .any(|child| is_file_view_class(&class_name(*child)))
+}
+
+fn is_file_view_class(class: &str) -> bool {
+    FILE_VIEW_CLASSES
+        .iter()
+        .any(|candidate| class_eq(class, candidate))
+}
+
 /// Vista IFileDialog 的文件名编辑框：可见的 Edit 里取最宽的
 /// （底部「文件名/文件夹」框横贯对话框，远宽于右上角搜索框）。
 fn find_vista_filename_edit(dialog: HWND) -> Option<HWND> {
@@ -416,6 +445,20 @@ mod tests {
         assert!(!class_eq("Edit", "EditBox"));
         assert!(!class_eq("SearchEditBoxWrapperClass", "Edit"));
         assert!(!class_eq("ComboBox", "ComboBoxEx32"));
+    }
+
+    #[test]
+    fn file_dialog_requires_a_file_view() {
+        // 老式文件对话框的结构性判据：文件列表视图。
+        assert!(is_file_view_class("SysListView32"));
+        assert!(is_file_view_class("shellview"));
+        assert!(is_file_view_class("SHELLDLL_DefView"));
+        // mstsc 远程桌面连接只有「计算机」下拉的 ComboBoxEx→ComboBox→Edit，
+        // 没有列表视图——曾因此被误判成文件对话框、误触发 Quick Switch。
+        assert!(!is_file_view_class("ComboBoxEx32"));
+        assert!(!is_file_view_class("ComboBox"));
+        assert!(!is_file_view_class("Edit"));
+        assert!(!is_file_view_class("ToolbarWindow32"));
     }
 
     #[test]
