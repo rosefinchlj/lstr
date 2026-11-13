@@ -440,6 +440,12 @@ struct DateMask {
     /// 两个日期的段输入；第二个仅闭区间（`A..B`）使用。
     dates: [DateMaskSegs; 2],
     two: bool,
+    /// 该侧是否只有年份（`date>2026`：年过滤，只编辑年段）。
+    year_only: [bool; 2],
+    /// 从 chip 进入编辑（而非输入框自动激活）：输入非条件字符 = 改搜查询。
+    from_chip_edit: bool,
+    /// 焦点段下一次数字输入是否整体覆盖旧值（chip 带来的旧值可直接改写）。
+    replace_digit: bool,
     /// 焦点：(日期下标, 段下标 0=年 1=月 2=日)。
     date_idx: usize,
     part: usize,
@@ -470,9 +476,21 @@ impl DateMask {
             prefix_display,
             dates: Default::default(),
             two: false,
+            year_only: [false; 2],
+            from_chip_edit: false,
+            replace_digit: true,
             date_idx: 0,
             part: 0,
             default: crate::search::conditions::today_ymd(),
+        }
+    }
+
+    /// 这一侧要渲染/跳段的段数：年份条件只有年段。
+    fn part_count(&self, date_idx: usize) -> usize {
+        if self.year_only[date_idx] {
+            1
+        } else {
+            3
         }
     }
 
@@ -563,17 +581,22 @@ impl DateMask {
     }
 
     /// 输入一位数字：年累加到 4 位自动跳段；月/日首位 ≥2/≥4 直接补 0 跳段，
-    /// 第二位非法则拒绝（保持等待）。
+    /// 第二位非法则拒绝（保持等待）。chip 带入的旧值在焦点段第一次
+    /// 输入数字时整体覆盖，不用先退格。
     fn feed_digit(&mut self, c: char) {
         let part = self.part;
         let width = date_mask_part_width(part);
+        if self.replace_digit {
+            self.typed_mut().clear();
+            self.replace_digit = false;
+        }
         if self.typed_str(self.date_idx, part).len() >= width {
             return;
         }
         match part {
             0 => {
                 self.typed_mut().push(c);
-                if self.typed_str(self.date_idx, 0).len() == 4 {
+                if !self.year_only[self.date_idx] && self.typed_str(self.date_idx, 0).len() == 4 {
                     self.advance();
                 }
             }
@@ -613,12 +636,15 @@ impl DateMask {
 
     fn advance(&mut self) {
         let last_date = if self.two { 1 } else { 0 };
-        if self.part < 2 {
+        if self.part + 1 < self.part_count(self.date_idx) {
             self.part += 1;
         } else if self.date_idx < last_date {
             self.date_idx += 1;
             self.part = 0;
+        } else {
+            return;
         }
+        self.replace_digit = self.from_chip_edit;
     }
 
     fn retreat(&mut self) {
@@ -626,8 +652,11 @@ impl DateMask {
             self.part -= 1;
         } else if self.date_idx > 0 {
             self.date_idx -= 1;
-            self.part = 2;
+            self.part = self.part_count(self.date_idx) - 1;
+        } else {
+            return;
         }
+        self.replace_digit = self.from_chip_edit;
     }
 
     /// ↑↓：段值 ±1（年夹紧、月回绕、日夹紧到当月天数）。
@@ -645,9 +674,13 @@ impl DateMask {
         };
         let width = date_mask_part_width(part);
         *self.typed_mut() = format!("{:0width$}", next, width = width);
+        self.replace_digit = true;
     }
 
     fn fmt_date(&self, date_idx: usize) -> String {
+        if self.year_only[date_idx] {
+            return self.display_part(date_idx, 0);
+        }
         format!(
             "{}-{}-{}",
             self.display_part(date_idx, 0),
@@ -695,13 +728,19 @@ impl DateMask {
     }
 
     /// 提交文本：未输完的段先夹紧固化，再拼规范条件（终结冒号由调用方
-    /// 通过 commit_conditions 消费）。
-    fn commit_text(&mut self) -> String {
-        let first = self.effective_date(0);
+    /// 通过 commit_conditions 消费）。年份条件提交成年份文本（不是整日）。
+    fn commit_text(&self) -> String {
+        let fmt = |date_idx: usize| {
+            if self.year_only[date_idx] {
+                format!("{:04}", self.effective_part(date_idx, 0))
+            } else {
+                date_mask_fmt(self.effective_date(date_idx))
+            }
+        };
         let value = if self.two {
-            format!("{}..{}", date_mask_fmt(first), date_mask_fmt(self.effective_date(1)))
+            format!("{}..{}", fmt(0), fmt(1))
         } else {
-            date_mask_fmt(first)
+            fmt(0)
         };
         if self.op.is_empty() {
             format!("{} {}:", self.field, value)
@@ -713,6 +752,27 @@ impl DateMask {
 
 fn date_mask_fmt((y, m, d): (i32, u32, u32)) -> String {
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// 把日期 chip 编辑文本里的一个值填进遮罩某一侧：完整日期 → 三段；
+/// 年份条件 → 只留年段（整年语义，不能展开成具体某天）。
+fn apply_date_edit_value(
+    mask: &mut DateMask,
+    date_idx: usize,
+    value: crate::search::conditions::DateEditValue,
+) {
+    use crate::search::conditions::DateEditValue;
+    match value {
+        DateEditValue::Day(ymd) => mask.dates[date_idx] = DateMask::from_ymd(ymd),
+        DateEditValue::Year(year) => {
+            mask.dates[date_idx] = DateMaskSegs {
+                y: format!("{year:04}"),
+                m: String::new(),
+                d: String::new(),
+            };
+            mask.year_only[date_idx] = true;
+        }
+    }
 }
 
 /// 大小分段输入遮罩：数字段 + 单位段（B/KB/MB/GB/TB），交互与日期遮罩一致：
@@ -727,6 +787,12 @@ struct SizeMask {
     idx: usize,
     /// 0 = 数字段，1 = 单位段。
     part: usize,
+    /// 从 chip 进入编辑（而非输入框自动激活）：输入非条件字符 = 改搜查询。
+    from_chip_edit: bool,
+    /// 数字段下一次数字输入是否整体覆盖旧值（chip 带来的旧值可直接改写）。
+    replace_digit: bool,
+    /// 连续输入的单位字母（`G` → GB、`GB` → GB）。
+    unit_typing: String,
 }
 
 #[derive(Clone, Debug)]
@@ -753,6 +819,9 @@ impl SizeMask {
             two: false,
             idx: 0,
             part: 0,
+            from_chip_edit: false,
+            replace_digit: true,
+            unit_typing: String::new(),
         }
     }
 
@@ -793,7 +862,12 @@ impl SizeMask {
             // 焦点在单位时输入数字：自动回到数字段。
             self.part = 0;
         }
-        if c == '.' && self.number().contains('.') {
+        self.unit_typing.clear();
+        if self.replace_digit {
+            self.number_mut().clear();
+            self.replace_digit = false;
+        }
+        if c == '.' && (self.number().is_empty() || self.number().contains('.')) {
             return;
         }
         if self.number().len() < 12 {
@@ -801,7 +875,28 @@ impl SizeMask {
         }
     }
 
+    /// 单位段输入字母：`G` → GB、`GB` → GB；不认识的字母返回 false，
+    /// 由调用方转成普通查询（编辑态不接受任意字符）。
+    fn feed_unit_letter(&mut self, c: char) -> bool {
+        let lower = c.to_ascii_lowercase();
+        let candidate = format!("{}{}", self.unit_typing, lower);
+        if let Some(unit) = crate::search::conditions::size_unit_index(&candidate) {
+            self.unit_typing = candidate;
+            self.sizes[self.idx].unit = unit;
+            self.part = 1;
+            return true;
+        }
+        if let Some(unit) = crate::search::conditions::size_unit_index(&lower.to_string()) {
+            self.unit_typing = lower.to_string();
+            self.sizes[self.idx].unit = unit;
+            self.part = 1;
+            return true;
+        }
+        false
+    }
+
     fn feed_backspace(&mut self) {
+        self.unit_typing.clear();
         if !self.number().is_empty() {
             self.number_mut().pop();
             return;
@@ -816,6 +911,8 @@ impl SizeMask {
             let next = pos + 1;
             self.idx = next / 2;
             self.part = next % 2;
+            self.replace_digit = self.from_chip_edit;
+            self.unit_typing.clear();
         }
     }
 
@@ -825,10 +922,14 @@ impl SizeMask {
             let prev = pos - 1;
             self.idx = prev / 2;
             self.part = prev % 2;
+            self.replace_digit = self.from_chip_edit;
+            self.unit_typing.clear();
         }
     }
 
     fn spin(&mut self, delta: i32) {
+        self.replace_digit = true;
+        self.unit_typing.clear();
         if self.part == 1 {
             let unit = self.sizes[self.idx].unit as i32 + delta;
             self.sizes[self.idx].unit = unit.clamp(0, 4) as usize;
@@ -1961,20 +2062,21 @@ impl LstrApp {
         if !self.remove_chip(index) {
             return false;
         }
-        // 日期 chip 且输入框没有其它文本：进入分段遮罩。
+        // 日期 chip 且输入框没有其它文本：进入分段遮罩（年份条件只编辑年段）。
         if matches!(chip.kind, ConditionChipKind::Date) && self.input.trim().is_empty() {
-            if let Some((op, first, second)) =
+            if let Some((field, op, first, second)) =
                 crate::search::conditions::parse_date_edit_parts(&text)
             {
                 let prefix = if op.is_empty() {
-                    "date ".to_string()
+                    format!("{field} ")
                 } else {
-                    format!("date {op} ")
+                    format!("{field} {op} ")
                 };
-                let mut mask = DateMask::new("date".into(), op, prefix);
-                mask.dates[0] = DateMask::from_ymd(first);
+                let mut mask = DateMask::new(field, op, prefix);
+                mask.from_chip_edit = true;
+                apply_date_edit_value(&mut mask, 0, first);
                 if let Some(second) = second {
-                    mask.dates[1] = DateMask::from_ymd(second);
+                    apply_date_edit_value(&mut mask, 1, second);
                     mask.two = true;
                 }
                 self.date_mask = Some(mask);
@@ -1999,6 +2101,7 @@ impl LstrApp {
                     format!("size{op}")
                 };
                 let mut mask = SizeMask::new("size".into(), op, prefix);
+                mask.from_chip_edit = true;
                 mask.sizes[0] = SizeMask::from_parts(first);
                 if let Some(second) = second {
                     mask.sizes[1] = SizeMask::from_parts(second);
@@ -2077,7 +2180,7 @@ impl LstrApp {
 
     /// 遮罩回车：固化各段（未输完的夹紧），拼规范条件文本提交成 chip。
     fn commit_date_mask(&mut self, ctx: &egui::Context) {
-        let Some(mut mask) = self.date_mask.take() else {
+        let Some(mask) = self.date_mask.take() else {
             return;
         };
         self.input = mask.commit_text();
@@ -2091,9 +2194,15 @@ impl LstrApp {
         self.trigger(ctx);
     }
 
-    /// 遮罩内输入了非数字字符（别名/中文段名）：退出遮罩转自由文本，
-    /// 已输入的段原样保留，输入的字符追加到末尾。
+    /// 遮罩内输入了不属于条件的字符。从 chip 进入编辑时：条件已经移出
+    /// filters，这里把遮罩的条件文本也一起丢掉，只保留用户输入的字符
+    /// （即「改搜普通查询」），不再留下半截条件；自动激活的遮罩则保留
+    /// 已输入片段继续自由编辑（别名/完整写法仍可用）。
     fn exit_date_mask_to_free_text(&mut self, ctx: &egui::Context, text: &str) {
+        let from_chip = self
+            .date_mask
+            .as_ref()
+            .is_some_and(|mask| mask.from_chip_edit);
         let partial = self
             .date_mask
             .as_ref()
@@ -2101,9 +2210,16 @@ impl LstrApp {
             .unwrap_or_default();
         self.date_mask = None;
         self.size_mask = None;
-        self.input = format!("{partial}{text}");
+        if from_chip {
+            self.condition_edit_backup = None;
+            self.condition_hold = false;
+            self.input = text.to_string();
+        } else {
+            self.input = format!("{partial}{text}");
+        }
         self.reset_history_recall();
         Self::reset_input_cursor(ctx);
+        self.focus_requested = true;
         self.trigger(ctx);
     }
 
@@ -2135,17 +2251,29 @@ impl LstrApp {
         self.trigger(ctx);
     }
 
-    /// 大小遮罩内输入非数字字符：退出遮罩转自由文本（保留已输入数字）。
+    /// 大小遮罩内输入了不属于条件的字符：从 chip 进入编辑时按「改搜
+    /// 普通查询」处理（条件文本整体丢弃）；自动激活时保留已输入数字。
     fn exit_size_mask_to_free_text(&mut self, ctx: &egui::Context, text: &str) {
+        let from_chip = self
+            .size_mask
+            .as_ref()
+            .is_some_and(|mask| mask.from_chip_edit);
         let partial = self
             .size_mask
             .as_ref()
             .map(|mask| mask.partial_text_for_exit(text))
             .unwrap_or_default();
         self.size_mask = None;
-        self.input = format!("{partial}{text}");
+        if from_chip {
+            self.condition_edit_backup = None;
+            self.condition_hold = false;
+            self.input = text.to_string();
+        } else {
+            self.input = format!("{partial}{text}");
+        }
         self.reset_history_recall();
         Self::reset_input_cursor(ctx);
+        self.focus_requested = true;
         self.trigger(ctx);
     }
 
@@ -2154,20 +2282,31 @@ impl LstrApp {
         if self.size_mask.is_none() {
             return false;
         }
-        // 数字/小数点进段；`:` 提交；其它字符退出遮罩转自由文本
-        //（用户继续打 `10M` 也能走普通条件解析）。
+        // 数字/小数点进段；`:` 提交；字母当单位输入（`G`→GB、`GB`→GB）；
+        // 空格不属于条件，直接忽略；其它字符 = 用户改搜普通查询。
+        // 从 chip 进入编辑时条件整体丢弃；自动激活时保留已输入片段继续打条件。
         let mut feed: Vec<char> = Vec::new();
+        let mut units: Vec<char> = Vec::new();
         let mut exit_text: Option<String> = None;
         let mut commit = false;
         ctx.input_mut(|i| {
             i.events.retain(|event| match event {
                 egui::Event::Text(text) => {
-                    if !text.is_empty()
-                        && text.chars().all(|c| c.is_ascii_digit() || c == '.')
-                    {
+                    if text.is_empty() {
+                        return true;
+                    }
+                    if text.chars().all(char::is_whitespace) {
+                        // 条件里没有空白：空格不进输入框，避免把条件拆坏。
+                        return false;
+                    }
+                    if text.chars().all(|c| c.is_ascii_digit() || c == '.') {
                         feed.extend(text.chars());
                     } else if matches!(text.as_str(), ":" | "：") {
                         commit = true;
+                    } else if text.chars().count() == 1
+                        && text.chars().all(|c| c.is_ascii_alphabetic())
+                    {
+                        units.extend(text.chars());
                     } else {
                         exit_text.get_or_insert_with(|| text.clone());
                     }
@@ -2184,10 +2323,21 @@ impl LstrApp {
             self.commit_size_mask(ctx);
             return true;
         }
-        let fed = !feed.is_empty();
+        let fed = !feed.is_empty() || !units.is_empty();
         for c in feed {
             if let Some(mask) = self.size_mask.as_mut() {
                 mask.feed_digit(c);
+            }
+        }
+        for c in units {
+            let accepted = self
+                .size_mask
+                .as_mut()
+                .is_some_and(|mask| mask.feed_unit_letter(c));
+            if !accepted {
+                // 不是合法单位字母：字母本身就是查询内容，条件整体丢弃。
+                self.exit_size_mask_to_free_text(ctx, &c.to_string());
+                return true;
             }
         }
         let mut handled = fed;
@@ -2266,13 +2416,21 @@ impl LstrApp {
         }
         // 文本事件：数字进段；`-`/`/`/`.` 当分隔符（当前段已有数字才跳段，
         // 否则忽略——避免 `2026` 自动跳段后再打 `-` 把月跳过去）；
-        // `:` 提交；其它字符退出遮罩转自由文本（别名仍可用）。
+        // `:` 提交；空格不属于条件，直接忽略；其它字符 = 改搜普通查询
+        //（从 chip 进入编辑时条件整体丢弃，自动激活时保留前缀继续打别名）。
         let mut feed: Vec<char> = Vec::new();
         let mut exit_text: Option<String> = None;
         let mut commit = false;
         ctx.input_mut(|i| {
             i.events.retain(|event| match event {
                 egui::Event::Text(text) => {
+                    if text.is_empty() {
+                        return true;
+                    }
+                    if text.chars().all(char::is_whitespace) {
+                        // 条件里没有空白：空格不进输入框，避免把条件拆坏。
+                        return false;
+                    }
                     if text
                         .chars()
                         .all(|c| c.is_ascii_digit() || matches!(c, '-' | '/' | '.'))
@@ -5153,7 +5311,7 @@ impl LstrApp {
                 );
                 x += galley_w("..");
             }
-            for part in 0..3 {
+            for part in 0..mask.part_count(date_idx) {
                 if part > 0 {
                     painter.text(
                         egui::pos2(x, center_y),
@@ -5224,6 +5382,7 @@ impl LstrApp {
             if let Some(mask) = self.date_mask.as_mut() {
                 mask.date_idx = date_idx;
                 mask.part = part;
+                mask.replace_digit = true;
             }
         }
     }
@@ -5360,6 +5519,8 @@ impl LstrApp {
             if let Some(mask) = self.size_mask.as_mut() {
                 mask.idx = idx;
                 mask.part = part;
+                mask.replace_digit = true;
+                mask.unit_typing.clear();
             }
         }
     }
@@ -10163,5 +10324,83 @@ mod path_layout_tests {
         mask.feed_digit('0');
         assert_eq!(mask.partial_text_for_exit("M"), "size>50");
         assert_eq!(mask.partial_text_for_exit(" "), "size>50MB");
+    }
+
+    #[test]
+    fn date_mask_year_only_edits_year_segment() {
+        use crate::search::conditions::DateEditValue;
+
+        // chip 编辑带来的年份条件：只渲染年段，提交仍是年份文本。
+        let mut mask = DateMask::new("date".into(), ">".into(), "date > ".into());
+        mask.from_chip_edit = true;
+        apply_date_edit_value(&mut mask, 0, DateEditValue::Year(2026));
+        assert_eq!(mask.part_count(0), 1, "年份条件只有年段");
+        assert_eq!(mask.mirror_text(), "date > 2026");
+
+        // 第一次输入数字整体覆盖旧年份；满 4 位不跳段（没有月/日）。
+        mask.feed_digit('2');
+        assert_eq!(mask.dates[0].y.as_str(), "2", "chip 旧值被整体覆盖");
+        for c in "025".chars() {
+            mask.feed_digit(c);
+        }
+        assert_eq!(mask.dates[0].y.as_str(), "2025");
+        assert_eq!((mask.date_idx, mask.part), (0, 0), "年份不自动跳段");
+        mask.advance();
+        assert_eq!((mask.date_idx, mask.part), (0, 0), "唯一一段无处可跳");
+        mask.spin(1);
+        assert_eq!(mask.dates[0].y.as_str(), "2026");
+        assert_eq!(mask.commit_text(), "date>2026:");
+    }
+
+    #[test]
+    fn date_mask_year_range_edits_both_years() {
+        use crate::search::conditions::DateEditValue;
+
+        let mut mask = DateMask::new("date".into(), String::new(), "date ".into());
+        mask.from_chip_edit = true;
+        apply_date_edit_value(&mut mask, 0, DateEditValue::Year(2023));
+        apply_date_edit_value(&mut mask, 1, DateEditValue::Year(2025));
+        mask.two = true;
+        assert_eq!(mask.mirror_text(), "date 2023..2025");
+        mask.advance();
+        assert_eq!((mask.date_idx, mask.part), (1, 0), "年段直接跳到下一侧");
+        mask.retreat();
+        assert_eq!((mask.date_idx, mask.part), (0, 0));
+        mask.dates[1].y = "2024".into();
+        assert_eq!(mask.commit_text(), "date 2023..2024:");
+    }
+
+    #[test]
+    fn size_mask_chip_edit_replaces_old_value_and_takes_units() {
+        let mut mask = SizeMask::new("size".into(), ">".into(), "size>".into());
+        mask.from_chip_edit = true;
+        mask.sizes[0] = SizeMask::from_parts(("10".into(), 2));
+
+        // chip 带来的旧值在第一次输入数字时整体覆盖。
+        mask.feed_digit('5');
+        assert_eq!(mask.number().as_str(), "5");
+        mask.feed_digit('0');
+        assert_eq!(mask.number().as_str(), "50");
+
+        // 字母按单位输入：G → GB、GB → GB，焦点自动落到单位段。
+        assert!(mask.feed_unit_letter('g'));
+        assert_eq!((mask.idx, mask.part), (0, 1));
+        assert_eq!(mask.unit_label(0), "GB");
+        assert!(mask.feed_unit_letter('B'));
+        assert_eq!(mask.unit_label(0), "GB");
+        assert_eq!(mask.mirror_text(), "size>50GB");
+        assert_eq!(mask.commit_text(), "size>50GB:");
+
+        // 不认识的大写/其它字母不接受，交给调用方转普通查询。
+        assert!(!mask.feed_unit_letter('X'));
+
+        // 自动激活的遮罩保持原有追加行为（不覆盖用户已输入的数字）。
+        let mut auto = SizeMask::new("size".into(), ">".into(), "size>".into());
+        auto.feed_digit('1');
+        auto.feed_digit('0');
+        auto.advance();
+        auto.retreat();
+        auto.feed_digit('5');
+        assert_eq!(auto.number().as_str(), "105");
     }
 }

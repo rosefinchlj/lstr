@@ -1143,30 +1143,63 @@ pub fn date_mask_prefix(input: &str) -> Option<(String, String)> {
     Some((input[..field_len].to_string(), op))
 }
 
-/// 解析 `date_edit_text` 生成的规范文本（无终结冒号）：
-/// 返回 (操作符文本, 第一日期, 第二日期 Option)。
+/// 日期 chip 编辑文本里的一个值：完整日期，或单个年份。
+/// 年份条件（`date>2026:` / `date 2023..2025:`）是整年语义，
+/// 不能展开成 `2026-01-01` 编辑（比较符语义会变），所以单独标记。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DateEditValue {
+    Day((i32, u32, u32)),
+    Year(i32),
+}
+
+/// 解析 `date_edit_text` / `source_edit_text` 生成的文本（无终结冒号）：
+/// 返回 (字段名, 操作符文本, 第一个值, 第二个值 Option)。
+/// 字段名支持全部别名（`日期>2026` / `dm:>2026-11-10`），编辑后按原字段重建。
 pub fn parse_date_edit_parts(
     text: &str,
-) -> Option<(String, (i32, u32, u32), Option<(i32, u32, u32)>)> {
-    let rest = text.trim_start().strip_prefix("date")?;
-    // 兼容紧凑写法 `date:>2026-11-10`：字段后的冒号直接跳过。
-    let rest = rest
-        .strip_prefix(':')
-        .or_else(|| rest.strip_prefix('：'))
-        .unwrap_or(rest);
-    let rest = rest.trim_start();
-    let (op, value_start) = match parse_op(rest) {
-        Some((_, op_len)) => (rest[..op_len].to_string(), skip_ws(rest, op_len)),
-        None => (String::new(), 0),
-    };
-    let value = rest[value_start..].trim();
-    if let Some((a, b)) = value.split_once("..") {
-        let first = parse_ymd(a.trim())?;
-        let second = parse_ymd(b.trim())?;
-        Some((op, first, Some(second)))
-    } else {
-        Some((op, parse_ymd(value)?, None))
+) -> Option<(String, String, DateEditValue, Option<DateEditValue>)> {
+    let text = text.trim_start();
+    let (field_len, compact, kind) = field_at(text, 0)?;
+    if kind != FieldKind::Date {
+        return None;
     }
+    let field = text[..field_len].to_string();
+    let mut i = field_len;
+    if compact {
+        // 紧凑写法 `date:>2026-11-10`：字段后的冒号属于语法，直接跳过。
+        i += colon_len(text, i)?;
+        i = skip_ws(text, i);
+    } else {
+        i = skip_ws(text, i);
+    }
+    let (op, value_start) = match parse_op(&text[i..]) {
+        Some((_, op_len)) => (text[i..i + op_len].to_string(), skip_ws(text, i + op_len)),
+        None => (String::new(), i),
+    };
+    let value = text[value_start..].trim();
+    if let Some((a, b)) = value.split_once("..") {
+        let first = parse_date_edit_value(a.trim())?;
+        let second = parse_date_edit_value(b.trim())?;
+        Some((field, op, first, Some(second)))
+    } else {
+        Some((field, op, parse_date_edit_value(value)?, None))
+    }
+}
+
+/// 编辑文本里的单值：完整日期，或 4 位年份（可带 `年`）。
+fn parse_date_edit_value(text: &str) -> Option<DateEditValue> {
+    if let Some(day) = parse_ymd(text) {
+        return Some(DateEditValue::Day(day));
+    }
+    let year_text = text.strip_suffix('年').unwrap_or(text);
+    if year_text.len() == 4 && year_text.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(year) = year_text.parse::<i32>() {
+            if (1970..=9999).contains(&year) {
+                return Some(DateEditValue::Year(year));
+            }
+        }
+    }
+    None
 }
 
 /// 当前本地日期（今天），供相对别名换算。
@@ -2032,20 +2065,46 @@ mod tests {
 
     #[test]
     fn date_edit_parts_parse_canonical_text() {
-        let (op, first, second) =
+        let (field, op, first, second) =
             parse_date_edit_parts("date 2026-11-07..2026-11-13").expect("range");
+        assert_eq!(field, "date");
         assert!(op.is_empty());
-        assert_eq!(first, (2026, 11, 7));
-        assert_eq!(second, Some((2026, 11, 13)));
+        assert_eq!(first, DateEditValue::Day((2026, 11, 7)));
+        assert_eq!(second, Some(DateEditValue::Day((2026, 11, 13))));
 
-        let (op, first, second) = parse_date_edit_parts("date >= 2026-11-11").expect("ge");
+        let (_, op, first, second) = parse_date_edit_parts("date >= 2026-11-11").expect("ge");
         assert_eq!(op, ">=");
-        assert_eq!(first, (2026, 11, 11));
+        assert_eq!(first, DateEditValue::Day((2026, 11, 11)));
         assert_eq!(second, None);
         assert!(parse_date_edit_parts("size >= 10M").is_none());
         // 紧凑写法也能解析（字段后的冒号跳过）。
         assert!(parse_date_edit_parts("date:>2026-11-10").is_some());
         assert!(parse_size_edit_parts("size:>10M").is_some());
+    }
+
+    #[test]
+    fn date_edit_parts_parse_year_values() {
+        // 只有年份：整年语义，编辑时按年份段处理（不能展开成 01-01）。
+        let (field, op, first, second) = parse_date_edit_parts("date>2026").expect("year");
+        assert_eq!(field, "date");
+        assert_eq!(op, ">");
+        assert_eq!(first, DateEditValue::Year(2026));
+        assert_eq!(second, None);
+
+        // 年份带「年」、年份区间、别名/中文字段都要能进编辑态。
+        let (_, _, first, _) = parse_date_edit_parts("date 2026年").expect("year suffix");
+        assert_eq!(first, DateEditValue::Year(2026));
+        let (_, op, first, second) = parse_date_edit_parts("date 2023..2025").expect("years");
+        assert!(op.is_empty());
+        assert_eq!(first, DateEditValue::Year(2023));
+        assert_eq!(second, Some(DateEditValue::Year(2025)));
+        let (field, op, first, _) = parse_date_edit_parts("日期≥2026").expect("alias field");
+        assert_eq!((field.as_str(), op.as_str()), ("日期", "≥"));
+        assert_eq!(first, DateEditValue::Year(2026));
+        // 非日期字段/非法值不进入遮罩。
+        assert!(parse_date_edit_parts("size>2026").is_none());
+        assert!(parse_date_edit_parts("date 1969").is_none());
+        assert!(parse_date_edit_parts("date 今天").is_none());
     }
 
     #[test]
