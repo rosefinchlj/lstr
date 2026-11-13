@@ -411,6 +411,8 @@ fn paint_condition_chip(
 enum ConditionChipKind {
     /// 当前类别（`self.scope`），与 Tab 是同一状态的两个视图。
     Scope,
+    /// 网络搜索模式（`filters.keyword`，`b ` → Bing）。
+    Keyword,
     Date,
     Size,
     /// `filters.path`（`path:D:\work` 提交的目录 chip）。
@@ -1198,8 +1200,8 @@ impl ConditionHistory {
 fn help_panel_height(width: f32) -> f32 {
     let group = |rows: f32| HELP_GROUP_HEAD_H + rows * HELP_ROW_H + HELP_GROUP_GAP;
     // 左列：位置 5 行（盘符 2 + 路径 2 + 分段）/ 筛选 6 行（日期、大小、
-    // 条件编辑、撤回…）/ 范围 3 行。行数必须与 `syntax` 表一致，否则末行被裁。
-    let left = group(5.0) + group(6.0) + group(3.0);
+    // 条件编辑、撤回…）/ 范围与搜索 4 行。行数必须与 `syntax` 表一致，否则末行被裁。
+    let left = group(5.0) + group(6.0) + group(4.0);
     let head = HELP_TOP_PAD + HELP_TITLE_H;
     if width >= 560.0 {
         head + left
@@ -2086,6 +2088,40 @@ impl LstrApp {
                 prepend_edit: true,
             });
         }
+        // 搜索 chip：网络搜索关键字（`b ` → Bing）。颜色沿用关键字结果行的橙色。
+        if let Some(trigger) = &self.filters.keyword {
+            let name = self
+                .cfg
+                .keywords
+                .iter()
+                .find(|kw| kw.trigger.eq_ignore_ascii_case(trigger))
+                .map(|kw| kw.name.clone())
+                .unwrap_or_else(|| trigger.clone());
+            let keyword_color = if theme.light {
+                Color32::from_rgb(150, 92, 20)
+            } else {
+                Color32::from_rgb(230, 170, 90)
+            };
+            chips.push(ConditionChipInfo {
+                kind: ConditionChipKind::Keyword,
+                label: "搜索",
+                value: name.clone(),
+                color: keyword_color,
+                bg: Color32::from_rgba_unmultiplied(
+                    keyword_color.r(),
+                    keyword_color.g(),
+                    keyword_color.b(),
+                    34,
+                ),
+                id: "keyword".into(),
+                tooltip: format!(
+                    "网络搜索：{name}（关键字 {trigger}）；双击改回文本，点 × 移除"
+                ),
+                edit_text: Some(format!("{trigger} ")),
+                hold_after_edit: true,
+                prepend_edit: true,
+            });
+        }
         if let Some(range) = self.filters.modified.as_ref().filter(|r| !r.is_empty()) {
             // tooltip 附带换算后的绝对日期：别名条件（今天/本周/近7天）
             // 能直接看到真实区间。
@@ -2264,6 +2300,8 @@ impl LstrApp {
         match kind {
             // 移除范围 chip = 回到「全部」页。
             Some(ConditionChipKind::Scope) => self.scope = Scope::All,
+            // 移除搜索 chip = 退出网络搜索模式。
+            Some(ConditionChipKind::Keyword) => self.filters.keyword = None,
             Some(ConditionChipKind::Date) => self.filters.modified = None,
             Some(ConditionChipKind::Size) => self.filters.size = None,
             Some(ConditionChipKind::Path) => self.filters.path = None,
@@ -2971,13 +3009,26 @@ impl LstrApp {
 
         // 条件提取在剥掉范围前缀之后的文本上做（`f date>…` 的 date 不能被
         // 前缀影响）；scope 用提交后的值判断条件是否生效。
-        let text = match &scope_change {
+        let mut text = match &scope_change {
             Some((_, rest)) => rest.clone(),
             None => self.input.clone(),
         };
         let effective_scope = scope_change
             .as_ref()
             .map_or(self.scope, |(scope, _)| *scope);
+
+        // 网络搜索关键字：`b rust` → 搜索 chip（Bing），剩余文本才是查询词。
+        // 与范围前缀一样要求 trigger 后有空白（只打 `b` 仍按普通查询）。
+        // 只有「全部」页有搜索模式；正则/浏览模式下关键字就是普通文本。
+        let keyword_change =
+            if self.filters.matches.regex || self.in_browse() || effective_scope != Scope::All {
+                None
+            } else {
+                crate::search::split_keyword(&self.cfg.keywords, &text)
+            };
+        if let Some((_, rest)) = &keyword_change {
+            text = rest.clone();
+        }
         let extracted = if self.conditions_apply(effective_scope) {
             let out = crate::search::conditions::extract(&text);
             self.condition_error = out.errors.first().cloned();
@@ -2987,7 +3038,7 @@ impl LstrApp {
             self.condition_error = None;
             None
         };
-        if scope_change.is_none() && extracted.is_none() {
+        if scope_change.is_none() && keyword_change.is_none() && extracted.is_none() {
             return false;
         }
 
@@ -3034,6 +3085,9 @@ impl LstrApp {
         self.record_condition_undo();
         if let Some((scope, _)) = scope_change {
             self.scope = scope;
+        }
+        if let Some((trigger, _)) = keyword_change {
+            self.filters.keyword = Some(trigger);
         }
         self.input = cleaned;
         self.filters.modified = (!dates.is_empty()).then_some(dates);
@@ -5219,9 +5273,10 @@ impl LstrApp {
             } else {
                 self.browse_root = Some(path);
                 self.browse_forward.clear();
-                // 浏览模式下位置由面包屑决定：位置筛选/路径 chip 都让位。
+                // 浏览模式下位置由面包屑决定：位置筛选/路径 chip/搜索 chip 都让位。
                 self.filters.location = None;
                 self.filters.path = None;
+                self.filters.keyword = None;
                 self.clear_input_text();
                 self.selected = 0;
                 self.scroll_y = 0.0;
@@ -5282,9 +5337,10 @@ impl LstrApp {
                 } else {
                     self.browse_root = Some(path);
                     self.browse_forward.clear();
-                    // 浏览模式下位置由面包屑决定：位置筛选/路径 chip 都让位。
+                    // 浏览模式下位置由面包屑决定：位置筛选/路径 chip/搜索 chip 都让位。
                     self.filters.location = None;
                     self.filters.path = None;
+                    self.filters.keyword = None;
                     self.clear_input_text();
                     self.selected = 0;
                     self.scroll_y = 0.0;
@@ -6075,6 +6131,7 @@ impl LstrApp {
                         if self.filters.path.is_some() {
                             self.record_condition_undo();
                             self.filters.path = None;
+                            self.filters.keyword = None;
                         }
                         self.filters.location = value.clone();
                     }
@@ -6163,11 +6220,12 @@ impl LstrApp {
                         ],
                     ),
                     (
-                        "范围",
+                        "范围 / 搜索",
                         &[
                             ("a 微信", "搜应用，a 收成范围 chip"),
                             ("f 文件", "只搜文件，f 收成范围 chip"),
                             ("> 命令", "命令页，> 收成范围 chip"),
+                            ("g rust", "网络搜索，g 收成搜索 chip"),
                         ],
                     ),
                 ];
@@ -7248,10 +7306,11 @@ impl LstrApp {
         }
         self.browse_root = Some(std::path::PathBuf::from(entry.full_path()));
         self.browse_forward.clear();
-        // 位置由面包屑决定（位置筛选与路径 chip 都让位）；其它筛选
+        // 位置由面包屑决定（位置筛选/路径 chip/搜索 chip 都让位）；其它筛选
         //（时间/类型/匹配）保留并继续生效。
         self.filters.location = None;
         self.filters.path = None;
+        self.filters.keyword = None;
         self.clear_input_text();
         self.selected = 0;
         self.scroll_y = 0.0;

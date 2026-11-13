@@ -2178,6 +2178,13 @@ fn run_worker(args: WorkerArgs) {
         // 输入框为空但筛选/日期条件仍生效时，不能走「最近使用」分支：
         // 条件单独查询要交给引擎做全表过滤（空 token 的过滤器路径）。
         if request.query.is_empty() && request.filters.is_empty() {
+            // 搜索 chip + 空查询：仍然给一行「用 Bing 搜索…」（否则空输入会走
+            // 最近使用，搜索模式看起来像消失了）。只有「全部」页有这个模式。
+            if request.query.scope == Scope::All {
+                if let Some(trigger) = request.filters.keyword.as_deref() {
+                    keyword_rows = keyword_entries_for(&request.keywords, trigger, "");
+                }
+            }
             if request.show_history {
                 if let Ok(history) = history.lock() {
                     entries = history.recent_entries(request.limit.max(8));
@@ -2268,13 +2275,22 @@ fn run_worker(args: WorkerArgs) {
                     total = entries.len();
                 }
                 Scope::All => {
-                    // 有筛选时只搜文件：位置/时间/类型对应用和命令没有意义，
-                    // 硬塞进来只会让人疑惑「选了 D 盘怎么还出现微信」。
-                    if request.filters.is_empty()
+                    // 搜索 chip 优先：chip 里的 trigger 就是用户选定的搜索模式，
+                    // 整段文本都是查询词（即使同时有筛选也照给这一行）。
+                    // 没有 chip 时退回「首词当 trigger」的老行为（只打 `b` 也能出）。
+                    if let Some(trigger) = request.filters.keyword.as_deref() {
+                        keyword_rows = keyword_entries_for(
+                            &request.keywords,
+                            trigger,
+                            &request.query.text,
+                        );
+                    } else if request.filters.is_empty()
                         && !in_folder_context
                         && !file_filter_active
                         && !request.filters.matches.regex
                     {
+                        // 有筛选时只搜文件：位置/时间/类型对应用和命令没有意义，
+                        // 硬塞进来只会让人疑惑「选了 D 盘怎么还出现微信」。
                         keyword_rows = keyword_entries(&request.keywords, &request.query.text);
                     }
                     let mut needs_exact = false;
@@ -2696,31 +2712,51 @@ fn keyword_entries(keywords: &[KeywordConfig], q: &str) -> Vec<Entry> {
         Some((head, rest)) => (head, rest.trim()),
         None => (trimmed, ""),
     };
-    keywords
+    keyword_row(keywords, head, rest).into_iter().collect()
+}
+
+/// 「搜索 chip」模式：trigger 已经由 UI 收进 chip，整段文本都是查询词。
+fn keyword_entries_for(keywords: &[KeywordConfig], trigger: &str, q: &str) -> Vec<Entry> {
+    keyword_row(keywords, trigger, q.trim()).into_iter().collect()
+}
+
+/// 输入开头是不是一个已配置的关键字：`b rust` → `(b, rust)`。
+///
+/// 要求 trigger 后面跟空白（和 `a `/`f ` 的范围前缀一致）：只打 `b` 时仍按
+/// 普通查询处理，结果里的「用 Bing 搜索…」行照旧由 [`keyword_entries`] 给出。
+pub fn split_keyword(keywords: &[KeywordConfig], raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim_start();
+    let (head, rest) = trimmed.split_once(char::is_whitespace)?;
+    let kw = keywords
         .iter()
-        .filter(|kw| kw.trigger.eq_ignore_ascii_case(head))
-        .filter_map(|kw| {
-            if let Some(url) = &kw.url {
-                let target = url.replace("{query}", &url_encode(rest));
-                let name = if rest.is_empty() {
-                    format!("用 {} 搜索…", kw.name)
-                } else {
-                    format!("用 {} 搜索：{}", kw.name, rest)
-                };
-                Some(keyword_entry(format!("kwurl:{}", kw.trigger), name, target))
-            } else if let Some(exec) = &kw.exec {
-                let target = exec.replace("{query}", rest);
-                let name = if rest.is_empty() {
-                    format!("{}（输入参数）", kw.name)
-                } else {
-                    format!("{}：{}", kw.name, rest)
-                };
-                Some(keyword_entry(format!("kwexec:{}", kw.trigger), name, target))
-            } else {
-                None
-            }
-        })
-        .collect()
+        .find(|kw| kw.trigger.eq_ignore_ascii_case(head))?;
+    Some((kw.trigger.clone(), rest.trim_start().to_string()))
+}
+
+/// 单个关键字 → 结果行（`url` 与 `exec` 二选一，模板里的 {query} 替换成 rest）。
+fn keyword_row(keywords: &[KeywordConfig], trigger: &str, rest: &str) -> Option<Entry> {
+    let kw = keywords
+        .iter()
+        .find(|kw| kw.trigger.eq_ignore_ascii_case(trigger))?;
+    if let Some(url) = &kw.url {
+        let target = url.replace("{query}", &url_encode(rest));
+        let name = if rest.is_empty() {
+            format!("用 {} 搜索…", kw.name)
+        } else {
+            format!("用 {} 搜索：{}", kw.name, rest)
+        };
+        Some(keyword_entry(format!("kwurl:{}", kw.trigger), name, target))
+    } else if let Some(exec) = &kw.exec {
+        let target = exec.replace("{query}", rest);
+        let name = if rest.is_empty() {
+            format!("{}（输入参数）", kw.name)
+        } else {
+            format!("{}：{}", kw.name, rest)
+        };
+        Some(keyword_entry(format!("kwexec:{}", kw.trigger), name, target))
+    } else {
+        None
+    }
 }
 
 fn keyword_entry(id: String, name: String, target: String) -> Entry {
@@ -2973,6 +3009,49 @@ mod tests {
         assert!(keyword_entries(&google(), "go rust").is_empty());
         assert!(keyword_entries(&google(), "x rust").is_empty());
         assert!(keyword_entries(&google(), "").is_empty());
+    }
+
+    #[test]
+    fn split_keyword_requires_space_and_known_trigger() {
+        let keywords = google();
+        assert_eq!(
+            split_keyword(&keywords, "g rust 语言"),
+            Some(("g".to_string(), "rust 语言".to_string()))
+        );
+        // trigger 大小写不敏感，收成配置里的规范写法。
+        assert_eq!(
+            split_keyword(&keywords, "G rust"),
+            Some(("g".to_string(), "rust".to_string()))
+        );
+        assert_eq!(
+            split_keyword(&keywords, "  g   rust"),
+            Some(("g".to_string(), "rust".to_string()))
+        );
+        // 只打 trigger（没有空白）不收 chip，仍由 keyword_entries 出提示行。
+        assert_eq!(split_keyword(&keywords, "g"), None);
+        assert_eq!(split_keyword(&keywords, ""), None);
+        // 未配置的 / 只是前缀的 trigger 都不算。
+        assert_eq!(split_keyword(&keywords, "go rust"), None);
+        assert_eq!(split_keyword(&keywords, "x rust"), None);
+    }
+
+    #[test]
+    fn keyword_chip_mode_treats_all_text_as_query() {
+        // 搜索 chip：trigger 已经被收走，整段文本都是查询词。
+        let rows = keyword_entries_for(&google(), "g", "rust 语言");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "kwurl:g");
+        assert_eq!(rows[0].name, "用 Google 搜索：rust 语言");
+        assert_eq!(
+            rows[0].path.as_ref().unwrap().to_string_lossy(),
+            "https://www.google.com/search?q=rust%20%E8%AF%AD%E8%A8%80"
+        );
+        // 空查询也要给「用 Google 搜索…」行（否则搜索模式看起来消失了）。
+        let rows = keyword_entries_for(&google(), "g", "");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "用 Google 搜索…");
+        // chip 的 trigger 不在配置里（配置被改过）→ 没有行，不 panic。
+        assert!(keyword_entries_for(&google(), "nope", "rust").is_empty());
     }
 
     #[test]

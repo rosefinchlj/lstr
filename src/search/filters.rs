@@ -73,6 +73,10 @@ pub struct SearchFilters {
     /// 与筛选条 `location` 是同一语义的两个入口：提交时后写覆盖（UI 侧
     /// 清另一方），避免出现「位置显示桌面、实际搜的是 D:\work」这种错觉。
     pub path: Option<PathBuf>,
+    /// 输入框里提交的网络搜索关键字（`b ` → Bing 的 trigger），即「搜索 chip」。
+    /// `is_empty` 刻意忽略它（和 `matches` 一样）：关键字是查询模式而不是筛选，
+    /// 不能让应用/命令结果因为「进了搜索模式」被当成“有筛选”而消失。
+    pub keyword: Option<String>,
     /// 文件名匹配选项。`is_empty` 刻意忽略它：开启匹配选项不应让
     /// 应用/命令/关键字结果被当成“有筛选”而消失。
     pub matches: MatchOptions,
@@ -89,11 +93,12 @@ impl SearchFilters {
             && self.path.is_none()
     }
 
-    /// 输入框里是否有条件 chip（日期 / 大小 / 路径 / 盘符）。
+    /// 输入框里是否有条件 chip（日期 / 大小 / 路径 / 盘符 / 搜索）。
     pub fn has_input_conditions(&self) -> bool {
         self.modified.is_some()
             || self.size.is_some()
             || self.path.is_some()
+            || self.keyword.is_some()
             || !self.drives.is_empty()
     }
 
@@ -592,6 +597,16 @@ mod tests {
             ..Default::default()
         });
         assert!(!filters.is_empty());
+    }
+
+    #[test]
+    fn keyword_chip_is_a_mode_not_a_filter() {
+        // 搜索 chip 进 has_input_conditions（chip 光标/删除要能找到它），
+        // 但不算“有筛选”：应用/命令结果不能被搜索模式挤掉。
+        let mut filters = SearchFilters::default();
+        filters.keyword = Some("b".to_string());
+        assert!(filters.is_empty());
+        assert!(filters.has_input_conditions());
     }
 
     #[test]
