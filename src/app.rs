@@ -1120,6 +1120,14 @@ impl SizeMask {
         format!("{}{}{}", self.head, self.op, self.tail)
     }
 
+    /// 自动激活时没写比较符（`size:`）：补默认「大于」。裸大小值没有语义
+    /// （`size:10MB:` 解析不出条件），默认档必须带比较符才能提交。
+    fn default_gt_if_bare(&mut self) {
+        if self.op.is_empty() && !self.two {
+            self.op = ">".to_string();
+        }
+    }
+
     fn from_parts((number, unit): (String, usize)) -> SizeSegs {
         SizeSegs {
             number,
@@ -4971,7 +4979,10 @@ impl LstrApp {
                     } else if let Some((field, op)) =
                         crate::search::conditions::size_mask_prefix(&self.input)
                     {
-                        let mask = SizeMask::new(field, op, self.input.clone());
+                        let mut mask = SizeMask::new(field, op, self.input.clone());
+                        // `size:` 没写比较符：补默认「大于」。裸大小值没有语义
+                        // （`size:10MB:` 解析不出条件），默认档要能直接提交。
+                        mask.default_gt_if_bare();
                         let text = mask.mirror_text();
                         self.size_mask = Some(mask);
                         // 默认 10 MB 先镜像进输入框，回车即可提交。
@@ -11435,6 +11446,29 @@ mod path_layout_tests {
         )
         .expect("edit parts");
         assert_eq!(parts.0, "=");
+    }
+
+    #[test]
+    fn size_mask_bare_prefix_defaults_to_greater() {
+        use crate::search::conditions::extract;
+
+        // 裸大小值不是条件（`size:10MB:` 解析不出 SizeRange）。
+        assert!(extract("size:10MB:").sizes.is_empty(), "裸值不该被当成大小条件");
+
+        // `size:` 自动激活：补默认 `>`，显示/提交都能用。
+        let mut mask = SizeMask::new("size".into(), String::new(), "size:".into());
+        mask.default_gt_if_bare();
+        assert_eq!(mask.mirror_text(), "size:>10MB");
+        let text = mask.commit_text();
+        assert_eq!(text, "size:>10MB:");
+        assert_eq!(extract(&text).sizes.len(), 1, "{text:?}");
+
+        // 默认档改比较符照样生效。
+        assert!(mask.feed_op_char('<'));
+        assert_eq!(mask.commit_text(), "size:<10MB:");
+
+        // 日期裸值本来就有「当天」语义，不补比较符。
+        assert_eq!(extract("date:2026-11-13:").dates.len(), 1);
     }
 
     #[test]
