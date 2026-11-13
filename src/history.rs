@@ -35,6 +35,15 @@ CREATE TABLE IF NOT EXISTS query_hits (
     PRIMARY KEY (query, entry_id)
 );
 CREATE INDEX IF NOT EXISTS idx_query_hits_lookup ON query_hits(query, hits DESC);
+
+-- 输入框历史：记录实际发出过查询的输入串，供 Ctrl+↑/↓ 调出。
+-- 连续打字/退格只保留最终形态（record_input 合并前缀关系），
+-- 避免 w / wx / wxi 把历史刷满。
+CREATE TABLE IF NOT EXISTS input_history (
+    text TEXT PRIMARY KEY,
+    last INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_input_history_last ON input_history(last DESC);
 ";
 
 fn now_secs() -> u64 {
@@ -453,6 +462,74 @@ impl History {
             .execute("DELETE FROM query_hits WHERE entry_id = ?1", params![id]);
     }
 
+    /// 条目是否在「最近使用」历史里（决定菜单要不要显示「从最近使用中移除」）。
+    pub fn contains(&self, id: &str) -> bool {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM history WHERE id = ?1)",
+                params![id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    }
+
+    /// 记录一条输入框查询串（每次真正发出搜索时调用）。
+    /// 与最近一条是前缀关系时直接替换：连续打字/退格只留最终形态。
+    pub fn record_input(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let now = now_secs() as i64;
+        let recent: Option<String> = self
+            .db
+            .query_row(
+                "SELECT text FROM input_history ORDER BY last DESC, rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(recent) = recent {
+            if recent == text {
+                let _ = self.db.execute(
+                    "UPDATE input_history SET last = ?2 WHERE text = ?1",
+                    params![text, now],
+                );
+                return;
+            }
+            if text.starts_with(&recent) || recent.starts_with(text) {
+                let _ = self
+                    .db
+                    .execute("DELETE FROM input_history WHERE text = ?1", params![recent]);
+            }
+        }
+        let _ = self.db.execute(
+            "INSERT OR REPLACE INTO input_history (text, last) VALUES (?1, ?2)",
+            params![text, now],
+        );
+        // 只留最近 100 条，避免无限增长。
+        let _ = self.db.execute(
+            "DELETE FROM input_history WHERE text NOT IN
+                (SELECT text FROM input_history ORDER BY last DESC, rowid DESC LIMIT 100)",
+            [],
+        );
+    }
+
+    /// 最近输入串（最新在前）。
+    pub fn recent_inputs(&self, limit: usize) -> Vec<String> {
+        let Ok(mut stmt) = self
+            .db
+            .prepare("SELECT text FROM input_history ORDER BY last DESC, rowid DESC LIMIT ?1")
+        else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, String>(0));
+        match rows {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     fn evict(&mut self, now: u64) {
         let count: i64 = self
             .db
@@ -530,8 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn record_increments_count_and_updates_snapshot() {
-        let mut history = History::in_memory();
+    fn record_increments_count_and_updates_snapshot() {        let mut history = History::in_memory();
         let mut current = entry("alpha");
         history.record(&current);
         current.name = "renamed.txt".to_string();
@@ -705,5 +781,47 @@ mod tests {
         assert_eq!(qh[0].2, 2);
         let freq = history.frecency_rows(10);
         assert_eq!(freq[0].3, 10); // alpha count 10 排首
+    }
+
+    #[test]
+    fn input_history_coalesces_typing_prefixes() {
+        let mut history = History::in_memory();
+        for text in ["w", "wx", "wxi", "wxin"] {
+            history.record_input(text);
+        }
+        // 连续打字只保留最终形态。
+        assert_eq!(history.recent_inputs(10), vec!["wxin"]);
+
+        // 退格回退同样合并。
+        history.record_input("wxi");
+        assert_eq!(history.recent_inputs(10), vec!["wxi"]);
+
+        // 完全不同的词另起一条（最新在前）。
+        history.record_input("hello");
+        assert_eq!(history.recent_inputs(10), vec!["hello", "wxi"]);
+        history.record_input("world");
+        assert_eq!(history.recent_inputs(10), vec!["world", "hello", "wxi"]);
+    }
+
+    #[test]
+    fn input_history_ignores_blank_and_caps_entries() {
+        let mut history = History::in_memory();
+        history.record_input("   ");
+        assert!(history.recent_inputs(10).is_empty());
+
+        for index in 0..120 {
+            history.record_input(&format!("query{index:03}"));
+        }
+        assert_eq!(history.recent_inputs(200).len(), 100, "只保留最近 100 条");
+    }
+
+    #[test]
+    fn contains_only_reports_recorded_entries() {
+        let mut history = History::in_memory();
+        history.record(&entry("alpha"));
+        assert!(history.contains("alpha"));
+        assert!(!history.contains("beta"));
+        history.remove("alpha");
+        assert!(!history.contains("alpha"));
     }
 }

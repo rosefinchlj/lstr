@@ -222,6 +222,58 @@ pub fn open_config() -> Result<(), String> {
         .map_err(|e| format!("打开配置失败: {e}"))
 }
 
+/// 删除到回收站（结果菜单「删除到回收站」用，UI 已做二次确认）。
+///
+/// 只允许固定本地盘：网络盘/可移动盘没有可靠的回收站，`FOF_ALLOWUNDO`
+/// 失败时可能变成永久删除，宁可拒绝也不冒数据丢失的风险。
+pub fn delete_to_recycle_bin(path: &Path) -> Result<(), String> {
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows::Win32::UI::Shell::{
+        SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
+        FOF_NOERRORUI, FOF_SILENT,
+    };
+
+    if !path.exists() {
+        return Err("文件不存在（可能已被删除）".to_string());
+    }
+    let text = path.display().to_string();
+    let Some(letter) = text
+        .chars()
+        .next()
+        .filter(|c| c.is_ascii_alphabetic())
+    else {
+        return Err("只支持本地盘符路径".to_string());
+    };
+    let root = wide(&format!("{letter}:\\"));
+    // DRIVE_FIXED = 3（Win32 稳定常量；没有为此引入 WindowsProgramming feature）。
+    let drive_type = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+    if drive_type != 3 {
+        return Err("该位置不支持回收站删除".to_string());
+    }
+
+    // SHFileOperationW 要求 pFrom 以双 NUL 结尾。
+    let mut from: Vec<u16> = text.encode_utf16().collect();
+    from.push(0);
+    from.push(0);
+    let flags =
+        (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_NOERRORUI.0 | FOF_SILENT.0) as u16;
+    let mut op = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        pTo: PCWSTR::null(),
+        fFlags: flags,
+        ..Default::default()
+    };
+    let code = unsafe { SHFileOperationW(&mut op) };
+    if code != 0 {
+        return Err(format!("删除失败（错误码 {code}）"));
+    }
+    if op.fAnyOperationsAborted.as_bool() {
+        return Err("删除已取消".to_string());
+    }
+    Ok(())
+}
+
 /// 打开 http(s) 链接（关键字网络搜索），交给系统默认浏览器。
 pub fn open_url(url: &str) -> Result<(), String> {
     let op = wide("open");

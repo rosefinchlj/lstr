@@ -760,7 +760,7 @@ fn help_panel_height(width: f32) -> f32 {
     if width >= 560.0 {
         head + left
     } else {
-        head + left + group(3.0) + group(4.0)
+        head + left + group(4.0) + group(4.0)
     }
 }
 
@@ -865,6 +865,14 @@ pub struct LstrApp {
     condition_history: ConditionHistory,
     /// 日期分段输入遮罩（date 条件的年/月/日结构化编辑）。
     date_mask: Option<DateMask>,
+    /// 输入历史召回：最近输入串缓存（最新在前）+ 当前游标 + 召回前草稿。
+    input_history: Vec<String>,
+    history_cursor: Option<usize>,
+    history_draft: String,
+    /// 删除确认（结果菜单「删除到回收站」）。
+    pending_delete: Option<PendingDelete>,
+    /// 当前打开的菜单里，选中条目是否在「最近使用」历史中。
+    menu_in_history: bool,
     /// 对话框事件到达但探测失败时的重试截止时间（子控件可能还没建好）。
     dialog_retry_until: Option<Instant>,
     /// 设置面板当前分页。
@@ -1040,6 +1048,11 @@ impl LstrApp {
             condition_edit_backup: None,
             condition_history: ConditionHistory::default(),
             date_mask: None,
+            input_history: Vec::new(),
+            history_cursor: None,
+            history_draft: String::new(),
+            pending_delete: None,
+            menu_in_history: false,
             dialog_retry_until: None,
             settings_tab: SettingsTab::Appearance,
             ime_composing: false,
@@ -1431,6 +1444,12 @@ impl LstrApp {
                 // 这批结果对应的查询词（条件已剥离）。结果行标注/高亮用它，
                 // 避免条件编辑期间把 `size >= …` 半截条件当拼音查询词。
                 self.results_query_text = self.input.clone();
+                // 输入历史：只记真正发出去的查询（浏览目录/路径模式不算）。
+                if self.browse_root.is_none() && !self.path_mode() {
+                    if let Ok(mut history) = self.history.lock() {
+                        history.record_input(&self.input);
+                    }
+                }
                 self.pending_gen = if let Some(root) = self.browse_root.clone() {
                     self.service.search_browse(
                         &self.input,
@@ -1625,6 +1644,7 @@ impl LstrApp {
         self.condition_hold = false;
         self.suggest_dismissed = None;
         self.suggest_index = 0;
+        self.reset_history_recall();
         Self::reset_input_cursor(ctx);
         self.focus_requested = true;
         self.trigger(ctx);
@@ -1734,6 +1754,7 @@ impl LstrApp {
         self.chip_caret = None;
         self.condition_hold = chip.hold_after_edit;
         self.suggest_dismissed = None;
+        self.reset_history_recall();
         Self::reset_input_cursor(ctx);
         self.focus_requested = true;
         self.trigger(ctx);
@@ -1806,6 +1827,7 @@ impl LstrApp {
             .unwrap_or_default();
         self.date_mask = None;
         self.input = format!("{partial}{text}");
+        self.reset_history_recall();
         Self::reset_input_cursor(ctx);
         self.trigger(ctx);
     }
@@ -1815,19 +1837,26 @@ impl LstrApp {
         if self.date_mask.is_none() {
             return false;
         }
-        // 文本事件：纯数字进段；其它字符退出遮罩转自由文本。
-        let mut digits = String::new();
+        // 文本事件：数字进段；`-`/`/`/`.` 当分隔符（当前段已有数字才跳段，
+        // 否则忽略——避免 `2026` 自动跳段后再打 `-` 把月跳过去）；
+        // `:` 提交；其它字符退出遮罩转自由文本（别名仍可用）。
+        let mut feed: Vec<char> = Vec::new();
         let mut exit_text: Option<String> = None;
+        let mut commit = false;
         ctx.input_mut(|i| {
             i.events.retain(|event| match event {
                 egui::Event::Text(text) => {
-                    if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) {
-                        digits.push_str(text);
-                        false
+                    if text
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || matches!(c, '-' | '/' | '.'))
+                    {
+                        feed.extend(text.chars());
+                    } else if matches!(text.as_str(), ":" | "：") {
+                        commit = true;
                     } else {
                         exit_text.get_or_insert_with(|| text.clone());
-                        false
                     }
+                    false
                 }
                 _ => true,
             })
@@ -1836,12 +1865,23 @@ impl LstrApp {
             self.exit_date_mask_to_free_text(ctx, &text);
             return true;
         }
-        for c in digits.chars() {
-            if let Some(mask) = self.date_mask.as_mut() {
-                mask.feed_digit(c);
+        if commit {
+            self.commit_date_mask(ctx);
+            return true;
+        }
+        for c in feed.iter().copied() {
+            if c.is_ascii_digit() {
+                if let Some(mask) = self.date_mask.as_mut() {
+                    mask.feed_digit(c);
+                }
+            } else if let Some(mask) = self.date_mask.as_mut() {
+                // 分隔符：当前段已输入数字才跳到下一段；段空时忽略。
+                if !mask.typed_str(mask.date_idx, mask.part).is_empty() {
+                    mask.advance();
+                }
             }
         }
-        let mut handled = !digits.is_empty();
+        let mut handled = !feed.is_empty();
         // Backspace：删段内数字；段已空且在最后一段时不消费（留给 chip 删除）。
         let ctrl_bksp = ctx.input(|i| i.modifiers.ctrl)
             && ctx.input(|i| i.key_pressed(Key::Backspace));
@@ -1956,6 +1996,62 @@ impl LstrApp {
         self.toast(ctx, "已重做条件".to_string());
         self.trigger(ctx);
     }
+
+    /// 退出历史召回状态（下一次 Ctrl+↑ 重新从最新一条开始）。
+    fn reset_history_recall(&mut self) {
+        self.history_cursor = None;
+        self.history_draft.clear();
+    }
+
+    /// 历史输入召回：`delta < 0` 更旧（Ctrl+↑），`delta > 0` 更新（Ctrl+↓）。
+    /// 第一次召回先抓一份最近输入列表，并记住当前输入作为草稿；
+    /// 一直按 ↓ 回到草稿。
+    fn recall_input(&mut self, ctx: &egui::Context, delta: i32) {
+        if self.history_cursor.is_none() {
+            let list = self
+                .history
+                .lock()
+                .map(|history| history.recent_inputs(100))
+                .unwrap_or_default();
+            if list.is_empty() {
+                self.toast(ctx, "没有历史输入".to_string());
+                return;
+            }
+            self.input_history = list;
+            self.history_draft = self.input.clone();
+            self.history_cursor = Some(0);
+        } else if delta > 0 {
+            let cursor = self.history_cursor.unwrap_or(0);
+            if cursor == 0 {
+                // 已到最新一条：再 ↓ 回到召回前的草稿。
+                self.history_cursor = None;
+                self.input = std::mem::take(&mut self.history_draft);
+                self.apply_recalled_input(ctx);
+                return;
+            }
+            self.history_cursor = Some(cursor - 1);
+        } else {
+            let cursor = self.history_cursor.unwrap_or(0);
+            let last = self.input_history.len().saturating_sub(1);
+            self.history_cursor = Some((cursor + 1).min(last));
+        }
+        let index = self.history_cursor.unwrap_or(0);
+        self.input = self.input_history[index].clone();
+        self.apply_recalled_input(ctx);
+    }
+
+    /// 把召回的历史输入放进输入框并重新搜索。
+    fn apply_recalled_input(&mut self, ctx: &egui::Context) {
+        self.chip_caret = None;
+        self.condition_hold = false;
+        self.condition_edit_backup = None;
+        self.date_mask = None;
+        self.suggest_dismissed = None;
+        self.suggest_index = 0;
+        Self::reset_input_cursor(ctx);
+        self.focus_requested = true;
+        self.trigger(ctx);
+    }
     /// 返回 true = 这次回车已被条件编辑消费（不再打开选中结果）。
     fn finish_condition_edit(&mut self, ctx: &egui::Context) -> bool {
         if self.condition_hold {
@@ -2059,6 +2155,7 @@ impl LstrApp {
         self.condition_hold = false;
         self.condition_edit_backup = None;
         self.chip_caret = None;
+        self.reset_history_recall();
         self.move_caret_to_end(ctx);
         // 条件提交会程序化改写输入，TextEdit 自带的文本撤销历史不再对应
         // 当前内容；清掉它，避免条件撤销栈空后 Ctrl+Z 又翻出旧文本。
@@ -2086,6 +2183,7 @@ impl LstrApp {
         self.suggest_index = 0;
         self.condition_edit_backup = None;
         self.date_mask = None;
+        self.reset_history_recall();
     }
 
     fn trigger(&mut self, ctx: &egui::Context) {
@@ -2174,6 +2272,8 @@ impl LstrApp {
         self.suggest_dismissed = None;
         self.suggest_index = 0;
         self.condition_edit_backup = None;
+        self.reset_history_recall();
+        self.pending_delete = None;
         // 普通唤出（双击 Space / 托盘）不携带 Explorer 目录上下文。
         self.typing_folder = None;
         self.typing_global = false;
@@ -2394,7 +2494,38 @@ impl LstrApp {
                 self.move_caret_to_end(ctx);
             }
         }
+        // 遮罩期间 TextEdit 不渲染：IME 上屏的中文（今天/本周）必须在这里
+        // 接管，退出遮罩转自由文本，否则字符会丢在隐藏的 TextEdit 里。
+        if self.date_mask.is_some() {
+            let mut committed: Option<String> = None;
+            ctx.input_mut(|i| {
+                i.events.retain(|event| match event {
+                    egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty() => {
+                        committed.get_or_insert_with(|| text.clone());
+                        false
+                    }
+                    _ => true,
+                })
+            });
+            if let Some(text) = committed {
+                self.exit_date_mask_to_free_text(ctx, &text);
+                return;
+            }
+        }
         if ime_active {
+            return;
+        }
+
+        // 删除确认是模态弹层：只接受 Enter 确认 / Esc 取消，其它按键不穿透。
+        if self.pending_delete.is_some() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.pending_delete = None;
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+                self.confirm_pending_delete(ctx);
+                return;
+            }
             return;
         }
 
@@ -2744,6 +2875,40 @@ impl LstrApp {
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
                 self.suggest_index = (self.suggest_index + len - 1) % len;
+                return;
+            }
+        }
+
+        // 历史输入召回：Ctrl+↑/↓ 始终可用；Alt+↑/↓ 在非浏览/路径模式也接受
+        //（浏览下 Alt+↑/↓ 是目录导航，不能抢）。
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::ArrowUp)) {
+            self.recall_input(ctx, -1);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::ArrowDown)) {
+            self.recall_input(ctx, 1);
+            return;
+        }
+        if !self.in_browse() && !self.path_mode() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowUp)) {
+                self.recall_input(ctx, -1);
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowDown)) {
+                self.recall_input(ctx, 1);
+                return;
+            }
+        }
+
+        // 没有结果时 ↑↓ 没有列表可导航：直接用于召回历史输入
+        //（有结果时 ↑↓ 仍是结果选择，避免抢走核心导航）。
+        if self.entries.is_empty() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                self.recall_input(ctx, -1);
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                self.recall_input(ctx, 1);
                 return;
             }
         }
@@ -3469,6 +3634,7 @@ impl LstrApp {
                         self.condition_hold = false;
                         self.chip_caret = None;
                         self.suggest_index = 0;
+                        self.reset_history_recall();
                         if let Some(dismissed) = &self.suggest_dismissed {
                             let trimmed = self.input.trim();
                             if trimmed.is_empty() || !trimmed.starts_with(dismissed.as_str()) {
@@ -3820,6 +3986,7 @@ impl LstrApp {
 
                 self.paint_footer(&painter, rect, &entries, &query);
                 self.paint_menu(ctx, list_rect);
+                self.paint_confirm_delete(ctx, rect);
                 self.paint_drag_resize(ui, &painter, rect);
             });
     }
@@ -4831,6 +4998,7 @@ impl LstrApp {
                             ("拼音", "全拼或首字母，wx → 微信"),
                             ("Tab", "切换范围"),
                             ("Alt+←", "返回上级范围"),
+                            ("Ctrl+↑↓", "上/下一条历史输入"),
                         ],
                     ),
                     (
@@ -5931,6 +6099,13 @@ impl LstrApp {
         }
         self.menu_open = true;
         self.menu_index = 0;
+        // 每条结果右键都查一次历史（打开菜单时一次，不是每帧）。
+        self.menu_in_history = self.entries.get(self.selected).is_some_and(|entry| {
+            self.history
+                .lock()
+                .map(|history| history.contains(&entry.id))
+                .unwrap_or(false)
+        });
     }
 
     fn menu_step(&mut self, delta: i32) {
@@ -5939,7 +6114,7 @@ impl LstrApp {
             return;
         };
         let actions = self.cfg.actions.clone();
-        let items = menu_items(entry, &actions);
+        let items = menu_items(entry, &actions, self.menu_in_history);
         if items.is_empty() {
             self.menu_open = false;
             return;
@@ -5961,7 +6136,7 @@ impl LstrApp {
             return;
         };
         let actions = self.cfg.actions.clone();
-        let items = menu_items(entry, &actions);
+        let items = menu_items(entry, &actions, self.menu_in_history);
         if let Some(item) = items.get(self.menu_index) {
             if item.enabled {
                 let action = item.action;
@@ -6054,6 +6229,178 @@ impl LstrApp {
                 self.trigger(ctx);
                 self.toast(ctx, "已从最近使用中移除".to_string());
             }
+            MenuAction::DeleteToRecycleBin => {
+                let Some(entry) = self.entries.get(self.selected).cloned() else {
+                    return;
+                };
+                let Some(path) = entry.path.clone() else {
+                    return;
+                };
+                // 不立即删：先弹二次确认，确认后才进回收站。
+                self.pending_delete = Some(PendingDelete {
+                    id: entry.id,
+                    name: entry.name,
+                    path,
+                });
+            }
+        }
+    }
+
+    fn confirm_pending_delete(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_delete.take() else {
+            return;
+        };
+        match shell::delete_to_recycle_bin(&pending.path) {
+            Ok(()) => {
+                if let Some(index) = self.entries.iter().position(|entry| entry.id == pending.id) {
+                    self.entries.remove(index);
+                    if self.selected >= self.entries.len() {
+                        self.selected = self.entries.len().saturating_sub(1);
+                    }
+                    self.total = self.total.saturating_sub(1);
+                }
+                if let Ok(mut history) = self.history.lock() {
+                    history.remove(&pending.id);
+                }
+                self.toast(ctx, "已移入回收站".to_string());
+                ctx.request_repaint();
+            }
+            Err(err) => self.toast(ctx, format!("删除失败：{err}")),
+        }
+    }
+
+    /// 删除二次确认：半透明遮罩 + 居中卡片；Enter 确认，Esc / 点遮罩取消。
+    fn paint_confirm_delete(&mut self, ctx: &egui::Context, rect: Rect) {
+        let Some(pending) = self.pending_delete.clone() else {
+            return;
+        };
+        let theme = self.theme;
+        let mut cancel = false;
+        let mut confirm = false;
+        egui::Area::new(Id::new("lstr-delete-dim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                let (_, response) = ui.allocate_exact_size(rect.size(), Sense::click());
+                ui.painter().rect_filled(
+                    rect,
+                    CornerRadius::same(theme.radius),
+                    Color32::from_black_alpha(80),
+                );
+                if response.clicked() {
+                    cancel = true;
+                }
+            });
+        let width = 400.0_f32.min(rect.width() - 48.0);
+        let height = 152.0;
+        let pos = egui::pos2(
+            rect.center().x - width / 2.0,
+            rect.center().y - height / 2.0,
+        );
+        egui::Area::new(Id::new("lstr-delete-confirm"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                let frame = egui::Frame {
+                    fill: theme.menu,
+                    stroke: Stroke::new(1.0_f32, theme.hair2),
+                    corner_radius: CornerRadius::same(12),
+                    inner_margin: egui::Margin::same(18),
+                    shadow: egui::epaint::Shadow {
+                        offset: [0, 12],
+                        blur: 34,
+                        spread: 0,
+                        color: Color32::from_black_alpha(130),
+                    },
+                    ..Default::default()
+                };
+                frame.show(ui, |ui| {
+                    ui.set_width(width - 36.0);
+                    ui.label(
+                        egui::RichText::new("删除到回收站？")
+                            .font(ui::text_font(16.0))
+                            .color(theme.text),
+                    );
+                    ui.add_space(6.0);
+                    let name = ui::middle_ellipsis(&pending.name, 30);
+                    ui.label(
+                        egui::RichText::new(name)
+                            .font(ui::mono_font(12.0))
+                            .color(theme.sub),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Enter 确认 · Esc 取消")
+                            .font(ui::mono_font(10.0))
+                            .color(theme.dim),
+                    );
+                    ui.add_space(14.0);
+                    let (row, _) = ui.allocate_exact_size(
+                        egui::vec2(width - 36.0, 32.0),
+                        Sense::hover(),
+                    );
+                    let painter = ui.painter().clone();
+                    let delete_rect = Rect::from_min_size(row.min, egui::vec2(104.0, 30.0));
+                    let cancel_rect = Rect::from_min_size(
+                        egui::pos2(delete_rect.right() + 10.0, row.top()),
+                        egui::vec2(104.0, 30.0),
+                    );
+                    let delete_resp =
+                        ui.interact(delete_rect, Id::new("lstr-delete-yes"), Sense::click());
+                    let cancel_resp =
+                        ui.interact(cancel_rect, Id::new("lstr-delete-no"), Sense::click());
+                    let warn = if theme.light {
+                        Color32::from_rgb(190, 70, 60)
+                    } else {
+                        Color32::from_rgb(214, 96, 84)
+                    };
+                    painter.rect_filled(
+                        delete_rect,
+                        CornerRadius::same(7),
+                        if delete_resp.hovered() {
+                            warn
+                        } else {
+                            warn.gamma_multiply(0.88)
+                        },
+                    );
+                    painter.text(
+                        delete_rect.center(),
+                        Align2::CENTER_CENTER,
+                        "删除",
+                        ui::text_font(13.0),
+                        Color32::WHITE,
+                    );
+                    painter.rect_filled(
+                        cancel_rect,
+                        CornerRadius::same(7),
+                        if cancel_resp.hovered() {
+                            theme.hover
+                        } else {
+                            theme.surface_hi
+                        },
+                    );
+                    painter.text(
+                        cancel_rect.center(),
+                        Align2::CENTER_CENTER,
+                        "取消",
+                        ui::text_font(13.0),
+                        theme.text,
+                    );
+                    if delete_resp.hovered() || cancel_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if delete_resp.clicked() {
+                        confirm = true;
+                    }
+                    if cancel_resp.clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            self.confirm_pending_delete(ctx);
+        } else if cancel {
+            self.pending_delete = None;
         }
     }
 
@@ -6065,7 +6412,7 @@ impl LstrApp {
             self.menu_open = false;
             return;
         };
-        let items = menu_items(&entry, &self.cfg.actions);
+        let items = menu_items(&entry, &self.cfg.actions, self.menu_in_history);
         let theme = self.theme;
         let item_h = 30.0;
         let width = 236.0;
@@ -8060,7 +8407,16 @@ enum MenuAction {
     OpenTerminal,
     RemoveHistory,
     AddFavorite,
+    DeleteToRecycleBin,
     CustomAction(usize),
+}
+
+/// 删除确认弹层的数据（菜单「删除到回收站」二次确认）。
+#[derive(Clone, Debug)]
+struct PendingDelete {
+    id: String,
+    name: String,
+    path: std::path::PathBuf,
 }
 
 /// 设置面板的分页。
@@ -8189,7 +8545,7 @@ struct MenuItem {
     action: MenuAction,
 }
 
-fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef]) -> Vec<MenuItem> {
+fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef], in_history: bool) -> Vec<MenuItem> {
     let is_command = entry.kind == Kind::Command;
     let is_program = entry.kind == Kind::Program;
     let is_file = entry.kind == Kind::File;
@@ -8198,6 +8554,9 @@ fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef]) -> Vec<MenuIt
     let can_admin = is_program || is_file || (entry.kind == Kind::App && entry.path.is_some());
     // 「在终端打开」只对文件系统条目有意义（文件夹自身 / 文件所在目录）。
     let can_terminal = entry.path.is_some()
+        && matches!(entry.kind, Kind::Folder | Kind::File | Kind::Program);
+    // 删除只对真实文件系统条目开放；应用（快捷方式/UWP）、命令不删。
+    let can_delete = entry.path.is_some()
         && matches!(entry.kind, Kind::Folder | Kind::File | Kind::Program);
     let mut items = vec![
         MenuItem {
@@ -8242,19 +8601,31 @@ fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef]) -> Vec<MenuIt
             enabled: can_terminal,
             action: MenuAction::OpenTerminal,
         },
-        MenuItem {
+    ];
+    // 只有真正在「最近使用」历史里的条目才显示移除项；普通搜索结果
+    // 没有可移除的东西，显示出来只会让人误以为能清掉搜索结果。
+    if in_history {
+        items.push(MenuItem {
             label: "从最近使用中移除".to_string(),
             shortcut: "",
-            enabled: !is_command,
+            enabled: true,
             action: MenuAction::RemoveHistory,
-        },
-        MenuItem {
-            label: "加入收藏".to_string(),
+        });
+    }
+    items.push(MenuItem {
+        label: "加入收藏".to_string(),
+        shortcut: "",
+        enabled: !is_command,
+        action: MenuAction::AddFavorite,
+    });
+    if can_delete {
+        items.push(MenuItem {
+            label: "删除到回收站…".to_string(),
             shortcut: "",
-            enabled: !is_command,
-            action: MenuAction::AddFavorite,
-        },
-    ];
+            enabled: true,
+            action: MenuAction::DeleteToRecycleBin,
+        });
+    }
     // P0-1：自定义动作作用于选中的结果，模板可引用 {action_path}。
     for (index, action) in actions.iter().enumerate() {
         items.push(MenuItem {
@@ -8654,6 +9025,7 @@ mod path_layout_tests {
         let app = menu_items(
             &menu_entry(Kind::App, Some(r"C:\Start Menu\Terminal.lnk")),
             &[],
+            false,
         );
         assert!(item(&app, MenuAction::Admin).enabled);
         let uwp = menu_items(
@@ -8662,14 +9034,15 @@ mod path_layout_tests {
                 Some(r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"),
             ),
             &[],
+            false,
         );
         assert!(
             item(&uwp, MenuAction::Admin).enabled,
             "打包应用也应可尝试，执行层会给出明确提示"
         );
-        let no_path = menu_items(&menu_entry(Kind::App, None), &[]);
+        let no_path = menu_items(&menu_entry(Kind::App, None), &[], false);
         assert!(!item(&no_path, MenuAction::Admin).enabled);
-        let folder = menu_items(&menu_entry(Kind::Folder, Some(r"C:\work")), &[]);
+        let folder = menu_items(&menu_entry(Kind::Folder, Some(r"C:\work")), &[], false);
         assert!(!item(&folder, MenuAction::Admin).enabled, "文件夹不支持提权");
     }
 
@@ -8681,15 +9054,46 @@ mod path_layout_tests {
             (Kind::File, r"C:\work\notes.txt"),
             (Kind::Program, r"C:\Tools\app.exe"),
         ] {
-            let items = menu_items(&menu_entry(kind, Some(path)), &[]);
+            let items = menu_items(&menu_entry(kind, Some(path)), &[], false);
             assert!(item(&items, MenuAction::OpenTerminal).enabled, "{kind:?} 应可终端打开");
         }
         for (kind, path) in [
             (Kind::App, Some(r"C:\Start Menu\Terminal.lnk")),
             (Kind::Command, None),
         ] {
-            let items = menu_items(&menu_entry(kind, path), &[]);
+            let items = menu_items(&menu_entry(kind, path), &[], false);
             assert!(!item(&items, MenuAction::OpenTerminal).enabled, "{kind:?} 不应终端打开");
+        }
+    }
+
+    #[test]
+    fn menu_only_offers_history_removal_when_recorded() {
+        let file = menu_entry(Kind::File, Some(r"C:\work\notes.txt"));
+        let not_recorded = menu_items(&file, &[], false);
+        assert!(
+            !not_recorded
+                .iter()
+                .any(|item| item.action == MenuAction::RemoveHistory),
+            "普通搜索结果不应出现「从最近使用中移除」"
+        );
+        let recorded = menu_items(&file, &[], true);
+        assert!(item(&recorded, MenuAction::RemoveHistory).enabled);
+    }
+
+    #[test]
+    fn delete_is_only_offered_for_file_system_entries() {
+        for (kind, path, expected) in [
+            (Kind::File, Some(r"C:\work\notes.txt"), true),
+            (Kind::Folder, Some(r"C:\work"), true),
+            (Kind::Program, Some(r"C:\Tools\app.exe"), true),
+            (Kind::App, Some(r"C:\Start Menu\Terminal.lnk"), false),
+            (Kind::Command, None, false),
+        ] {
+            let items = menu_items(&menu_entry(kind, path), &[], false);
+            let has = items
+                .iter()
+                .any(|item| item.action == MenuAction::DeleteToRecycleBin);
+            assert_eq!(has, expected, "{kind:?}");
         }
     }
 
