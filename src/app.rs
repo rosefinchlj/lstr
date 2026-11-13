@@ -91,11 +91,22 @@ impl IconStore {
             Kind::File => Some(GENERIC_FILE_ICON),
             _ => None,
         };
+        // 书签的 path 是 URL，shell 取不到图标；统一用 Edge 的可执行文件图标。
+        let path = if entry.kind == Kind::Bookmark {
+            let Some(edge) = crate::win::icons::edge_exe() else {
+                // 没装 Edge：不请求，行绘制回退到地球图标。
+                self.pending.remove(&key);
+                return;
+            };
+            edge.to_string_lossy().into_owned()
+        } else {
+            entry.full_path()
+        };
         if self
             .tx
             .send(IconJob {
                 key: key.clone(),
-                path: entry.full_path(),
+                path,
                 generic,
             })
             .is_err()
@@ -209,7 +220,9 @@ fn icon_key(entry: &Entry) -> String {
             }
             _ => "icon:file".to_string(),
         },
-        Kind::Command | Kind::Bookmark => String::new(),
+        Kind::Command => String::new(),
+        // 所有书签共用一张 Edge 图标（后台从 msedge.exe 取一次，见 IconStore::request）。
+        Kind::Bookmark => "icon:bookmark".to_string(),
         _ => format!("icon:{}", entry.id),
     }
 }
@@ -6174,7 +6187,7 @@ impl LstrApp {
                 egui::pos2(row_rect.left() + 24.0, row_rect.center().y),
                 egui::vec2(20.0, 20.0),
             );
-            let texture = if matches!(entry.kind, Kind::Command | Kind::Bookmark) {
+            let texture = if entry.kind == Kind::Command {
                 None
             } else {
                 let key = icon_key(entry);
@@ -7574,7 +7587,7 @@ impl LstrApp {
             y += side + 8.0;
         } else {
             // 和结果行共用同一份纹理，UWP 图标只解析一次。
-            let texture = if matches!(entry.kind, Kind::Command | Kind::Bookmark) {
+            let texture = if entry.kind == Kind::Command {
                 None
             } else {
                 let key = icon_key(entry);

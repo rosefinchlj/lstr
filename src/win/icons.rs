@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use eframe::egui::ColorImage;
@@ -37,6 +38,21 @@ pub fn load_icon(path: &str, size: u32) -> Option<ColorImage> {
 /// 一次调用只要亚毫秒，适合交给后台线程批量取。
 pub fn load_icon_with_attrs(path: &str, size: u32, attrs: u32) -> Option<ColorImage> {
     shget_icon(path, size, attrs, true)
+}
+
+/// Edge 可执行文件的路径：书签结果统一显示 Edge 图标（用户默认用它开网页）。
+/// 未安装/装在非常规位置时返回 None，调用方回退到绘制的地球图标。
+pub fn edge_exe() -> Option<PathBuf> {
+    for var in ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"] {
+        let Some(base) = std::env::var_os(var) else {
+            continue;
+        };
+        let candidate = PathBuf::from(base).join(r"Microsoft\Edge\Application\msedge.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn shget_icon(path: &str, size: u32, attrs: u32, use_attrs: bool) -> Option<ColorImage> {
@@ -399,6 +415,20 @@ mod tests {
         let image = load_icon("C:\\Windows\\notepad.exe", 32).expect("notepad icon");
         assert_eq!(image.size, [32, 32]);
         assert_eq!(image.pixels.len(), 32 * 32);
+    }
+
+    /// 书签行图标来自 Edge 的 exe；未安装 Edge 的机器跳过（调用方回退地球图标）。
+    #[test]
+    fn loads_edge_icon_when_installed() {
+        let Some(exe) = edge_exe() else {
+            return;
+        };
+        let image = load_icon(&exe.to_string_lossy(), 32).expect("edge icon");
+        assert_eq!(image.size, [32, 32]);
+        assert!(
+            image.pixels.iter().any(|pixel| pixel.a() > 0),
+            "Edge 图标不应是整张透明图"
+        );
     }
 
     #[test]
