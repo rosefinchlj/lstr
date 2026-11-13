@@ -2032,11 +2032,13 @@ impl LstrApp {
         }
     }
 
-    /// 日期/大小条件是否在当前上下文生效：正则、PathTyping、应用/命令/书签页不解析；
-    /// 浏览模式生效（与时间/类型筛选一致）。
+    /// 日期/大小/路径等条件是否在当前上下文解析：正则、PathTyping、应用/命令/
+    /// 书签页、以及网络搜索模式都不解析；浏览模式生效（与时间/类型筛选一致）。
     fn conditions_apply(&self, scope: Scope) -> bool {
         !self.filters.matches.regex
             && !self.path_mode()
+            // 搜索模式：输入框里的一切都是搜索词（包括 `date>…`、`a ` 这些）。
+            && self.filters.keyword.is_none()
             && !matches!(scope, Scope::App | Scope::Bookmark | Scope::Command)
     }
 
@@ -2993,6 +2995,12 @@ impl LstrApp {
         if self.condition_hold {
             return false;
         }
+        // 搜索模式（搜索 chip 已存在）：输入框里的一切都是搜索词——不再解析
+        // 范围/日期/大小/路径/盘符，也不会再收一个关键字 chip 来换引擎
+        //（换引擎用 × 退出或双击 chip 改文本）。正则模式不算搜索模式。
+        if self.filters.keyword.is_some() && !self.filters.matches.regex {
+            return false;
+        }
         // 盘符 chip 后面继续打路径分隔符：先把盘符还原成文本，交给路径模式。
         if self.restore_drive_for_path() {
             self.move_caret_to_end(ctx);
@@ -3029,12 +3037,15 @@ impl LstrApp {
         if let Some((_, rest)) = &keyword_change {
             text = rest.clone();
         }
-        let extracted = if self.conditions_apply(effective_scope) {
+        // 同一个改动里刚收下关键字（`b date>…:` 一次粘贴）：剩余文本就是
+        // 搜索词，不再当条件解析。
+        let extracted = if keyword_change.is_none() && self.conditions_apply(effective_scope) {
             let out = crate::search::conditions::extract(&text);
             self.condition_error = out.errors.first().cloned();
             (!out.is_empty()).then_some(out)
         } else {
-            // 范围切到条件不生效的页（应用/命令/书签）时，旧错误也要清掉。
+            // 范围切到条件不生效的页（应用/命令/书签）、或刚进搜索模式时，
+            // 旧错误也要清掉。
             self.condition_error = None;
             None
         };
@@ -4533,6 +4544,16 @@ impl LstrApp {
                             .unwrap_or_else(|| folder.to_string_lossy().into_owned());
                         format!("在 {name} 中搜索（Ctrl+Shift+G 全局）…")
                     }
+                } else if let Some(trigger) = &self.filters.keyword {
+                    // 搜索模式：输入框内容全部作为网络搜索词。
+                    let name = self
+                        .cfg
+                        .keywords
+                        .iter()
+                        .find(|kw| kw.trigger.eq_ignore_ascii_case(trigger))
+                        .map(|kw| kw.name.clone())
+                        .unwrap_or_else(|| trigger.clone());
+                    format!("输入 {name} 搜索内容…")
                 } else {
                     hint_for(query.scope).to_string()
                 };
@@ -4540,8 +4561,7 @@ impl LstrApp {
                 // 标签用比例字体、值用等宽字体；日期=琥珀色，大小=冷色，盘符=绿色。
                 // 搜索模式下筛选条件不参与查询（本地索引整个跳过），对应 chip
                 // 置灰；范围/搜索 chip 自己是模式，不随此变灰（见下）。
-                let disabled =
-                    !self.conditions_apply(query.scope) || self.filters.keyword.is_some();
+                let disabled = !self.conditions_apply(query.scope);
                 let chips = self.condition_chips();
                 let mut text_rect = search_rect;
                 if !chips.is_empty() {
@@ -6243,7 +6263,7 @@ impl LstrApp {
                             ("a 微信", "搜应用，a 收成范围 chip"),
                             ("f 文件", "只搜文件，f 收成范围 chip"),
                             ("> 命令", "命令页，> 收成范围 chip"),
-                            ("g rust", "g 收成 chip，只出搜索行"),
+                            ("g rust", "全部当搜索词，只出搜索行"),
                         ],
                     ),
                 ];
