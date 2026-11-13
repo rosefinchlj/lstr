@@ -291,9 +291,22 @@ fn condition_chip_width(painter: &egui::Painter, label: &str, value: &str, dense
     pad + label_w + value_w + pad + clear
 }
 
+/// chip 在当前类别下是否只是置灰展示（点击/编辑/删除都不响应）。
+/// 范围/搜索 chip 本身是「当前模式」，不随条件失效，任何时候都能操作。
+fn chip_inactive(kind: ConditionChipKind, conditions_apply: bool) -> bool {
+    !conditions_apply
+        && !matches!(
+            kind,
+            ConditionChipKind::Scope | ConditionChipKind::Keyword
+        )
+}
+
 /// 画一个条件 chip（标签比例字体 + 值等宽字体 + × 命中区），返回
 /// `(宽度, 是否点了 ×, 是否点了本体, 是否双击本体)`。日期/大小/盘符共用；
 /// 单击定位虚拟光标，双击进入编辑。
+///
+/// 当前类别下不生效的条件只做置灰展示（`interactive = false`）：不响应
+/// 点击/双击/×，hover 也不再高亮，避免「灰着的条件还能被编辑/删掉」。
 fn paint_condition_chip(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
@@ -306,6 +319,7 @@ fn paint_condition_chip(
     id: &str,
     tooltip: &str,
     dense: bool,
+    interactive: bool,
 ) -> (f32, bool, bool, bool) {
     let (label_size, value_size, pad, gap, clear_w, chip_h) = if dense {
         (11.0, 11.0, 8.0, 5.0, 14.0, 22.0)
@@ -333,8 +347,8 @@ fn paint_condition_chip(
     );
     let body_rect = Rect::from_min_max(chip.min, egui::pos2(clear.left() - 2.0, chip.max.y));
     let pointer = ui.ctx().pointer_hover_pos();
-    let body_hover = pointer.is_some_and(|pos| body_rect.contains(pos));
-    let clear_hover = pointer.is_some_and(|pos| clear.contains(pos));
+    let body_hover = interactive && pointer.is_some_and(|pos| body_rect.contains(pos));
+    let clear_hover = interactive && pointer.is_some_and(|pos| clear.contains(pos));
 
     // 背景：类型色低透明度；hover 略微加深。边框很淡，靠留白和字色分层。
     let fill = if body_hover {
@@ -389,13 +403,14 @@ fn paint_condition_chip(
         },
     );
 
+    let sense = if interactive { Sense::click() } else { Sense::hover() };
     let body = ui
-        .interact(body_rect, Id::new(("lstr-cond-chip-body", id)), Sense::click())
+        .interact(body_rect, Id::new(("lstr-cond-chip-body", id)), sense)
         .on_hover_text(tooltip.to_string());
     let response = ui
-        .interact(clear, Id::new(("lstr-cond-chip-clear", id)), Sense::click())
+        .interact(clear, Id::new(("lstr-cond-chip-clear", id)), sense)
         .on_hover_text(tooltip.to_string());
-    if body_hover || clear_hover {
+    if interactive && (body_hover || clear_hover) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     (
@@ -448,6 +463,20 @@ fn left_chip_index(caret: Option<usize>, count: usize, text_at_start: bool) -> O
         None if text_at_start => Some(count - 1),
         None => None,
     }
+}
+
+/// chip 边界光标的 ← 移动：`None`（文本区）= 从最右进入，落在 `count`
+/// （最后一个 chip 右侧）；一路左移，最左停在 1（边界 0 没有左邻 chip）。
+fn chip_caret_left(caret: Option<usize>, count: usize) -> Option<usize> {
+    match caret {
+        Some(index) => Some(index.saturating_sub(1).max(1)),
+        None => Some(count),
+    }
+}
+
+/// chip 边界光标的 → 移动：右移一格；已经在 `count` 就回到文本区。
+fn chip_caret_right(caret: Option<usize>, count: usize) -> Option<usize> {
+    caret.and_then(|index| (index < count).then_some(index + 1))
 }
 
 /// 删除第 `removed` 个 chip 后，虚拟光标应落在的位置（chip 数变为 `new_count`）。
@@ -2507,16 +2536,26 @@ impl LstrApp {
             .is_some_and(|range| range.primary.index == 0 && range.secondary.index == 0)
     }
 
+    /// chip 在当前类别下只是置灰展示（条件不生效）：不可点、不可编辑/删除。
+    /// 范围/搜索 chip 本身是模式，任何时候都能操作。
+    fn chip_inactive(&self, index: usize) -> bool {
+        let Some(chip) = self.condition_chips().into_iter().nth(index) else {
+            return true;
+        };
+        chip_inactive(chip.kind, self.conditions_apply(self.scope))
+    }
+
     /// 光标左侧最近的条件 chip 下标（编辑用：虚拟光标优先，否则最右 chip）。
     fn condition_edit_target(&self) -> Option<usize> {
         let count = self.condition_chips().len();
-        left_chip_index(self.chip_caret, count, true)
+        left_chip_index(self.chip_caret, count, true).filter(|&index| !self.chip_inactive(index))
     }
 
     /// Ctrl+Backspace 的删除目标：虚拟光标左侧 chip；否则文本在开头时删最右 chip。
     fn condition_delete_target(&self, ctx: &egui::Context) -> Option<usize> {
         let count = self.condition_chips().len();
         left_chip_index(self.chip_caret, count, self.text_at_start(ctx))
+            .filter(|&index| !self.chip_inactive(index))
     }
 
     /// 删除第 `index` 个条件 chip，并修正虚拟光标。
@@ -3780,8 +3819,10 @@ impl LstrApp {
         }
 
         // 条件 chip 可能在别处被清掉（筛选条/时间预设）：虚拟光标及时失效。
+        // 边界下标合法范围是 0..=count（count = 最后一个 chip 右侧），不能
+        // 用 >= 判，否则「光标在最后 chip 右侧」每帧都被清掉、← 走不动。
         let chip_count = self.condition_chips().len();
-        if self.chip_caret.is_some_and(|index| index >= chip_count) {
+        if self.chip_caret.is_some_and(|index| index > chip_count) {
             self.chip_caret = None;
         }
 
@@ -4104,20 +4145,13 @@ impl LstrApp {
                 && left_should_handle
                 && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft))
             {
-                self.chip_caret = match self.chip_caret {
-                    // 边界 0（第一个 chip 左侧）没有可编辑/删除的左邻，停在 1。
-                    Some(index) => Some(index.saturating_sub(1).max(1)),
-                    None => Some(count),
-                };
+                self.chip_caret = chip_caret_left(self.chip_caret, count);
                 return;
             }
             if self.chip_caret.is_some()
                 && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowRight))
             {
-                self.chip_caret = self
-                    .chip_caret
-                    .and_then(|index| index.checked_add(1))
-                    .filter(|&index| index < count);
+                self.chip_caret = chip_caret_right(self.chip_caret, count);
                 return;
             }
         }
@@ -4819,8 +4853,8 @@ impl LstrApp {
                 // 条件 chip：固定在输入框左侧，文本区整体右移。
                 // 标签用比例字体、值用等宽字体；日期=琥珀色，大小=冷色，盘符=绿色。
                 // 搜索模式下筛选条件不参与查询（本地索引整个跳过），对应 chip
-                // 置灰；范围/搜索 chip 自己是模式，不随此变灰（见下）。
-                let disabled = !self.conditions_apply(query.scope);
+                // 置灰且不可操作；范围/搜索 chip 自己是模式，不随此变灰（见下）。
+                let conditions_ok = self.conditions_apply(query.scope);
                 let chips = self.condition_chips();
                 let mut text_rect = search_rect;
                 if !chips.is_empty() {
@@ -4849,6 +4883,9 @@ impl LstrApp {
                     let mut edit_target: Option<usize> = None;
                     for (index, chip) in chips.iter().enumerate() {
                         let label = if compact { "" } else { chip.label };
+                        // 范围/搜索 chip 是「当前模式」本身，不随条件失效置灰
+                        // （它们是别的 chip 失效的原因），也仍然可操作。
+                        let dead = chip_inactive(chip.kind, conditions_ok);
                         let (w, clear_clicked, body_clicked, body_double) = paint_condition_chip(
                             ui,
                             &painter,
@@ -4856,44 +4893,16 @@ impl LstrApp {
                             chip_top,
                             label,
                             &chip.value,
-                            // 范围/搜索 chip 是「当前模式」本身，不随条件失效
-                            // 置灰（它们是别的 chip 失效的原因）。
-                            if disabled
-                                && !matches!(
-                                    chip.kind,
-                                    ConditionChipKind::Scope | ConditionChipKind::Keyword
-                                )
-                            {
-                                theme.dim
-                            } else {
-                                chip.color
-                            },
-                            if disabled
-                                && !matches!(
-                                    chip.kind,
-                                    ConditionChipKind::Scope | ConditionChipKind::Keyword
-                                )
-                            {
-                                theme.hover
-                            } else {
-                                chip.bg
-                            },
+                            if dead { theme.dim } else { chip.color },
+                            if dead { theme.hover } else { chip.bg },
                             &chip.id,
                             &format!(
                                 "{}{}",
                                 chip.tooltip,
-                                if disabled
-                                && !matches!(
-                                    chip.kind,
-                                    ConditionChipKind::Scope | ConditionChipKind::Keyword
-                                )
-                            {
-                                    "；当前上下文不生效"
-                                } else {
-                                    ""
-                                }
+                                if dead { "；当前上下文不生效" } else { "" }
                             ),
                             dense,
+                            !dead,
                         );
                         if clear_clicked {
                             removed = Some(index);
@@ -10955,6 +10964,37 @@ mod path_layout_tests {
         // ← 从文本开头进 chip 区落在最后一个 chip 右侧（边界 = count）：
         // 编辑/删除命中的是最后一个 chip，和没光标时一致。
         assert_eq!(left_chip_index(Some(3), 3, true), Some(2));
+    }
+
+    #[test]
+    fn chip_caret_moves_between_boundaries() {
+        // ← 从文本区进入：落在最后一个 chip 右侧，然后一路左移，最左停在 1。
+        assert_eq!(chip_caret_left(None, 3), Some(3));
+        assert_eq!(chip_caret_left(Some(3), 3), Some(2));
+        assert_eq!(chip_caret_left(Some(2), 3), Some(1));
+        assert_eq!(chip_caret_left(Some(1), 3), Some(1), "边界 0 没有左邻");
+        // → 右移，最后一个边界之后回到文本区。
+        assert_eq!(chip_caret_right(Some(1), 3), Some(2));
+        assert_eq!(chip_caret_right(Some(2), 3), Some(3));
+        assert_eq!(chip_caret_right(Some(3), 3), None);
+        assert_eq!(chip_caret_right(None, 3), None);
+    }
+
+    #[test]
+    fn inactive_chip_predicate_only_dims_conditions() {
+        use ConditionChipKind::*;
+        // 条件生效时全部可操作（点击/编辑/删除）。
+        for kind in [Scope, Keyword, Date, Size, Path, Drive(0)] {
+            assert!(!chip_inactive(kind, true), "{kind:?}");
+        }
+        // 条件不生效（应用/书签/命令页、正则、路径模式、网络搜索）：
+        // 只有范围/搜索 chip 还能操作，其余只置灰展示。
+        assert!(!chip_inactive(Scope, false));
+        assert!(!chip_inactive(Keyword, false));
+        assert!(chip_inactive(Date, false));
+        assert!(chip_inactive(Size, false));
+        assert!(chip_inactive(Path, false));
+        assert!(chip_inactive(Drive(0), false));
     }
 
     #[test]
