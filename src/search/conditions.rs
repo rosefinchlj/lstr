@@ -101,6 +101,8 @@ fn scan_drives(
     spans: &mut Vec<(usize, usize)>,
     drives: &mut Vec<DriveFilter>,
 ) {
+    // 只收当前真实存在的盘符：`Y:` 这种不存在的盘不应变成条件 chip。
+    let available = crate::search::filters::available_drives();
     let mut i = 0usize;
     while i < raw.len() {
         if !is_boundary(raw, i) {
@@ -113,8 +115,10 @@ fn scan_drives(
             .unwrap_or(raw.len());
         if end > i {
             if let Some(drive) = parse_drive_token(&raw[i..end]) {
-                spans.push((i, end));
-                drives.push(drive);
+                if available.contains(&drive.letter) {
+                    spans.push((i, end));
+                    drives.push(drive);
+                }
             }
         }
         i = end;
@@ -783,6 +787,92 @@ fn parse_op(input: &str) -> Option<(Op, usize)> {
         }
     }
     None
+}
+
+/// 输入框大小遮罩的单位显示顺序（与 `size_unit` 的解析保持一致）。
+pub const SIZE_UNIT_LABELS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+
+/// 单位文本 → 显示下标（B/KB/MB/GB/TB）。
+pub fn size_unit_index(raw: &str) -> Option<usize> {
+    match raw.to_ascii_uppercase().as_str() {
+        "B" => Some(0),
+        "K" | "KB" | "KIB" => Some(1),
+        "M" | "MB" | "MIB" => Some(2),
+        "G" | "GB" | "GIB" => Some(3),
+        "T" | "TB" | "TIB" => Some(4),
+        _ => None,
+    }
+}
+
+/// 输入是否整串就是「大小字段 + 操作符」且值还没开始输入：
+/// 是则返回 (字段, 操作符文本)，供输入框大小分段遮罩激活。
+pub fn size_mask_prefix(input: &str) -> Option<(String, String)> {
+    let (field_len, compact, kind) = field_at(input, 0)?;
+    if kind != FieldKind::Size {
+        return None;
+    }
+    let mut i = field_len;
+    if compact {
+        i += colon_len(input, i)?;
+        i = skip_ws(input, i);
+    } else {
+        i = skip_ws(input, i);
+        if parse_op(&input[i..]).is_none() {
+            return None;
+        }
+    }
+    let mut op = String::new();
+    if let Some((_, op_len)) = parse_op(&input[i..]) {
+        op = input[i..i + op_len].to_string();
+        i += op_len;
+        i = skip_ws(input, i);
+    }
+    if i != input.len() {
+        return None;
+    }
+    Some((input[..field_len].to_string(), op))
+}
+
+/// 解析 `size_edit_text` 生成的规范文本（无终结冒号）：
+/// 返回 (操作符, (数字文本, 单位下标), 第二个大小 Option)。
+pub fn parse_size_edit_parts(
+    text: &str,
+) -> Option<(String, (String, usize), Option<(String, usize)>)> {
+    let rest = text.trim_start().strip_prefix("size")?;
+    let rest = rest.trim_start();
+    let (op, value_start) = match parse_op(rest) {
+        Some((_, op_len)) => (rest[..op_len].to_string(), skip_ws(rest, op_len)),
+        None => (String::new(), 0),
+    };
+    let value = rest[value_start..].trim();
+    if let Some((a, b)) = value.split_once("..") {
+        Some((
+            op,
+            split_size_display(a.trim())?,
+            Some(split_size_display(b.trim())?),
+        ))
+    } else {
+        Some((op, split_size_display(value)?, None))
+    }
+}
+
+fn split_size_display(text: &str) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+        i += 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let number = text[..i].to_string();
+    let unit = text[i..].trim();
+    let unit = if unit.is_empty() {
+        0
+    } else {
+        size_unit_index(unit)?
+    };
+    Some((number, unit))
 }
 
 /// 当前 token（到空白/冒号为止），用于错误文案，避免把后面整段输入带进去。
@@ -1521,6 +1611,18 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_drives_are_not_conditions() {
+        let available = crate::search::filters::available_drives();
+        let Some(missing) = ('A'..='Z').find(|letter| !available.contains(letter)) else {
+            return;
+        };
+        let input = format!("{missing}: foo");
+        let out = extract(&input);
+        assert!(out.drives.is_empty(), "{missing}: 不应成为盘符条件");
+        assert_eq!(out.cleaned, input, "不存在的盘符要保留原文");
+    }
+
+    #[test]
     fn suggestions_match_strict_keyword_prefixes() {
         let size = suggestions("s");
         assert_eq!(size.len(), 1);
@@ -1564,6 +1666,54 @@ mod tests {
         let again = extract(&text).dates.remove(0);
         assert_eq!(again.after, range.after, "{text:?}");
         assert_eq!(again.before, range.before, "{text:?}");
+    }
+
+    #[test]
+    fn size_edit_parts_parse_canonical_text() {
+        let (op, first, second) = parse_size_edit_parts("size >= 10485761B").expect("ge");
+        assert_eq!(op, ">=");
+        assert_eq!(first, ("10485761".to_string(), 0));
+        assert_eq!(second, None);
+
+        let (op, first, second) = parse_size_edit_parts("size 10M..100M").expect("range");
+        assert!(op.is_empty());
+        assert_eq!(first, ("10".to_string(), 2));
+        assert_eq!(second, Some(("100".to_string(), 2)));
+
+        assert!(parse_size_edit_parts("date 2026-11-13").is_none());
+    }
+
+    #[test]
+    fn size_mask_prefix_activation() {
+        assert_eq!(
+            size_mask_prefix("size>"),
+            Some(("size".to_string(), ">".to_string()))
+        );
+        assert_eq!(
+            size_mask_prefix("size >= "),
+            Some(("size".to_string(), ">=".to_string()))
+        );
+        assert_eq!(
+            size_mask_prefix("大小≥"),
+            Some(("大小".to_string(), "≥".to_string()))
+        );
+        assert_eq!(
+            size_mask_prefix("size:"),
+            Some(("size".to_string(), String::new()))
+        );
+        for input in ["size", "size ", "size>10", "date>", ""] {
+            assert!(size_mask_prefix(input).is_none(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn size_unit_index_maps_aliases() {
+        assert_eq!(size_unit_index("B"), Some(0));
+        assert_eq!(size_unit_index("k"), Some(1));
+        assert_eq!(size_unit_index("MB"), Some(2));
+        assert_eq!(size_unit_index("GiB"), Some(3));
+        assert_eq!(size_unit_index("tb"), Some(4));
+        assert_eq!(size_unit_index("X"), None);
     }
 
     #[test]

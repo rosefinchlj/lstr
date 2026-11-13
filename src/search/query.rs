@@ -119,7 +119,12 @@ fn parse_drive_token(token: &str) -> Option<(char, bool)> {
     if !letter.is_ascii_alphabetic() {
         return None;
     }
-    Some((letter.to_ascii_uppercase() as char, exclude))
+    let letter = letter.to_ascii_uppercase() as char;
+    // 不存在的盘符（如 Y:）按普通搜索词处理，不能变成盘符过滤条件。
+    if !crate::search::filters::available_drives().contains(&letter) {
+        return None;
+    }
+    Some((letter, exclude))
 }
 
 fn strip_prefix_ci<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
@@ -176,6 +181,18 @@ mod tests {
         // 非法 token 按普通词处理：多字符前缀 / 带反斜杠的路径
         let q = parse("abc: c:\\foo", Scope::All);
         assert_eq!(q.text, "abc: c:\\foo");
+        assert!(q.drive_mask().is_none());
+    }
+
+    #[test]
+    fn unavailable_drive_tokens_are_text() {
+        let available = crate::search::filters::available_drives();
+        let Some(missing) = ('A'..='Z').find(|letter| !available.contains(letter)) else {
+            return;
+        };
+        let input = format!("{missing}: foo");
+        let q = parse(&input, Scope::All);
+        assert_eq!(q.text, input, "不存在的盘符应留作普通搜索词");
         assert!(q.drive_mask().is_none());
     }
 

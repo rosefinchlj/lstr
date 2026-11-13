@@ -275,9 +275,9 @@ fn paint_condition_chip(
     dense: bool,
 ) -> (f32, bool, bool, bool) {
     let (label_size, value_size, pad, gap, clear_w, chip_h) = if dense {
-        (11.0, 11.0, 8.0, 5.0, 14.0, 24.0)
+        (11.0, 11.0, 8.0, 5.0, 14.0, 22.0)
     } else {
-        (12.0, 12.0, 10.0, 6.0, 16.0, 26.0)
+        (12.0, 12.0, 10.0, 6.0, 16.0, 24.0)
     };
     let label_galley = (!label.is_empty())
         .then(|| painter.layout_no_wrap(label.to_string(), ui::text_font(label_size), color));
@@ -720,6 +720,189 @@ fn date_mask_fmt((y, m, d): (i32, u32, u32)) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// 大小分段输入遮罩：数字段 + 单位段（B/KB/MB/GB/TB），交互与日期遮罩一致：
+/// Tab/←→ 跳段、↑↓ 加减（数字 ±1、单位换档）、数字从左覆盖默认值、回车提交。
+#[derive(Clone, Debug)]
+struct SizeMask {
+    field: String,
+    op: String,
+    prefix_display: String,
+    sizes: [SizeSegs; 2],
+    two: bool,
+    idx: usize,
+    /// 0 = 数字段，1 = 单位段。
+    part: usize,
+}
+
+#[derive(Clone, Debug)]
+struct SizeSegs {
+    number: String,
+    /// `SIZE_UNIT_LABELS` 下标，默认 MB(2)。
+    unit: usize,
+}
+
+fn default_size_segs() -> SizeSegs {
+    SizeSegs {
+        number: String::new(),
+        unit: 2,
+    }
+}
+
+impl SizeMask {
+    fn new(field: String, op: String, prefix_display: String) -> Self {
+        Self {
+            field,
+            op,
+            prefix_display,
+            sizes: [default_size_segs(), default_size_segs()],
+            two: false,
+            idx: 0,
+            part: 0,
+        }
+    }
+
+    fn from_parts((number, unit): (String, usize)) -> SizeSegs {
+        SizeSegs {
+            number,
+            unit: unit.min(4),
+        }
+    }
+
+    fn number(&self) -> &String {
+        &self.sizes[self.idx].number
+    }
+
+    fn number_mut(&mut self) -> &mut String {
+        let idx = self.idx;
+        &mut self.sizes[idx].number
+    }
+
+    fn display_number(&self, idx: usize) -> String {
+        if self.sizes[idx].number.is_empty() {
+            "10".to_string()
+        } else {
+            self.sizes[idx].number.clone()
+        }
+    }
+
+    fn unit_label(&self, idx: usize) -> &'static str {
+        crate::search::conditions::SIZE_UNIT_LABELS[self.sizes[idx].unit.min(4)]
+    }
+
+    fn effective_number(&self, idx: usize) -> f64 {
+        self.display_number(idx).parse().unwrap_or(10.0)
+    }
+
+    fn feed_digit(&mut self, c: char) {
+        if self.part == 1 {
+            // 焦点在单位时输入数字：自动回到数字段。
+            self.part = 0;
+        }
+        if c == '.' && self.number().contains('.') {
+            return;
+        }
+        if self.number().len() < 12 {
+            self.number_mut().push(c);
+        }
+    }
+
+    fn feed_backspace(&mut self) {
+        if !self.number().is_empty() {
+            self.number_mut().pop();
+            return;
+        }
+        self.retreat();
+    }
+
+    fn advance(&mut self) {
+        let last = if self.two { 3 } else { 1 };
+        let pos = self.idx * 2 + self.part;
+        if pos < last {
+            let next = pos + 1;
+            self.idx = next / 2;
+            self.part = next % 2;
+        }
+    }
+
+    fn retreat(&mut self) {
+        let pos = self.idx * 2 + self.part;
+        if pos > 0 {
+            let prev = pos - 1;
+            self.idx = prev / 2;
+            self.part = prev % 2;
+        }
+    }
+
+    fn spin(&mut self, delta: i32) {
+        if self.part == 1 {
+            let unit = self.sizes[self.idx].unit as i32 + delta;
+            self.sizes[self.idx].unit = unit.clamp(0, 4) as usize;
+            return;
+        }
+        let mut value = self.effective_number(self.idx) + delta as f64;
+        if value < 0.0 {
+            value = 0.0;
+        }
+        let text = if (value.fract()).abs() < 1e-9 {
+            format!("{}", value as u64)
+        } else {
+            format!("{value:.2}")
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string()
+        };
+        self.sizes[self.idx].number = text;
+    }
+
+    fn part_text(&self, idx: usize) -> String {
+        format!("{}{}", self.display_number(idx), self.unit_label(idx))
+    }
+
+    fn mirror_text(&self) -> String {
+        if self.two {
+            format!(
+                "{} {}..{}",
+                self.field,
+                self.part_text(0),
+                self.part_text(1)
+            )
+        } else {
+            format!("{}{}{}", self.field, self.op, self.part_text(0))
+        }
+    }
+
+    /// 退出遮罩转自由文本时的已输入部分。用户继续输入单位字母（`10M`）时
+    /// 不要带默认单位，否则会拼成 `10MBM`；其它字符带上当前单位。
+    fn partial_text_for_exit(&self, exit_text: &str) -> String {
+        let include_unit = !exit_text
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic());
+        self.partial_text_with_unit(include_unit)
+    }
+
+    fn partial_text_with_unit(&self, include_unit: bool) -> String {
+        let fmt = |idx: usize| {
+            if self.sizes[idx].number.is_empty() {
+                String::new()
+            } else if include_unit {
+                format!("{}{}", self.sizes[idx].number, self.unit_label(idx))
+            } else {
+                self.sizes[idx].number.clone()
+            }
+        };
+        if self.two {
+            format!("{} {}..{}", self.field, fmt(0), fmt(1))
+        } else {
+            format!("{}{}{}", self.field, self.op, fmt(0))
+        }
+    }
+
+    fn commit_text(&self) -> String {
+        format!("{}:", self.mirror_text())
+    }
+}
+
 /// 条件操作撤销/重做用的一份状态快照。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConditionSnapshot {
@@ -910,6 +1093,8 @@ pub struct LstrApp {
     condition_history: ConditionHistory,
     /// 日期分段输入遮罩（date 条件的年/月/日结构化编辑）。
     date_mask: Option<DateMask>,
+    /// 大小分段输入遮罩（size 条件的数字/单位结构化编辑）。
+    size_mask: Option<SizeMask>,
     /// 输入历史召回：最近输入串缓存（最新在前）+ 当前游标 + 召回前草稿。
     input_history: Vec<String>,
     history_cursor: Option<usize>,
@@ -1095,6 +1280,7 @@ impl LstrApp {
             condition_edit_backup: None,
             condition_history: ConditionHistory::default(),
             date_mask: None,
+            size_mask: None,
             input_history: Vec::new(),
             history_cursor: None,
             history_draft: String::new(),
@@ -1695,6 +1881,8 @@ impl LstrApp {
         self.input = fill;
         self.chip_caret = None;
         self.condition_hold = false;
+        self.date_mask = None;
+        self.size_mask = None;
         self.suggest_dismissed = None;
         self.suggest_index = 0;
         self.reset_history_recall();
@@ -1789,6 +1977,7 @@ impl LstrApp {
                     mask.two = true;
                 }
                 self.date_mask = Some(mask);
+                self.size_mask = None;
                 self.chip_caret = None;
                 self.condition_hold = false;
                 self.suggest_dismissed = None;
@@ -1798,6 +1987,35 @@ impl LstrApp {
                 return true;
             }
         }
+        // 大小 chip 且输入框没有其它文本：数字/单位分段遮罩。
+        if matches!(chip.kind, ConditionChipKind::Size) && self.input.trim().is_empty() {
+            if let Some((op, first, second)) =
+                crate::search::conditions::parse_size_edit_parts(&text)
+            {
+                let prefix = if op.is_empty() {
+                    "size ".to_string()
+                } else {
+                    format!("size{op}")
+                };
+                let mut mask = SizeMask::new("size".into(), op, prefix);
+                mask.sizes[0] = SizeMask::from_parts(first);
+                if let Some(second) = second {
+                    mask.sizes[1] = SizeMask::from_parts(second);
+                    mask.two = true;
+                }
+                self.size_mask = Some(mask);
+                self.date_mask = None;
+                self.chip_caret = None;
+                self.condition_hold = false;
+                self.suggest_dismissed = None;
+                Self::reset_input_cursor(ctx);
+                self.focus_requested = true;
+                self.sync_size_mask(ctx);
+                return true;
+            }
+        }
+        self.date_mask = None;
+        self.size_mask = None;
         let trimmed = self.input.trim_end();
         self.input = if trimmed.is_empty() {
             text
@@ -1826,6 +2044,7 @@ impl LstrApp {
         self.condition_hold = false;
         self.chip_caret = None;
         self.date_mask = None;
+        self.size_mask = None;
         Self::reset_input_cursor(ctx);
         self.focus_requested = true;
         self.trigger(ctx);
@@ -1862,6 +2081,7 @@ impl LstrApp {
         };
         self.input = mask.commit_text();
         self.date_mask = None;
+        self.size_mask = None;
         self.condition_edit_backup = None;
         self.condition_hold = false;
         self.focus_requested = true;
@@ -1879,10 +2099,163 @@ impl LstrApp {
             .map(|mask| mask.partial_text())
             .unwrap_or_default();
         self.date_mask = None;
+        self.size_mask = None;
         self.input = format!("{partial}{text}");
         self.reset_history_recall();
         Self::reset_input_cursor(ctx);
         self.trigger(ctx);
+    }
+
+    /// 大小遮罩内容镜像回输入框并保持查询暂停。
+    fn sync_size_mask(&mut self, ctx: &egui::Context) {
+        let text = self
+            .size_mask
+            .as_ref()
+            .map(|mask| mask.mirror_text())
+            .unwrap_or_default();
+        if self.input != text {
+            self.input = text;
+        }
+        self.chip_caret = None;
+        self.trigger(ctx);
+    }
+
+    /// 大小遮罩回车：拼规范条件文本（默认 10 MB）提交成 chip。
+    fn commit_size_mask(&mut self, ctx: &egui::Context) {
+        let Some(mask) = self.size_mask.take() else {
+            return;
+        };
+        self.input = mask.commit_text();
+        self.condition_edit_backup = None;
+        self.condition_hold = false;
+        self.focus_requested = true;
+        Self::reset_input_cursor(ctx);
+        self.commit_conditions(ctx);
+        self.trigger(ctx);
+    }
+
+    /// 大小遮罩内输入非数字字符：退出遮罩转自由文本（保留已输入数字）。
+    fn exit_size_mask_to_free_text(&mut self, ctx: &egui::Context, text: &str) {
+        let partial = self
+            .size_mask
+            .as_ref()
+            .map(|mask| mask.partial_text_for_exit(text))
+            .unwrap_or_default();
+        self.size_mask = None;
+        self.input = format!("{partial}{text}");
+        self.reset_history_recall();
+        Self::reset_input_cursor(ctx);
+        self.trigger(ctx);
+    }
+
+    /// 大小遮罩按键处理。返回 true = 本帧按键已被遮罩消费。
+    fn handle_size_mask_keys(&mut self, ctx: &egui::Context) -> bool {
+        if self.size_mask.is_none() {
+            return false;
+        }
+        // 数字/小数点进段；`:` 提交；其它字符退出遮罩转自由文本
+        //（用户继续打 `10M` 也能走普通条件解析）。
+        let mut feed: Vec<char> = Vec::new();
+        let mut exit_text: Option<String> = None;
+        let mut commit = false;
+        ctx.input_mut(|i| {
+            i.events.retain(|event| match event {
+                egui::Event::Text(text) => {
+                    if !text.is_empty()
+                        && text.chars().all(|c| c.is_ascii_digit() || c == '.')
+                    {
+                        feed.extend(text.chars());
+                    } else if matches!(text.as_str(), ":" | "：") {
+                        commit = true;
+                    } else {
+                        exit_text.get_or_insert_with(|| text.clone());
+                    }
+                    false
+                }
+                _ => true,
+            })
+        });
+        if let Some(text) = exit_text {
+            self.exit_size_mask_to_free_text(ctx, &text);
+            return true;
+        }
+        if commit {
+            self.commit_size_mask(ctx);
+            return true;
+        }
+        let fed = !feed.is_empty();
+        for c in feed {
+            if let Some(mask) = self.size_mask.as_mut() {
+                mask.feed_digit(c);
+            }
+        }
+        let mut handled = fed;
+        // 数字段为空时 Ctrl+Backspace 不消费，留给「删左邻 chip」。
+        let ctrl_bksp = ctx.input(|i| i.modifiers.ctrl)
+            && ctx.input(|i| i.key_pressed(Key::Backspace));
+        let number_empty = self
+            .size_mask
+            .as_ref()
+            .is_some_and(|mask| mask.number().is_empty());
+        if ctrl_bksp && !number_empty {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backspace)) {
+                if let Some(mask) = self.size_mask.as_mut() {
+                    mask.feed_backspace();
+                }
+                handled = true;
+            }
+        } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace))
+            || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete))
+        {
+            if let Some(mask) = self.size_mask.as_mut() {
+                mask.feed_backspace();
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
+            if let Some(mask) = self.size_mask.as_mut() {
+                mask.advance();
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) {
+            if let Some(mask) = self.size_mask.as_mut() {
+                mask.retreat();
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowRight)) {
+            if let Some(mask) = self.size_mask.as_mut() {
+                mask.advance();
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft)) {
+            if let Some(mask) = self.size_mask.as_mut() {
+                mask.retreat();
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+            if let Some(mask) = self.size_mask.as_mut() {
+                mask.spin(1);
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+            if let Some(mask) = self.size_mask.as_mut() {
+                mask.spin(-1);
+            }
+            handled = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+            self.commit_size_mask(ctx);
+            return true;
+        }
+        if handled {
+            self.sync_size_mask(ctx);
+        }
+        handled
     }
 
     /// 遮罩按键处理。返回 true = 本帧按键已被遮罩消费。
@@ -2022,6 +2395,7 @@ impl LstrApp {
         self.menu_open = false;
         self.filter_menu = None;
         self.date_mask = None;
+        self.size_mask = None;
         self.condition_hold = self.conditions_apply(self.scope)
             && !crate::search::conditions::extract(&self.input).is_empty();
         Self::reset_input_cursor(ctx);
@@ -2099,6 +2473,7 @@ impl LstrApp {
         self.condition_hold = false;
         self.condition_edit_backup = None;
         self.date_mask = None;
+        self.size_mask = None;
         self.suggest_dismissed = None;
         self.suggest_index = 0;
         Self::reset_input_cursor(ctx);
@@ -2236,6 +2611,7 @@ impl LstrApp {
         self.suggest_index = 0;
         self.condition_edit_backup = None;
         self.date_mask = None;
+        self.size_mask = None;
         self.reset_history_recall();
     }
 
@@ -2316,6 +2692,7 @@ impl LstrApp {
             self.browse_forward.clear();
             self.condition_history.clear();
             self.date_mask = None;
+            self.size_mask = None;
         }
         Self::reset_input_cursor(ctx);
         self.filter_menu = None;
@@ -2549,7 +2926,7 @@ impl LstrApp {
         }
         // 遮罩期间 TextEdit 不渲染：IME 上屏的中文（今天/本周）必须在这里
         // 接管，退出遮罩转自由文本，否则字符会丢在隐藏的 TextEdit 里。
-        if self.date_mask.is_some() {
+        if self.date_mask.is_some() || self.size_mask.is_some() {
             let mut committed: Option<String> = None;
             ctx.input_mut(|i| {
                 i.events.retain(|event| match event {
@@ -2561,7 +2938,11 @@ impl LstrApp {
                 })
             });
             if let Some(text) = committed {
-                self.exit_date_mask_to_free_text(ctx, &text);
+                if self.date_mask.is_some() {
+                    self.exit_date_mask_to_free_text(ctx, &text);
+                } else {
+                    self.exit_size_mask_to_free_text(ctx, &text);
+                }
                 return;
             }
         }
@@ -2611,6 +2992,9 @@ impl LstrApp {
         // 日期分段遮罩：数字进段、Tab/←→ 跳段、↑↓ 加减、回车提交，
         // 非数字字符退出遮罩转自由文本（别名仍可用）。
         if self.date_mask.is_some() && self.handle_date_mask_keys(ctx) {
+            return;
+        }
+        if self.size_mask.is_some() && self.handle_size_mask_keys(ctx) {
             return;
         }
 
@@ -3615,8 +3999,9 @@ impl LstrApp {
                     if self.chip_caret.is_some_and(|index| index >= chips.len()) {
                         self.chip_caret = None;
                     }
-                    let chip_h = if dense { 24.0 } else { 26.0 };
-                    let chip_top = search_rect.bottom() - chip_h;
+                    let chip_h = if dense { 22.0 } else { 24.0 };
+                    // 输入文字视觉上贴底：chip 再往下压 2px（仍在分隔线上方）。
+                    let chip_top = search_rect.bottom() - chip_h + 2.0;
                     let mut x = search_rect.left();
                     let mut chip_lefts = Vec::with_capacity(chips.len());
                     let mut removed: Option<usize> = None;
@@ -3677,8 +4062,8 @@ impl LstrApp {
                         .min(search_rect.right() - 40.0)
                         .max(search_rect.left());
                 }
-                // 日期分段遮罩：先失效检查（输入与遮罩不一致 = 被外部改写），
-                // 再按「日期字段+操作符且值未输入」自动激活。
+                // 日期/大小分段遮罩：先失效检查（输入与遮罩不一致 = 被外部改写），
+                // 再按「字段+操作符且值未输入」自动激活。
                 if self.date_mask.is_some() {
                     let mirror = self
                         .date_mask
@@ -3689,7 +4074,18 @@ impl LstrApp {
                         self.date_mask = None;
                     }
                 }
+                if self.size_mask.is_some() {
+                    let mirror = self
+                        .size_mask
+                        .as_ref()
+                        .map(|mask| mask.mirror_text())
+                        .unwrap_or_default();
+                    if mirror != self.input {
+                        self.size_mask = None;
+                    }
+                }
                 if self.date_mask.is_none()
+                    && self.size_mask.is_none()
                     && !self.ime_composing
                     && !self.condition_hold
                     && self.conditions_apply(query.scope)
@@ -3702,12 +4098,22 @@ impl LstrApp {
                         self.date_mask = Some(mask);
                         // 激活即镜像默认日期到输入框（查询仍由 is_composing 暂停）。
                         self.input = text;
+                    } else if let Some((field, op)) =
+                        crate::search::conditions::size_mask_prefix(&self.input)
+                    {
+                        let mask = SizeMask::new(field, op, self.input.clone());
+                        let text = mask.mirror_text();
+                        self.size_mask = Some(mask);
+                        // 默认 10 MB 先镜像进输入框，回车即可提交。
+                        self.input = text;
                     }
                 }
-                let mask_active = self.date_mask.is_some();
+                let mask_active = self.date_mask.is_some() || self.size_mask.is_some();
                 let mut text_response = None;
-                if mask_active {
+                if self.date_mask.is_some() {
                     self.paint_date_mask(ui, &painter, text_rect);
+                } else if self.size_mask.is_some() {
+                    self.paint_size_mask(ui, &painter, text_rect);
                 } else {
                     let response = ui.put(
                         text_rect,
@@ -4808,6 +5214,142 @@ impl LstrApp {
         }
     }
 
+    /// 大小分段遮罩渲染：前缀 + 数字段 + 单位段（默认 10 MB 暗色），
+    /// 焦点段下划线 + 光标，点击段切换焦点。
+    fn paint_size_mask(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, text_rect: Rect) {
+        let Some(mask) = self.size_mask.clone() else {
+            return;
+        };
+        let theme = self.theme;
+        let font = ui::text_font(22.0);
+        let center_y = text_rect.center().y;
+        let seg_h = 24.0;
+        let galley_w = |text: &str| {
+            painter
+                .layout_no_wrap(text.to_string(), font.clone(), theme.text)
+                .size()
+                .x
+        };
+        let mut x = text_rect.left();
+        painter.text(
+            egui::pos2(x, center_y),
+            Align2::LEFT_CENTER,
+            &mask.prefix_display,
+            font.clone(),
+            theme.text,
+        );
+        x += galley_w(&mask.prefix_display);
+        let count = if mask.two { 2 } else { 1 };
+        let mut focus_request: Option<(usize, usize)> = None;
+        for idx in 0..count {
+            if idx == 1 {
+                painter.text(
+                    egui::pos2(x, center_y),
+                    Align2::LEFT_CENTER,
+                    "..",
+                    font.clone(),
+                    theme.dim,
+                );
+                x += galley_w("..");
+            }
+            let typed = mask.sizes[idx].number.clone();
+            let display = mask.display_number(idx);
+            let defaulting = typed.is_empty();
+            let typed_w = galley_w(&typed);
+            let number_w = galley_w(&display).max(galley_w("00"));
+            if defaulting {
+                painter.text(
+                    egui::pos2(x, center_y),
+                    Align2::LEFT_CENTER,
+                    &display,
+                    font.clone(),
+                    theme.dim,
+                );
+            } else {
+                painter.text(
+                    egui::pos2(x, center_y),
+                    Align2::LEFT_CENTER,
+                    &typed,
+                    font.clone(),
+                    theme.text,
+                );
+            }
+            if mask.idx == idx && mask.part == 0 {
+                let underline_y = center_y + seg_h / 2.0 + 2.0;
+                painter.line_segment(
+                    [
+                        egui::pos2(x - 2.0, underline_y),
+                        egui::pos2(x + number_w + 2.0, underline_y),
+                    ],
+                    Stroke::new(1.5_f32, theme.amber),
+                );
+                let caret_x = x + typed_w;
+                painter.line_segment(
+                    [
+                        egui::pos2(caret_x, center_y - seg_h / 2.0),
+                        egui::pos2(caret_x, center_y + seg_h / 2.0),
+                    ],
+                    Stroke::new(1.5_f32, theme.amber),
+                );
+            }
+            let hit = Rect::from_min_size(
+                egui::pos2(x, center_y - seg_h / 2.0),
+                egui::vec2(number_w, seg_h),
+            );
+            if ui
+                .interact(hit, Id::new(("size-mask-num", idx)), Sense::click())
+                .clicked()
+            {
+                focus_request = Some((idx, 0));
+            }
+            x += number_w;
+
+            let unit = mask.unit_label(idx);
+            let unit_w = galley_w(unit);
+            painter.text(
+                egui::pos2(x, center_y),
+                Align2::LEFT_CENTER,
+                unit,
+                font.clone(),
+                if defaulting { theme.dim } else { theme.text },
+            );
+            if mask.idx == idx && mask.part == 1 {
+                let underline_y = center_y + seg_h / 2.0 + 2.0;
+                painter.line_segment(
+                    [
+                        egui::pos2(x - 2.0, underline_y),
+                        egui::pos2(x + unit_w + 2.0, underline_y),
+                    ],
+                    Stroke::new(1.5_f32, theme.amber),
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(x, center_y - seg_h / 2.0),
+                        egui::pos2(x, center_y + seg_h / 2.0),
+                    ],
+                    Stroke::new(1.5_f32, theme.amber),
+                );
+            }
+            let hit = Rect::from_min_size(
+                egui::pos2(x, center_y - seg_h / 2.0),
+                egui::vec2(unit_w, seg_h),
+            );
+            if ui
+                .interact(hit, Id::new(("size-mask-unit", idx)), Sense::click())
+                .clicked()
+            {
+                focus_request = Some((idx, 1));
+            }
+            x += unit_w;
+        }
+        if let Some((idx, part)) = focus_request {
+            if let Some(mask) = self.size_mask.as_mut() {
+                mask.idx = idx;
+                mask.part = part;
+            }
+        }
+    }
+
     /// 条件联想弹层：贴在搜索行下方，Foreground 盖住筛选条与结果列表。
     fn paint_condition_suggest(&mut self, ctx: &egui::Context, anchor: egui::Pos2) {
         let suggestions = self.condition_suggestions();
@@ -5074,7 +5616,7 @@ impl LstrApp {
                         &[
                             ("ext:rs", "按扩展名"),
                             ("日期", "date>2026-11-10: 今年/2025"),
-                            ("大小", "size>10M: 按文件大小"),
+                            ("大小", "size>10M: 数字/单位分段"),
                             ("Ctrl+Bksp", "删条件；加 Shift 编辑"),
                             ("Ctrl+Z/Y", "撤回 / 取消撤回条件"),
                             ("匹配", "大小写 / 全词 / 正则"),
@@ -9383,8 +9925,7 @@ mod path_layout_tests {
     }
 
     #[test]
-    fn condition_terminator_is_stripped_for_editing() {
-        assert_eq!(
+    fn condition_terminator_is_stripped_for_editing() {        assert_eq!(
             strip_condition_terminator("date>2026-11-10:"),
             "date>2026-11-10"
         );
@@ -9558,5 +10099,55 @@ mod path_layout_tests {
         let mut mask = date_mask_op(">");
         mask.dates[0] = DateMask::from_ymd((2026, 11, 13));
         assert_eq!(mask.mirror_text(), "date>2026-11-13");
+    }
+
+    #[test]
+    fn size_mask_defaults_and_units() {
+        let mut mask = SizeMask::new("size".into(), ">".into(), "size>".into());
+        // 默认 10 MB，回车即可提交。
+        assert_eq!(mask.mirror_text(), "size>10MB");
+        for c in "25".chars() {
+            mask.feed_digit(c);
+        }
+        assert_eq!(mask.number().as_str(), "25");
+        // Tab 到单位段，↑ 换档到 GB。
+        mask.advance();
+        assert_eq!((mask.idx, mask.part), (0, 1));
+        mask.spin(1);
+        assert_eq!(mask.unit_label(0), "GB");
+        assert_eq!(mask.mirror_text(), "size>25GB");
+        assert_eq!(mask.commit_text(), "size>25GB:");
+    }
+
+    #[test]
+    fn size_mask_spin_and_range_text() {
+        let mut mask = SizeMask::new("size".into(), String::new(), "size ".into());
+        mask.sizes[0] = SizeMask::from_parts(("10".into(), 2));
+        mask.sizes[1] = SizeMask::from_parts(("100".into(), 2));
+        mask.two = true;
+        assert_eq!(mask.mirror_text(), "size 10MB..100MB");
+        mask.spin(1);
+        assert_eq!(mask.sizes[0].number, "11");
+        mask.idx = 1;
+        mask.part = 0;
+        mask.spin(-1);
+        assert_eq!(mask.sizes[1].number, "99");
+        assert_eq!(mask.commit_text(), "size 11MB..99MB:");
+    }
+
+    #[test]
+    fn size_mask_partial_text_keeps_typed_only() {
+        let mut mask = SizeMask::new("size".into(), ">".into(), "size>".into());
+        assert_eq!(
+            mask.partial_text_for_exit(" "),
+            "size>",
+            "默认值不带入自由文本"
+        );
+        mask.feed_digit('5');
+        assert_eq!(mask.partial_text_for_exit(" "), "size>5MB");
+        // 继续输单位字母时不能带默认单位，否则会拼成 10MBM。
+        mask.feed_digit('0');
+        assert_eq!(mask.partial_text_for_exit("M"), "size>50");
+        assert_eq!(mask.partial_text_for_exit(" "), "size>50MB");
     }
 }
