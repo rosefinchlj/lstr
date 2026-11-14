@@ -978,12 +978,14 @@ impl Engine {
                         self.volumes[i].syncing = false;
                         return;
                     };
-                    let n = store.remove_unseen();
-                    if store.needs_compact() {
-                        store.compact();
-                    }
-                    n
+                    store.remove_unseen()
                 };
+                // 对账收尾的整卷 compact 实测 3.4-3.6s(C 123 万条):同步跑会把
+                // 同线程排队中的查询堵满一轮 —— 用户打字实测 queued=3184ms、
+                // 状态行「总 3203ms / 引擎 10ms」。改成与 maintain 相同的分片
+                // 任务(每片 4ms、片间查询优先出队),换血后再落盘;保存语义
+                // 不变,只是顺延 1-3 秒且不再让查询整段等待。
+                let paged = self.start_compact_for(i);
                 self.bump_generation(i);
                 if let Some(store) = &self.volumes[i].store {
                     self.pinyin[i] = PinyinCache::rebuild(store);
@@ -991,6 +993,7 @@ impl Engine {
                 self.volumes[i].syncing = false;
                 self.volumes[i].dirty = true;
                 // 对账结果立即落盘:这是本轮启动后最值钱的快照。
+                // (分片 compact 未完成时保存由后续 maintain 轮次接手)
                 self.volumes[i].save_retry_at = None;
                 self.recompute_phase();
                 let (count, letter) = self
@@ -999,7 +1002,8 @@ impl Engine {
                     .map(|v| (v.store.as_ref().map(|s| s.len()).unwrap_or(0), v.letter))
                     .unwrap_or((0, '?'));
                 snapshot::debug_log(&format!(
-                    "dirsync end {guid:032x} letter={letter} removed={removed} count={count}"
+                    "dirsync end {guid:032x} letter={letter} removed={removed} count={count}{}",
+                    if paged { " (compact paged)" } else { "" }
                 ));
             }
             EngineMsg::DirChildren { guid, parent_frn, recs } => {
@@ -1754,6 +1758,43 @@ impl Engine {
     }
 
     /// 推进分片 compact 一个时间预算。返回 true = 已完成(或任务已失效)。
+    /// 为第 i 卷启动分片 compact(与 maintain 同一个 `CompactTask`)。
+    /// 返回 true = 已交给分片任务:调用方不要再同步 `store.compact()`,
+    /// 代次/拼音/脏标记由 [`Self::advance_compact`] 在换血时收尾。
+    /// 仅当需要 compact 且当前没有别的卷在压缩时接管;否则返回 false 由调用方
+    /// 走原同步路径(单卷收尾由此保证不会并发两个任务)。
+    fn start_compact_for(&mut self, i: usize) -> bool {
+        if self.running_compact.is_some() {
+            return false;
+        }
+        let need = self.volumes[i]
+            .store
+            .as_ref()
+            .is_some_and(|s| s.needs_compact());
+        if !need {
+            return false;
+        }
+        let guid = self.volumes[i].guid;
+        let letter = self.volumes[i].letter;
+        let len = self.volumes[i]
+            .store
+            .as_ref()
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let Some(task) = self.volumes[i].store.as_ref().and_then(CompactTask::new) else {
+            return false;
+        };
+        self.running_compact = Some(RunningCompact {
+            guid,
+            vol_index: i,
+            task,
+        });
+        snapshot::debug_log(&format!(
+            "compact vol {letter} (paged) begin len={len} (dirsync end)"
+        ));
+        true
+    }
+
     fn advance_compact(&mut self, budget: Duration) -> bool {
         let Some(mut rc) = self.running_compact.take() else { return true };
         let done = {
@@ -3410,6 +3451,76 @@ mod tests {
         };
         assert!(engine.path_of(&stale).is_none());
         assert!(engine.pinyin_of(&stale).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 对账收尾的整卷 compact 不能同步跑:实测 C 卷 3.4-3.6s,同线程排队中的
+    /// 查询要整段等待(用户打字实测 queued=3184ms、状态行「总 3203ms / 引擎
+    /// 10ms」)。DirSyncEnd 越过阈值时必须交给分片任务,片间查询仍可服务,
+    /// 换血后再落盘。
+    #[test]
+    fn dirsync_end_defers_whole_volume_compact_to_slices() {
+        let dir = temp_index_dir("dirsync-paged-compact");
+        let guid = 0x3436u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+
+        // 第一轮对账:5000 条全部「本轮见过」
+        engine.handle(EngineMsg::DirSyncBegin { guid });
+        let recs: Vec<Rec> = (0..5000u64)
+            .map(|k| rec(10_000 + k, 0, 0, &format!("f{k:05}.txt")))
+            .collect();
+        engine.handle(EngineMsg::Records { guid, recs, next_usn: 500 });
+        engine.handle(EngineMsg::DirSyncEnd { guid, ok: true });
+        assert!(
+            engine.running_compact.is_none(),
+            "未到 compact 阈值不得启动整卷重排"
+        );
+        let mut rounds = 0;
+        while engine.volumes[0].dirty && rounds < 200 {
+            engine.maintain();
+            rounds += 1;
+        }
+
+        // 第二轮对账:只见到 10 条 → 其余 4990 条判死,越过 dead 阈值
+        engine.handle(EngineMsg::DirSyncBegin { guid });
+        let recs: Vec<Rec> = (0..10u64)
+            .map(|k| rec(10_000 + k, 0, 0, &format!("f{k:05}.txt")))
+            .collect();
+        engine.handle(EngineMsg::Records { guid, recs, next_usn: 600 });
+        engine.handle(EngineMsg::DirSyncEnd { guid, ok: true });
+
+        assert!(
+            engine.running_compact.is_some(),
+            "对账收尾应把整卷 compact 交给分片任务,不得同步跑完"
+        );
+        // 分片期间查询可用(旧实现这里要等完整卷重排)
+        let probe = QuerySpec {
+            tokens: vec!["f000".into()],
+            ..Default::default()
+        };
+        assert!(
+            engine.query(&probe).total > 0,
+            "分片 compact 期间查询必须仍能服务"
+        );
+
+        // 分片按轮推进,完成后自动落盘
+        let mut rounds = 0;
+        while engine.running_compact.is_some() && rounds < 500 {
+            engine.maintain();
+            rounds += 1;
+        }
+        assert!(engine.running_compact.is_none(), "分片 compact 应有限轮内完成");
+        let mut rounds = 0;
+        while engine.volumes[0].dirty && rounds < 500 {
+            engine.maintain();
+            rounds += 1;
+        }
+        assert!(!engine.volumes[0].dirty, "换血后应完成落盘");
+
+        let engine2 = engine_with(&dir);
+        let store2 = engine2.volumes[0].store.as_ref().unwrap();
+        assert_eq!(store2.len(), 10, "只剩第二轮见到的 10 条");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
