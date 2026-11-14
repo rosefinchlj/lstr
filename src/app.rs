@@ -1556,6 +1556,11 @@ pub struct LstrApp {
     /// 键盘上下键选择后的短时间内不允许 hover 抢选中：鼠标移动事件和按键
     /// 落在同一帧时，光标正好停在第三行会把「下移一格」覆盖成第三行。
     hover_suppress_until: Instant,
+    /// 进入目录后的短暂点击屏蔽：双击文件夹时第一击已经切到新列表，
+    /// 第二击会落在新列表同坐标的行上，不挡住就会连跳两层（甚至误开文件）。
+    /// 只挡「同一位置的连击」，进入后点别的行不受影响。
+    click_suppress_until: Instant,
+    click_suppress_at: Option<egui::Pos2>,
     dialog: Option<DialogInfo>,
     settings_open: bool,
     preview_open: bool,
@@ -1766,6 +1771,8 @@ impl LstrApp {
             needle_ready: false,
             mouse_moved: false,
             hover_suppress_until: Instant::now(),
+            click_suppress_until: Instant::now(),
+            click_suppress_at: None,
             dialog: None,
             settings_open: false,
             preview_open,
@@ -6967,6 +6974,7 @@ impl LstrApp {
         }
         let mut hovered = None;
         let mut clicked = None;
+        let mut activated = None;
         let mut drag_started = None;
         let q = display_text.to_lowercase();
         // Browse 下不是“浏览目录条目”而是递归搜索结果，关键词照常高亮。
@@ -7043,8 +7051,15 @@ impl LstrApp {
             {
                 hovered = Some(index);
             }
-            if response.clicked() && self.shown_at.elapsed() > Duration::from_millis(120) {
+            // 单击只做「聚焦选中」，打开/进入走双击或 Enter：单击即打开时，
+            // 想先看一眼预览、或在列表上挪鼠标都很容易误开文件。
+            let click_ok = self.shown_at.elapsed() > Duration::from_millis(120)
+                && !self.click_suppressed(ui.ctx());
+            if response.clicked() && click_ok {
                 clicked = Some(index);
+            }
+            if response.double_clicked() && click_ok {
+                activated = Some(index);
             }
             // 拖出到其他应用（微信/邮件/IDE）：OLE 接管鼠标后这里拿到 drag_started。
             if response.drag_started() {
@@ -7530,6 +7545,25 @@ impl LstrApp {
             }
         }
         if let Some(index) = clicked {
+            self.menu_open = false;
+            // 对话框模式：单击即选（填路径 / 跳到文件夹），这是用户在对话框里
+            // 的主操作，多一步双击反而慢。普通模式才按「单击=聚焦」处理。
+            if self.dialog.is_some() {
+                self.activate_index(ui.ctx(), index);
+            } else {
+                self.selected = index;
+                // 文件夹单击直接进入浏览；文件/应用/书签/命令只高亮。
+                if self.entries.get(index).is_some_and(|e| e.kind == Kind::Folder)
+                    && self.descend_index(ui.ctx(), index)
+                {
+                    // 500ms（系统双击阈值）+ 同一位置才算连击：慢双击也能挡住，
+                    // 而进入目录后去点别的行不会被打断。
+                    self.click_suppress_until = Instant::now() + Duration::from_millis(500);
+                    self.click_suppress_at = ui.ctx().input(|i| i.pointer.interact_pos());
+                }
+            }
+        }
+        if let Some(index) = activated {
             self.activate_index(ui.ctx(), index);
         }
         if let Some(index) = drag_started {
@@ -7841,6 +7875,20 @@ impl LstrApp {
 
     /// 文件夹结果：进入深路径浏览模式。输入框清空为过滤词，当前目录写进
     /// browse_root（不再把整条路径塞进输入框）。返回 false 表示不是文件夹。
+    /// 刚「单击文件夹进入」后，同一位置的连击是否要忽略（双击的第二击）。
+    fn click_suppressed(&self, ctx: &egui::Context) -> bool {
+        if Instant::now() >= self.click_suppress_until {
+            return false;
+        }
+        match (
+            self.click_suppress_at,
+            ctx.input(|i| i.pointer.interact_pos()),
+        ) {
+            (Some(entered), Some(now)) => entered.distance(now) < 8.0,
+            _ => false,
+        }
+    }
+
     fn descend_index(&mut self, ctx: &egui::Context, index: usize) -> bool {
         let Some(entry) = self.entries.get(index) else {
             return false;
