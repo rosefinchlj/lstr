@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use crate::noise::{is_build_output_segment, is_exec_name};
 use crate::usn::Rec;
 
 /// 可暂停的 compact（4ms 分片），供引擎空闲维护使用。
@@ -389,6 +390,10 @@ pub struct VolumeStore {
     /// 噪声锚点:compact 时被整树剔除的「顶层噪声目录」FRN。
     /// 之后到达的子文件按锚点立即判噪,避免父链断裂导致泄漏。
     noise_anchors: std::collections::HashSet<u64>,
+    /// 构建产物锚点(是 `noise_anchors` 的子集):这些 FRN 虽是噪声段目录,
+    /// 子树仍保留目录 + 可执行文件。插入时的「父是锚点 ⇒ 直接判噪」快捷路径
+    /// 必须把它们排除,否则新构建出来的 exe 会被整片判噪(见 noise.rs 例外)。
+    soft_anchors: std::collections::HashSet<u64>,
     /// 排除规则(空=不分类、不回收)。语义见 noise.rs:目录自身可见,子孙剔除。
     pub exclude: crate::noise::ExcludeRules,
     /// 本卷盘符(锚定路径模式的盘符过滤用;未知时 '?')。
@@ -491,6 +496,7 @@ impl VolumeStore {
             ancestry_dirty: false,
             unresolved: HashMap::new(),
             noise_anchors: std::collections::HashSet::new(),
+            soft_anchors: std::collections::HashSet::new(),
             exclude,
             letter,
             chain_buf: Vec::new(),
@@ -562,6 +568,7 @@ impl VolumeStore {
             .filter(|&(_, parent_frn)| parent_frn != 0 && parent_frn != ROOT_FRN)
             .collect(),
             noise_anchors: std::collections::HashSet::new(),
+            soft_anchors: std::collections::HashSet::new(),
             exclude,
             letter,
             chain_buf: Vec::new(),
@@ -1131,7 +1138,11 @@ impl VolumeStore {
                     && self.attrs[old as usize] & 0x10 != 0
                     && self.exclude.is_segment(self.name_lc(old))
                 {
-                    self.noise_anchors.insert(self.frn[old as usize]);
+                    let frn = self.frn[old as usize];
+                    self.noise_anchors.insert(frn);
+                    if is_build_output_segment(self.name_lc(old)) {
+                        self.soft_anchors.insert(frn);
+                    }
                 }
                 if self.children_built {
                     self.move_child(old, old_parent, new_p);
@@ -1162,7 +1173,12 @@ impl VolumeStore {
         self.names_lc.extend_from_slice(&name_lc);
         self.names_lc.push(0);
         self.frn.push(frn);
-        let anchored = !self.exclude.is_empty() && self.noise_anchors.contains(&parent_frn);
+        // 「父是噪声锚点 ⇒ 子项直接判噪」的快捷路径(父链断开也不再解析)。
+        // 构建产物锚点(target/…)例外:必须正常解析父链并逐个分类,否则
+        // 新构建出来的 exe 会被整片判噪。
+        let anchored = !self.exclude.is_empty()
+            && self.noise_anchors.contains(&parent_frn)
+            && !self.soft_anchors.contains(&parent_frn);
         let p = if parent_frn == 0 || anchored {
             NO_PARENT
         } else {
@@ -1216,6 +1232,9 @@ impl VolumeStore {
             // 每新增一个子目录都会触发下一次全量重判(实测 1.3s/次)。
             if self.exclude.is_segment(&name_lc) && self.attrs[slot as usize] & 0x10 != 0 {
                 self.noise_anchors.insert(frn);
+                if is_build_output_segment(&name_lc) {
+                    self.soft_anchors.insert(frn);
+                }
             }
         }
         true
@@ -1223,6 +1242,7 @@ impl VolumeStore {
 
     pub fn remove(&mut self, frn: u64) -> bool {
         self.noise_anchors.remove(&frn);
+        self.soft_anchors.remove(&frn);
         if let Some(slot) = self.find_slot(frn) {
             if self.attrs[slot as usize] & ATTR_DEAD == 0 {
                 self.attrs[slot as usize] |= ATTR_DEAD;
@@ -1250,21 +1270,31 @@ impl VolumeStore {
         let mut cur = self.parent[slot as usize];
         let mut self_noise = false;
         let mut broke_early = false;
+        // 命中「构建产物」噪声段(软噪声):子树保留目录 + 可执行文件。
+        // 命中软噪声**不能**提前收手:外层还可能有硬噪声(node_modules 等),
+        // 必须继续上溯判死,否则 node_modules/x/dist/a.exe 会被误留。
+        let mut soft_hit = false;
         let has_anchored = self.exclude.has_anchored();
         self.chain_buf.clear();
         while cur != NO_PARENT && hops < 64 {
             let name_lc = self.name_lc(cur);
             if self.exclude.is_segment(name_lc) {
-                self_noise = true;
-                broke_early = true;
-                break;
-            }
-            if self.noise_anchors.contains(&self.frn[cur as usize]) {
-                self_noise = true;
-                broke_early = true;
-                break;
-            }
-            if self.attrs[cur as usize] & ATTR_NOISE != 0 {
+                if is_build_output_segment(name_lc) {
+                    soft_hit = true;
+                } else {
+                    self_noise = true;
+                    broke_early = true;
+                    break;
+                }
+            } else if self.noise_anchors.contains(&self.frn[cur as usize]) {
+                if is_build_output_segment(name_lc) {
+                    soft_hit = true;
+                } else {
+                    self_noise = true;
+                    broke_early = true;
+                    break;
+                }
+            } else if self.attrs[cur as usize] & ATTR_NOISE != 0 {
                 // 祖先已判噪(其父链可能已断),子孙必然同判
                 self_noise = true;
                 broke_early = true;
@@ -1300,6 +1330,15 @@ impl VolumeStore {
             if anchor_hit {
                 let frn = self.frn[slot as usize];
                 self.noise_anchors.insert(frn);
+            }
+        }
+        // 构建产物子树的例外:目录一律保留(索引里的路径靠父链解析,祖先缺
+        // 一环 exe 的路径就断了),可执行文件保留,其余文件照旧排除。
+        // 硬噪声(段名/锚点/已判噪祖先/锚定路径命中)优先,不被豁免。
+        if !self_noise && soft_hit {
+            let is_dir = self.attrs[slot as usize] & 0x10 != 0;
+            if !is_dir && !is_exec_name(self.name_lc(slot)) {
+                self_noise = true;
             }
         }
         self.chain_buf.clear();
@@ -1431,7 +1470,11 @@ impl VolumeStore {
                     continue; // 只看可见目录
                 }
                 if self.exclude.is_segment(self.name_lc(s)) {
-                    self.noise_anchors.insert(self.frn[s as usize]);
+                    let frn = self.frn[s as usize];
+                    self.noise_anchors.insert(frn);
+                    if is_build_output_segment(self.name_lc(s)) {
+                        self.soft_anchors.insert(frn);
+                    }
                 }
             }
             // 分类产生的 NOISE 位重新过滤 live
@@ -1930,6 +1973,57 @@ mod tests {
         assert_eq!(total, 1, "搜 node_modules 应找到目录本身");
         let (_, total, _) = crate::query::query_volume(&s, &spec("dep"), 100);
         assert_eq!(total, 0, "噪声内容不可搜");
+    }
+
+    /// 构建产物子树例外:目录 + 可执行文件保留,其余文件照旧剔除;
+    /// 软噪声被硬噪声包住时(node_modules/x/dist/a.exe)仍整体剔除。
+    #[test]
+    fn build_output_subtree_keeps_dirs_and_execs() {
+        let mut raws: Vec<String> = crate::noise::builtin_patterns();
+        raws.push("dist".to_string()); // 把 dist 也变成软噪声段,验证硬噪声优先
+        let mut s = VolumeStore::new(crate::noise::ExcludeRules::build(&raws), 'E');
+        insert(&mut s, 5, 0, 0x10, "proj");
+        insert(&mut s, 10, 5, 0x10, "target");
+        insert(&mut s, 11, 10, 0x10, "release");
+        insert(&mut s, 12, 11, 0, "app.exe");
+        insert(&mut s, 13, 11, 0, "app.rlib");
+        insert(&mut s, 14, 11, 0x10, "deps");
+        insert(&mut s, 15, 14, 0, "test-1.exe");
+        insert(&mut s, 16, 14, 0, "libfoo.rlib");
+        insert(&mut s, 17, 5, 0x10, "dist");
+        insert(&mut s, 18, 17, 0, "setup.msi");
+        // 硬噪声包住软噪声:dist 里的 exe 仍要整棵剔除
+        insert(&mut s, 20, 5, 0x10, "node_modules");
+        insert(&mut s, 21, 20, 0x10, "pkg");
+        insert(&mut s, 22, 21, 0x10, "dist");
+        insert(&mut s, 23, 22, 0, "tool.exe");
+        s.compact();
+
+        assert!(s.find_slot(10).is_some(), "target 目录本身可见");
+        assert!(
+            s.find_slot(11).is_some(),
+            "target/release 目录必须保留(路径靠父链解析)"
+        );
+        assert!(s.find_slot(12).is_some(), "target/release/app.exe 应可搜");
+        assert_eq!(s.find_slot(13), None, "target/release/app.rlib 照旧剔除");
+        assert!(s.find_slot(14).is_some(), "target/release/deps 目录保留");
+        assert!(s.find_slot(15).is_some(), "deps/test-1.exe 应可搜");
+        assert_eq!(s.find_slot(16), None, "deps/libfoo.rlib 照旧剔除");
+        assert!(s.find_slot(18).is_some(), "dist/setup.msi 应可搜(.msi 也算产物)");
+        assert_eq!(
+            s.find_slot(23),
+            None,
+            "node_modules 下的 dist/tool.exe 仍被硬噪声整棵剔除"
+        );
+
+        let spec = |t: &str| crate::query::QuerySpec {
+            tokens: vec![t.into()],
+            ..Default::default()
+        };
+        let (_, total, _) = crate::query::query_volume(&s, &spec("app.exe"), 100);
+        assert_eq!(total, 1, "全局搜 app.exe 必须命中构建产物");
+        let (_, total, _) = crate::query::query_volume(&s, &spec("app.rlib"), 100);
+        assert_eq!(total, 0, "中间产物(.rlib)不该出现在结果里");
     }
 
     #[test]

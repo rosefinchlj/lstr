@@ -1,6 +1,14 @@
 //! 噪声排除:索引层语义是「噪声目录自身保留可搜,整棵子孙不进索引」(省内存):
 //! 搜 `node_modules`/`temp`/`target` 能找到目录本身,但其内容不索引。
 //!
+//! **例外(2026-11-14)**:构建产物目录([`BUILD_OUTPUT_SEGMENTS`],如 `target`)
+//! 的子树保留「目录 + 可执行文件(.exe/.msi/.msix)」,只排除其余文件。
+//! 背景:开发者最常搜的就是刚构建出来的 exe,而整棵排除会让全局搜索看不到
+//! `E:\…\lstr\target\release\lstr.exe`(完整路径能搜到是因为走了文件系统浏览,
+//! 不查索引,行为不一致)。目录必须一起保留 —— 索引里的路径靠父链解析,
+//! 祖先缺一环路径就断了。代价可控:实测 Rust 工程 `target/` 2.76 万文件里
+//! 只有 190 个 exe + 1733 个目录,相比整棵入库省 93% 条目。
+//!
 //! 排除表来自「噪声」设置页的排除行(用户可增删,内置段名也作为普通行存在)。
 //! 两种模式(按归一化后是否含 `/` 区分):
 //! - 段名模式(`node_modules`):任意层级的同名目录。
@@ -56,6 +64,36 @@ pub fn is_noise_segment(name_lc: &[u8]) -> bool {
         .map(|s| NOISE_SEGMENTS.binary_search(&s).is_ok())
         .unwrap_or(false)
 }
+
+/// 构建产物段名(小写、有序):这些目录若被用户/默认排除表判为噪声,
+/// 其子树仍保留「目录 + 可执行文件」,见模块文档的例外说明。
+///
+/// 只列「产物目录」;`node_modules`/`.git`/缓存类不在此列 —— 那些子树里
+/// 没有值得单独保留的可执行产物,整棵排除才是对的。
+pub const BUILD_OUTPUT_SEGMENTS: &[&str] = &["bin", "build", "dist", "out", "target"];
+
+/// 是否为构建产物段名。`name_lc` 必须是小写名字。
+pub fn is_build_output_segment(name_lc: &[u8]) -> bool {
+    std::str::from_utf8(name_lc)
+        .map(|s| BUILD_OUTPUT_SEGMENTS.binary_search(&s).is_ok())
+        .unwrap_or(false)
+}
+
+/// 是否为可直接运行/安装的产物扩展名(小写名字比对)。
+pub fn is_exec_name(name_lc: &[u8]) -> bool {
+    [&b".exe"[..], b".msi", b".msix"]
+        .iter()
+        .any(|ext| name_lc.ends_with(ext))
+}
+
+/// 分类语义版本:实现变更(而不只是规则表变更)也必须让已有快照失效。
+/// 快照 header 存的是 [`ExcludeRules::hash`],语义改了要换哈希,否则旧快照
+/// 会带着旧分类继续用、看不到新保留的条目。
+/// - v2(2026-11-14):构建产物子树保留目录 + 可执行文件。
+const SEMANTICS_VERSION: u64 = 2;
+
+/// 语义版本混入哈希的乘数(奇数,避免把版本号消掉)。
+const SEMANTICS_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// 归一化一个排除模式:trim、小写、反斜杠转正斜杠、去尾斜杠。空串返回 None。
 pub fn normalize_pattern(raw: &str) -> Option<String> {
@@ -216,7 +254,8 @@ impl ExcludeRules {
             d.hash(&mut h);
             segs.hash(&mut h);
         }
-        h.finish()
+        // 语义版本参与哈希:分类实现变了也要让旧快照失效(见 SEMANTICS_VERSION)。
+        h.finish() ^ SEMANTICS_VERSION.wrapping_mul(SEMANTICS_SALT)
     }
 }
 
