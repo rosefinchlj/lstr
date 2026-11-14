@@ -13,6 +13,7 @@ use lstr_index::{
 };
 
 use crate::model::{Entry, Kind, Query, Scope};
+use crate::search::drive_weight::EffectiveWeights;
 use crate::search::entrymeta::{initial_of, kept_in_scope, kind_of, tone_for};
 use crate::search::filters::SearchFilters;
 use crate::search::pinyin;
@@ -93,6 +94,7 @@ impl BuiltinProvider {
         query: &Query,
         filters: &SearchFilters,
         limit: usize,
+        weights: &EffectiveWeights,
     ) -> Result<(Vec<Entry>, usize), String> {
         // 单分类作用域(文件夹/程序/文件)必须在这里按 kind 过滤:引擎侧过滤
         // 负责候选,keep 再兜底类型漂移。8e2e208 把 kind 抽成 run 的参数后,
@@ -101,7 +103,7 @@ impl BuiltinProvider {
         let scope = query.scope;
         self.run(query, filters, limit, scope_kind_filter(scope), move |kind| {
             kept_in_scope(scope, kind)
-        })
+        }, weights)
     }
 
     /// 旧「全部」双路实现:folders/files 各跑一次全引擎。生产路径已改为
@@ -114,6 +116,7 @@ impl BuiltinProvider {
         filters: &SearchFilters,
         limit: usize,
         folders: bool,
+        weights: &EffectiveWeights,
     ) -> Result<(Vec<Entry>, usize), String> {
         let kind_filter = if folders { KindFilter::Folders } else { KindFilter::All };
         self.run(query, filters, limit, kind_filter, move |kind| {
@@ -122,7 +125,7 @@ impl BuiltinProvider {
             } else {
                 kind != Kind::Folder
             }
-        })
+        }, weights)
     }
 
     /// 旧元数据路径(逐条 find_meta)的双路 oracle:只用于 release 基准对照
@@ -134,13 +137,15 @@ impl BuiltinProvider {
         filters: &SearchFilters,
         limit: usize,
         folders: bool,
+        weights: &EffectiveWeights,
     ) -> (Vec<Entry>, usize) {
-        let mut spec = build_spec(query, filters);
+        let mut spec = build_spec(query, filters, weights);
         spec.kind = if folders { KindFilter::Folders } else { KindFilter::All };
         let outcome = self.query_spec(&spec);
+        let ordered = self.ordered_hits(&outcome.hits, weights);
         let mut entries = Vec::with_capacity(outcome.hits.len().min(limit));
         self.fill_entries_per_entry(
-            &outcome.hits,
+            &ordered,
             query,
             limit,
             |kind| {
@@ -170,8 +175,9 @@ impl BuiltinProvider {
         filters: &SearchFilters,
         folder_limit: usize,
         file_limit: usize,
+        weights: &EffectiveWeights,
     ) -> Result<SplitOnceResult, String> {
-        let mut spec = build_spec(query, filters);
+        let mut spec = build_spec(query, filters, weights);
         spec.kind = KindFilter::All;
         // 精确同名补集与时间/日期条件同查：候选仍要过 mtime 过滤，不会把
         // 区间外的同名项带回来。
@@ -186,11 +192,15 @@ impl BuiltinProvider {
         let t_engine = std::time::Instant::now();
         let outcome = self.query_split_exact_spec(&spec, exact_needle.as_deref());
         let engine_ms = t_engine.elapsed().as_secs_f32() * 1000.0;
-        let mut folders = Vec::with_capacity(outcome.folder_hits.len().min(folder_limit));
-        let mut files = Vec::with_capacity(outcome.file_hits.len().min(file_limit));
+        // 多卷命中按权重公平交织后再收尾：否则字母序靠前的盘会吃光
+        // folder/file 预算（D/E 的候选根本进不了排序池）。
+        let folder_ordered = self.ordered_hits(&outcome.folder_hits, weights);
+        let file_ordered = self.ordered_hits(&outcome.file_hits, weights);
+        let mut folders = Vec::with_capacity(folder_ordered.len().min(folder_limit));
+        let mut files = Vec::with_capacity(file_ordered.len().min(file_limit));
         let t_folders = std::time::Instant::now();
         self.collect_entries(
-            &outcome.folder_hits,
+            &folder_ordered,
             query,
             folder_limit,
             |kind| kind == Kind::Folder,
@@ -199,7 +209,7 @@ impl BuiltinProvider {
         let folder_collect_ms = t_folders.elapsed().as_secs_f32() * 1000.0;
         let t_files = std::time::Instant::now();
         self.collect_entries(
-            &outcome.file_hits,
+            &file_ordered,
             query,
             file_limit,
             |kind| kind != Kind::Folder,
@@ -216,13 +226,15 @@ impl BuiltinProvider {
         let mut exact_ms = 0.0f32;
         if truncation > 0 && exact_needle.is_some() {
             let t_exact = std::time::Instant::now();
-            self.collect_exact_entries(&outcome.exact_hits, query, 50, &mut exact);
+            let exact_ordered = self.ordered_hits(&outcome.exact_hits, weights);
+            self.collect_exact_entries(&exact_ordered, query, 50, &mut exact);
             exact_ms = t_exact.elapsed().as_secs_f32() * 1000.0;
         }
         // 前缀补集(A-3):与精确同名补集同条件(有截断才补),复用同一收尾。
         let mut prefix = Vec::new();
         if truncation > 0 && exact_needle.is_some() {
-            self.collect_exact_entries(&outcome.prefix_hits, query, 50, &mut prefix);
+            let prefix_ordered = self.ordered_hits(&outcome.prefix_hits, weights);
+            self.collect_exact_entries(&prefix_ordered, query, 50, &mut prefix);
         }
         // 测试构建不落盘日志。
         #[cfg(test)]
@@ -260,16 +272,18 @@ impl BuiltinProvider {
         query: &Query,
         filters: &SearchFilters,
         limit: usize,
+        weights: &EffectiveWeights,
     ) -> Result<(Vec<Entry>, usize), String> {
-        let mut spec = build_spec(query, filters);
+        let mut spec = build_spec(query, filters, weights);
         spec.exact = Some(if filters.matches.case_sensitive {
             query.text.clone()
         } else {
             query.text.to_lowercase()
         });
         let outcome = self.query_spec(&spec);
-        let mut entries = Vec::with_capacity(outcome.hits.len().min(limit));
-        self.collect_exact_entries(&outcome.hits, query, limit, &mut entries);
+        let ordered = self.ordered_hits(&outcome.hits, weights);
+        let mut entries = Vec::with_capacity(ordered.len().min(limit));
+        self.collect_exact_entries(&ordered, query, limit, &mut entries);
         Ok((entries, outcome.total))
     }
 
@@ -280,13 +294,30 @@ impl BuiltinProvider {
         limit: usize,
         kind_filter: KindFilter,
         keep: impl Fn(Kind) -> bool,
+        weights: &EffectiveWeights,
     ) -> Result<(Vec<Entry>, usize), String> {
-        let mut spec = build_spec(query, filters);
+        let mut spec = build_spec(query, filters, weights);
         spec.kind = kind_filter;
         let outcome = self.query_spec(&spec);
-        let mut entries = Vec::with_capacity(outcome.hits.len().min(limit));
-        self.collect_entries(&outcome.hits, query, limit, keep, &mut entries);
+        let ordered = self.ordered_hits(&outcome.hits, weights);
+        let mut entries = Vec::with_capacity(ordered.len().min(limit));
+        self.collect_entries(&ordered, query, limit, keep, &mut entries);
         Ok((entries, outcome.total))
+    }
+
+    /// 多卷命中按盘符权重公平交织（返回按「该先看谁」排好的序列）。
+    fn ordered_hits(
+        &self,
+        hits: &[lstr_index::Hit],
+        weights: &EffectiveWeights,
+    ) -> Vec<lstr_index::Hit> {
+        order_hits(hits, |vol| {
+            self.engine
+                .volumes
+                .get(vol as usize)
+                .map(|volume| weights.weight(volume.letter))
+                .unwrap_or(100)
+        })
     }
 
     /// 候选阶段收尾(零 FS):limit 预算、空名/kind 过滤、路径拼接。
@@ -467,7 +498,11 @@ fn scope_kind_filter(scope: Scope) -> KindFilter {
 }
 
 /// Query + SearchFilters → 引擎查询规格。
-pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
+///
+/// `weights` 只贡献两件事：权重 0 的盘并入卷掩码（引擎整卷跳过），以及
+/// 调用方用同一份权重给候选做公平交织/排序。显式条件锁定的盘已在
+/// `EffectiveWeights` 里还原成 100，所以 `path:C:\…` 在 C 权重 0 时仍可搜。
+pub fn build_spec(query: &Query, filters: &SearchFilters, weights: &EffectiveWeights) -> QuerySpec {
     // 相对路径分段（`DeepSeek\xxx`）：不是正则时最后一段仍是名字锚点
     // （走 n-gram/memmem 候选），段链由引擎在候选封顶前逐级校验；
     // 尾部带分隔符（`DeepSeek\`）没有名字锚点，交给过滤器全量列举。
@@ -515,11 +550,8 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
         size_before: None,
         // 盘符过滤（c:/d: 限定、-c: 排除）：交给引擎在卷循环直接跳过，
         // 省掉整卷扫描；0 掩码（全排除）→ 查询结果为空。
-        // 输入框盘符 chip 与查询文本里的盘符 token 求交。
-        vol_mask: crate::search::filters::intersect_drive_masks(
-            query.drive_mask(),
-            filters.drive_mask(),
-        ),
+        // 输入框盘符 chip 与查询文本里的盘符 token 求交；权重 0 的盘再并进来。
+        vol_mask: effective_vol_mask(query, filters, weights),
         case_sensitive: filters.matches.case_sensitive,
         whole_word: filters.matches.whole_word,
         regex: (filters.matches.regex && !query.text.is_empty()).then(|| query.text.clone()),
@@ -569,6 +601,88 @@ pub fn build_spec(query: &Query, filters: &SearchFilters) -> QuerySpec {
         }
     }
     spec
+}
+
+/// 按卷权重公平交织命中序列。
+///
+/// 引擎把各卷命中按盘符顺序拼成一个数组，旧的 `collect_entries` 直接从头
+/// 截断：只要字母序靠前的盘（C）命中数超过候选预算，其它盘的候选根本
+/// 进不了排序池——这是「C 盘霸屏」的主因，与打分权重无关。
+///
+/// 每次取「已取条数 / 权重」最小的卷（整数交叉相乘比较，避免浮点误差），
+/// 权重全 100 时退化为等额轮转；某卷耗尽后份额自动让给其它卷。
+/// `Hit` 在引擎输出里同卷连续，按段切 lane 即可，无需重排。
+fn order_hits(
+    hits: &[lstr_index::Hit],
+    weight_of: impl Fn(u32) -> u8,
+) -> Vec<lstr_index::Hit> {
+    struct Lane {
+        start: usize,
+        end: usize,
+        weight: u64,
+    }
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    let mut lanes: Vec<Lane> = Vec::new();
+    for (index, hit) in hits.iter().enumerate() {
+        match lanes.last_mut() {
+            Some(lane) if lane.end == index && hits[index - 1].vol == hit.vol => {
+                lane.end = index + 1;
+            }
+            _ => {
+                lanes.push(Lane {
+                    start: index,
+                    end: index + 1,
+                    weight: weight_of(hit.vol) as u64,
+                });
+            }
+        }
+    }
+    // 权重 0 的卷引擎已按掩码跳过；万一混进来也不占份额。
+    lanes.retain(|lane| lane.weight > 0);
+    let mut taken = vec![0usize; lanes.len()];
+    let mut ordered = Vec::with_capacity(hits.len());
+    loop {
+        let mut best: Option<usize> = None;
+        for (index, lane) in lanes.iter().enumerate() {
+            if lane.start + taken[index] >= lane.end {
+                continue;
+            }
+            match best {
+                None => best = Some(index),
+                Some(current) => {
+                    if (taken[index] as u64) * lanes[current].weight
+                        < (taken[current] as u64) * lane.weight
+                    {
+                        best = Some(index);
+                    }
+                }
+            }
+        }
+        let Some(index) = best else { break };
+        // Hit 是 Copy（16 字节）；顺序本身才是产出，拷贝成本可忽略。
+        ordered.push(hits[lanes[index].start + taken[index]]);
+        taken[index] += 1;
+    }
+    ordered
+}
+
+/// 卷掩码 = 显式盘符条件（`C:` / `-C:` / chip）∩ 权重非 0 的盘。
+/// 显式条件把搜索限定到某盘时，权重 0 的盘本来就不在掩码里，两者互不干扰。
+fn effective_vol_mask(
+    query: &Query,
+    filters: &SearchFilters,
+    weights: &EffectiveWeights,
+) -> Option<u32> {
+    let base =
+        crate::search::filters::intersect_drive_masks(query.drive_mask(), filters.drive_mask());
+    let zero = weights.zero_mask();
+    if zero == 0 {
+        return base;
+    }
+    const ALL: u32 = (1u32 << 26) - 1;
+    Some(base.unwrap_or(ALL) & !zero)
 }
 
 /// worker 收到 Shutdown 后的退出等待上限:worker 要 join 各卷线程(对账批次
@@ -892,6 +1006,180 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
+    /// 测试基线：全盘中性（权重不参与），与旧行为逐条等价。
+    fn neutral_weights() -> EffectiveWeights {
+        EffectiveWeights::neutral()
+    }
+
+    fn fake_hits(vol: u32, count: usize) -> Vec<lstr_index::Hit> {
+        (0..count as u32)
+            .map(|slot| lstr_index::Hit {
+                vol,
+                slot,
+                generation: 1,
+                mtime: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn weighted_interleave_respects_drive_weights() {
+        let mut hits = fake_hits(0, 200);
+        hits.extend(fake_hits(1, 200));
+        hits.extend(fake_hits(2, 200));
+        // 卷 0（C）= 50，其余 100。
+        let ordered = order_hits(&hits, |vol| if vol == 0 { 50 } else { 100 });
+        let window: Vec<u32> = ordered.iter().take(120).map(|hit| hit.vol).collect();
+        let count = |vol: u32| window.iter().filter(|v| **v == vol).count();
+        let (c, d, e) = (count(0), count(1), count(2));
+        assert!(c < d && c < e, "低权重盘份额应更小: C={c} D={d} E={e}");
+        assert!((d as i32 - e as i32).abs() <= 1, "同权重盘应等额: {d}/{e}");
+        // 50:100 ≈ 1:2（交错误差 ±1）。
+        let expect_c = (d as i32) / 2;
+        assert!(
+            (c as i32 - expect_c).abs() <= 2,
+            "C 份额应约为 D 的一半: C={c} D={d}"
+        );
+    }
+
+    #[test]
+    fn equal_weights_round_robin_evenly() {
+        // 全 100 时退化为等额轮转：旧实现是「C 从头上吃光预算」。
+        let mut hits = fake_hits(0, 40);
+        hits.extend(fake_hits(1, 40));
+        let ordered = order_hits(&hits, |_| 100);
+        let first: Vec<u32> = ordered.iter().take(4).map(|hit| hit.vol).collect();
+        assert_eq!(first, vec![0, 1, 0, 1]);
+        let c = ordered.iter().take(40).filter(|hit| hit.vol == 0).count();
+        assert_eq!(c, 20, "前 40 个候选应两盘各半");
+    }
+
+    #[test]
+    fn exhausted_drive_spills_share_to_others() {
+        let mut hits = fake_hits(0, 5);
+        hits.extend(fake_hits(1, 50));
+        let ordered = order_hits(&hits, |vol| if vol == 0 { 50 } else { 100 });
+        assert_eq!(ordered.len(), 55, "所有命中都必须保留");
+        assert_eq!(ordered.iter().filter(|hit| hit.vol == 1).count(), 50);
+    }
+
+    #[test]
+    fn zero_weight_drive_is_skipped_by_interleave() {
+        let mut hits = fake_hits(0, 10);
+        hits.extend(fake_hits(1, 10));
+        let ordered = order_hits(&hits, |vol| if vol == 0 { 0 } else { 100 });
+        assert!(ordered.iter().all(|hit| hit.vol == 1));
+    }
+
+    /// 真实 Engine 双卷夹具：假 C 卷（100 条候选，不落盘）+ 真实夹具卷。
+    /// 验证权重 0 是引擎级硬排除，而 `path:C:\fake` 能把它恢复回来。
+    #[test]
+    fn zero_drive_weight_excludes_volume_and_path_condition_restores_it() {
+        let Some(mut fx) = real_index(20, 2, "drive-weight") else { return };
+        let fx_letter = fx
+            .test_dir
+            .to_string_lossy()
+            .chars()
+            .next()
+            .expect("夹具盘符");
+        let fake_letter = if fx_letter.eq_ignore_ascii_case(&'C') { 'D' } else { 'C' };
+        let guid = 0x7777u128;
+        fx.provider.engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: fake_letter,
+            journal_id: 1,
+            next_usn: 100,
+            est_records: 0,
+        });
+        fx.provider.engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        let mut recs = vec![Rec {
+            frn: 1,
+            parent_frn: 0,
+            attrs: 0x10,
+            op: Op::Upsert,
+            name: "fake".to_string(),
+            mtime: 0,
+            size: 0,
+        }];
+        for index in 0..100u64 {
+            recs.push(Rec {
+                frn: 1000 + index,
+                parent_frn: 1,
+                attrs: 0,
+                op: Op::Upsert,
+                name: format!("ai_fake_{index:03}.txt"),
+                mtime: 0,
+                size: 0,
+            });
+        }
+        fx.provider.engine.handle(EngineMsg::Records {
+            guid,
+            recs,
+            next_usn: 100,
+        });
+        fx.provider.engine.handle(EngineMsg::VolumeReady {
+            guid,
+            journal_id: 1,
+            next_usn: 100,
+            count: 101,
+        });
+
+        let query = parse("ai", Scope::All);
+        let mut cfg = crate::config::RankConfig::default();
+        cfg.drive_weights.clear();
+        cfg.set_drive_weight(fake_letter, 0);
+        let filters = SearchFilters::default();
+        let weights = EffectiveWeights::new(&cfg, &query, &filters, None, None);
+        let result = fx
+            .provider
+            .search_split_once(&query, &filters, 40, 60, &weights)
+            .expect("split");
+        let candidates = |result: &SplitOnceResult| -> Vec<String> {
+            result
+                .files
+                .iter()
+                .chain(result.folders.iter())
+                .map(|entry| entry.full_path())
+                .collect()
+        };
+        let paths_found = candidates(&result);
+        assert!(
+            paths_found
+                .iter()
+                .all(|path| !path.starts_with(&format!("{fake_letter}:"))),
+            "权重 0 的盘不应产生候选: {paths_found:?}"
+        );
+        assert!(result.all_total > 0, "真实夹具卷仍应命中");
+        assert!(
+            paths_found
+                .iter()
+                .all(|path| path.starts_with(&format!("{fx_letter}:"))),
+            "剩余候选都应来自真实夹具卷"
+        );
+
+        // path:C:\fake 显式锁定该盘：权重 0 被覆盖，候选取自假卷。
+        let mut filters = SearchFilters::default();
+        filters.path = Some(PathBuf::from(format!("{fake_letter}:\\fake")));
+        let weights = EffectiveWeights::new(&cfg, &query, &filters, None, None);
+        assert_eq!(weights.weight(fake_letter), 100, "path: 条件锁定该盘");
+        let result = fx
+            .provider
+            .search_split_once(&query, &filters, 40, 60, &weights)
+            .expect("split");
+        assert!(
+            result.all_total >= 100,
+            "假卷 100 条候选都应计入总数: {}",
+            result.all_total
+        );
+        let paths_found = candidates(&result);
+        assert!(
+            paths_found
+                .iter()
+                .all(|path| path.starts_with(&format!("{fake_letter}:\\fake"))),
+            "path: 锁定后候选应来自假卷: {paths_found:?}"
+        );
+    }
+
     struct RealIndex {
         provider: BuiltinProvider,
         test_dir: std::path::PathBuf,
@@ -1170,11 +1458,11 @@ mod tests {
         ] {
             let query = parse(text, Scope::All);
             let filters = SearchFilters::default();
-            let legacy_folders = fx.provider.search_split(&query, &filters, folder_limit, true).unwrap();
-            let legacy_files = fx.provider.search_split(&query, &filters, file_limit, false).unwrap();
+            let legacy_folders = fx.provider.search_split(&query, &filters, folder_limit, true, &neutral_weights()).unwrap();
+            let legacy_files = fx.provider.search_split(&query, &filters, file_limit, false, &neutral_weights()).unwrap();
             let result = fx
                 .provider
-                .search_split_once(&query, &filters, folder_limit, file_limit)
+                .search_split_once(&query, &filters, folder_limit, file_limit, &neutral_weights())
                 .unwrap();
             assert_eq!(result.folders, legacy_folders.0, "folders 候选不一致: {text}");
             assert_eq!(result.files, legacy_files.0, "files 候选不一致: {text}");
@@ -1190,7 +1478,7 @@ mod tests {
         let Some(fx) = real_index(20, 3, "hit-mtime") else { return };
         let query = parse("ai", Scope::All);
         let filters = SearchFilters::default();
-        let mut spec = build_spec(&query, &filters);
+        let mut spec = build_spec(&query, &filters, &neutral_weights());
         spec.kind = KindFilter::All;
         let outcome = fx.provider.engine.query(&spec);
         let mut hit = *outcome.hits.first().expect("fixture 应至少有一个候选");
@@ -1242,7 +1530,7 @@ mod tests {
         let Some(fx) = real_index(600, 120, "meta-parity") else { return };
         let query = parse("ai", Scope::All);
         let filters = SearchFilters::default();
-        let mut spec = build_spec(&query, &filters);
+        let mut spec = build_spec(&query, &filters, &neutral_weights());
         spec.kind = KindFilter::All;
         let outcome = fx
             .provider
@@ -1298,7 +1586,7 @@ mod tests {
         let Some(fx) = real_index(600, 120, "meta-batch") else { return };
         let query = parse("ai", Scope::All);
         let filters = SearchFilters::default();
-        let mut spec = build_spec(&query, &filters);
+        let mut spec = build_spec(&query, &filters, &neutral_weights());
         spec.kind = KindFilter::All;
         let outcome = fx.provider.engine.query_split_with_exact(&spec, Some("ai"));
         assert!(!outcome.aborted);
@@ -1345,7 +1633,7 @@ mod tests {
             ("ext:txt", 20, 40),
         ] {
             let query = parse(text, Scope::All);
-            let mut spec = build_spec(&query, &filters);
+            let mut spec = build_spec(&query, &filters, &neutral_weights());
             spec.kind = KindFilter::All;
             // 与 search_split_once 的 exact_needle 同口径：空文本（纯过滤器 /
             // 尾分隔符路径）不再走「全量列举」的 exact 补集。
@@ -1357,7 +1645,7 @@ mod tests {
                 .query_split_with_exact(&spec, needle.as_deref());
             let result = fx
                 .provider
-                .search_split_once(&query, &filters, folder_limit, file_limit)
+                .search_split_once(&query, &filters, folder_limit, file_limit, &neutral_weights())
                 .unwrap();
             let lazy: Vec<Entry> = result
                 .exact
@@ -1385,7 +1673,7 @@ mod tests {
         assert!(query.path_components.is_some());
         let result = fx
             .provider
-            .search_split_once(&query, &filters, 30, 60)
+            .search_split_once(&query, &filters, 30, 60, &neutral_weights())
             .unwrap();
         let names: Vec<&str> = result.folders.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"ai_dir_0001"), "{names:?}");
@@ -1401,7 +1689,7 @@ mod tests {
         let upper = parse(&format!(r"{tag}\AI_DIR_0001"), Scope::All);
         let result = fx
             .provider
-            .search_split_once(&upper, &filters, 30, 60)
+            .search_split_once(&upper, &filters, 30, 60, &neutral_weights())
             .unwrap();
         assert!(result.folders.iter().any(|e| e.name == "ai_dir_0001"));
 
@@ -1410,7 +1698,7 @@ mod tests {
         assert!(query.path_components.as_ref().is_some_and(|p| p.trailing));
         let result = fx
             .provider
-            .search_split_once(&query, &filters, 30, 60)
+            .search_split_once(&query, &filters, 30, 60, &neutral_weights())
             .unwrap();
         assert!(!result.files.is_empty(), "应列出目录内文件");
         assert!(
@@ -1429,7 +1717,7 @@ mod tests {
         let missing = parse(&format!(r"{tag}\no_such_dir\ai_dir_0001"), Scope::All);
         let result = fx
             .provider
-            .search_split_once(&missing, &filters, 30, 60)
+            .search_split_once(&missing, &filters, 30, 60, &neutral_weights())
             .unwrap();
         assert!(result.folders.is_empty() && result.files.is_empty());
     }
@@ -1443,7 +1731,7 @@ mod tests {
         let Some(fx) = real_index(600, 120, "e2e-parity") else { return };
         let query = parse("ai", Scope::All);
         let filters = SearchFilters::default();
-        let mut spec = build_spec(&query, &filters);
+        let mut spec = build_spec(&query, &filters, &neutral_weights());
         spec.kind = KindFilter::All;
         let outcome = fx
             .provider
@@ -1533,6 +1821,7 @@ mod tests {
             Vec::new(),
             &noise,
             Some(&pending),
+            &neutral_weights(),
         );
         assert_eq!(old_final, new_final, "最终 Entry 逐字段/顺序不一致");
         assert!(!new_final.is_empty(), "最终条目不能为空");
@@ -1553,17 +1842,17 @@ mod tests {
         // 旧路径:folders/files 两路各自逐条 find_meta,达到预算才停。
         let (mut old_folders, folder_total) = fx
             .provider
-            .search_split_per_entry(&query, &filters, folder_fetch, true);
+            .search_split_per_entry(&query, &filters, folder_fetch, true, &neutral_weights());
         let (mut old_files, all_total) = fx
             .provider
-            .search_split_per_entry(&query, &filters, file_fetch, false);
+            .search_split_per_entry(&query, &filters, file_fetch, false, &neutral_weights());
         let file_total = all_total.saturating_sub(folder_total);
         let truncation = folder_total.saturating_sub(old_folders.len())
             + file_total.saturating_sub(old_files.len());
         old_folders.append(&mut old_files);
         let mut old_entries = old_folders;
         if truncation > 0 {
-            let mut spec = build_spec(&query, &filters);
+            let mut spec = build_spec(&query, &filters, &neutral_weights());
             spec.kind = KindFilter::All;
             let outcome = fx.provider.engine.query_split_with_exact(&spec, Some("ai"));
             let mut exact = Vec::new();
@@ -1575,7 +1864,7 @@ mod tests {
         // 新路径:同一预算下候选零 FS,元数据留给 finalize 之后。
         let result = fx
             .provider
-            .search_split_once(&query, &filters, folder_fetch, file_fetch)
+            .search_split_once(&query, &filters, folder_fetch, file_fetch, &neutral_weights())
             .unwrap();
         let mut pending = PendingMeta::new();
         pending.mark(&result.folders, true);
@@ -1618,6 +1907,7 @@ mod tests {
             Vec::new(),
             &noise,
             Some(&pending),
+            &neutral_weights(),
         );
         assert_eq!(
             old_final, new_final,
@@ -1643,17 +1933,17 @@ mod tests {
 
         let (mut old_folders, folder_total) = fx
             .provider
-            .search_split_per_entry(&query, &filters, folder_fetch, true);
+            .search_split_per_entry(&query, &filters, folder_fetch, true, &neutral_weights());
         let (mut old_files, all_total) = fx
             .provider
-            .search_split_per_entry(&query, &filters, file_fetch, false);
+            .search_split_per_entry(&query, &filters, file_fetch, false, &neutral_weights());
         let file_total = all_total.saturating_sub(folder_total);
         let truncation = folder_total.saturating_sub(old_folders.len())
             + file_total.saturating_sub(old_files.len());
         old_folders.append(&mut old_files);
         let mut old_entries = old_folders;
         if truncation > 0 {
-            let mut spec = build_spec(&query, &filters);
+            let mut spec = build_spec(&query, &filters, &neutral_weights());
             spec.kind = KindFilter::All;
             let outcome = fx.provider.engine.query_split_with_exact(&spec, Some("ai"));
             let mut exact = Vec::new();
@@ -1664,7 +1954,7 @@ mod tests {
 
         let result = fx
             .provider
-            .search_split_once(&query, &filters, folder_fetch, file_fetch)
+            .search_split_once(&query, &filters, folder_fetch, file_fetch, &neutral_weights())
             .unwrap();
         let mut pending = PendingMeta::new();
         pending.mark(&result.folders, true);
@@ -1707,6 +1997,7 @@ mod tests {
             Vec::new(),
             &noise,
             Some(&pending),
+            &neutral_weights(),
         );
         let deleted_str = deleted.to_string_lossy().to_lowercase();
         assert!(
@@ -1793,6 +2084,7 @@ mod tests {
             Vec::new(),
             &noise,
             Some(&pending),
+            &neutral_weights(),
         );
         assert_eq!(old_final, new_final);
         assert_eq!(new_final.len(), 1, "exact 副本必须保留");
@@ -1808,7 +2100,7 @@ mod tests {
         let Some(fx) = real_index(160, 40, "meta-fallback") else { return };
         let query = parse("ai", Scope::All);
         let filters = SearchFilters::default();
-        let mut spec = build_spec(&query, &filters);
+        let mut spec = build_spec(&query, &filters, &neutral_weights());
         spec.kind = KindFilter::All;
         let outcome = fx.provider.engine.query_split(&spec);
 
@@ -1860,7 +2152,7 @@ mod tests {
             out.sort_by(|a, b| a.partial_cmp(b).unwrap());
             (out[iters / 2], out[iters - 1])
         };
-        let mut spec = build_spec(&query, &filters);
+        let mut spec = build_spec(&query, &filters, &neutral_weights());
         spec.kind = KindFilter::All;
         let outcome = fx
             .provider
@@ -1922,7 +2214,7 @@ mod tests {
         // 新路径第 1 步:候选构造(零 FS)。
         let (candidate_p50, _) = samples(
             Box::new(|| {
-                fx.provider.search_split_once(&query, &filters, 120, 480).unwrap();
+                fx.provider.search_split_once(&query, &filters, 120, 480, &neutral_weights()).unwrap();
             }),
             1,
             7,
@@ -1930,7 +2222,7 @@ mod tests {
         // 新路径完整链路:候选零 FS → finalize 内只对最终候选 find_meta。
         let one = fx
             .provider
-            .search_split_once(&query, &filters, 120, 480)
+            .search_split_once(&query, &filters, 120, 480, &neutral_weights())
             .unwrap();
         let mut pending = PendingMeta::new();
         pending.mark(&one.folders, true);
@@ -1950,6 +2242,7 @@ mod tests {
                     Vec::new(),
                     &noise,
                     Some(&pending),
+                    &neutral_weights(),
                 );
                 assert!(!out.is_empty());
             }),
@@ -1964,6 +2257,7 @@ mod tests {
             Vec::new(),
             &noise,
             Some(&pending),
+            &neutral_weights(),
         );
         let (engine_p50, _) = samples(
             Box::new(|| {
@@ -1981,9 +2275,9 @@ mod tests {
     fn ext_filter_is_normalized_for_index() {
         // M1:ext:RS / ext:.rs 必须规范化成索引里的小写无点形式。
         let filters = SearchFilters::default();
-        let spec = build_spec(&parse("ext:RS", Scope::All), &filters);
+        let spec = build_spec(&parse("ext:RS", Scope::All), &filters, &neutral_weights());
         assert_eq!(spec.ext.as_deref(), Some("rs"));
-        let spec = build_spec(&parse("ext:.arj", Scope::All), &filters);
+        let spec = build_spec(&parse("ext:.arj", Scope::All), &filters, &neutral_weights());
         assert_eq!(spec.ext.as_deref(), Some("arj"));
     }
 
@@ -1994,21 +2288,21 @@ mod tests {
             path: Some(PathBuf::from(r"D:\Work")),
             ..Default::default()
         };
-        let spec = build_spec(&parse("", Scope::All), &filters);
+        let spec = build_spec(&parse("", Scope::All), &filters, &neutral_weights());
         assert_eq!(spec.path_prefix.as_deref(), Some(r"d:\work"));
 
         // 2) 手输/浏览根的 query.path_filter 优先于 chip。
-        let spec = build_spec(&parse(r"path:E:\foo", Scope::All), &filters);
+        let spec = build_spec(&parse(r"path:E:\foo", Scope::All), &filters, &neutral_weights());
         assert_eq!(spec.path_prefix.as_deref(), Some(r"e:\foo"));
 
         // 3) chip 优先于筛选条「位置」。
         filters.location = Some(crate::search::filters::LocationFilter::Drive('C'));
-        let spec = build_spec(&parse("", Scope::All), &filters);
+        let spec = build_spec(&parse("", Scope::All), &filters, &neutral_weights());
         assert_eq!(spec.path_prefix.as_deref(), Some(r"d:\work"));
 
         // 4) 没有 chip 时回退到位置。
         filters.path = None;
-        let spec = build_spec(&parse("", Scope::All), &filters);
+        let spec = build_spec(&parse("", Scope::All), &filters, &neutral_weights());
         assert_eq!(spec.path_prefix.as_deref(), Some(r"c:\"));
     }
 
@@ -2019,6 +2313,7 @@ mod tests {
         let spec = build_spec(
             &crate::search::query::parse_regex(r"ext:rs ^api-.*\.dll$", Scope::All),
             &filters,
+            &neutral_weights(),
         );
         assert_eq!(spec.regex.as_deref(), Some(r"ext:rs ^api-.*\.dll$"));
         assert!(spec.tokens.is_empty(), "正则模式不能再按空白拆 token");

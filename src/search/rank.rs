@@ -1,6 +1,7 @@
 use crate::config::RankConfig;
 use crate::history::History;
 use crate::model::{Entry, Kind};
+use crate::search::drive_weight::EffectiveWeights;
 
 // 匹配档位分值来自 RankConfig（设置面板可调），这里只保留固定微调。
 // 各档默认值：精确 1000 / 前缀 800 / 子串 600 / 多词 550 / 分隔符 520 /
@@ -69,10 +70,17 @@ pub struct RankPlan {
     /// 同一查询内不会变，预归一化不改变匹配结果。
     noise: Vec<(String, i32)>,
     snapshot: crate::history::RankSnapshot,
+    /// 本次请求的盘符权重（显式条件锁定的盘已还原成 100）。
+    weights: EffectiveWeights,
 }
 
 impl RankPlan {
-    pub fn new(q: &str, history: &History, cfg: &RankConfig) -> Self {
+    pub fn new(
+        q: &str,
+        history: &History,
+        cfg: &RankConfig,
+        weights: &EffectiveWeights,
+    ) -> Self {
         let needle = q.trim().to_lowercase();
         let noise = cfg
             .noise_rules
@@ -88,19 +96,21 @@ impl RankPlan {
             snapshot: history.rank_snapshot(&needle),
             needle,
             noise,
+            weights: weights.clone(),
         }
     }
 }
 
-/// 按分数从高到低稳定排序（使用设置面板里的排序权重）。
+/// 按分数从高到低稳定排序（使用设置面板里的排序权重 + 本次盘符权重）。
 pub fn rank_with(
     entries: &mut Vec<Entry>,
     q: &str,
     history: &History,
     app_boost: i32,
     cfg: &RankConfig,
+    weights: &EffectiveWeights,
 ) {
-    let plan = RankPlan::new(q, history, cfg);
+    let plan = RankPlan::new(q, history, cfg, weights);
     entries.sort_by_cached_key(|entry| {
         std::cmp::Reverse(score_entry_planned(entry, &plan, app_boost, cfg))
     });
@@ -109,7 +119,14 @@ pub fn rank_with(
 /// 测试用默认权重的包装。
 #[cfg(test)]
 pub fn rank(entries: &mut Vec<Entry>, q: &str, history: &History, app_boost: i32) {
-    rank_with(entries, q, history, app_boost, &RankConfig::default());
+    rank_with(
+        entries,
+        q,
+        history,
+        app_boost,
+        &RankConfig::default(),
+        &EffectiveWeights::neutral(),
+    );
 }
 
 /// 单个条目的排序分（默认权重，测试用）。
@@ -127,7 +144,7 @@ pub fn score_entry_with(
     app_boost: i32,
     cfg: &RankConfig,
 ) -> i32 {
-    let plan = RankPlan::new(q, history, cfg);
+    let plan = RankPlan::new(q, history, cfg, &EffectiveWeights::neutral());
     score_entry_planned(entry, &plan, app_boost, cfg)
 }
 
@@ -196,9 +213,22 @@ pub fn score_entry_planned(
         + exact_shallow_points
         + recency_points(entry.modified, cfg, plan.snapshot.now())
         + path_adjustment(entry, &path_lc, needle, cfg, &plan.noise)
+        // 盘符权重：用户显式偏好（默认系统盘 50 → 同档落后 50 分）。
+        // 只作用于文件类条目——应用/命令/书签的 path 是启动目标或 URL，
+        // 不该被「C 盘降权」连坐（否则「微信」会被顶到文件后面）。
+        - drive_points(entry, &path_lc, plan)
         // P1-1：同一查询词下用户上次选过这个结果时加权。
         // 全局 frecency 回答「常用吗」，query_boost 回答「搜这个词时要的是哪个」。
         + plan.snapshot.boost(&entry.id)
+}
+
+/// 盘符权重扣分：路径所在盘每降 1 点权重扣 1 分（权重 100 = 0 分）。
+/// 不参与空查询的「最近使用」排序——历史是用户真实用过的，不该被偏好压。
+fn drive_points(entry: &Entry, path_lc: &str, plan: &RankPlan) -> i32 {
+    if !matches!(entry.kind, Kind::File | Kind::Folder | Kind::Program) {
+        return 0;
+    }
+    plan.weights.penalty_for_path(path_lc)
 }
 
 /// `Entry::full_path()` 的小写版本，一次分配；旧实现每候选调用 2-3 次
@@ -714,7 +744,7 @@ mod tests {
 
         // 输入顺序故意把旧的放前面,rank 后新的必须排第一。
         let mut entries = vec![stale, fresh];
-        rank_with(&mut entries, "notes", &history, 0, &cfg);
+        rank_with(&mut entries, "notes", &history, 0, &cfg, &EffectiveWeights::neutral());
         assert_eq!(entries[0].id, "fresh");
         assert_eq!(entries[1].id, "stale");
     }
@@ -735,7 +765,7 @@ mod tests {
             "未知 mtime 不能凭空加分"
         );
         let mut entries = vec![unknown, stale];
-        rank_with(&mut entries, "notes", &history, 0, &cfg);
+        rank_with(&mut entries, "notes", &history, 0, &cfg, &EffectiveWeights::neutral());
         assert_eq!(entries[0].id, "unknown", "同分稳定排序应保持输入顺序");
         assert_eq!(entries[1].id, "stale");
     }
@@ -947,7 +977,7 @@ mod tests {
         let mut normalized = entry("normalized", "myre_port.pdf", Kind::File);
         normalized.path = Some(cwd.join("myre_port.pdf"));
         let mut entries = vec![normalized, tokens];
-        rank_with(&mut entries, "my report", &History::in_memory(), 3, &cfg);
+        rank_with(&mut entries, "my report", &History::in_memory(), 3, &cfg, &EffectiveWeights::neutral());
         assert_eq!(entries[0].id, "tokens");
     }
 
@@ -1017,5 +1047,69 @@ mod tests {
             3,
         );
         assert_eq!(entries[0].id, "cmd:settings");
+    }
+
+    fn with_path(id: &str, name: &str, kind: Kind, path: &str) -> Entry {
+        let mut item = entry(id, name, kind);
+        item.path = Some(PathBuf::from(path));
+        item
+    }
+
+    #[test]
+    fn drive_weight_breaks_ties_toward_preferred_drive() {
+        // 同档、同深度、同名：唯一差别是所在盘的权重。
+        let cfg = RankConfig::default();
+        let mut entries = vec![
+            with_path("c", "report.txt", Kind::File, r"C:\work\report.txt"),
+            with_path("d", "report.txt", Kind::File, r"D:\work\report.txt"),
+        ];
+        let weights = EffectiveWeights::from_pairs(&[('C', 50), ('D', 100)]);
+        rank_with(
+            &mut entries,
+            "report",
+            &History::in_memory(),
+            0,
+            &cfg,
+            &weights,
+        );
+        assert_eq!(entries[0].id, "d", "同档下应优先高权重盘");
+    }
+
+    #[test]
+    fn drive_weight_never_overturns_exact_match() {
+        // 权重再低也不能把「精确同名」压到「名称前缀」后面：
+        // 精确档 1000-99=901 > 前缀档 800。
+        let cfg = RankConfig::default();
+        let mut entries = vec![
+            with_path("prefix", "report-2024.txt", Kind::File, r"D:\work\report-2024.txt"),
+            with_path("exact", "report", Kind::File, r"C:\work\report"),
+        ];
+        let weights = EffectiveWeights::from_pairs(&[('C', 1), ('D', 100)]);
+        rank_with(
+            &mut entries,
+            "report",
+            &History::in_memory(),
+            0,
+            &cfg,
+            &weights,
+        );
+        assert_eq!(entries[0].id, "exact");
+    }
+
+    #[test]
+    fn apps_are_not_penalized_by_drive_weight() {
+        // 应用条目的 path 是开始菜单快捷方式（通常在 C），不参与盘符权重，
+        // 否则「微信」会被同名的 D 盘文件顶掉。
+        let cfg = RankConfig::default();
+        let weights = EffectiveWeights::from_pairs(&[('C', 1), ('D', 100)]);
+        let on_c = with_path("c", "微信", Kind::App, r"C:\apps\微信.lnk");
+        let on_d = with_path("d", "微信", Kind::App, r"D:\apps\微信.lnk");
+        let history = History::in_memory();
+        let plan = RankPlan::new("微信", &history, &cfg, &weights);
+        assert_eq!(
+            score_entry_planned(&on_c, &plan, 3, &cfg),
+            score_entry_planned(&on_d, &plan, 3, &cfg),
+            "应用条目不参与盘符权重"
+        );
     }
 }

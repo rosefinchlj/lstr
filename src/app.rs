@@ -1548,6 +1548,10 @@ pub struct LstrApp {
     more_exhausted: bool,
     /// 筛选条选择：位置 / 时间 / 类型（按钮操作，不输入查询语法）。
     filters: SearchFilters,
+    /// 搜索栏盘符权重滑块的查询节流：拖拽中最多每 180ms 重查一次。
+    drive_query_at: Option<Instant>,
+    /// 系统盘盘符（搜索栏滑块控制的就是它）。
+    system_drive: char,
     /// 打开中的筛选下拉菜单。
     filter_menu: Option<FilterMenuKind>,
     /// 输入框条件 chip 的虚拟光标：`Some(i)` = 光标在第 i 个 chip 左侧
@@ -1747,6 +1751,8 @@ impl LstrApp {
             more_pending: false,
             more_exhausted: false,
             filters: SearchFilters::default(),
+            drive_query_at: None,
+            system_drive: crate::config::system_drive_letter(),
             filter_menu: None,
             chip_caret: None,
             condition_hold: false,
@@ -5425,6 +5431,13 @@ impl LstrApp {
             }
             x += width + 18.0;
         }
+        // 系统盘权重滑块：占用 Tab 行右侧的空白区（「Tab · Alt ←→」提示左侧），
+        // 不挤压筛选条；窄窗口 / 浏览模式下自动隐藏。
+        if !self.in_browse() {
+            let hint_left = rect.right() - PAD - 78.0;
+            let control_left = hint_left - 148.0 - 12.0;
+            self.paint_drive_weight(ui, painter, control_left, y - 1.0, x);
+        }
         painter.text(
             egui::pos2(rect.right() - PAD, y + 4.0),
             Align2::RIGHT_TOP,
@@ -5896,6 +5909,145 @@ impl LstrApp {
         }
 
         self.paint_filter_menu(ui, rect);
+    }
+
+    /// Tab 行右端的「系统盘权重」滑块：0 = 不检索该盘，100 = 与其它盘同等。
+    ///
+    /// 滑块只改偏好，不改索引：0 时引擎直接跳过该卷（可随时拖回来）。
+    /// 显式条件（`C:` / `path:C:\…` / 位置 / 浏览 / Explorer 就地搜索）锁定
+    /// 该盘时置灰——本次查询按 100 处理，但配置里的值保持不变，删掉条件后
+    /// 偏好原样恢复。
+    fn paint_drive_weight(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        left: f32,
+        y: f32,
+        tabs_right: f32,
+    ) {
+        let theme = self.theme;
+        let letter = self.system_drive;
+        if !self.cfg.index.volume_enabled(letter) {
+            return;
+        }
+        // 路径模式只是列目录，盘符权重不参与。
+        if self.path_mode() {
+            return;
+        }
+        if !matches!(
+            self.scope,
+            Scope::All | Scope::Folder | Scope::File | Scope::Program
+        ) {
+            return;
+        }
+        // 窄窗口放不下：类别 Tab 优先。
+        const CONTROL_W: f32 = 148.0;
+        if left < tabs_right + 16.0 {
+            return;
+        }
+
+        // 与 worker 共用同一份锁定判定，避免 UI 说「不生效」而结果照旧。
+        let query = crate::search::query::parse(&self.input, self.scope);
+        let base_folder = if self.typing_global {
+            None
+        } else {
+            self.typing_folder.as_deref()
+        };
+        let weights = crate::search::drive_weight::EffectiveWeights::new(
+            &self.cfg.rank,
+            &query,
+            &self.filters,
+            self.browse_root.as_deref(),
+            base_folder,
+        );
+        let pinned = weights.is_pinned(letter);
+        let enabled = !pinned;
+        let weight = self.cfg.rank.drive_weight(letter);
+
+        let color = if pinned {
+            theme.dim
+        } else if weight == 0 {
+            theme.amber
+        } else {
+            theme.sub
+        };
+        let label_galley =
+            painter.layout_no_wrap(format!("{letter}盘"), ui::text_font(11.0), color);
+        let value_text = if weight == 0 {
+            "不检索".to_string()
+        } else {
+            weight.to_string()
+        };
+        let value_galley = painter.layout_no_wrap(value_text, ui::mono_font(11.0), color);
+        painter.galley(
+            egui::pos2(left, y + 11.0 - label_galley.size().y / 2.0),
+            label_galley.clone(),
+            color,
+        );
+        painter.galley(
+            egui::pos2(
+                left + CONTROL_W - value_galley.size().x,
+                y + 11.0 - value_galley.size().y / 2.0,
+            ),
+            value_galley.clone(),
+            color,
+        );
+
+        let slider_rect = Rect::from_min_max(
+            egui::pos2(left + label_galley.size().x + 8.0, y + 1.0),
+            egui::pos2(left + CONTROL_W - value_galley.size().x - 8.0, y + 21.0),
+        );
+        let mut value = weight as f32;
+        let slider = egui::Slider::new(&mut value, 0.0..=100.0)
+            .integer()
+            .show_value(false)
+            .trailing_fill(true);
+        let response = ui
+            .scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(slider_rect)
+                    .id_salt(("lstr-drive-weight", letter))
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    // egui 默认浅色主题的滑轨与 Frost 底色几乎同色（截图里只剩
+                    // 一个悬空圆点）。显式给轨道/已选段上色，权重一眼可读。
+                    ui.visuals_mut().widgets.inactive.bg_fill = theme.hair2;
+                    ui.visuals_mut().widgets.hovered.bg_fill = theme.hair2;
+                    ui.visuals_mut().widgets.noninteractive.bg_fill = theme.hair;
+                    ui.visuals_mut().widgets.active.bg_fill = theme.amber;
+                    ui.visuals_mut().selection.bg_fill = theme.amber.gamma_multiply(0.6);
+                    ui.spacing_mut().slider_width = (slider_rect.width() - 4.0).max(50.0);
+                    ui.add_enabled(enabled, slider)
+                },
+            )
+            .inner;
+        let tooltip = if pinned {
+            format!(
+                "当前查询已锁定 {letter} 盘（{letter}: 或 path:{letter}:\\…），此滑块不生效；删掉条件后偏好恢复"
+            )
+        } else if weight == 0 {
+            format!("{letter} 盘不参与检索；向右拖动可恢复（0 = 不检索，100 = 与其它盘同等）")
+        } else {
+            format!(
+                "{letter} 盘权重：100 = 与其它盘同等，0 = 完全不检索。显式 {letter}: / path:{letter}:\\… 条件优先于此设置"
+            )
+        };
+        let response = response.on_hover_text(tooltip);
+        if enabled && response.changed() {
+            self.cfg.rank
+                .set_drive_weight(letter, value.round().clamp(0.0, 100.0) as u8);
+            let now = Instant::now();
+            let due = self
+                .drive_query_at
+                .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(180));
+            if due || response.drag_stopped() {
+                self.drive_query_at = Some(now);
+                self.trigger(ui.ctx());
+            }
+            if response.drag_stopped() || !response.dragged() {
+                let _ = self.cfg.save();
+            }
+        }
     }
 
     fn filter_items(&self, kind: FilterMenuKind) -> Vec<FilterItem> {
@@ -9828,6 +9980,107 @@ impl LstrApp {
                 // 设置页打开时 footer 不绘制,toast 只作为关闭设置后的兜底;
                 // 页面内的可见提示是上面那行「至少保留一个卷」。
                 self.toast(ctx, "至少保留一个盘".to_string());
+            }
+        }
+
+        // —— 盘符权重 ——
+        // 与「索引卷」相邻：先决定哪些盘进索引，再调各盘的候选份额与同档排序。
+        // 0 = 不检索（引擎整卷跳过，可随时拖回）；显式 C: / path:C:\… 条件优先。
+        let indexed: Vec<char> = known
+            .iter()
+            .copied()
+            .filter(|letter| self.cfg.index.volume_enabled(*letter))
+            .collect();
+        if !indexed.is_empty() {
+            Self::settings_label(painter, &theme, area.left(), y, "盘符权重");
+            const WEIGHT_COLS: usize = 2;
+            const WEIGHT_ROW_H: f32 = 26.0;
+            const WEIGHT_GAP: f32 = 8.0;
+            let start_x = area.left() + 130.0;
+            let cell_w = ((area.right() - start_x - WEIGHT_GAP * (WEIGHT_COLS as f32 - 1.0))
+                / WEIGHT_COLS as f32)
+                .floor()
+                .max(140.0);
+            let mut weight_changed = false;
+            for (index, letter) in indexed.iter().copied().enumerate() {
+                let col = index % WEIGHT_COLS;
+                let row = index / WEIGHT_COLS;
+                let cell = Rect::from_min_size(
+                    egui::pos2(
+                        start_x + col as f32 * (cell_w + WEIGHT_GAP),
+                        y + row as f32 * (WEIGHT_ROW_H + 4.0),
+                    ),
+                    egui::vec2(cell_w, WEIGHT_ROW_H),
+                );
+                let mut weight = self.cfg.rank.drive_weight(letter);
+                let color = if weight == 0 { theme.amber } else { theme.sub };
+                painter.text(
+                    egui::pos2(cell.left(), cell.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("{letter}盘"),
+                    ui::text_font(11.0),
+                    color,
+                );
+                let value_text = if weight == 0 {
+                    "不检索".to_string()
+                } else {
+                    weight.to_string()
+                };
+                let value_galley =
+                    painter.layout_no_wrap(value_text, ui::mono_font(10.5), color);
+                painter.galley(
+                    egui::pos2(
+                        cell.right() - value_galley.size().x,
+                        cell.center().y - value_galley.size().y / 2.0,
+                    ),
+                    value_galley.clone(),
+                    color,
+                );
+                let slider_rect = Rect::from_min_max(
+                    egui::pos2(cell.left() + 32.0, cell.top() + 2.0),
+                    egui::pos2(cell.right() - value_galley.size().x - 8.0, cell.bottom() - 2.0),
+                );
+                let mut value = weight as f32;
+                let slider = egui::Slider::new(&mut value, 0.0..=100.0)
+                    .integer()
+                    .show_value(false)
+                    .trailing_fill(true);
+                if ui
+                    .scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(slider_rect)
+                            .id_salt(("lstr-drive-weight-setting", letter))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        |ui| {
+                            ui.visuals_mut().widgets.inactive.bg_fill = theme.hair2;
+                            ui.visuals_mut().widgets.hovered.bg_fill = theme.hair2;
+                            ui.visuals_mut().widgets.noninteractive.bg_fill = theme.hair;
+                            ui.visuals_mut().widgets.active.bg_fill = theme.amber;
+                            ui.visuals_mut().selection.bg_fill = theme.amber.gamma_multiply(0.6);
+                            ui.spacing_mut().slider_width = (slider_rect.width() - 4.0).max(50.0);
+                            ui.add(slider)
+                        },
+                    )
+                    .inner
+                    .changed()
+                {
+                    weight = value.round().clamp(0.0, 100.0) as u8;
+                    self.cfg.rank.set_drive_weight(letter, weight);
+                    weight_changed = true;
+                }
+            }
+            let rows = indexed.len().div_ceil(WEIGHT_COLS);
+            y += rows as f32 * (WEIGHT_ROW_H + 4.0) + 18.0;
+            painter.text(
+                egui::pos2(area.left(), y - 14.0),
+                Align2::LEFT_TOP,
+                "0 = 不检索该盘；C: / path:C:\\… 等显式条件优先于权重",
+                ui::mono_font(10.0),
+                theme.dim,
+            );
+            if weight_changed {
+                let _ = self.cfg.save();
+                self.trigger(ctx);
             }
         }
 

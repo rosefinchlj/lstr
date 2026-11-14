@@ -244,7 +244,12 @@ fn fixture() -> Option<Fixture> {
 fn search(fx: &Fixture, input: &str, scope: Scope, filters: &SearchFilters) -> (Vec<Entry>, usize) {
     let q = query::parse(input, scope);
     fx.provider
-        .search(&q, filters, 50)
+        .search(
+            &q,
+            filters,
+            50,
+            &crate::search::drive_weight::EffectiveWeights::neutral(),
+        )
         .unwrap_or_else(|err| panic!("搜索 {input:?} 失败: {err}"))
 }
 

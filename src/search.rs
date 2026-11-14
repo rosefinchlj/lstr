@@ -6,6 +6,7 @@ pub mod calc;
 mod acceptance_tests;
 pub mod builtin;
 pub mod conditions;
+pub mod drive_weight;
 pub mod entrymeta;
 pub mod filters;
 pub mod fuzzy;
@@ -1286,7 +1287,30 @@ fn finalize_entries(
     keyword_rows: Vec<Entry>,
 ) -> Vec<Entry> {
     let noise = lstr_index::engine::NoiseRules::from_static(exclude_patterns(config));
-    finalize_entries_with_pending(entries, request, history, config, keyword_rows, &noise, None).0
+    let weights = weights_for_request(request);
+    finalize_entries_with_pending(
+        entries,
+        request,
+        history,
+        config,
+        keyword_rows,
+        &noise,
+        None,
+        &weights,
+    )
+    .0
+}
+
+/// 本次请求的盘符权重（worker 与测试共用一处计算）。
+/// 必须在浏览/目录上下文改写 `query` 之后调用：`path_filter` 决定「锁定」判定。
+fn weights_for_request(request: &Request) -> crate::search::drive_weight::EffectiveWeights {
+    crate::search::drive_weight::EffectiveWeights::new(
+        &request.rank,
+        &request.query,
+        &request.filters,
+        request.browse_root.as_deref(),
+        request.base_folder.as_deref(),
+    )
 }
 
 /// finalize 的惰性元数据版:rank 之后、去重/截断之前,只对「会进入最终列表」
@@ -1304,6 +1328,7 @@ fn finalize_entries_with_pending(
     keyword_rows: Vec<Entry>,
     noise: &lstr_index::engine::NoiseRules,
     pending: Option<&PendingMeta>,
+    drive_weights: &crate::search::drive_weight::EffectiveWeights,
 ) -> (Vec<Entry>, f64) {
     // 排除行硬过滤:索引层已不收录排除目录,但历史/收藏等来源仍可能
     // 带进已排除路径;这里统一剔除,保证「排除=搜不到」对所有来源成立。
@@ -1331,6 +1356,7 @@ fn finalize_entries_with_pending(
             &history,
             config.app_boost,
             &request.rank,
+            drive_weights,
         );
     }
     let t_rank = t_mark.elapsed().as_secs_f64() * 1000.0;
@@ -1648,12 +1674,14 @@ fn browse_response(
         .collect();
     let total = entries.len();
     if let Ok(history) = history.lock() {
+        // 浏览目录是单卷列目录、且由用户显式导航进入：盘符权重不参与。
         rank::rank_with(
             &mut entries,
             filter,
             &history,
             config.app_boost,
             &request.rank,
+            &crate::search::drive_weight::EffectiveWeights::neutral(),
         );
     }
     // 浏览目录不是「搜索前 N 条」：放宽上限，列表靠 UI 滚动查看。
@@ -2114,6 +2142,10 @@ fn run_worker(args: WorkerArgs) {
             continue;
         }
 
+        // 盘符权重：必须放在浏览/目录上下文改写 query（path_filter）之后算，
+        // 否则「Explorer 里在 C:\work 就地搜索」会被误判成没有锁定 C。
+        let drive_weights = weights_for_request(&request);
+
         // 目录/路径范围或纯文件过滤（ext:/path:/时间/类型/盘符）只搜文件：
         // 应用、UWP、命令、关键字都不应该混进来。
         let path_scoped = request.browse_root.is_some()
@@ -2322,6 +2354,7 @@ fn run_worker(args: WorkerArgs) {
                                 &request.filters,
                                 folder_fetch,
                                 file_fetch,
+                                &drive_weights,
                             );
                             match r_split {
                                 Ok(mut result) => {
@@ -2421,7 +2454,7 @@ fn run_worker(args: WorkerArgs) {
                             } else {
                                 let t_exact = Instant::now();
                                 let r_exact =
-                                    b.search_exact(&request.query, &request.filters, 50);
+                                    b.search_exact(&request.query, &request.filters, 50, &drive_weights);
                                 diag_exact = t_exact.elapsed().as_secs_f32() * 1000.0;
                                 if let Ok((mut exact, _)) = r_exact {
                                     pending_meta.mark(&exact, false);
@@ -2436,7 +2469,7 @@ fn run_worker(args: WorkerArgs) {
                     let mut needs_exact = false;
                     if let Some(b) = &builtin {
                         let fetch = fetch_count(&request.query, request.limit, request.deliver);
-                        match b.search(&request.query, &request.filters, fetch) {
+                        match b.search(&request.query, &request.filters, fetch, &drive_weights) {
                             Ok((mut files, count)) => {
                                 total = count;
                                 needs_exact = count > files.len();
@@ -2454,7 +2487,7 @@ fn run_worker(args: WorkerArgs) {
                     if needs_exact {
                         if let Some(b) = &builtin {
                             if let Ok((mut exact, _)) =
-                                b.search_exact(&request.query, &request.filters, 50)
+                                b.search_exact(&request.query, &request.filters, 50, &drive_weights)
                             {
                                 pending_meta.mark(&exact, false);
                                 entries.append(&mut exact);
@@ -2501,6 +2534,7 @@ fn run_worker(args: WorkerArgs) {
             keyword_rows,
             &noise,
             (!pending_meta.is_empty()).then_some(&pending_meta),
+            &drive_weights,
         );
         let diag_meta = meta_ms as f32;
         let diag_finalize =
@@ -2970,6 +3004,7 @@ mod tests {
             Vec::new(),
             &noise,
             None,
+            &crate::search::drive_weight::EffectiveWeights::neutral(),
         );
         let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
         assert!(!ids.contains(&"inside"), "排除目录子孙必须被剔除");

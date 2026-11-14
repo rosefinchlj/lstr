@@ -1,5 +1,6 @@
 use crate::assets::{ActionDef, CommandDef, Favorite};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -245,6 +246,27 @@ pub struct RankConfig {
     /// 噪声规则表：可在设置「噪声」页增删改。`exclude = true` 的行是「排除」
     /// 语义（索引层整树剔除，不进结果），`exclude = false` 为降权行。
     pub noise_rules: Vec<NoiseRule>,
+    /// 盘符权重（大写盘符 → 0..=100）。0 = 完全不检索该盘（引擎级硬排除）；
+    /// 1..=100 = 参与查询，但候选份额与同档排序分按比例下调。
+    /// 缺省 = 系统盘 50、其它盘 100。显式条件（`C:` / `path:C:\…` / 位置 /
+    /// 浏览 / Explorer 就地搜索）命中某盘时，该盘本次请求按 100 处理。
+    #[serde(default = "default_drive_weights")]
+    pub drive_weights: BTreeMap<String, u8>,
+}
+
+/// 系统盘盘符（`%SystemDrive%`，异常时回落 C）。
+pub fn system_drive_letter() -> char {
+    std::env::var("SystemDrive")
+        .ok()
+        .and_then(|value| value.chars().next())
+        .map(|letter| letter.to_ascii_uppercase())
+        .filter(|letter| letter.is_ascii_uppercase())
+        .unwrap_or('C')
+}
+
+/// 盘符权重的出厂默认：系统盘降到 50（用户的资料通常在其它盘），其余 100。
+fn default_drive_weights() -> BTreeMap<String, u8> {
+    BTreeMap::from([(system_drive_letter().to_string(), 50)])
 }
 
 /// 一条噪声规则：`exclude = false` 时路径（不区分大小写）包含 `pattern`
@@ -274,6 +296,7 @@ impl Default for RankConfig {
             recent_boost: 15,
             noise_strength: 100,
             noise_rules: default_noise_rules(),
+            drive_weights: default_drive_weights(),
         }
     }
 }
@@ -412,6 +435,44 @@ impl RankConfig {
         ];
         tiers.sort_by(|a, b| b.1.cmp(&a.1));
         tiers
+    }
+
+    /// 某盘的权重：配置里没有 = 100（中性）。非法盘符同样按中性处理。
+    pub fn drive_weight(&self, letter: char) -> u8 {
+        let letter = letter.to_ascii_uppercase();
+        self.drive_weights
+            .get(&letter.to_string())
+            .copied()
+            .unwrap_or(100)
+            .min(100)
+    }
+
+    /// 写入某盘权重（搜索栏滑块 / 设置页共用）。写 100 仍保留显式键，
+    /// 避免「用户调到 100」被当成缺省而在下次 load 时回落系统盘默认值。
+    pub fn set_drive_weight(&mut self, letter: char, weight: u8) {
+        let letter = letter.to_ascii_uppercase();
+        if !letter.is_ascii_uppercase() {
+            return;
+        }
+        self.drive_weights
+            .insert(letter.to_string(), weight.min(100));
+    }
+
+    /// 手写 config.toml 的归一化：键统一成大写单字母、值夹到 0..=100，
+    /// 非法键直接丢弃（不阻断整份配置加载）。
+    pub fn normalize_drive_weights(&mut self) {
+        let map = std::mem::take(&mut self.drive_weights);
+        let mut out = BTreeMap::new();
+        for (key, weight) in map {
+            let Some(letter) = key.trim().chars().next() else {
+                continue;
+            };
+            let letter = letter.to_ascii_uppercase();
+            if letter.is_ascii_uppercase() {
+                out.insert(letter.to_string(), weight.min(100));
+            }
+        }
+        self.drive_weights = out;
     }
 }
 
@@ -557,6 +618,7 @@ impl Config {
             // 补齐旧配置缺少的内置噪声规则（新增规则不靠用户手动「恢复默认」）。
             Ok(mut cfg) => {
                 cfg.rank.backfill_missing_noise_rules();
+                cfg.rank.normalize_drive_weights();
                 cfg.max_load_results = normalize_max_load_results(cfg.max_load_results);
                 cfg.index.normalize_volumes();
                 cfg.index.normalize();
@@ -610,6 +672,39 @@ pub fn parse_hex(input: &str) -> Option<[u8; 3]> {
 mod tests {
     use super::*;
 
+
+    // —— 盘符权重(rank.drive_weights)——
+
+    #[test]
+    fn drive_weights_default_to_system_drive_half() {
+        let cfg = Config::default();
+        let system = system_drive_letter();
+        assert_eq!(cfg.rank.drive_weight(system), 50);
+        assert_eq!(cfg.rank.drive_weight('Z'), 100, "未配置的盘保持中性");
+    }
+
+    #[test]
+    fn drive_weight_normalization_uppercases_and_clamps() {
+        let mut rank = RankConfig::default();
+        rank.drive_weights.clear();
+        rank.drive_weights.insert(" c ".to_string(), 250);
+        rank.drive_weights.insert("1".to_string(), 10);
+        rank.drive_weights.insert(String::new(), 1);
+        rank.normalize_drive_weights();
+        assert_eq!(rank.drive_weight('C'), 100, "超过 100 的权重夹到上限");
+        assert_eq!(rank.drive_weights.len(), 1, "非字母/空键被丢弃");
+    }
+
+    #[test]
+    fn drive_weight_survives_toml_roundtrip() {
+        let mut cfg = Config::default();
+        cfg.rank.set_drive_weight('E', 20);
+        cfg.rank.set_drive_weight('C', 100);
+        let text = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(back.rank.drive_weight('E'), 20);
+        assert_eq!(back.rank.drive_weight('C'), 100, "显式 100 不能被默认值覆盖");
+    }
 
     // —— 索引卷选择(index.volumes)——
 
