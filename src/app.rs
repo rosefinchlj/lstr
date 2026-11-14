@@ -1659,6 +1659,11 @@ pub struct LstrApp {
     crumb_more: bool,
     /// 设置页「唤起热键」录制状态（None = 未在录制）。
     hotkey_recording: Option<HotkeyRecording>,
+    /// 「噪声」页规则列表的过滤词（子序列模糊匹配；空 = 显示全部）。
+    noise_filter: String,
+    /// 正在编辑的规则行（未过滤下标）：过滤生效时也要保住它，否则输入到
+    /// 一半规则不再匹配、行被抽走，焦点和光标一起丢。
+    noise_filter_keep: Option<usize>,
 }
 
 impl LstrApp {
@@ -1828,6 +1833,8 @@ impl LstrApp {
             crumb_more: false,
             typing_global: false,
             hotkey_recording: None,
+            noise_filter: String::new(),
+            noise_filter_keep: None,
         }
     }
 
@@ -9706,7 +9713,47 @@ impl LstrApp {
         let mut rules = self.cfg.rank.noise_rules.clone();
         let mut changed = false;
         let mut remove = None;
-        let list_top = area.top() + 56.0;
+
+        // 过滤框:规则可能上百条(内置段名 + 用户自定义),没有过滤只能滚。
+        // 子序列匹配(不要求连续、大小写与斜杠方向不敏感):`nmd` 命中
+        // node_modules,`tgt rel` 命中 -target/release/。
+        let filter_h = 26.0;
+        let filter_rect = Rect::from_min_max(
+            egui::pos2(area.left(), area.top() + 54.0),
+            egui::pos2(area.right(), area.top() + 54.0 + filter_h),
+        );
+        let mut keep = self.noise_filter_keep;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(filter_rect), |ui| {
+            ui.horizontal(|ui| {
+                let clear_w = if self.noise_filter.is_empty() { 0.0 } else { 26.0 };
+                let edit_w = (filter_rect.width() - 96.0 - clear_w).max(120.0);
+                let resp = ui.add_sized(
+                    [edit_w, filter_h - 2.0],
+                    egui::TextEdit::singleline(&mut self.noise_filter)
+                        .hint_text("过滤规则（模糊：nmd → node_modules）"),
+                );
+                if resp.changed() {
+                    // 过滤词变了:不再保护上一帧的编辑行(它可能已不匹配)
+                    keep = None;
+                }
+                if !self.noise_filter.is_empty() && ui.button("×").clicked() {
+                    self.noise_filter.clear();
+                    keep = None;
+                }
+                let shown = rules
+                    .iter()
+                    .filter(|r| noise_rule_matches(&r.pattern, &self.noise_filter))
+                    .count();
+                ui.label(
+                    egui::RichText::new(format!("{shown}/{} 条", rules.len()))
+                        .font(ui::mono_font(10.5))
+                        .color(theme.sub),
+                );
+            });
+        });
+        let filter = self.noise_filter.clone();
+        let filtering = !filter.trim().is_empty();
+        let list_top = filter_rect.bottom() + 8.0;
         let list_rect = Rect::from_min_max(
             egui::pos2(area.left(), list_top),
             egui::pos2(area.right(), (area.bottom() - 40.0).max(list_top + 60.0)),
@@ -9721,6 +9768,14 @@ impl LstrApp {
             .show(ui, |ui| {
                 ui.set_width(list_rect.width());
                 for (index, rule) in rules.iter_mut().enumerate() {
+                    // 过滤中:只有命中词的行显示;正在编辑的行无论如何保住
+                    // (否则输入到一半规则不再匹配,行被抽走、焦点丢失)。
+                    if filtering
+                        && keep != Some(index)
+                        && !noise_rule_matches(&rule.pattern, &filter)
+                    {
+                        continue;
+                    }
                     ui.horizontal(|ui| {
                         let edit_w = (list_rect.width() - 236.0).max(140.0);
                         let response = ui.add_sized(
@@ -9730,6 +9785,9 @@ impl LstrApp {
                         );
                         if response.changed() {
                             changed = true;
+                        }
+                        if response.has_focus() {
+                            keep = Some(index);
                         }
                         // 行为切换:点击在 排除/降权 间翻转
                         let label = if rule.exclude { "排除" } else { "降权" };
@@ -9798,8 +9856,21 @@ impl LstrApp {
                         }
                     });
                 }
+                if filtering
+                    && !rules
+                        .iter()
+                        .any(|r| noise_rule_matches(&r.pattern, &filter))
+                {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("没有匹配的规则")
+                            .font(ui::text_font(11.0))
+                            .color(theme.sub),
+                    );
+                }
             });
         });
+        self.noise_filter_keep = keep;
 
         if let Some(index) = remove {
             if index < rules.len() {
@@ -9848,6 +9919,10 @@ impl LstrApp {
                 exclude: false,
             });
             changed = true;
+            // 新行 pattern 为空,任何过滤词都不会命中它。不清过滤的话用户点
+            // 「添加」后看不到新行,以为按钮没生效。
+            self.noise_filter.clear();
+            self.noise_filter_keep = None;
         }
         if needs_rebuild
             && mk_btn(ui, area.left() + 112.0, 110.0, "lstr-noise-rebuild", "立即重建", true)
@@ -11029,6 +11104,20 @@ fn split_at_chars(text: &str, count: usize) -> (String, String) {
     (head, tail)
 }
 
+/// 「噪声」页规则过滤:空格分隔多个词,每个词都要在该规则文本里按**子序列**
+/// 命中(顺序出现即可,不要求连续),大小写与斜杠方向不敏感。
+///
+/// 例:`nmd` → `node_modules`;`tgt rel` → `-target/release/`;
+/// `d/pd` → `D:\ProgramData`。空查询命中全部。
+fn noise_rule_matches(pattern: &str, query: &str) -> bool {
+    let normalize = |s: &str| s.to_lowercase().replace('\\', "/");
+    let hay = normalize(pattern);
+    normalize(query).split_whitespace().all(|term| {
+        let mut chars = hay.chars();
+        term.chars().all(|c| chars.any(|h| h == c))
+    })
+}
+
 /// 路径行是否属于「拼音命中」。
 ///
 /// 条件(全部满足):
@@ -11088,6 +11177,27 @@ fn hint_for(scope: Scope) -> &'static str {
 #[cfg(test)]
 mod path_layout_tests {
     use super::*;
+
+    #[test]
+    fn noise_rule_filter_matches_subsequences() {
+        // 空查询 = 不过滤
+        assert!(noise_rule_matches("node_modules", ""));
+        assert!(noise_rule_matches("node_modules", "   "));
+        // 子序列(不必连续)、大小写不敏感
+        assert!(noise_rule_matches("node_modules", "nmd"));
+        assert!(noise_rule_matches("node_modules", "NODE"));
+        assert!(noise_rule_matches("node_modules", "modules"));
+        // 多词:每个词都要命中(空格分开)
+        assert!(noise_rule_matches("-target/release/", "tgt rel"));
+        assert!(!noise_rule_matches("-target/release/", "tgt dbg"));
+        // 反斜杠/正斜杠等价
+        assert!(noise_rule_matches(r"D:\ProgramData", "d/pd"));
+        assert!(noise_rule_matches(r"D:\ProgramData", r"d\pd"));
+        // 不命中
+        assert!(!noise_rule_matches("node_modules", "xyz"));
+        // 顺序必须一致(子序列,不是字符集合):target 里 g 之后没有 r
+        assert!(!noise_rule_matches("target", "gtr"));
+    }
 
     #[test]
     fn split_at_chars_keeps_the_full_path() {
