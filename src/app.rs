@@ -291,6 +291,25 @@ fn condition_chip_width(painter: &egui::Painter, label: &str, value: &str, dense
     pad + label_w + value_w + pad + clear
 }
 
+/// 给 egui Slider 补一个实心把手。
+///
+/// egui 的轨道与把手共用 `widgets.inactive.bg_fill`，没法只给把手填色：
+/// 浅色主题下把手是「底色填充 + 深色描边」，看起来是个空心圆圈。这里在
+/// 把手位置再画一个实心圆（半径覆盖描边），`value` 范围固定 0..=100。
+fn paint_slider_knob(
+    painter: &egui::Painter,
+    slider_rect: Rect,
+    value: f32,
+    color: Color32,
+) {
+    let handle_r = slider_rect.height() / 2.5;
+    let x0 = slider_rect.left() + handle_r;
+    let x1 = slider_rect.right() - handle_r;
+    let cx = x0 + (x1 - x0) * (value / 100.0).clamp(0.0, 1.0);
+    // +1.5 覆盖 hovered/active 时 egui 的 expansion(1.0) 与 1px 描边。
+    painter.circle_filled(egui::pos2(cx, slider_rect.center().y), handle_r + 1.5, color);
+}
+
 /// chip 在当前类别下是否只是置灰展示（点击/编辑/删除都不响应）。
 /// 范围/搜索 chip 本身是「当前模式」，不随条件失效，任何时候都能操作。
 fn chip_inactive(kind: ConditionChipKind, conditions_apply: bool) -> bool {
@@ -5224,7 +5243,7 @@ impl LstrApp {
                     }
                 }
 
-                self.paint_tabs(ui, &painter, rect);
+                self.paint_tabs(ui, &painter, rect, rect.right() - PAD - preview_w);
                 self.paint_filters(ui, &painter, rect);
                 let crumb_h = if let Some(root) = self.browse_root.clone() {
                     self.paint_breadcrumb(ui, &painter, rect, &root);
@@ -5384,7 +5403,13 @@ impl LstrApp {
             });
     }
 
-    fn paint_tabs(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
+    fn paint_tabs(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        right_limit: f32,
+    ) {
         let theme = self.theme;
         let y = rect.top() + SEARCH_H + 6.0;
         let mut x = rect.left() + PAD;
@@ -5431,20 +5456,12 @@ impl LstrApp {
             }
             x += width + 18.0;
         }
-        // 系统盘权重滑块：占用 Tab 行右侧的空白区（「Tab · Alt ←→」提示左侧），
-        // 不挤压筛选条；窄窗口 / 浏览模式下自动隐藏。
+        // 系统盘权重滑块：右端对齐列表列（预览打开时随 preview_w 内缩，
+        // 不越过分隔线）；窄窗口 / 浏览模式 / 路径模式下自动隐藏。
         if !self.in_browse() {
-            let hint_left = rect.right() - PAD - 78.0;
-            let control_left = hint_left - 148.0 - 12.0;
-            self.paint_drive_weight(ui, painter, control_left, y - 1.0, x);
+            // 再留 4px：预览分隔线在 list_rect.right() + 3 处。
+            self.paint_drive_weight(ui, painter, right_limit - 148.0 - 4.0, y - 1.0, x);
         }
-        painter.text(
-            egui::pos2(rect.right() - PAD, y + 4.0),
-            Align2::RIGHT_TOP,
-            "Tab · Alt ←→",
-            ui::mono_font(10.0),
-            theme.dim,
-        );
         if let Some(scope) = clicked {
             self.set_scope(ui.ctx(), scope);
         }
@@ -6021,6 +6038,10 @@ impl LstrApp {
                 },
             )
             .inner;
+        let shown = value;
+        // 实心把手（egui 默认把手是底色填充 + 描边，浅色下像空心圈）。
+        let knob_color = if enabled { theme.amber } else { theme.dim };
+        paint_slider_knob(painter, slider_rect, shown, knob_color);
         let tooltip = if pinned {
             format!(
                 "当前查询已锁定 {letter} 盘（{letter}: 或 path:{letter}:\\…），此滑块不生效；删掉条件后偏好恢复"
@@ -9992,7 +10013,38 @@ impl LstrApp {
             .filter(|letter| self.cfg.index.volume_enabled(*letter))
             .collect();
         if !indexed.is_empty() {
-            Self::settings_label(painter, &theme, area.left(), y, "盘符权重");
+            // 标签 + 帮助图标：说明收进 tooltip，不再占一行提示文字。
+            let label_galley =
+                painter.layout_no_wrap("盘符权重".to_string(), ui::text_font(12.5), theme.sub);
+            painter.galley(
+                egui::pos2(area.left(), y + 14.0 - label_galley.size().y / 2.0),
+                label_galley.clone(),
+                theme.sub,
+            );
+            let icon_center = egui::pos2(area.left() + label_galley.size().x + 12.0, y + 14.0);
+            let icon = ui.interact(
+                Rect::from_center_size(icon_center, egui::vec2(16.0, 16.0)),
+                Id::new("lstr-drive-weight-help"),
+                Sense::hover(),
+            );
+            painter.circle_stroke(
+                icon_center,
+                6.0,
+                Stroke::new(
+                    1.0_f32,
+                    if icon.hovered() { theme.text } else { theme.hair2 },
+                ),
+            );
+            painter.text(
+                icon_center,
+                Align2::CENTER_CENTER,
+                "?",
+                ui::mono_font(9.5),
+                if icon.hovered() { theme.text } else { theme.dim },
+            );
+            icon.on_hover_text(
+                "0 = 不检索该盘（引擎整卷跳过，索引仍在，可随时拖回）\n1~100 = 候选窗口份额与同档排序分按比例下调\nC: / -C: / path:C:\\… 等显式条件优先于权重；本设置只影响查询",
+            );
             const WEIGHT_COLS: usize = 2;
             const WEIGHT_ROW_H: f32 = 26.0;
             const WEIGHT_GAP: f32 = 8.0;
@@ -10045,7 +10097,7 @@ impl LstrApp {
                     .integer()
                     .show_value(false)
                     .trailing_fill(true);
-                if ui
+                let response = ui
                     .scope_builder(
                         egui::UiBuilder::new()
                             .max_rect(slider_rect)
@@ -10061,23 +10113,17 @@ impl LstrApp {
                             ui.add(slider)
                         },
                     )
-                    .inner
-                    .changed()
-                {
+                    .inner;
+                let shown = value;
+                paint_slider_knob(painter, slider_rect, shown, theme.amber);
+                if response.changed() {
                     weight = value.round().clamp(0.0, 100.0) as u8;
                     self.cfg.rank.set_drive_weight(letter, weight);
                     weight_changed = true;
                 }
             }
             let rows = indexed.len().div_ceil(WEIGHT_COLS);
-            y += rows as f32 * (WEIGHT_ROW_H + 4.0) + 18.0;
-            painter.text(
-                egui::pos2(area.left(), y - 14.0),
-                Align2::LEFT_TOP,
-                "0 = 不检索该盘；C: / path:C:\\… 等显式条件优先于权重",
-                ui::mono_font(10.0),
-                theme.dim,
-            );
+            y += rows as f32 * (WEIGHT_ROW_H + 4.0) + 10.0;
             if weight_changed {
                 let _ = self.cfg.save();
                 self.trigger(ctx);
