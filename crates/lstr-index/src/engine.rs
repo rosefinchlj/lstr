@@ -93,6 +93,16 @@ pub struct VolumeState {
     sidecar_pending: bool,
     /// 下次允许旁车写盘的时间(节流;失败按同间隔重试,写盘毫秒级,退避无必要)。
     sidecar_retry_at: Option<Instant>,
+    /// 内存日志里已追加进文件的前缀条数:追加式写盘只写
+    /// `sidecar_ops[sidecar_flushed..]`,不再每 5s 重写整份日志。
+    /// 加载(回放完毕)/重建(save)/清日志时与 ops 同步。
+    sidecar_flushed: usize,
+    /// watcher 目录刷新的日志聚合窗口(每卷独立):解压/构建期间目录事件可达
+    /// 数百条/秒,逐条落日志既慢又刷屏,这里按秒级窗口合成一行。
+    watch_dirs: u32,
+    watch_added: u64,
+    watch_removed: u64,
+    watch_log_at: Option<Instant>,
     /// 捕获开关:全量保存成功后武装;对账/重扫/重置窗口内关闭 —— 这些变更
     /// 的持久化走全量快照,不进旁车(关闭期间的位点推进由 journal 回放兜底)。
     capture_on: bool,
@@ -175,23 +185,38 @@ pub const MTIME_BACKFILL_PER_ROUND: usize = 128;
 ///
 /// 依据(2026-11 实测):USN 稳态下就绪卷每 ~60s 全量保存一次,C 卷 117 万条
 /// 每次占引擎线程 1.6-2s,查询每分钟撞上一次 1-3 秒停顿。稳态增量改由旁车
-/// 游标承载(sidecar.rs,毫秒级写盘)后,全量快照只需做阶段归档,10 分钟一次
-/// 足以把崩溃后的 journal 回放窗口控制在分钟级;对账收尾/优雅退出仍立即全量。
-const FULL_SAVE_INTERVAL_SECS: u64 = 600;
+/// 游标承载(sidecar.rs,毫秒级写盘)后,全量快照只需做阶段归档。
+///
+/// 2026-11-14:600s→1800s。旁车改写为追加式后,全量快照不再是「唯一的变更
+/// 载体」,只是归档点;实测 C 卷 65.7MB、D 卷 78MB 的整文件重写是磁盘写入的
+/// 绝对大头(C 卷每 6.7 分钟一次 ≈ 14GB/天)。放宽到 30 分钟把这份写入压到
+/// 约 1/3,代价只是「旁车文件损坏时」的 journal 回放窗口变长(默认
+/// 32MB journal 在本机 ~14MB/h 的变更量下可覆盖约 2 小时,余量充足);
+/// 正常路径(旁车完好)崩溃恢复完全不受影响。对账收尾/优雅退出仍立即全量。
+const FULL_SAVE_INTERVAL_SECS: u64 = 1800;
 
-/// 旁车写盘节流:USN 轮询 500ms 一批,变更按序积压在内存日志,合并 5s 原子
-/// 写一次(几 KB)。崩溃最多丢一个节流窗口的日志 —— 游标以旁车文件里的为准,
-/// 缺口由 journal 回放补齐,不存在丢数据。
+/// 旁车写盘节流:USN 轮询 500ms 一批,变更按序积压在内存日志,合并 5s 追加
+/// 写一次(只写新增块,几 KB)。崩溃最多丢一个节流窗口的日志 —— 游标以旁车
+/// 文件里的为准,缺口由 journal 回放补齐,不存在丢数据。
 const SIDECAR_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// 旁车日志容量上限(变更条数):超出即触发立即全量保存并停捕(内存有界)。
-/// 稳态远达不到;突发批量变更(如解压/同步盘)时回落全量保存的既有路径。
-const SIDECAR_MAX_RECS: usize = 8192;
+/// 旁车日志容量上限(变更条数):超出即触发全量保存并停捕(内存有界)。
+///
+/// 2026-11-14:8192→32768。上限决定「多久全量重写一次整卷快照」——旧值在
+/// C 卷(~20 条/s 变更)下 6.7 分钟就撞顶,每撞一次写 65MB。32k 条约占
+/// 2.5MB 内存、文件约 6.5MB,启动回放仍是毫秒~百毫秒级,把全量间隔拉到
+/// 20 分钟以上;真正的兜底仍由 FULL_SAVE_INTERVAL 与溢出闩共同保证。
+const SIDECAR_MAX_RECS: usize = 32768;
 
 /// 旁车日志溢出后,全量保存的最小延迟:溢出本身有界(停捕),无需秒级抢救;
 /// 60s 上限避免高频变更卷把「溢出→整卷保存→几秒后再溢出」打成连环保存。
 /// 期间的位点缺口由 journal 回放兜底(crash 安全语义不变)。
 const SIDECAR_OVERFLOW_SAVE_DELAY: Duration = Duration::from_secs(60);
+
+/// watcher 目录事件的日志聚合窗口:解压/构建时事件可达数百条/秒,逐条落日志
+/// 既刷屏又制造大量小写(旧实现每条一次 open+write+close)。窗口内合并成
+/// 「多少个目录、增删多少条」一行,诊断信息不丢。
+const WATCH_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 渐进 apply 缓冲:对账/首扫的 Records 不再一口气整条消息打完,而是按块
 /// 消化,块间让宿主线程回去服务查询。按卷分组,保证同卷记录的消费顺序与
@@ -408,6 +433,9 @@ impl Engine {
         sidecar_base: (u64, i64),
         sidecar_cursor: i64,
     ) -> VolumeState {
+        // 加载时回放的 ops 已经在旁车里(文件即权威副本),追加游标直接到末尾,
+        // 否则第一次 maintain 会把整份日志再写一遍。
+        let sidecar_flushed = sidecar_ops.len();
         VolumeState {
             guid,
             letter: h.letter,
@@ -424,6 +452,7 @@ impl Engine {
             save_retry_at: None,
             sidecar_overflowed: false,
             sidecar_ops,
+            sidecar_flushed,
             sidecar_base,
             sidecar_cursor,
             sidecar_pending: false,
@@ -431,6 +460,10 @@ impl Engine {
             capture_on: true,
             usn_watch: UsnWatchState::Off,
             cursor_at: None,
+            watch_dirs: 0,
+            watch_added: 0,
+            watch_removed: 0,
+            watch_log_at: None,
         }
     }
 
@@ -526,7 +559,8 @@ impl Engine {
                     Ok(None) => {}
                     Err(()) => {
                         snapshot::debug_log(&format!(
-                            "sidecar {guid:032x}: corrupt, discarded (recover via journal replay)"
+                            "sidecar {guid:032x}: invalid or incompatible, discarded \
+                             (recover via journal replay)"
                         ));
                         sidecar::remove(&dir, guid);
                     }
@@ -600,6 +634,7 @@ impl Engine {
                 save_retry_at: None,
                 sidecar_overflowed: false,
                 sidecar_ops: Vec::new(),
+                sidecar_flushed: 0,
                 sidecar_base: (0, 0),
                 sidecar_cursor: 0,
                 sidecar_pending: false,
@@ -607,6 +642,10 @@ impl Engine {
                 capture_on: false,
                 usn_watch: UsnWatchState::Off,
                 cursor_at: None,
+                watch_dirs: 0,
+                watch_added: 0,
+                watch_removed: 0,
+                watch_log_at: None,
             });
             self.pinyin.push(PinyinCache::empty());
             let i = self.volumes.len() - 1;
@@ -652,6 +691,7 @@ impl Engine {
             v.complete = false;
             v.capture_on = false;
             v.sidecar_ops = Vec::new();
+            v.sidecar_flushed = 0;
             v.sidecar_pending = false;
             v.sidecar_overflowed = false;
             self.pinyin[i] = PinyinCache::empty();
@@ -758,6 +798,7 @@ impl Engine {
                         // (基线守卫在加载时兜底)。
                         v.capture_on = false;
                         v.sidecar_ops = Vec::new();
+                        v.sidecar_flushed = 0;
                         v.sidecar_pending = false;
                         v.sidecar_overflowed = false;
                         v.sidecar_cursor = v.next_usn;
@@ -987,9 +1028,7 @@ impl Engine {
                         .capture(SidecarOp::Children { parent_frn, recs: recs.clone() }, None);
                 }
                 if added > 0 || removed > 0 {
-                    snapshot::debug_log(&format!(
-                        "watch {guid:032x} parent={parent_frn} added={added} removed={removed}"
-                    ));
+                    self.note_watch_event(i, added, removed);
                 }
             }
             EngineMsg::JournalReset { guid } => {
@@ -1005,6 +1044,7 @@ impl Engine {
                         v.dirty = false;
                         v.capture_on = false;
                         v.sidecar_ops = Vec::new();
+                        v.sidecar_flushed = 0;
                         v.sidecar_pending = false;
                         v.sidecar_overflowed = false;
                         v.sidecar_base = (0, 0);
@@ -1868,6 +1908,16 @@ impl Engine {
     /// 空闲维护:需要的卷 compact + 落盘(旁车优先,全量降频)。
     /// 返回是否做了事(调用方可据此让路)。
     pub fn maintain(&mut self) -> bool {
+        // watcher 聚合日志的补发:窗口到点但此后没有新事件时,最后一批计数
+        // 否则会一直压在内存里不落日志。
+        for i in 0..self.volumes.len() {
+            let due = self.volumes[i]
+                .watch_log_at
+                .is_none_or(|at| at.elapsed() >= WATCH_LOG_INTERVAL);
+            if due && self.volumes[i].watch_dirs > 0 {
+                Self::flush_watch_log(&mut self.volumes[i]);
+            }
+        }
         // 有分片 compact 在进行:本轮只推进它(4ms 片),查询在片间出队。
         if self.running_compact.is_some() {
             self.advance_compact(COMPACT_STEP_BUDGET);
@@ -2138,6 +2188,7 @@ impl Engine {
         v.sidecar_base = (v.journal_id, v.next_usn);
         v.sidecar_cursor = v.next_usn;
         v.sidecar_ops = Vec::new();
+        v.sidecar_flushed = 0;
         v.sidecar_pending = false;
         v.sidecar_retry_at = None;
         v.sidecar_overflowed = false;
@@ -2159,16 +2210,31 @@ impl Engine {
         v.save_retry_at = Some(Instant::now() + Duration::from_secs(secs));
     }
 
-    /// 写旁车文件(内存日志 → 原子小文件)。成功清 pending 并进入节流窗口;
-    /// 失败保留 pending(内存日志是权威副本),下轮再试(写盘毫秒级,固定
-    /// 间隔重试即可,无需退避)。
+    /// 写旁车文件(内存日志新增部分 → 追加块)。成功推进已落盘前缀并进入
+    /// 节流窗口;失败保留待写部分(内存日志是权威副本),下轮再试(写盘毫秒级,
+    /// 固定间隔重试即可,无需退避)。
     fn write_sidecar(&mut self, i: usize) -> bool {
-        let (guid, letter, base, cursor, ops) = {
+        let (guid, letter, base, cursor, ops, total) = {
             let v = &self.volumes[i];
-            (v.guid, v.letter, v.sidecar_base, v.sidecar_cursor, v.sidecar_ops.clone())
+            let from = v.sidecar_flushed.min(v.sidecar_ops.len());
+            (
+                v.guid,
+                v.letter,
+                v.sidecar_base,
+                v.sidecar_cursor,
+                v.sidecar_ops[from..].to_vec(),
+                v.sidecar_ops.len(),
+            )
         };
+        if ops.is_empty() {
+            // 只有游标推进、没有条目级变更:不产生新块,清 pending 即可。
+            let v = &mut self.volumes[i];
+            v.sidecar_pending = false;
+            v.sidecar_retry_at = Some(Instant::now() + SIDECAR_SAVE_INTERVAL);
+            return true;
+        }
         let started = Instant::now();
-        let result = sidecar::save(&self.cfg.index_dir, guid, base, cursor, &ops);
+        let result = sidecar::append(&self.cfg.index_dir, guid, base, cursor, &ops);
         let ms = started.elapsed().as_millis();
         if ms > 100 {
             crate::snapshot::debug_log(&format!(
@@ -2180,6 +2246,7 @@ impl Engine {
         let v = &mut self.volumes[i];
         match result {
             Ok(()) => {
+                v.sidecar_flushed = total;
                 v.sidecar_pending = false;
                 v.sidecar_retry_at = Some(Instant::now() + SIDECAR_SAVE_INTERVAL);
                 true
@@ -2191,6 +2258,35 @@ impl Engine {
                 false
             }
         }
+    }
+
+    /// watcher 目录事件计数:窗口内的增删合并成一行日志(见 WATCH_LOG_INTERVAL)。
+    fn note_watch_event(&mut self, i: usize, added: usize, removed: usize) {
+        let v = &mut self.volumes[i];
+        v.watch_dirs = v.watch_dirs.saturating_add(1);
+        v.watch_added = v.watch_added.saturating_add(added as u64);
+        v.watch_removed = v.watch_removed.saturating_add(removed as u64);
+        let due = v
+            .watch_log_at
+            .is_none_or(|at| at.elapsed() >= WATCH_LOG_INTERVAL);
+        if due {
+            Self::flush_watch_log(v);
+        }
+    }
+
+    /// 落一行 watcher 聚合日志并清空计数(无事件时为空操作)。
+    fn flush_watch_log(v: &mut VolumeState) {
+        if v.watch_dirs == 0 {
+            return;
+        }
+        snapshot::debug_log(&format!(
+            "watch {:032x} dirs={} added={} removed={}",
+            v.guid, v.watch_dirs, v.watch_added, v.watch_removed
+        ));
+        v.watch_dirs = 0;
+        v.watch_added = 0;
+        v.watch_removed = 0;
+        v.watch_log_at = Some(Instant::now());
     }
 
     /// 落盘单个卷。成功返回 true 并清 dirty;失败保留 dirty、指数退避(H6)。
@@ -2800,6 +2896,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 旁车追加式写盘:每个节流窗口只把新增记录追加到文件末尾,历史块字节
+    /// 原样保留(旧实现每次重写「自快照以来的全部日志」,C 卷日志长到 1.6MB
+    /// 时等于每 5s 写 1.6MB)。
+    #[test]
+    fn sidecar_appends_instead_of_rewriting() {
+        let dir = temp_index_dir("sidecar-append");
+        let guid = 0x3333u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain(), "首次全量保存");
+
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec_file(20, 10, "append0.txt")],
+            next_usn: 200,
+        });
+        assert!(engine.maintain(), "首块追加");
+        let first_bytes = std::fs::read(sidecar::path(&dir, guid)).unwrap();
+
+        for k in 1..3u64 {
+            engine.handle(EngineMsg::Records {
+                guid,
+                recs: vec![rec_file(20 + k, 10, &format!("append{k}.txt"))],
+                next_usn: 200 + k as i64,
+            });
+            // 越过 5s 节流窗口(测试里直接清掉到期时间)
+            engine.volumes[0].sidecar_retry_at = None;
+            assert!(engine.maintain(), "后续块追加");
+        }
+        let later = std::fs::read(sidecar::path(&dir, guid)).unwrap();
+        assert!(
+            later.starts_with(&first_bytes),
+            "历史块字节必须原样保留,只允许在末尾增长"
+        );
+        assert!(later.len() > first_bytes.len(), "追加后文件应变长");
+        let sc = sidecar::load(&dir, guid).unwrap().unwrap();
+        assert_eq!(sc.next_usn, 202);
+        assert_eq!(sc.ops.len(), 3);
+        assert_eq!(engine.volumes[0].sidecar_flushed, 3, "已落盘前缀应与日志等长");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 旁车游标/增量日志:稳态变更只写旁车(全量快照不动),重启后
     /// 「快照 + 旁车回放」恢复出与退出时刻一致的 store 与游标;
     /// 旁车日志跨重启延续累积,直到下一次全量保存归档。
@@ -2978,10 +3116,14 @@ mod tests {
             "溢出闩只触发一次,后续批次不得再改截止时间"
         );
 
-        // 模拟溢出延迟已到:全量保存执行
+        // 模拟溢出延迟已到:全量保存执行(大卷走分段保存,按宿主节奏多轮推进)
         engine.volumes[0].save_retry_at = None;
-        assert!(engine.maintain(), "溢出后全量保存应执行");
-        assert!(!engine.volumes[0].dirty);
+        let mut rounds = 0;
+        while engine.volumes[0].dirty && rounds < 500 {
+            assert!(engine.maintain(), "溢出后全量保存应执行");
+            rounds += 1;
+        }
+        assert!(!engine.volumes[0].dirty, "全量保存应在有限轮内完成");
         assert!(!engine.volumes[0].sidecar_overflowed, "保存成功清溢出闩");
         assert!(sidecar::load(&dir, guid).unwrap().is_none(), "全量保存后旁车删除");
         assert_ne!(std::fs::read(&snap_path).unwrap(), before, "快照应已重写");
@@ -3623,9 +3765,10 @@ mod tests {
         });
         assert!(engine.volumes[0].sidecar_pending);
 
-        // 阻断旁车写盘:把 tmp 路径占成目录,File::create 必失败
-        let tmp = dir.join(format!("cur_{guid:032x}.tmp"));
-        std::fs::create_dir_all(&tmp).unwrap();
+        // 阻断旁车写盘:把旁车最终路径占成目录,OpenOptions 打不开必失败
+        // (追加式写盘不经过 tmp,不能再拿 tmp 路径做故障注入)。
+        let blocked = sidecar::path(&dir, guid);
+        std::fs::create_dir_all(&blocked).unwrap();
         engine.flush_all();
 
         // 回落全量:快照已含 gamma,重启直接读到;dirty 随全量成功清除
