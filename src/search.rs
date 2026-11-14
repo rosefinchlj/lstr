@@ -10,6 +10,7 @@ pub mod drive_weight;
 pub mod entrymeta;
 pub mod filters;
 pub mod fuzzy;
+pub mod notes;
 pub mod pinyin;
 pub mod query;
 pub mod rank;
@@ -35,6 +36,10 @@ const APPS_RELOAD_INTERVAL: Duration = Duration::from_secs(90);
 /// 浏览器书签的刷新周期。书签文件由浏览器原子写入，重载只是解析 JSON /
 /// 复制 places.sqlite（本机 500 条量级 <10ms），比应用索引更宽松即可。
 const BOOKMARKS_RELOAD_INTERVAL: Duration = Duration::from_secs(120);
+
+/// 有道云笔记本地库的刷新周期。主库只有几百条、解析 <10ms；主库/WAL
+/// 的 mtime 变了才重载（客户端同步时 WAL 会持续增长）。
+const NOTES_RELOAD_INTERVAL: Duration = Duration::from_secs(120);
 
 /// 首屏交付的候选上限。窗口只按「一屏结果数」长高，其余靠滚轮查看。
 pub(crate) const MIN_DELIVER: usize = 100;
@@ -167,6 +172,11 @@ pub struct SearchService {
     /// 书签 id → 收藏夹层级（「收藏夹栏 › 工作 › 需求」）。worker 每次
     /// 重载书签索引时整体刷新，UI 用它渲染结果行副标题。
     bookmark_folders: Arc<Mutex<HashMap<String, String>>>,
+    /// 有道云笔记索引开关（设置页即时生效）：关闭时清空索引并且不再把
+    /// 笔记并入结果；重新打开会立即读取本地库。
+    notes_enabled: Arc<AtomicBool>,
+    /// 笔记 id → 笔记本层级（「学习 › Rust」），UI 行副标题用。
+    note_folders: Arc<Mutex<HashMap<String, String>>>,
     /// 自研索引状态(设置页/状态行用);worker 线程随时刷新。
     pub index_status: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
     /// 「参与索引的卷」掩码(lstr_index::volmask 位掩码,bit i='A'+i),
@@ -198,6 +208,10 @@ impl SearchService {
         let bookmark_folders: Arc<Mutex<HashMap<String, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let worker_bookmark_folders = Arc::clone(&bookmark_folders);
+        let notes_enabled = Arc::new(AtomicBool::new(config.index.notes));
+        let worker_notes_enabled = Arc::clone(&notes_enabled);
+        let note_folders: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let worker_note_folders = Arc::clone(&note_folders);
         let status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>> = Arc::new(Mutex::new(None));
         let worker_status = Arc::clone(&status_slot);
         // 卷选择:启动时从配置取快照(空列表 = 全部盘),之后设置页改掩码即可
@@ -233,6 +247,8 @@ impl SearchService {
                     apps_dirty: worker_apps_dirty,
                     bookmarks_enabled: worker_bookmarks_enabled,
                     bookmark_folders: worker_bookmark_folders,
+                    notes_enabled: worker_notes_enabled,
+                    note_folders: worker_note_folders,
                     status_slot: worker_status,
                     index_cmd_rx,
                     index_cmd_tx: worker_index_cmd_tx,
@@ -260,6 +276,8 @@ impl SearchService {
             apps_dirty,
             bookmarks_enabled,
             bookmark_folders,
+            notes_enabled,
+            note_folders,
             index_status: status_slot,
             volume_mask,
             index_cmd: index_cmd_tx,
@@ -505,6 +523,19 @@ impl SearchService {
     /// 书签 id → 收藏夹层级快照；UI 在每次拿到新响应时同步一次。
     pub fn bookmark_folders(&self) -> HashMap<String, String> {
         self.bookmark_folders
+            .lock()
+            .map(|map| map.clone())
+            .unwrap_or_default()
+    }
+
+    /// 设置页「有道云笔记」开关：worker 下一轮维护立即清空/重建（不等 TTL）。
+    pub fn set_notes_enabled(&self, on: bool) {
+        self.notes_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// 笔记 id → 笔记本层级快照；UI 在每次拿到新响应时同步一次。
+    pub fn note_folders(&self) -> HashMap<String, String> {
+        self.note_folders
             .lock()
             .map(|map| map.clone())
             .unwrap_or_default()
@@ -1336,9 +1367,9 @@ fn finalize_entries_with_pending(
     let exclude = noise.rules();
     if !exclude.is_empty() {
         entries.retain(|e| match &e.path {
-            // 书签/命令的 path 是 URL/URI，不是文件系统路径：`/cache/`、
+            // 书签/笔记/命令的 path 是 URL/URI，不是文件系统路径：`/cache/`、
             // `-target/` 这类噪声片段会误伤 `https://…/cache/…`。
-            Some(_) if matches!(e.kind, Kind::Bookmark | Kind::Command) => true,
+            Some(_) if matches!(e.kind, Kind::Bookmark | Kind::Note | Kind::Command) => true,
             Some(p) => !exclude
                 .path_excluded(&p.to_string_lossy().to_lowercase().replace('\\', "/")),
             None => true,
@@ -1565,6 +1596,8 @@ struct WorkerArgs {
     apps_dirty: Arc<AtomicBool>,
     bookmarks_enabled: Arc<AtomicBool>,
     bookmark_folders: Arc<Mutex<HashMap<String, String>>>,
+    notes_enabled: Arc<AtomicBool>,
+    note_folders: Arc<Mutex<HashMap<String, String>>>,
     status_slot: Arc<Mutex<Option<builtin::IndexUiStatus>>>,
     index_cmd_rx: Receiver<ClientCommand>,
     /// 控制指令发送端(run_worker 的排除规则变更检测用它发 Rescan 掩码)。
@@ -1614,7 +1647,7 @@ fn browse_response(
             Scope::Folder => entry.kind == Kind::Folder,
             Scope::Program => entry.kind == Kind::Program,
             Scope::File => entry.kind == Kind::File,
-            Scope::App | Scope::Bookmark | Scope::Command => false,
+            Scope::App | Scope::Bookmark | Scope::Note | Scope::Command => false,
         })
         .filter(|entry| {
             drive_mask.is_none_or(|mask| {
@@ -1706,6 +1739,60 @@ fn publish_bookmark_folders(
     }
 }
 
+/// 笔记索引重建后把「id → 笔记本层级」整体推给 UI（行副标题用）。
+fn publish_note_folders(slot: &Arc<Mutex<HashMap<String, String>>>, notes: &notes::NoteIndex) {
+    if let Ok(mut map) = slot.lock() {
+        *map = notes.folder_map();
+    }
+}
+
+/// 笔记专用响应：在通用 finalize 之前返回，避免「仅文件夹命中」的条目
+/// 因为名字不含查询词被 rank 打 0 分后丢掉（搜 rust → 学习 › Rust 整夹）。
+fn notes_response(
+    request: &Request,
+    notes: &notes::NoteIndex,
+    enabled: bool,
+    history: &Arc<Mutex<History>>,
+) -> Response {
+    let started = Instant::now();
+    let take = request.deliver.max(request.limit);
+    let (entries, total) = if !enabled {
+        (Vec::new(), 0)
+    } else if request.query.text.trim().is_empty() {
+        // 空输入 = 最近修改的笔记；total 用真实总数，UI 才会发「加载更多」。
+        (notes.top(take), notes.count())
+    } else {
+        let strict = !request.filters.matches.is_default();
+        // 严格匹配（大小写/全词/正则）时不做拼音/模糊/文件夹兜底，避免
+        // 「区分大小写搜 rust」仍被文件夹路径带出一整夹笔记。严格模式下
+        // 先取全量再复核，total 才与「复核后真正能看到的条数」同口径。
+        let limit = if strict { usize::MAX } else { take };
+        let (mut hits, total) = match history.lock() {
+            Ok(history) => notes.search(
+                &request.query.text,
+                limit,
+                !strict,
+                Some(&history),
+                &request.rank,
+            ),
+            Err(_) => notes.search(&request.query.text, limit, !strict, None, &request.rank),
+        };
+        hits.retain(|entry| {
+            app_matches_options(&entry.name, &request.query.text, &request.filters)
+        });
+        let total = if strict { hits.len() } else { total };
+        hits.truncate(take);
+        (hits, total)
+    };
+    Response {
+        generation: request.generation,
+        entries,
+        total,
+        elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
+        error: None,
+    }
+}
+
 fn run_worker(args: WorkerArgs) {
     let WorkerArgs {
         rx,
@@ -1716,6 +1803,8 @@ fn run_worker(args: WorkerArgs) {
         apps_dirty,
         bookmarks_enabled,
         bookmark_folders,
+        notes_enabled,
+        note_folders,
         status_slot,
         index_cmd_rx,
         index_cmd_tx,
@@ -1789,6 +1878,19 @@ fn run_worker(args: WorkerArgs) {
             "bookmarks: loaded {} entries",
             bookmarks.count()
         ));
+    }
+    // 有道云笔记：主剧本是只读 SQLite，本机 391 条有效笔记约 10ms。
+    // 关闭时保持空索引，搜索路径也不会再查询它。
+    let mut notes = if notes_enabled.load(Ordering::Relaxed) {
+        notes::NoteIndex::load()
+    } else {
+        notes::NoteIndex::empty()
+    };
+    let mut notes_loaded = Instant::now();
+    let mut notes_stamp = notes::source_stamp();
+    publish_note_folders(&note_folders, &notes);
+    if notes_enabled.load(Ordering::Relaxed) {
+        lstr_index::snapshot::debug_log(&format!("notes: loaded {} entries", notes.count()));
     }
     let mut dir_cache = browse::DirCache::new();
     let (uwp_tx, uwp_rx) = mpsc::channel::<Vec<Entry>>();
@@ -2012,6 +2114,28 @@ fn run_worker(args: WorkerArgs) {
                 bookmarks_loaded = Instant::now();
             }
         }
+        // 笔记索引：同书签，TTL + 主库/WAL mtime；开关关闭立即清空。
+        if forced || notes_loaded.elapsed() > NOTES_RELOAD_INTERVAL {
+            let enabled = notes_enabled.load(Ordering::Relaxed);
+            let stamp = notes::source_stamp();
+            if !enabled {
+                notes = notes::NoteIndex::empty();
+                notes_stamp.clear();
+                notes_loaded = Instant::now();
+                publish_note_folders(&note_folders, &notes);
+            } else if forced || stamp != notes_stamp {
+                notes = notes::NoteIndex::load();
+                notes_stamp = stamp;
+                notes_loaded = Instant::now();
+                publish_note_folders(&note_folders, &notes);
+                lstr_index::snapshot::debug_log(&format!(
+                    "notes: reloaded {} entries",
+                    notes.count()
+                ));
+            } else {
+                notes_loaded = Instant::now();
+            }
+        }
         while let Ok(next) = rx.try_recv() {
             // 只保留最新请求(取消语义),每个出队的都要回退等待计数
             request = next;
@@ -2204,6 +2328,7 @@ fn run_worker(args: WorkerArgs) {
         let mut diag_split = 0f32;
         let mut diag_apps = 0f32;
         let mut diag_bookmarks = 0f32;
+        let mut diag_notes = 0f32;
         let mut diag_exact = 0f32;
         // 自定义关键字行（g rust → 用 Google 搜索）：之后钉在结果顶部，不参与打分。
         let mut keyword_rows: Vec<Entry> = Vec::new();
@@ -2217,6 +2342,20 @@ fn run_worker(args: WorkerArgs) {
         // 填好(供 rank 零 FS 打分),size/展示用 mtime 由 finalize 只对最终
         // 展示条目逐条 find_meta(见 finalize_entries_with_pending)。
         let mut pending_meta = PendingMeta::new();
+
+        // 笔记页走专用响应：文件夹命中（名字不含查询词）在通用 finalize 里
+        // 会被 rank 打 0 分后丢弃，必须在这里整表返回。
+        if request.query.scope == Scope::Note && !keyword_only {
+            let response = notes_response(
+                &request,
+                &notes,
+                notes_enabled.load(Ordering::Relaxed),
+                &history,
+            );
+            send_response(&tx, &request, response);
+            ctx.request_repaint();
+            continue;
+        }
 
         // 输入框为空但筛选/日期条件仍生效时，不能走「最近使用」分支：
         // 条件单独查询要交给引擎做全表过滤（空 token 的过滤器路径）。
@@ -2434,6 +2573,38 @@ fn run_worker(args: WorkerArgs) {
                             total += bookmark_hits.len();
                             entries.append(&mut bookmark_hits);
                         }
+                        // 有道云笔记：只并入「名称命中」；文件夹命中留给
+                        // 「笔记」页，否则在「全部」里搜 rust 会被整夹笔记淹没。
+                        if notes_enabled.load(Ordering::Relaxed) {
+                            let t_notes = Instant::now();
+                            let (mut note_hits, _) = match history.lock() {
+                                Ok(history) => notes.search(
+                                    &request.query.text,
+                                    request.limit,
+                                    false,
+                                    Some(&history),
+                                    &request.rank,
+                                ),
+                                Err(_) => notes.search(
+                                    &request.query.text,
+                                    request.limit,
+                                    false,
+                                    None,
+                                    &request.rank,
+                                ),
+                            };
+                            // 严格匹配同样约束笔记：拼音/模糊命中按名字复核。
+                            note_hits.retain(|entry| {
+                                app_matches_options(
+                                    &entry.name,
+                                    &request.query.text,
+                                    &request.filters,
+                                )
+                            });
+                            diag_notes = t_notes.elapsed().as_secs_f32() * 1000.0;
+                            total += note_hits.len();
+                            entries.append(&mut note_hits);
+                        }
                     }
                     // M7:应用/命令命中也要计入总数,
                     // 否则会出现「显示 0 个结果但列表里有内容」。
@@ -2542,11 +2713,12 @@ fn run_worker(args: WorkerArgs) {
         let diag_total = started.elapsed().as_secs_f32() * 1000.0;
         if (diag_total > 15.0 || profile_queries()) && !request.query.text.is_empty() {
             lstr_index::snapshot::debug_log(&format!(
-                "search: stage gen={} split={:.1}ms apps={:.1}ms bm={:.1}ms exact={:.1}ms finalize={:.1}ms meta={:.1}ms total={:.1}ms text={:?}",
+                "search: stage gen={} split={:.1}ms apps={:.1}ms bm={:.1}ms notes={:.1}ms exact={:.1}ms finalize={:.1}ms meta={:.1}ms total={:.1}ms text={:?}",
                 request.generation,
                 diag_split,
                 diag_apps,
                 diag_bookmarks,
+                diag_notes,
                 diag_exact,
                 diag_finalize,
                 diag_meta,
@@ -2634,6 +2806,7 @@ fn scope_matches(scope: Scope, entry: &Entry) -> bool {
         Scope::File => entry.kind == Kind::File,
         Scope::App => entry.kind == Kind::App,
         Scope::Bookmark => entry.kind == Kind::Bookmark,
+        Scope::Note => entry.kind == Kind::Note,
         Scope::Command => entry.kind == Kind::Command,
     }
 }
@@ -2660,6 +2833,9 @@ pub fn stale_history_entry(entry: &Entry, apps: &[Entry]) -> bool {
         // 书签是 URL：浏览器的收藏夹文件可能暂时读不到（未安装/被占用），
         // 此时把历史条目杀掉反而像是丢了；URL 本身永远可尝试打开。
         Kind::Bookmark => false,
+        // 笔记是 URL：本地库暂时读不到（同步/被占用）时也不该杀掉历史条目，
+        // 网页链接本身永远可以尝试打开。
+        Kind::Note => false,
         Kind::Command => false,
     }
 }

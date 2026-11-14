@@ -10,6 +10,9 @@ pub enum Kind {
     Command,
     /// 浏览器收藏夹条目：`path` 存 URL，Enter 交给默认浏览器打开。
     Bookmark,
+    /// 有道云笔记条目：`path` 存网页版笔记链接，Enter 交给默认浏览器打开。
+    /// 只在本地库可读时产生（见 `search/notes.rs`）。
+    Note,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,19 +23,21 @@ pub enum Scope {
     File,
     App,
     Bookmark,
+    Note,
     Command,
 }
 
 impl Scope {
     /// 标签栏显示顺序：应用放第一列；默认选中「全部」由启动时 scope 决定。
-    /// 书签与命令同为「非文件系统」来源，并排放在最后两列。
-    pub const ALL: [Scope; 7] = [
+    /// 书签/笔记/命令同为「非文件系统」来源，并排放在最后三列。
+    pub const ALL: [Scope; 8] = [
         Scope::App,
         Scope::All,
         Scope::Folder,
         Scope::Program,
         Scope::File,
         Scope::Bookmark,
+        Scope::Note,
         Scope::Command,
     ];
 
@@ -44,6 +49,7 @@ impl Scope {
             Scope::File => "文件",
             Scope::App => "应用",
             Scope::Bookmark => "书签",
+            Scope::Note => "笔记",
             Scope::Command => "命令",
         }
     }

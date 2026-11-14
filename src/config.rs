@@ -108,6 +108,11 @@ pub struct IndexConfig {
     /// 书签进入「全部」搜索结果，Enter 用默认浏览器打开。设置页即时生效。
     #[serde(default = "default_true")]
     pub bookmarks: bool,
+    /// 索引有道云笔记的本地库（只读）：
+    /// 笔记进入「全部」与「笔记」页，Enter 用默认浏览器打开网页版笔记。
+    /// 设置页即时生效；关闭后 worker 立即清空索引。
+    #[serde(default = "default_true")]
+    pub notes: bool,
 }
 
 fn default_incremental() -> String {
@@ -131,6 +136,7 @@ impl Default for IndexConfig {
             scan_throttle_ms: 0,
             journal_poll_ms: default_journal_poll_ms(),
             bookmarks: true,
+            notes: true,
         }
     }
 }
