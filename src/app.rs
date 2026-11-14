@@ -35,6 +35,8 @@ enum IconSource {
     Favicon(String),
     /// 应用 / 程序等普通条目：从真实路径取 shell 图标。
     Shell(String),
+    /// 自绘字形（有道云笔记）：不取 shell/favicon，直接用 paint_file_icon。
+    Glyph,
 }
 
 struct IconJob {
@@ -49,6 +51,8 @@ fn icon_source(entry: &Entry) -> IconSource {
         Kind::Folder => IconSource::Generic(entry.full_path(), GENERIC_FOLDER_ICON),
         Kind::File => IconSource::Generic(entry.full_path(), GENERIC_FILE_ICON),
         Kind::Bookmark => IconSource::Favicon(entry.full_path()),
+        // 笔记的 path 是网页深链：取 favicon 会回退成 Edge 图标，改用自绘字形。
+        Kind::Note => IconSource::Glyph,
         _ => IconSource::Shell(entry.full_path()),
     }
 }
@@ -73,6 +77,7 @@ impl IconStore {
                         IconSource::Shell(path) => {
                             crate::win::icons::load_icon(&path, 32)
                         }
+                        IconSource::Glyph => None,
                     };
                     if done_tx.send((job.key, image)).is_err() {
                         break;
@@ -243,6 +248,8 @@ fn icon_key(entry: &Entry) -> String {
         Kind::Command => String::new(),
         // 每份书签按 URL 单独缓存网站 favicon（取不到时后台回退 Edge 图标）。
         Kind::Bookmark => format!("icon:{}", entry.id),
+        // 所有笔记共用一个自绘字形，不产生后台图标任务。
+        Kind::Note => "icon:note".to_string(),
         _ => format!("icon:{}", entry.id),
     }
 }
@@ -1635,6 +1642,8 @@ pub struct LstrApp {
     learn_badges: HashMap<String, crate::history::LearnBadge>,
     /// 书签 id → 收藏夹层级（「收藏夹栏 › 工作 › 需求」），随每次响应刷新。
     bookmark_folders: HashMap<String, String>,
+    /// 笔记 id → 笔记本层级（「学习 › Rust」），随每次响应刷新。
+    note_folders: HashMap<String, String>,
     /// 产生当前结果列表的查询词（请求发出时的输入，条件已剥离）。
     /// 结果行的「拼音 xx / 模糊 xx / 关键词高亮」必须用它：条件编辑/联想
     /// 暂停期间输入框里是半截条件，拿它当查询词会把 `size >= …` 标成拼音命中。
@@ -1817,6 +1826,7 @@ impl LstrApp {
             learn_for: String::new(),
             learn_badges: HashMap::new(),
             bookmark_folders: HashMap::new(),
+            note_folders: HashMap::new(),
             results_query_text: String::new(),
             learning_view_frecency: false,
             noise_exclude_applied,
@@ -2298,6 +2308,7 @@ impl LstrApp {
                 self.more_pending = false;
                 self.entries = response.entries;
                 self.bookmark_folders = self.service.bookmark_folders();
+                self.note_folders = self.service.note_folders();
                 self.total = response.total;
                 self.elapsed_ms = response.elapsed_ms;
                 self.error = response.error;
@@ -4452,7 +4463,7 @@ impl LstrApp {
                 self.toast(ctx, "对话框已关闭".to_string());
                 return;
             }
-            if matches!(entry.kind, Kind::Command | Kind::Bookmark) {
+            if matches!(entry.kind, Kind::Command | Kind::Bookmark | Kind::Note) {
                 self.toast(ctx, "对话框模式只能选择文件或文件夹".to_string());
                 return;
             }
@@ -4501,8 +4512,8 @@ impl LstrApp {
             self.descend_index(ctx, index);
             return;
         }
-        if entry.kind == Kind::Bookmark {
-            // 书签 = URL：交给系统默认浏览器打开，不经过 explorer。
+        if matches!(entry.kind, Kind::Bookmark | Kind::Note) {
+            // 书签/笔记 = URL：交给系统默认浏览器打开，不经过 explorer。
             match shell::open_url(&entry.full_path()) {
                 Ok(()) => {
                     self.service.record_open(&entry);
@@ -4556,7 +4567,7 @@ impl LstrApp {
         let Some(entry) = self.entries.get(self.selected).cloned() else {
             return;
         };
-        if matches!(entry.kind, Kind::Command | Kind::Bookmark) {
+        if matches!(entry.kind, Kind::Command | Kind::Bookmark | Kind::Note) {
             self.toast(ctx, "该结果没有所在位置".to_string());
             return;
         }
@@ -4572,7 +4583,10 @@ impl LstrApp {
         let Some(entry) = self.entries.get(self.selected).cloned() else {
             return;
         };
-        if matches!(entry.kind, Kind::Command | Kind::Folder | Kind::Bookmark) {
+        if matches!(
+            entry.kind,
+            Kind::Command | Kind::Folder | Kind::Bookmark | Kind::Note
+        ) {
             self.toast(ctx, "该结果不支持提权".to_string());
             return;
         }
@@ -4589,7 +4603,11 @@ impl LstrApp {
             return;
         };
         ctx.copy_text(entry.full_path());
-        let what = if entry.kind == Kind::Bookmark { "链接" } else { "路径" };
+        let what = if matches!(entry.kind, Kind::Bookmark | Kind::Note) {
+            "链接"
+        } else {
+            "路径"
+        };
         self.toast(ctx, format!("已复制{what}"));
     }
 
@@ -7112,7 +7130,7 @@ impl LstrApp {
                 ui::paint_file_icon(painter, icon_rect, entry.kind, theme.sub);
             }
 
-            let pinyin_hit = matches!(entry.kind, Kind::App | Kind::Bookmark)
+            let pinyin_hit = matches!(entry.kind, Kind::App | Kind::Bookmark | Kind::Note)
                 && self.filters.matches.is_default()
                 && !q.is_empty()
                 && !entry.name.to_lowercase().contains(&q)
@@ -7126,7 +7144,7 @@ impl LstrApp {
                 && !q.is_empty()
                 && matches!(
                     entry.kind,
-                    Kind::App | Kind::Command | Kind::Program | Kind::Bookmark
+                    Kind::App | Kind::Command | Kind::Program | Kind::Bookmark | Kind::Note
                 )
                 && !entry.name.to_lowercase().contains(&q)
             {
@@ -7384,6 +7402,27 @@ impl LstrApp {
                             format!("书签 · {where_text} · Enter 打开浏览器")
                         }
                     }
+                    Kind::Note => {
+                        // 副标题回答「这篇笔记在哪个笔记本」：完整层级足够
+                        // 区分同名笔记；拼音/模糊命中沿用应用行的提示方式。
+                        let folder = self
+                            .note_folders
+                            .get(&entry.id)
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        let where_text = if folder.is_empty() {
+                            "有道云笔记".to_string()
+                        } else {
+                            format!("有道云笔记 · {folder}")
+                        };
+                        if pinyin_hit {
+                            format!("{where_text} · 拼音 {display_text}")
+                        } else if fuzzy_hit.is_some() {
+                            format!("{where_text} · 模糊 {display_text}")
+                        } else {
+                            where_text
+                        }
+                    }
                     Kind::Command => {
                         if entry.id.starts_with("kwurl:") {
                             let host = entry
@@ -7410,7 +7449,7 @@ impl LstrApp {
                     }
                 };
                 // 应用/书签行也显示学习徽标(路径行已在 lead 里体现)。
-                if matches!(entry.kind, Kind::App | Kind::Bookmark) {
+                if matches!(entry.kind, Kind::App | Kind::Bookmark | Kind::Note) {
                     if let Some(b) = self.learn_badges.get(&entry.id) {
                         if b.recent_pick {
                             subtitle = format!("上次选中 · {subtitle}");
@@ -8592,6 +8631,7 @@ impl LstrApp {
             Kind::App => "应用",
             Kind::Command => "命令",
             Kind::Bookmark => "书签",
+            Kind::Note => "笔记",
         };
         let mut name_job = ui::text_job_case(
             &entry.name,
@@ -9090,6 +9130,7 @@ impl LstrApp {
                                     Kind::App => "应用",
                                     Kind::Command => "命令",
                                     Kind::Bookmark => "书签",
+                                    Kind::Note => "笔记",
                                 };
                                 cell(ui, x0, c0_w, name.clone(), theme.text);
                                 cell(ui, x1, c1_w, kind_label.to_string(), theme.sub);
@@ -10232,6 +10273,39 @@ impl LstrApp {
         );
         y += ROW;
 
+        // —— 有道云笔记 ——
+        // 只读本地库（%APPDATA%\ynote-desktop\*\ynote-data\*.db），不联网、
+        // 不写回；Enter 用默认浏览器打开网页版笔记（首次需在浏览器登录一次）。
+        Self::settings_label(painter, &theme, area.left(), y, "有道云笔记");
+        let note_rect = Rect::from_min_size(
+            egui::pos2(area.left() + 130.0, y),
+            egui::vec2((area.right() - area.left() - 130.0).max(120.0), 30.0),
+        );
+        let mut notes_on = self.cfg.index.notes;
+        if Self::settings_checkbox(
+            ui,
+            painter,
+            &theme,
+            Id::new("lstr-idx-notes"),
+            note_rect,
+            &mut notes_on,
+        ) {
+            self.cfg.index.notes = notes_on;
+            let _ = self.cfg.save();
+            self.service.set_notes_enabled(notes_on);
+            // 立即重载/清空，不用等 120s TTL。
+            self.service.invalidate_apps();
+            self.trigger(ctx);
+        }
+        painter.text(
+            egui::pos2(note_rect.left() + 30.0, note_rect.center().y),
+            Align2::LEFT_CENTER,
+            "本地只读 · 首次需在浏览器登录笔记网页版 · 即时生效",
+            ui::text_font(11.0),
+            theme.sub,
+        );
+        y += ROW;
+
         // —— 内置索引实时层 ——
         // 程序只使用自研内置索引；实时层决定索引怎么追文件变化。
         let current_incremental = self.cfg_index_incremental();
@@ -10750,7 +10824,7 @@ fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef], in_history: b
     let is_command = entry.kind == Kind::Command;
     let is_program = entry.kind == Kind::Program;
     let is_file = entry.kind == Kind::File;
-    let is_bookmark = entry.kind == Kind::Bookmark;
+    let is_link = matches!(entry.kind, Kind::Bookmark | Kind::Note);
     // 应用（开始菜单 .lnk / App Paths / UWP）也允许尝试提权：普通 .lnk 与
     // 系统工具（appwiz.cpl、taskmgr）都能提权；UWP 由执行层给出明确提示。
     let can_admin = is_program || is_file || (entry.kind == Kind::App && entry.path.is_some());
@@ -10770,11 +10844,11 @@ fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef], in_history: b
         MenuItem {
             label: "在资源管理器中定位".to_string(),
             shortcut: "Ctrl ↵",
-            enabled: !is_command && !is_bookmark,
+            enabled: !is_command && !is_link,
             action: MenuAction::Reveal,
         },
         MenuItem {
-            label: if is_bookmark { "复制链接" } else { "复制路径" }.to_string(),
+            label: if is_link { "复制链接" } else { "复制路径" }.to_string(),
             shortcut: "Ctrl C",
             enabled: !is_command,
             action: MenuAction::CopyPath,
@@ -10818,7 +10892,7 @@ fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef], in_history: b
         label: "加入收藏".to_string(),
         shortcut: "",
         // 收藏是 Quick Switch 的文件/文件夹/应用入口，URL 加进去没有语义。
-        enabled: !is_command && !is_bookmark,
+        enabled: !is_command && !is_link,
         action: MenuAction::AddFavorite,
     });
     if can_delete {
@@ -11069,18 +11143,19 @@ fn dialog_hint(scope: Scope) -> &'static str {
         Scope::Folder => "搜索文件夹并跳转…",
         Scope::File | Scope::Program => "搜索文件并填入…",
         Scope::All => "搜索并填入当前对话框…",
-        Scope::App | Scope::Bookmark | Scope::Command => "对话框模式…",
+        Scope::App | Scope::Bookmark | Scope::Note | Scope::Command => "对话框模式…",
     }
 }
 
 fn hint_for(scope: Scope) -> &'static str {
     match scope {
-        Scope::All => "搜索文件、应用、书签或命令…",
+        Scope::All => "搜索文件、应用、书签、笔记或命令…",
         Scope::Folder => "搜索文件夹…",
         Scope::Program => "搜索可执行程序…",
         Scope::File => "搜索文件…",
         Scope::App => "搜索应用…",
         Scope::Bookmark => "搜索书签…",
+        Scope::Note => "搜索笔记或笔记本…",
         Scope::Command => "搜索命令…",
     }
 }

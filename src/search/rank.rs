@@ -19,6 +19,8 @@ const COMMAND_BOOST: i32 = 300;
 // 浏览器书签同分时略微抬升：搜 github 时用户多半想开网页，而不是打开
 // 某个恰好叫 github 的文件/目录（只在同一匹配档位内起作用，不跨档）。
 const BOOKMARK_BOOST: i32 = 100;
+// 有道云笔记同理：搜到笔记标题时，用户目标是去读/改这条笔记。
+const NOTE_BOOST: i32 = 100;
 // 精确同名时按路径深浅再排一次：E:\use 应压过
 // C:\...\perl5\core_perl\Test\use 这种深埋的同名目录（home 加权会反过来）。
 const EXACT_SHALLOW_DEPTH: i32 = 12;
@@ -166,6 +168,7 @@ pub fn score_entry_planned(
         Kind::App | Kind::Program => app_boost.max(0) * APP_BOOST_UNIT,
         Kind::Command => COMMAND_BOOST,
         Kind::Bookmark => BOOKMARK_BOOST,
+        Kind::Note => NOTE_BOOST,
         _ => 0,
     };
     let folder_points = if entry.kind == Kind::Folder {
@@ -191,8 +194,10 @@ pub fn score_entry_planned(
         0
     };
     // 拉丁字母查询命中中文应用/程序拼音时，启动目标应排到普通文件前面。
-    let pinyin_app_points = if matches!(entry.kind, Kind::App | Kind::Program | Kind::Bookmark)
-        && !name_lc.contains(needle)
+    let pinyin_app_points = if matches!(
+        entry.kind,
+        Kind::App | Kind::Program | Kind::Bookmark | Kind::Note
+    ) && !name_lc.contains(needle)
     {
         let mut hit = false;
         if let Some(pinyin) = &entry.pinyin {
@@ -336,8 +341,9 @@ fn noise_penalty_prepared(
     rules: &[(String, i32)],
 ) -> i32 {
     // 书签的「路径」是 URL：噪声规则（/cache/、/target/…）按文件路径设计，
-    // 拿来罚 `https://…/cache/…` 只会让正常网页莫名沉底。
-    if kind == Kind::Bookmark {
+    // 拿来罚 `https://…/cache/…` 只会让正常网页莫名沉底。笔记的 path 也是
+    // 网页深链，同理不参与噪声扣分。
+    if matches!(kind, Kind::Bookmark | Kind::Note) {
         return 0;
     }
     let mut worst = 0;
@@ -498,7 +504,7 @@ fn match_tier(
     // 文件类由引擎按子串过滤，模糊档加不出新结果只会带来噪声。
     if matches!(
         entry.kind,
-        Kind::App | Kind::Command | Kind::Program | Kind::Bookmark
+        Kind::App | Kind::Command | Kind::Program | Kind::Bookmark | Kind::Note
     ) {
         let mut best = crate::search::fuzzy::score_dense(&entry.name, needle);
         if best.is_none() {
@@ -517,7 +523,7 @@ fn match_tier(
         }
     }
 
-    if path_lc.contains(needle) {
+    if entry.kind != Kind::Note && path_lc.contains(needle) {
         return cfg.path_only;
     }
 
@@ -532,6 +538,7 @@ fn kind_preference(kind: Kind) -> i32 {
         Kind::Program => 8,
         Kind::File => 5,
         Kind::Bookmark => 12,
+        Kind::Note => 12,
         Kind::Command => 0,
     }
 }
