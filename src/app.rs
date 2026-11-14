@@ -294,20 +294,28 @@ fn condition_chip_width(painter: &egui::Painter, label: &str, value: &str, dense
 /// 给 egui Slider 补一个实心把手。
 ///
 /// egui 的轨道与把手共用 `widgets.inactive.bg_fill`，没法只给把手填色：
-/// 浅色主题下把手是「底色填充 + 深色描边」，看起来是个空心圆圈。这里在
-/// 把手位置再画一个实心圆（半径覆盖描边），`value` 范围固定 0..=100。
+/// 浅色主题下把手是「底色填充 + 深色描边」，看起来是个空心圆圈。
+/// 这里在把手位置再画一个实心圆盖住它，`value` 范围固定 0..=100。
+///
+/// `widget_rect` 必须传 Slider 自己的 `response.rect`（不是外面给的布局
+/// 矩形）：egui 的把手圆心按 `rect.x_range().shrink(rect.height()/2.5)`
+/// 计算，用外层矩形会在两端差出几像素，hover 时露出的描边偏到一边。
 fn paint_slider_knob(
     painter: &egui::Painter,
-    slider_rect: Rect,
+    widget_rect: Rect,
     value: f32,
     color: Color32,
 ) {
-    let handle_r = slider_rect.height() / 2.5;
-    let x0 = slider_rect.left() + handle_r;
-    let x1 = slider_rect.right() - handle_r;
+    let handle_r = widget_rect.height() / 2.5;
+    let x0 = widget_rect.left() + handle_r;
+    let x1 = widget_rect.right() - handle_r;
     let cx = x0 + (x1 - x0) * (value / 100.0).clamp(0.0, 1.0);
-    // +1.5 覆盖 hovered/active 时 egui 的 expansion(1.0) 与 1px 描边。
-    painter.circle_filled(egui::pos2(cx, slider_rect.center().y), handle_r + 1.5, color);
+    // +2.0 盖住 hover/active 的 expansion(1.0) 与 1px 描边。
+    painter.circle_filled(
+        egui::pos2(cx, widget_rect.center().y),
+        handle_r + 2.0,
+        color,
+    );
 }
 
 /// chip 在当前类别下是否只是置灰展示（点击/编辑/删除都不响应）。
@@ -6041,7 +6049,7 @@ impl LstrApp {
         let shown = value;
         // 实心把手（egui 默认把手是底色填充 + 描边，浅色下像空心圈）。
         let knob_color = if enabled { theme.amber } else { theme.dim };
-        paint_slider_knob(painter, slider_rect, shown, knob_color);
+        paint_slider_knob(painter, response.rect, shown, knob_color);
         let tooltip = if pinned {
             format!(
                 "当前查询已锁定 {letter} 盘（{letter}: 或 path:{letter}:\\…），此滑块不生效；删掉条件后偏好恢复"
@@ -10115,7 +10123,7 @@ impl LstrApp {
                     )
                     .inner;
                 let shown = value;
-                paint_slider_knob(painter, slider_rect, shown, theme.amber);
+                paint_slider_knob(painter, response.rect, shown, theme.amber);
                 if response.changed() {
                     weight = value.round().clamp(0.0, 100.0) as u8;
                     self.cfg.rank.set_drive_weight(letter, weight);
