@@ -8199,7 +8199,9 @@ impl LstrApp {
             + FILTER_H
             + if self.browse_root.is_some() { CRUMB_H } else { 0.0 }
             + LIST_GAP;
-        let row_top = list_top + self.selected as f32 * theme.row_h;
+        // 行的屏幕位置必须减掉滚动偏移：否则列表一滚动，菜单就按"第几行 ×
+        // 行高"算到未滚动的原始位置，跑到选中行下方很远的地方。
+        let row_top = list_top + self.selected as f32 * theme.row_h - self.scroll_y;
         let mut top = row_top + theme.row_h + 2.0;
         if top + height > rect.bottom() - FOOTER_H - 4.0 {
             top = row_top - height - 2.0;
