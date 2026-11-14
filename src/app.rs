@@ -264,6 +264,10 @@ const HELP_TITLE_H: f32 = 24.0;
 const HELP_GROUP_HEAD_H: f32 = 21.0;
 const HELP_ROW_H: f32 = 19.0;
 const HELP_GROUP_GAP: f32 = 8.0;
+/// Tab 行右端「系统盘权重」控件总宽（标签 + 滑轨 + 数值槽）。
+/// 数值槽固定成「不检索」的宽度：否则 99→100 多一位数字会把滑轨右边界
+/// 顶左，拖到端点时圆点会跟着跳一下。
+const DRIVE_WEIGHT_W: f32 = 160.0;
 
 /// 搜索框左侧条件 chip 的宽度（不绘制）。`label` 为空 = 紧凑模式（只画值）。
 /// `dense` = 多个条件时的缩小版（字号/内边距/高度都更小）。
@@ -5468,7 +5472,7 @@ impl LstrApp {
         // 不越过分隔线）；窄窗口 / 浏览模式 / 路径模式下自动隐藏。
         if !self.in_browse() {
             // 再留 4px：预览分隔线在 list_rect.right() + 3 处。
-            self.paint_drive_weight(ui, painter, right_limit - 148.0 - 4.0, y - 1.0, x);
+            self.paint_drive_weight(ui, painter, right_limit - DRIVE_WEIGHT_W - 4.0, y - 1.0, x);
         }
         if let Some(scope) = clicked {
             self.set_scope(ui.ctx(), scope);
@@ -5966,7 +5970,6 @@ impl LstrApp {
             return;
         }
         // 窄窗口放不下：类别 Tab 优先。
-        const CONTROL_W: f32 = 148.0;
         if left < tabs_right + 16.0 {
             return;
         }
@@ -6004,6 +6007,11 @@ impl LstrApp {
             weight.to_string()
         };
         let value_galley = painter.layout_no_wrap(value_text, ui::mono_font(11.0), color);
+        // 数值槽按最宽文案（「不检索」）预留：拖到 100 多一位数也不挤滑轨。
+        let value_slot = painter
+            .layout_no_wrap("不检索".to_string(), ui::mono_font(11.0), color)
+            .size()
+            .x;
         painter.galley(
             egui::pos2(left, y + 11.0 - label_galley.size().y / 2.0),
             label_galley.clone(),
@@ -6011,7 +6019,7 @@ impl LstrApp {
         );
         painter.galley(
             egui::pos2(
-                left + CONTROL_W - value_galley.size().x,
+                left + DRIVE_WEIGHT_W - value_galley.size().x,
                 y + 11.0 - value_galley.size().y / 2.0,
             ),
             value_galley.clone(),
@@ -6020,7 +6028,7 @@ impl LstrApp {
 
         let slider_rect = Rect::from_min_max(
             egui::pos2(left + label_galley.size().x + 8.0, y + 1.0),
-            egui::pos2(left + CONTROL_W - value_galley.size().x - 8.0, y + 21.0),
+            egui::pos2(left + DRIVE_WEIGHT_W - value_slot - 8.0, y + 21.0),
         );
         let mut value = weight as f32;
         let slider = egui::Slider::new(&mut value, 0.0..=100.0)
@@ -10088,6 +10096,11 @@ impl LstrApp {
                 };
                 let value_galley =
                     painter.layout_no_wrap(value_text, ui::mono_font(10.5), color);
+                // 固定数值槽：99→100 不会把滑轨右边界顶左（圆点跳一下）。
+                let value_slot = painter
+                    .layout_no_wrap("不检索".to_string(), ui::mono_font(10.5), color)
+                    .size()
+                    .x;
                 painter.galley(
                     egui::pos2(
                         cell.right() - value_galley.size().x,
@@ -10098,7 +10111,7 @@ impl LstrApp {
                 );
                 let slider_rect = Rect::from_min_max(
                     egui::pos2(cell.left() + 32.0, cell.top() + 2.0),
-                    egui::pos2(cell.right() - value_galley.size().x - 8.0, cell.bottom() - 2.0),
+                    egui::pos2(cell.right() - value_slot - 8.0, cell.bottom() - 2.0),
                 );
                 let mut value = weight as f32;
                 let slider = egui::Slider::new(&mut value, 0.0..=100.0)
