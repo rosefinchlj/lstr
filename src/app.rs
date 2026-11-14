@@ -6764,9 +6764,15 @@ impl LstrApp {
         let painter = painter.with_clip_rect(list_area);
         let painter = &painter;
 
-        // 微小抖动（<2px）不算“真的在动”：Windows 高 DPI 下指针可能每帧
-        // 报 0.5~1px 的噪声，足以在按 ↓ 的同一帧把选中抢到第三行。
-        let pointer_moved = ui.ctx().input(|i| i.pointer.delta().length_sq() > 4.0);
+        // 「真的在动」以本帧有没有指针移动事件为准：慢速移动每帧常只挪
+        // 1~2px，光看位移阈值会漏判，hover 抢选中被推迟一两帧，行底色先闪
+        // 一帧近白的 hover 底再跳到选中色。位移阈值保留作兜底（事件合并时）。
+        let pointer_moved = ui.ctx().input(|i| {
+            i.pointer.delta().length_sq() > 4.0
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::PointerMoved(_)))
+        });
         if pointer_moved {
             self.mouse_moved = true;
         }
@@ -6861,7 +6867,10 @@ impl LstrApp {
                 self.menu_index = 0;
             }
             let selected = index == self.selected;
-            if selected {
+            // 抢选中在帧末才写回 self.selected：这一帧就按选中色画。否则
+            // 同一行先出 hover 底色、下一帧才变选中色（鼠标慢移时白闪）。
+            let will_select = !self.menu_open && hovered == Some(index);
+            if selected || will_select {
                 painter.rect_filled(
                     row_rect.shrink2(egui::vec2(0.0, 1.0)),
                     CornerRadius::same(8),
@@ -7251,7 +7260,7 @@ impl LstrApp {
                 );
             }
 
-            if selected {
+            if selected || will_select {
                 self.needle_target = row_rect.top() + (theme.row_h - NEEDLE_H) / 2.0;
             }
         }
