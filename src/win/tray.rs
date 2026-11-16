@@ -15,6 +15,8 @@ pub enum TrayAction {
     Show,
     Settings,
     Quit,
+    /// 退出并连带停掉提权索引服务（常驻模式下默认只退出 GUI）。
+    QuitAndStopWorker,
     /// 右键:由 `poll` 在 owner 窗口上弹原生菜单(不返回给 App)。
     Menu,
 }
@@ -62,6 +64,7 @@ pub fn install_wake(ctx: &eframe::egui::Context) {
             "tray.show" => Some(TrayAction::Show),
             "tray.settings" => Some(TrayAction::Settings),
             "tray.quit" => Some(TrayAction::Quit),
+            "tray.quit_stop_worker" => Some(TrayAction::QuitAndStopWorker),
             _ => None,
         };
         if let Some(action) = action {
@@ -75,11 +78,18 @@ pub fn create() -> Result<TrayState, String> {
     let menu = Menu::new();
     let show = MenuItem::with_id("tray.show", "显示 lstr", true, None::<Accelerator>);
     let settings = MenuItem::with_id("tray.settings", "设置", true, None::<Accelerator>);
-    let quit = MenuItem::with_id("tray.quit", "退出", true, None::<Accelerator>);
+    let quit = MenuItem::with_id("tray.quit", "退出（保留索引服务）", true, None::<Accelerator>);
+    let quit_stop = MenuItem::with_id(
+        "tray.quit_stop_worker",
+        "退出并停止索引服务",
+        true,
+        None::<Accelerator>,
+    );
     menu.append(&show)
         .and_then(|_| menu.append(&settings))
         .and_then(|_| menu.append(&PredefinedMenuItem::separator()))
         .and_then(|_| menu.append(&quit))
+        .and_then(|_| menu.append(&quit_stop))
         .map_err(|e| format!("托盘菜单创建失败: {e}"))?;
 
     let icon = build_icon().ok_or_else(|| "托盘图标创建失败".to_string())?;

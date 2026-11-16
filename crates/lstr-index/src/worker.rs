@@ -38,6 +38,12 @@ const FRAME_CHANNEL_CAP: usize = 32;
 /// Shutdown」留下的提权 worker;正常关闭走 Shutdown 立即退出,不会等这么久。
 const IDLE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// 常驻模式(`--index-keep-alive`)下无客户端等待上限:客户端正常退出时
+/// 发 `Detach` 而不是 `Shutdown`,worker 保持索引热态等下一次连接——
+/// 下次启动免 UAC、免 1~3 分钟重建。30 分钟窗口覆盖「关掉再打开」的日常
+/// 使用;超时后仍优雅退出并写 clean-exit 标记(用户注销/关机同样会结束它)。
+const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// 退出看门狗宽限:stop 发出后给卷线程这么久退出;到点仍未退则强制结束
 /// 进程,保证正常退出几秒内 worker 必退(不锁 exe 挡住重编译)。与主进程
 /// WORKER_EXIT_WAIT 同量级;卷线程大多 500ms 内响应 stop,看门狗只是兜底。
@@ -84,6 +90,9 @@ pub struct WorkerOpts {
     pub scan_throttle_ms: u64,
     /// journal 轮询间隔毫秒(usn 增量层;worker 侧二次兜底最小 100)。
     pub journal_poll_ms: u64,
+    /// 会话结束后是否继续常驻（客户端 Detach/退出时保留索引热态）。
+    /// 常驻时无客户端等待期从 120s 延长到 [`KEEP_ALIVE_IDLE_TIMEOUT`]。
+    pub keep_alive: bool,
 }
 
 impl Default for WorkerOpts {
@@ -94,6 +103,7 @@ impl Default for WorkerOpts {
             volumes: None,
             scan_throttle_ms: 0,
             journal_poll_ms: 500,
+            keep_alive: false,
         }
     }
 }
@@ -281,6 +291,7 @@ pub fn worker_main() -> i32 {
                 };
             }
             "--index-journal" => parsed.journal = true,
+            "--index-keep-alive" => parsed.keep_alive = true,
             "--index-poll-ms" => {
                 let Some(raw) = args.next() else {
                     crate::snapshot::debug_log("worker: missing --index-poll-ms value");
@@ -351,9 +362,10 @@ pub fn worker_main() -> i32 {
     let _ = OPTS.set(parsed);
     crate::snapshot::debug_log(&format!(
         "worker: opts scan_mode={mode:?} journal={journal} volumes={volumes:?} \
-         poll_ms={} throttle_ms={}",
+         poll_ms={} throttle_ms={} keep_alive={}",
         opts().journal_poll_ms,
         opts().scan_throttle_ms,
+        opts().keep_alive,
     ));
     let Ok(server) = win::create_pipe_server(PIPE_NAME) else {
         // 管道已存在 = 已有 worker 在跑(主进程重拉时可能撞上),静默退出
@@ -378,7 +390,8 @@ impl Worker {
     fn run(&mut self) -> i32 {
         loop {
             // 阻塞的 ConnectNamedPipe 放到独立线程,主线程带超时等待:
-            // 无客户端超过 IDLE_ACCEPT_TIMEOUT 就关闭句柄退出(兜底清理残留)。
+            // 无客户端超过空闲上限就关闭句柄退出(兜底清理残留)。
+            // 常驻模式用 KEEP_ALIVE_IDLE_TIMEOUT,普通模式 120s。
             let (connected_tx, connected_rx) = mpsc::channel::<bool>();
             let addr = self.server.0 as usize;
             let acceptor = std::thread::Builder::new()
@@ -389,13 +402,21 @@ impl Worker {
                     let _ = connected_tx.send(ok);
                 })
                 .ok();
-            let connected = match connected_rx.recv_timeout(IDLE_ACCEPT_TIMEOUT) {
+            let idle_timeout = if opts().keep_alive {
+                KEEP_ALIVE_IDLE_TIMEOUT
+            } else {
+                IDLE_ACCEPT_TIMEOUT
+            };
+            let connected = match connected_rx.recv_timeout(idle_timeout) {
                 Ok(v) => v,
                 Err(_) => {
                     // 空闲超时:没有客户端。accept 线程仍阻塞在 ConnectNamedPipe,
                     // 不做关闭/join(同步句柄上的取消行为不可靠),直接返回让进程退出
                     // —— worker 是独立进程,main 返回即回收所有线程。
-                    crate::snapshot::debug_log("worker: idle timeout, exiting");
+                    crate::snapshot::debug_log(&format!(
+                        "worker: idle timeout (keep_alive={}), exiting",
+                        opts().keep_alive
+                    ));
                     return 0;
                 }
             };
@@ -416,8 +437,8 @@ impl Worker {
             }
             // 触发窗口:仅在「会话结束但未置位 EXIT_AFTER_SESSION」时到达 ——
             // 即主进程崩溃/被杀,管道断开恰落在 try_read_frame 读帧间隙、由
-            // 会话循环末尾的 pipe_alive 兜底检出。重建后等新主进程重连;
-            // 无客户端则 IDLE_ACCEPT_TIMEOUT 兜底退出。
+            // 会话循环末尾的 pipe_alive 兜底检出;或者客户端显式 Detach 常驻。
+            // 重建后等新主进程重连;无客户端则空闲上限兜底退出。
             match win::create_pipe_server(PIPE_NAME) {
                 Ok(s) => self.server = s,
                 Err(_) => {
@@ -579,6 +600,14 @@ fn run_session(client: HANDLE) {
                 }
                 Frame::Shutdown => {
                     EXIT_AFTER_SESSION.store(true, Ordering::Relaxed);
+                    break 'session;
+                }
+                Frame::Detach => {
+                    // 客户端正常退出、但要求保留索引服务:结束本会话,
+                    // 不置 EXIT_AFTER_SESSION → 外层重建管道等待下一次连接。
+                    crate::snapshot::debug_log(
+                        "worker: client detached, staying alive for next session",
+                    );
                     break 'session;
                 }
                 _ => {}

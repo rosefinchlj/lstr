@@ -137,6 +137,13 @@ pub fn shutdown_and_wait(client: HANDLE, pipe_name: &str, timeout: Duration) -> 
     wait_worker_exit(pipe_name, timeout)
 }
 
+/// 向 worker 发 `Frame::Detach`:结束本次会话但让 worker 继续常驻
+/// （保持索引热态，下次启动免 UAC 秒连）。不等待进程退出。
+/// 返回 false = 写帧失败（管道已断，进程可能已退出）。
+pub fn detach(client: HANDLE) -> bool {
+    write_frame(client, &Frame::Detach)
+}
+
 /// 控制指令 → 线上帧。主进程发指令的**唯一**映射点:新增指令只改这里,
 /// 避免各处手搓 `Frame` 与协议枚举漂移。
 pub fn command_frame(cmd: &crate::ClientCommand) -> Frame {

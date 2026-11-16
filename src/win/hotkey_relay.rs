@@ -159,7 +159,7 @@ fn signal_relay() {
 
 /// 当前前台窗口是否属于提权进程。只用于决定是否转发，不影响普通窗口：
 /// 普通窗口由主进程自己的钩子处理，避免同一次双击触发两次 toggle。
-fn foreground_is_elevated() -> bool {
+pub(crate) fn foreground_is_elevated() -> bool {
     unsafe {
         let foreground = GetForegroundWindow();
         if foreground.0.is_null() {

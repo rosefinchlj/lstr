@@ -138,6 +138,11 @@ pub struct IndexConfig {
     /// 设置页即时生效；关闭后 worker 立即清空索引。
     #[serde(default = "default_true")]
     pub notes: bool,
+    /// 退出 lstr 时保留提权索引服务常驻（P0-3）：
+    /// 下次启动免 UAC、免 1~3 分钟重建，索引保持热态；托盘「退出并停止
+    /// 索引服务」可强制连 worker 一起退出。默认开（爆款目标：关掉再开秒回）。
+    #[serde(default = "default_true")]
+    pub keep_worker_alive: bool,
 }
 
 fn default_incremental() -> String {
@@ -162,6 +167,7 @@ impl Default for IndexConfig {
             journal_poll_ms: default_journal_poll_ms(),
             bookmarks: true,
             notes: true,
+            keep_worker_alive: true,
         }
     }
 }

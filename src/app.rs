@@ -1709,6 +1709,8 @@ impl LstrApp {
         ui::apply_text_styles(&cc.egui_ctx);
 
         let preview_open = cfg.preview;
+        // P0-3：退出时是否保留索引服务（默认开）。设置页切换即时更新静态标志。
+        crate::search::builtin::set_keep_worker_alive(cfg.index.keep_worker_alive);
         // 必须在 SearchService::new 之前创建：worker 启动后会立刻 OpenEvent。
         let hotkey_relay = HotkeyRelay::create();
         let mut service = SearchService::new(cfg.clone(), Arc::clone(&history), cc.egui_ctx.clone());
@@ -2218,6 +2220,12 @@ impl LstrApp {
             Some(TrayAction::Menu) => {} // 右键菜单在 TrayState::poll 内部弹出
             Some(TrayAction::Quit) => {
                 self.exit_reason = "tray";
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(TrayAction::QuitAndStopWorker) => {
+                // 常驻模式下默认只退 GUI；这个入口连提权索引服务一起收掉。
+                crate::search::builtin::set_stop_worker_on_exit(true);
+                self.exit_reason = "tray-stop-worker";
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             None => {}
@@ -9921,6 +9929,47 @@ impl LstrApp {
             },
             ui::mono_font(10.5),
             if self.typing.is_some() { theme.sub } else { theme.dim },
+        );
+
+        y += ROW;
+        Self::settings_label(
+            painter,
+            &theme,
+            area.left(),
+            y,
+            "退出后保留索引服务",
+        );
+        let mut keep_worker = self.cfg.index.keep_worker_alive;
+        if Self::settings_checkbox(
+            ui,
+            painter,
+            &theme,
+            Id::new("lstr-keep-worker-check"),
+            Rect::from_min_size(egui::pos2(ctrl_x, y), egui::vec2(60.0, 22.0)),
+            &mut keep_worker,
+        ) {
+            self.cfg.index.keep_worker_alive = keep_worker;
+            let _ = self.cfg.save();
+            crate::search::builtin::set_keep_worker_alive(keep_worker);
+            self.toast(
+                ctx,
+                if keep_worker {
+                    "已开启：退出后索引服务常驻，下次启动免 UAC、免重建".to_string()
+                } else {
+                    "已关闭：退出 lstr 时同时停止索引服务".to_string()
+                },
+            );
+        }
+        painter.text(
+            egui::pos2(ctrl_x + 70.0, y + 14.0),
+            Align2::LEFT_CENTER,
+            if keep_worker {
+                "下次启动秒开（托盘可强制全退）"
+            } else {
+                "下次启动需重新授权/建索引"
+            },
+            ui::mono_font(10.5),
+            if keep_worker { theme.sub } else { theme.dim },
         );
 
         painter.text(

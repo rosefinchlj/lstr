@@ -28,6 +28,42 @@ pub fn request_worker_relaunch() {
     RELAUNCH_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+/// P0-3：GUI 正常退出时保留提权 worker 常驻（免下次 UAC、免重建索引）。
+/// 由设置页 `index.keep_worker_alive` 初始化，运行期改设置即时生效。
+pub(crate) static KEEP_WORKER_ALIVE: AtomicBool = AtomicBool::new(true);
+
+/// 托盘「退出并停止索引服务」：本次退出强制发 `Shutdown`，不等 keep-alive。
+pub(crate) static STOP_WORKER_ON_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// 更新退出时是否保留索引服务（设置页开关调用）。
+pub fn set_keep_worker_alive(enabled: bool) {
+    KEEP_WORKER_ALIVE.store(enabled, Ordering::SeqCst);
+}
+
+/// 本次退出是否要连带停掉索引服务。
+pub fn set_stop_worker_on_exit(enabled: bool) {
+    STOP_WORKER_ON_EXIT.store(enabled, Ordering::SeqCst);
+}
+
+/// 退出收尾：常驻模式发 `Detach`（worker 不退出，保持索引热态），
+/// 否则发 `Shutdown` 并等 worker 收尾（有超时）。
+fn farewell(client: windows::Win32::Foundation::HANDLE) {
+    let keep = KEEP_WORKER_ALIVE.load(Ordering::Relaxed)
+        && !STOP_WORKER_ON_EXIT.load(Ordering::Relaxed);
+    if keep {
+        let _ = idx_client::detach(client);
+        lstr_index::snapshot::debug_log(
+            "client: detached (worker kept alive for next launch)",
+        );
+    } else {
+        let _ = idx_client::shutdown_and_wait(
+            client,
+            lstr_index::PIPE_NAME,
+            WORKER_EXIT_WAIT,
+        );
+    }
+}
+
 /// UI 聚合状态:索引构建进度。
 #[derive(Clone, Debug)]
 pub struct IndexUiStatus {
@@ -727,6 +763,9 @@ pub fn spawn_client_thread(
         .name("lstr-idx-client".to_string())
         .spawn(move || {
             let _done_guard = ClientDoneGuard(client_done);
+            // P0-3：以启动时的配置初始化「退出保留索引服务」；设置页改动
+            // 通过 set_keep_worker_alive 即时更新，无需重启。
+            KEEP_WORKER_ALIVE.store(index_cfg.keep_worker_alive, Ordering::SeqCst);
             let mut first_connect = !launched_worker;
             let mut launch_declined = false;
             // 测试进程里不拉起提权 worker:UAC 弹窗会卡住无人值守的测试。
@@ -746,11 +785,9 @@ pub fn spawn_client_thread(
                         if let Ok(client) =
                             idx_client::connect_and_handshake(snapshot, Duration::from_secs(3))
                         {
-                            let _ = idx_client::shutdown_and_wait(
-                                client,
-                                lstr_index::PIPE_NAME,
-                                WORKER_EXIT_WAIT,
-                            );
+                            // 常驻模式下只 Detach：worker 保持索引热态，下次
+                            // 启动免 UAC、免重建；托盘「退出并停止」才真退出。
+                            farewell(client);
                             idx_win::close(client);
                         }
                     }
@@ -841,11 +878,11 @@ fn frame_loop(
     );
     'frames: loop {
         if shutdown.load(Ordering::Relaxed) {
-            // M4 + 退出收 worker:主进程要退出时显式发 Shutdown 并**等待
-            // worker 退出**(有超时)。旧实现只写一帧就断开,进程随即退出 ——
-            // 帧能不能到达全看线程调度,实测多次留下提权 worker 占住唯一
-            // 管道实例,下次启动撞上旧 worker 出现怪状态。
-            let _ = idx_client::shutdown_and_wait(client, lstr_index::PIPE_NAME, WORKER_EXIT_WAIT);
+            // M4 + 退出收 worker:主进程要退出时显式发 Shutdown/Detach 并
+            // 视模式等待 worker 退出(有超时)。旧实现只写一帧就断开,进程随即
+            // 退出 —— 帧能不能到达全看线程调度,实测多次留下提权 worker 占住
+            // 唯一管道实例,下次启动撞上旧 worker 出现怪状态。
+            farewell(client);
             break 'frames;
         }
         // 设置页指令(切卷/重建卷):非阻塞写帧,不打断下面的读循环。
@@ -873,13 +910,9 @@ fn frame_loop(
             Some(frame) => {
                 if let Some(msg) = to_engine_msg(frame) {
                     if tx.send(msg).is_err() {
-                        // 引擎线程已经收工(服务被 drop):顺手通知 worker 退出
-                        // 并等其收尾(与退出路径同款语义)。
-                        let _ = idx_client::shutdown_and_wait(
-                            client,
-                            lstr_index::PIPE_NAME,
-                            WORKER_EXIT_WAIT,
-                        );
+                        // 引擎线程已经收工(服务被 drop):顺手通知 worker 收尾
+                        // (常驻模式 Detach 保留热态,与退出路径同款语义)。
+                        farewell(client);
                         break 'frames;
                     }
                 }
@@ -920,7 +953,7 @@ fn to_engine_msg(frame: lstr_index::proto::Frame) -> Option<EngineMsg> {
         F::VolumeGone { guid } => EngineMsg::VolumeGone { guid },
         F::VolumeAppeared { guid, letter } => EngineMsg::VolumeAppeared { guid, letter },
         F::UsnWatch { guid, state } => EngineMsg::UsnWatch { guid, state },
-        F::WorkerExit { .. } | F::Shutdown => return None,
+        F::WorkerExit { .. } | F::Shutdown | F::Detach => return None,
         F::Hello { .. } | F::Welcome { .. } | F::Rescan { .. } => return None,
         // C→W 控制帧(设置页切卷):worker 不会回给主进程,遇到即忽略。
         F::SetVolumes { .. } => return None,
@@ -973,6 +1006,9 @@ pub fn worker_launch_args(index: &crate::config::IndexConfig, volume_mask: u32) 
         if !volumes.is_empty() {
             extra.push_str(&format!(" --index-volumes {}", volumes.join(",")));
         }
+    }
+    if index.keep_worker_alive {
+        extra.push_str(" --index-keep-alive");
     }
     extra
 }

@@ -1,6 +1,6 @@
 //! 管道帧协议:u32 长度前缀 | u8 类型 | 载荷(全部小端)。
 //!
-//! C→W:Hello(握手,带每卷续传位点)/ Rescan / Shutdown / SetVolumes
+//! C→W:Hello(握手,带每卷续传位点)/ Rescan / Shutdown / Detach / SetVolumes
 //! W→C:Welcome / VolumeMeta / ScanBegin / ScanProgress / Batch / VolumeReady
 //!      / JournalReset / VolumeGone / VolumeAppeared / WorkerExit
 
@@ -25,6 +25,9 @@ pub mod frame_type {
     pub const SET_VOLUMES: u8 = 17;
     /// USN 实时增量层每卷状态上报(usn 后端):Off/Watching/Backoff/Disabled。
     pub const USN_WATCH: u8 = 18;
+    /// 客户端正常退出、但要求保留 worker 常驻（下次启动免 UAC/秒连）。
+    /// 与 `SHUTDOWN` 的区别：会话结束但进程继续等待下一个客户端。
+    pub const DETACH: u8 = 19;
     // W→C
     pub const WELCOME: u8 = 2;
     pub const VOLUME_META: u8 = 3;
@@ -156,6 +159,10 @@ pub enum Frame {
         mask: u32,
     },
     Shutdown,
+    /// 客户端正常退出，但请求 worker 继续常驻（保持索引热态、下次免 UAC）。
+    /// worker 收到后结束本次会话、重建管道实例等待下一个客户端；
+    /// 只有 `Shutdown` 才会让 worker 进程退出。
+    Detach,
 }
 
 struct W {
@@ -429,6 +436,7 @@ impl Frame {
                 w
             }
             Frame::Shutdown => W::new(frame_type::SHUTDOWN),
+            Frame::Detach => W::new(frame_type::DETACH),
         };
         // 前置长度(含类型字节)
         let mut out = Vec::with_capacity(4 + w.buf.len());
@@ -518,6 +526,7 @@ impl Frame {
                 state: UsnWatchState::from_u8(r.u8()?),
             },
             frame_type::SHUTDOWN => Frame::Shutdown,
+            frame_type::DETACH => Frame::Detach,
             _ => return None,
         })
     }
@@ -584,6 +593,7 @@ mod tests {
             Frame::UsnWatch { guid: 7, state: crate::usnwatch::UsnWatchState::Watching },
             Frame::UsnWatch { guid: u128::MAX, state: crate::usnwatch::UsnWatchState::Disabled },
             Frame::Shutdown,
+            Frame::Detach,
         ];
         for f in frames {
             let bytes = f.encode();
