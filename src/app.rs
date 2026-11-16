@@ -2053,7 +2053,8 @@ impl LstrApp {
         }
 
         // 2) 普通键按下 → 组合键路径；同时打断双击修饰键序列。
-        for (key, modifiers) in &key_events {
+        // 只看本帧第一个键:余下按键留给后续帧(同帧多键本就只处理第一个)。
+        if let Some((key, modifiers)) = key_events.first() {
             let Some(primary) = primary_key_from_egui(*key) else {
                 // 不可录制的键（方向键/标点等）：打断双击修饰键序列（与运行时
                 // 检测器「中间杂键重置」语义一致），提示后继续等。

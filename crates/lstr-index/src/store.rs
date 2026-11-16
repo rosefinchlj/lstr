@@ -54,11 +54,14 @@ const COMPACT_DEAD: u32 = 4096;
 /// 94³×8B≈6.6MB/卷,小卷(如 1.7 万条)的倒排几乎全是这个固定表开销;
 /// 而小卷名字区用 memmem SIMD 扫描本就极快(<8MB 约 <3ms),不值得为它
 /// 常驻 6.6MB 表。低于阈值不建倒排,查询回落 memmem(等价性有测试保证)。
-/// 测试构建恒为 0:始终建倒排,保证「快路径≡memmem」等价性测试覆盖 ngram。
+/// 测试构建取 1:只要有名字就建倒排(test 里没有 8MB 大卷),保证
+/// 「快路径≡memmem」等价性测试覆盖 ngram。不能取 0:`--all-targets` 下
+/// `len() < 0` 会被 clippy 判成恒假比较(absurd_extreme_comparisons)。
+/// 取 1 与取 0 等价:两处调用点都先判 `name_off.is_empty()`。
 #[cfg(not(test))]
 const NGRAM_MIN_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(test)]
-const NGRAM_MIN_BYTES: usize = 0;
+const NGRAM_MIN_BYTES: usize = 1;
 
 /// n-gram 字母表大小:可打印非空格 ASCII(0x21..=0x7E)。
 /// 空格与非 ASCII 视为分隔符(切分 run):全字母表 token 的子串出现必然
