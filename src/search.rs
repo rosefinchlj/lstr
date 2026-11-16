@@ -2451,6 +2451,16 @@ fn run_worker(args: WorkerArgs) {
             // 再按当前世界过滤：文件可能已删除/移动/改名，应用可能已卸载，
             // 否则「最近使用」里点开就是「打开失败」。
             entries.retain(|entry| !stale_history_entry(entry, apps.all()));
+            // B9：Fallback（内置索引不可用）时，历史里的文件/文件夹是旧快照，
+            // 无法校验存在性、点开常失败；只保留不依赖索引来源的应用/命令/书签/笔记。
+            if builtin.is_none() {
+                entries.retain(|entry| {
+                    matches!(
+                        entry.kind,
+                        Kind::App | Kind::Command | Kind::Bookmark | Kind::Note
+                    )
+                });
+            }
             // 空查询 = 纯「最近使用」：清空历史后就是空列表，不再补常用应用
             // （补位会让用户以为历史没清掉）；想看已安装应用去「应用」标签。
             if request.query.scope == Scope::App {
