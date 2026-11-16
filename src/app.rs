@@ -1534,6 +1534,9 @@ pub struct LstrApp {
     /// 枚举一次固定卷要跑 26 组 GetDriveType/GetVolumeInformation,不能每帧调。
     index_drives: Option<(Instant, Vec<char>)>,
     pending_gen: u64,
+    /// 搜索服务自动重启次数（P1-13/B1 supervisor）：超过上限就如实报错，
+    /// 不再无限重建（避免 panic 循环时每帧重开线程）。
+    service_restarts: u32,
     /// 诊断用：请求发出时刻（定位「显示 70ms、实际等 2s」的排队来源）。
     search_sent_at: Option<Instant>,
     waiting: bool,
@@ -1769,6 +1772,7 @@ impl LstrApp {
             index_fallback: false,
             index_drives: None,
             pending_gen,
+            service_restarts: 0,
             search_sent_at: None,
             waiting: true,
             dirty_at: None,
@@ -2306,8 +2310,16 @@ impl LstrApp {
             }
         }
         self.poll_index_status(ctx);
+        let mut panic_error: Option<String> = None;
         if let Some(response) = self.service.poll() {
-            if response.generation == self.pending_gen {
+            if response.generation == u64::MAX {
+                // supervisor 哨兵：搜索线程 panic 后由外层 catch_unwind 发出。
+                panic_error = Some(
+                    response
+                        .error
+                        .unwrap_or_else(|| "搜索服务异常退出".to_string()),
+                );
+            } else if response.generation == self.pending_gen {
                 // 诊断：总延迟 vs 服务端执行时间。差值 = 排队/唤醒开销。
                 if let Some(sent) = self.search_sent_at.take() {
                     let total_ms = sent.elapsed().as_millis();
@@ -2353,9 +2365,48 @@ impl LstrApp {
                 }
             }
         }
+        // 哨兵响应可能丢失(旧服务已退出/通道满了被丢):每帧看标志兜底,
+        // 否则一次 panic 就会让 UI 永久停在「搜索中…」(评审 P1-13/B1)。
+        if panic_error.is_none() && self.service.worker_panicked() {
+            panic_error = Some("搜索服务线程异常退出".to_string());
+        }
+        if let Some(reason) = panic_error {
+            self.restart_search_service(ctx, &reason);
+        }
         if self.waiting {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
+    }
+
+    /// P1-13/B1 自愈：搜索线程 panic 后重建整个 SearchService（带重启上限），
+    /// 并立即重放当前查询，用户不必重新输入。重启后 service_restarts 保留，
+    /// 连续超过上限说明存在确定性 panic，如实报错而不是每帧重开线程。
+    fn restart_search_service(&mut self, ctx: &egui::Context, reason: &str) {
+        const MAX_RESTARTS: u32 = 3;
+        if self.service_restarts >= MAX_RESTARTS {
+            self.error = Some(format!("{reason}；搜索服务多次异常，请重启 lstr"));
+            self.waiting = false;
+            return;
+        }
+        self.service_restarts += 1;
+        lstr_index::snapshot::debug_log(&format!(
+            "search: ui restart service attempt={} reason={reason}",
+            self.service_restarts
+        ));
+        self.service =
+            SearchService::new(self.cfg.clone(), Arc::clone(&self.history), ctx.clone());
+        self.service.set_limit(self.cfg.max_results);
+        self.service.set_keywords(self.cfg.keywords.clone());
+        self.service.set_hidden(&self.cfg.hidden_apps);
+        self.service.set_favorites(self.cfg.favorites.clone());
+        self.service.set_show_hidden(self.show_hidden);
+        self.pending_gen = 0;
+        self.search_sent_at = None;
+        self.waiting = false;
+        self.error = None;
+        // 下一帧经防抖路径立刻重发当前查询（含条件/浏览目录/对话框模式）。
+        self.dirty_at = Some(Instant::now());
+        self.toast(ctx, "搜索服务已自动重启".to_string());
     }
 
     /// 日期/大小/路径等条件是否在当前上下文解析：正则、PathTyping、应用/命令/
@@ -7113,13 +7164,34 @@ impl LstrApp {
             // 打字瞬间结果还没回来，先显示「搜索中…」，避免一帧空列表闪成
             // 「没有匹配项」再被结果替换。
             if self.waiting {
+                // 等待超过 2s 说明慢在服务端（索引维护/首扫）或搜索线程异常，
+                // 如实显示已等待时长，用户知道程序没死（评审 P1-13 体验面）。
+                let waited = self
+                    .search_sent_at
+                    .map(|sent| sent.elapsed())
+                    .unwrap_or_default();
+                let slow = waited > Duration::from_secs(2);
+                let (text, color) = if slow {
+                    (format!("搜索服务响应较慢（已 {:.1}s）", waited.as_secs_f32()), theme.amber)
+                } else {
+                    ("搜索中…".to_string(), theme.dim)
+                };
                 painter.text(
                     egui::pos2(rect.center().x, list_top + 44.0),
                     Align2::CENTER_CENTER,
-                    "搜索中…",
+                    &text,
                     ui::text_font(15.0),
-                    theme.dim,
+                    color,
                 );
+                if slow {
+                    painter.text(
+                        egui::pos2(rect.center().x, list_top + 68.0),
+                        Align2::CENTER_CENTER,
+                        "索引维护/首次构建期间可能较慢；Esc 收起后仍会在后台完成",
+                        ui::mono_font(11.5),
+                        theme.dim,
+                    );
+                }
                 self.needle_target = 0.0;
                 self.scrollable = false;
                 return;
@@ -7922,18 +7994,25 @@ impl LstrApp {
                 }
             )
         } else {
+            // total 计数在 10 万处截断(见 query::TOTAL_CAP),显示为近似值;
+            // 被截断时明确提示,避免用户把「10万+」当成完整结果集(评审 P1-7)。
+            // 总=按键请求发出到结果上屏(含排队/IPC/帧等待);引擎=worker 内纯执行。
+            let capped = self.total >= 100_000;
+            let total_text = if capped {
+                "10万+".to_string()
+            } else {
+                self.total.to_string()
+            };
+            let cap_note = if capped {
+                " · 已截断，输入更精确的条件可缩小范围"
+            } else {
+                ""
+            };
             format!(
-                // total 计数在 10 万处截断(见 query::TOTAL_CAP),显示为近似值。
-                // 总=按键请求发出到结果上屏(含排队/IPC/帧等待);引擎=worker 内纯执行。
-                "{} 个结果 · 总 {:.0}ms · 引擎 {:.0}ms{}",
-                if self.total >= 100_000 {
-                    "10万+".to_string()
-                } else {
-                    self.total.to_string()
-                },
+                "{total_text} 个结果 · 总 {:.0}ms · 引擎 {:.0}ms{}{cap_note}",
                 self.ui_total_ms.unwrap_or(self.elapsed_ms),
                 self.elapsed_ms,
-                if self.scrollable { " · 滚轮查看更多" } else { "" }
+                if self.scrollable { " · 滚轮查看更多" } else { "" },
             )
         };
         if let Some(root) = &self.browse_root {

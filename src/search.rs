@@ -141,6 +141,17 @@ fn send_response(tx: &Sender<Response>, request: &Request, response: Response) {
     let _ = tx.send(response);
 }
 
+/// 把 `catch_unwind` 捕获的 panic 载荷转成一行可读摘要(日志与 UI 提示用)。
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "未知 panic 载荷".to_string()
+    }
+}
+
 /// 上一次查询的完整参数：滚到底加载更多时原样重发，只放大交付上限。
 #[derive(Clone)]
 struct LastQuery {
@@ -202,6 +213,9 @@ pub struct SearchService {
     /// 优雅退出收尾完成标志:run_worker 在 flush_all + 等 client 线程收尾后
     /// 置位;`graceful_shutdown` 轮询它给 eframe::App::on_exit 一个有界等待。
     worker_collected: Arc<AtomicBool>,
+    /// 搜索线程 panic 标志:外层 catch_unwind 兜住 unwind 后置位,UI 侧据此
+    /// 重建 SearchService。哨兵响应只是快路径,标志位保证不丢(同一帧兜底)。
+    worker_panicked: Arc<AtomicBool>,
 }
 
 impl SearchService {
@@ -238,6 +252,12 @@ impl SearchService {
         let shutdown_client = Arc::new(AtomicBool::new(false));
         let worker_collected = Arc::new(AtomicBool::new(false));
         let client_done = Arc::new(AtomicBool::new(false));
+        // supervisor:搜索线程 panic 时置位,UI 下一帧重建整个 SearchService。
+        let worker_panicked = Arc::new(AtomicBool::new(false));
+        let panic_flag = Arc::clone(&worker_panicked);
+        let panic_shutdown = Arc::clone(&shutdown_client);
+        let panic_collected = Arc::clone(&worker_collected);
+        let panic_tx = response_tx.clone();
         let (done_s, done_w, done_c) = (
             Arc::clone(&shutdown_client),
             Arc::clone(&worker_collected),
@@ -247,26 +267,49 @@ impl SearchService {
         std::thread::Builder::new()
             .name("lstr-search".to_string())
             .spawn(move || {
-                run_worker(WorkerArgs {
-                    rx: request_rx,
-                    tx: response_tx,
-                    history: worker_history,
-                    config: worker_config,
-                    ctx,
-                    apps_dirty: worker_apps_dirty,
-                    bookmarks_enabled: worker_bookmarks_enabled,
-                    bookmark_folders: worker_bookmark_folders,
-                    notes_enabled: worker_notes_enabled,
-                    note_folders: worker_note_folders,
-                    status_slot: worker_status,
-                    index_cmd_rx,
-                    index_cmd_tx: worker_index_cmd_tx,
-                    volume_mask: worker_volume_mask,
-                    noise_slot: worker_noise_slot,
-                    shutdown_client: done_s,
-                    worker_collected: done_w,
-                    client_done: done_c,
-                })
+                // 搜索线程是全局单点:一旦 panic,整个搜索服务失联,UI 会永久
+                // 停在「搜索中…」(评审 P1-13/B1)。这里兜住 unwind:记日志、
+                // 让 client 线程走优雅收尾(否则它发现引擎通道断开后会再
+                // runas 拉起提权 worker,无端弹一次 UAC)、置标志并给 UI 发
+                // 一条哨兵响应(gen=u64::MAX)触发重建。
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_worker(WorkerArgs {
+                        rx: request_rx,
+                        tx: response_tx,
+                        history: worker_history,
+                        config: worker_config,
+                        ctx,
+                        apps_dirty: worker_apps_dirty,
+                        bookmarks_enabled: worker_bookmarks_enabled,
+                        bookmark_folders: worker_bookmark_folders,
+                        notes_enabled: worker_notes_enabled,
+                        note_folders: worker_note_folders,
+                        status_slot: worker_status,
+                        index_cmd_rx,
+                        index_cmd_tx: worker_index_cmd_tx,
+                        volume_mask: worker_volume_mask,
+                        noise_slot: worker_noise_slot,
+                        shutdown_client: done_s,
+                        worker_collected: done_w,
+                        client_done: done_c,
+                    })
+                }));
+                if let Err(payload) = result {
+                    let detail = panic_payload_message(payload.as_ref());
+                    lstr_index::snapshot::debug_log(&format!(
+                        "search: worker thread panicked, service will restart: {detail}"
+                    ));
+                    panic_shutdown.store(true, Ordering::Relaxed);
+                    panic_collected.store(true, Ordering::Relaxed);
+                    panic_flag.store(true, Ordering::Release);
+                    let _ = panic_tx.send(Response {
+                        generation: u64::MAX,
+                        entries: Vec::new(),
+                        total: 0,
+                        elapsed_ms: 0.0,
+                        error: Some(format!("搜索服务异常退出：{detail}")),
+                    });
+                }
             })
             .expect("spawn search worker");
         Self {
@@ -299,6 +342,7 @@ impl SearchService {
             noise_slot,
             shutdown_client,
             worker_collected,
+            worker_panicked,
         }
     }
 
@@ -577,6 +621,12 @@ impl SearchService {
             latest = Some(response);
         }
         latest
+    }
+
+    /// 搜索线程是否已 panic 退出。哨兵响应可能因通道状态丢失(或 UI 还没
+    /// 处理到),UI 每帧读这个标志兜底触发重建。
+    pub fn worker_panicked(&self) -> bool {
+        self.worker_panicked.load(Ordering::Relaxed)
     }
 
     pub fn record_open(&self, entry: &Entry) {
@@ -3131,6 +3181,28 @@ mod tests {
             "文件不属于「书签」页"
         );
         assert!(!stale_history_entry(&bookmark, &[]), "书签历史不按磁盘存在性判断");
+    }
+
+    /// 搜索线程 supervisor:panic 载荷转成可读摘要(&str / String / 其他)。
+    #[test]
+    fn panic_payload_message_is_readable() {
+        let text = std::panic::catch_unwind(|| std::panic::panic_any("搜索线程炸了"))
+            .err()
+            .map(|payload| panic_payload_message(payload.as_ref()))
+            .unwrap_or_default();
+        assert_eq!(text, "搜索线程炸了", "&str 载荷应原样取出");
+
+        let owned = std::panic::catch_unwind(|| std::panic::panic_any(String::from("assert failed")))
+            .err()
+            .map(|payload| panic_payload_message(payload.as_ref()))
+            .unwrap_or_default();
+        assert_eq!(owned, "assert failed", "String 载荷应原样取出");
+
+        let other = std::panic::catch_unwind(|| std::panic::panic_any(42u32))
+            .err()
+            .map(|payload| panic_payload_message(payload.as_ref()))
+            .unwrap_or_default();
+        assert_eq!(other, "未知 panic 载荷", "非字符串载荷回退固定文案");
     }
 
     /// 测试隔离:测试进程不会拉起提权 worker(cfg(test) 下 spawn_client_thread
