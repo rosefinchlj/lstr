@@ -13,11 +13,13 @@
 //!   scan_mode 与 base_len 解耦:空卷 compact 后 base_len 仍为 0,但已 ready。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::noise::{is_build_output_segment, is_exec_name};
 use crate::usn::Rec;
 
-/// 可暂停的 compact（4ms 分片），供引擎空闲维护使用。
+/// 可暂停的 compact（默认 25ms 片）。小卷由引擎同步跑完，大卷在独立
+/// 后台线程里对 fork 快照重排，查询线程不再执行任何 compact 切片。
 mod compact;
 pub(crate) use compact::CompactTask;
 
@@ -339,8 +341,11 @@ fn for_each_ngram(name: &[u8], b: &mut impl FnMut(usize), t: &mut impl FnMut(usi
 }
 
 pub struct VolumeStore {
-    pub names: Vec<u8>,
-    pub names_lc: Vec<u8>,
+    /// 名字区。用 `Arc` 是为了后台 compact 的 fork 快照能共享大块名字区:
+    /// 稳态写入唯一持有(make_mut 原地扩展),只有后台任务运行期间才可能
+    /// 短暂共享(此时写入被引擎冻结,不会触发整块复制)。
+    pub names: Arc<Vec<u8>>,
+    pub names_lc: Arc<Vec<u8>>,
     pub name_off: Vec<u32>,
     /// slot 按小写名序排序;仅 compact 后有效,scan 模式为空。
     pub offs: Vec<u32>,
@@ -474,8 +479,8 @@ impl VolumeStore {
             exclude.summary()
         ));
         Self {
-            names: Vec::with_capacity(4 << 20),
-            names_lc: Vec::with_capacity(4 << 20),
+            names: Arc::new(Vec::with_capacity(4 << 20)),
+            names_lc: Arc::new(Vec::with_capacity(4 << 20)),
             name_off: Vec::with_capacity(1 << 16),
             off_index: Vec::with_capacity(1 << 16),
             offs: Vec::new(),
@@ -539,8 +544,8 @@ impl VolumeStore {
             .map(|&o| mask_of_bytes(slice_at(&names_lc, o as usize)))
             .collect();
         let mut s = Self {
-            names,
-            names_lc,
+            names: Arc::new(names),
+            names_lc: Arc::new(names_lc),
             name_off,
             off_index,
             offs,
@@ -587,6 +592,49 @@ impl VolumeStore {
         s.rebuild_mtime_pending();
         s.rebuild_size_pending();
         s
+    }
+
+    /// 后台 compact 用的快照:名字区共享 `Arc`(大块零拷贝),其余列浅拷贝。
+    ///
+    /// 只复制 compact 会读取/改写的列;派生索引(`off_index`/`ngram`/
+    /// `children`/待回填队列)不复制 —— compact 不读它们,Install 阶段会按
+    /// 新列重建。调用期间引擎必须冻结同卷写入(与旧分片 compact 相同),
+    /// 因此快照与实时列同构,回放语义一致。
+    pub fn fork_for_compact(&self) -> Self {
+        Self {
+            names: Arc::clone(&self.names),
+            names_lc: Arc::clone(&self.names_lc),
+            name_off: self.name_off.clone(),
+            off_index: Vec::new(),
+            offs: self.offs.clone(),
+            frn: self.frn.clone(),
+            parent: self.parent.clone(),
+            attrs: self.attrs.clone(),
+            mtime: self.mtime.clone(),
+            size: self.size.clone(),
+            mtime_pending: Vec::new(),
+            size_pending: Vec::new(),
+            char_mask: self.char_mask.clone(),
+            base_len: self.base_len,
+            scan_mode: self.scan_mode,
+            delta: self.delta.clone(),
+            delta_frn: self.delta_frn.clone(),
+            dead_count: self.dead_count,
+            renames: self.renames,
+            ancestry_dirty: self.ancestry_dirty,
+            unresolved: self.unresolved.clone(),
+            noise_anchors: self.noise_anchors.clone(),
+            soft_anchors: self.soft_anchors.clone(),
+            exclude: self.exclude.clone(),
+            letter: self.letter,
+            chain_buf: Vec::new(),
+            ngram: None,
+            ngram_base_len: self.ngram_base_len,
+            reindex: self.reindex.clone(),
+            reindex_mark: self.reindex_mark.clone(),
+            children: HashMap::new(),
+            children_built: self.children_built,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -1119,10 +1167,12 @@ impl VolumeStore {
                     self.renames += 1;
                     let name_lc = fold_case(name);
                     self.name_off[old as usize] = self.names.len() as u32;
-                    self.names.extend_from_slice(name);
-                    self.names.push(0);
-                    self.names_lc.extend_from_slice(&name_lc);
-                    self.names_lc.push(0);
+                    let names = Arc::make_mut(&mut self.names);
+                    names.extend_from_slice(name);
+                    names.push(0);
+                    let names_lc = Arc::make_mut(&mut self.names_lc);
+                    names_lc.extend_from_slice(&name_lc);
+                    names_lc.push(0);
                     self.off_index.push((self.name_off[old as usize], old));
                     self.char_mask[old as usize] = mask_of_bytes(name);
                     // base 槽改名:旧名 posting 失效 → 标记跳过 + 进 overlay
@@ -1168,10 +1218,12 @@ impl VolumeStore {
         let name_lc = fold_case(name);
         self.name_off.push(off);
         self.off_index.push((off, slot));
-        self.names.extend_from_slice(name);
-        self.names.push(0);
-        self.names_lc.extend_from_slice(&name_lc);
-        self.names_lc.push(0);
+        let names = Arc::make_mut(&mut self.names);
+        names.extend_from_slice(name);
+        names.push(0);
+        let names_lc = Arc::make_mut(&mut self.names_lc);
+        names_lc.extend_from_slice(&name_lc);
+        names_lc.push(0);
         self.frn.push(frn);
         // 「父是噪声锚点 ⇒ 子项直接判噪」的快捷路径(父链断开也不再解析)。
         // 构建产物锚点(target/…)例外:必须正常解析父链并逐个分类,否则
@@ -1587,8 +1639,8 @@ impl VolumeStore {
         names_lc.shrink_to_fit();
         let off_index: Vec<(u32, u32)> =
             name_off.iter().enumerate().map(|(i, &o)| (o, i as u32)).collect();
-        self.names = names;
-        self.names_lc = names_lc;
+        self.names = Arc::new(names);
+        self.names_lc = Arc::new(names_lc);
         self.name_off = name_off;
         self.off_index = off_index;
         self.offs = offs;

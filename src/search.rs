@@ -1958,11 +1958,12 @@ fn run_worker(args: WorkerArgs) {
                     }
                     b.engine.maintain();
                     *handshake_slot.lock().unwrap() = b.engine.handshake_state();
-                    // 分片 compact 也要持续推进:maintenance_busy 让主循环立刻
-                    // 回来再给下一片,否则会阻塞在 recv_timeout(150ms) 上。
+                    // 真后台 compact 不占用本线程:不需要忙轮询去看它,主循环
+                    // 正常 recv_timeout(150ms) 即可(查询/消息会立刻唤醒)。
+                    // 冻结消息只在 compact 结束后需要连续回放 —— 此时
+                    // compact_in_progress 已翻 false,has_deferred 才让本循环忙转。
                     maintenance_busy = b.engine.save_in_progress()
-                        || b.engine.has_deferred_msgs()
-                        || b.engine.compact_in_progress();
+                        || (b.engine.has_deferred_msgs() && !b.engine.compact_in_progress());
                 }
             }
             // —— 排除规则表变化检测(「立即重建」)——

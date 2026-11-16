@@ -1,9 +1,10 @@
-//! 可暂停的整卷 compact（4ms 分片，查询线程片间照常服务）。
+//! 可暂停的整卷 compact（大卷独立后台线程，小卷引擎线程同步跑完）。
 //!
 //! 背景：`VolumeStore::compact` 是同步全量重建。实测 D 卷 148 万条最坏 3.6s，
 //! 其中全量噪声重判占 74%（已改为按 `ancestry_dirty` 触发）、ngram 重建
-//! 约 400ms、列重建约 100ms。引擎空闲维护直接调用它会把同一线程上的查询
-//! 堵住数秒。
+//! 约 400ms、列重建约 100ms。即使在引擎线程上切成 4ms 片，累计仍会占用
+//! 查询线程数秒；大卷现在改为「fork 快照 + 独立线程重排 + 完成后换血」，
+//! 查询线程只保留 channel 轮询与 O(1) 收尾。
 //!
 //! 本任务把 compact 拆成可恢复的阶段，每次 `advance` 最多跑 `budget`：
 //! 解析未消解父链 → 收集 live → 按需全量判噪 → FRN 排序 → 重映射 →
@@ -11,8 +12,8 @@
 //! 阶段会原地改 attrs/parent/anchors（与旧 compact 语义一致，查询可照常
 //! 读取）外，构建阶段只读旧列、结果写在任务自己的缓冲里，最后 O(1) 换血。
 //!
-//! 调用方（Engine）必须在任务运行期间冻结修改类消息（同分段保存），
-//! 并在换血后 bump generation、重建拼音缓存。
+//! 调用方（Engine）必须在任务运行期间冻结同卷修改类消息（同分段保存），
+//! 并在换血后 bump generation、替换拼音缓存。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -39,11 +40,8 @@ enum Phase {
 
 pub(crate) struct CompactTask {
     phase: Phase,
-    started: Instant,
     /// 换血是否已发生（持久;abort 时据此补代次/拼音收尾）。
     swapped: bool,
-    /// 换血事件是否已通知宿主（`take_installed` 只报一次）。
-    install_notified: bool,
     /// 任务开始时的旧列长度（remap 按旧 slot 下标寻址）。
     old_len: u32,
     /// 解析父链阶段快照（运行期 store 冻结，unresolved 稳定）。
@@ -93,9 +91,7 @@ impl CompactTask {
         }
         Some(Self {
             phase: Phase::Resolve,
-            started: Instant::now(),
             swapped: false,
-            install_notified: false,
             old_len: store.name_off.len() as u32,
             resolve_pairs: Vec::new(),
             resolve_cursor: 0,
@@ -131,23 +127,9 @@ impl CompactTask {
         })
     }
 
-    /// 是否刚完成换血（引擎据此 bump generation + 重建拼音缓存）。
-    pub(crate) fn take_installed(&mut self) -> bool {
-        if self.swapped && !self.install_notified {
-            self.install_notified = true;
-            true
-        } else {
-            false
-        }
-    }
-
     /// 换血是否已发生（持久标志,abort 收尾用）。
     pub(crate) fn installed(&self) -> bool {
         self.swapped
-    }
-
-    pub(crate) fn elapsed(&self) -> Duration {
-        self.started.elapsed()
     }
 
     /// 实际占用（片内耗时累计），不含片间处理消息/等调度。
@@ -460,8 +442,8 @@ impl CompactTask {
             self.offs.extend_from_slice(&self.offs_base[self.offs_base_pos..]);
             self.offs.extend_from_slice(&self.offs_delta[self.offs_delta_pos..]);
         }
-        store.names = std::mem::take(&mut self.names);
-        store.names_lc = std::mem::take(&mut self.names_lc);
+        store.names = std::sync::Arc::new(std::mem::take(&mut self.names));
+        store.names_lc = std::sync::Arc::new(std::mem::take(&mut self.names_lc));
         store.name_off = std::mem::take(&mut self.name_off);
         store.offs = std::mem::take(&mut self.offs);
         store.frn = std::mem::take(&mut self.frn);
