@@ -383,23 +383,28 @@ fn path_adjustment(
     let mut hint = (name_raw + depth_raw) * detail_cap / 50;
 
     let env = env_paths();
-    let mut context = 0;
+    // B8：上下文按「档位内剩余预算」等比例缩放，而不是直接截断。
+    // 旧实现把 home(20)/parent(60)/cwd(90) 直接 min 到 15，三档全部饱和成
+    // 同一个分，当前目录优先实际失效；缩放后仍保持 cwd > parent > home 的
+    // 相对次序，同时永远不越过下一档（总预算仍是 cap - detail_cap）。
+    let mut context_raw = 0;
     if let Some(home) = &env.home {
         if is_under_path(&path, home) {
-            context += 20;
+            context_raw += 20;
         }
     }
     if let Some(parent) = &env.cwd_parent {
         if is_under_path(&path, parent) {
-            context += 60;
+            context_raw += 60;
         }
     }
     if let Some(cwd) = &env.cwd {
         if is_under_path(&path, cwd) {
-            context += 90;
+            context_raw += 90;
         }
     }
-    hint += context.min(cap - detail_cap);
+    const CONTEXT_RAW_MAX: i32 = 170; // home 20 + parent 60 + cwd 90
+    hint += context_raw * (cap - detail_cap) / CONTEXT_RAW_MAX;
 
     // 噪声惩罚是「排除」信号，不受上界限制：该沉下去的就要沉下去。
     hint - noise_penalty_prepared(&normalized_path, needle, entry.kind, cfg, rules)
@@ -972,6 +977,31 @@ mod tests {
             "cwd 内短名/浅路径仍应更靠前: short={short_hint}, deep={deep_hint}"
         );
     }
+
+    #[test]
+    fn cwd_context_outranks_parent_and_home_without_saturating() {
+        // B8 回归：旧实现 context.min(15) 让 home/parent/cwd 全饱和，
+        // 当前目录优先卖点失效。缩放后必须 cwd > parent，且仍受档位帽约束。
+        let cfg = RankConfig::default();
+        let cap = heuristic_cap(&cfg);
+        let cwd = std::env::current_dir().expect("cwd");
+        let parent = cwd.parent().expect("cwd parent");
+        let mut in_cwd = entry("in_cwd", "a", Kind::Folder);
+        in_cwd.path = Some(cwd.join("a"));
+        let mut in_parent = entry("in_parent", "a", Kind::Folder);
+        in_parent.path = Some(parent.join("a"));
+        let cwd_hint = adj(&in_cwd, "a", &cfg);
+        let parent_hint = adj(&in_parent, "a", &cfg);
+        assert!(
+            cwd_hint > parent_hint,
+            "当前目录内条目应高于父目录: cwd={cwd_hint}, parent={parent_hint}"
+        );
+        assert!(
+            cwd_hint <= cap,
+            "上下文加分不得跨档: hint={cwd_hint}, cap={cap}"
+        );
+    }
+
 
     #[test]
     fn tokens_match_not_overtaken_by_cwd_normalized_match() {

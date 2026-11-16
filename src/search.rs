@@ -2476,7 +2476,10 @@ fn run_worker(args: WorkerArgs) {
         } else {
             match request.query.scope {
                 Scope::App => {
-                    entries = apps.search(&request.query.text, request.limit);
+                    // B2：应用页同样按 deliver 取数，滚到底「加载更多」才能真
+                    // 的加载出后面的应用（旧实现固定 request.limit=8 条）。
+                    let take = request.deliver.max(request.limit);
+                    entries = apps.search(&request.query.text, take);
                     entries.retain(|entry| {
                         app_matches_options(&entry.name, &request.query.text, &request.filters)
                     });
@@ -2589,8 +2592,12 @@ fn run_worker(args: WorkerArgs) {
                         && !file_filter_active
                         && !request.filters.matches.regex
                     {
+                        // B2：应用/书签/笔记同属「非文件来源」，也应按
+                        // deliver 放宽取数；否则「加载更多」只增文件、这三类
+                        // 永远停在默认 8 条，且 total 也按 8 条封顶。
+                        let source_take = request.deliver.max(request.limit).min(120);
                         let t_apps = Instant::now();
-                        let mut app_hits = apps.search(&request.query.text, request.limit);
+                        let mut app_hits = apps.search(&request.query.text, source_take);
                         app_hits.retain(|entry| {
                             app_matches_options(
                                 &entry.name,
@@ -2609,7 +2616,7 @@ fn run_worker(args: WorkerArgs) {
                         if bookmarks_enabled.load(Ordering::Relaxed) {
                             let t_bookmarks = Instant::now();
                             let mut bookmark_hits =
-                                bookmarks.search(&request.query.text, request.limit);
+                                bookmarks.search(&request.query.text, source_take);
                             // 严格匹配（大小写/全词）同样约束书签：拼音/模糊/
                             // 纯 URL 命中都要按名字复核，否则「区分大小写」失效。
                             bookmark_hits.retain(|entry| {
@@ -2630,14 +2637,14 @@ fn run_worker(args: WorkerArgs) {
                             let (mut note_hits, _) = match history.lock() {
                                 Ok(history) => notes.search(
                                     &request.query.text,
-                                    request.limit,
+                                    source_take,
                                     false,
                                     Some(&history),
                                     &request.rank,
                                 ),
                                 Err(_) => notes.search(
                                     &request.query.text,
-                                    request.limit,
+                                    source_take,
                                     false,
                                     None,
                                     &request.rank,

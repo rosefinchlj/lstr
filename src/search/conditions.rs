@@ -459,6 +459,37 @@ fn parse_from(
 ///
 /// 空值/未闭合引号返回 `Err(None)`（= 仍在输入，配合 `is_composing` 暂停查询）；
 /// 非空但不是本地路径/UNC 的值返回 `Err(Some(..))`，在结果区给错误提示。
+/// 裸路径遇空白时的容错：若把空格后的词继续拼进路径、整串仍是真实存在
+/// 的路径，就把空格并入路径（`path:C:\Program Files` 不必打引号）。
+/// 只有**整串真实存在**才扩展，所以 `path:D:\work 报告` 里的「报告」仍按
+/// 搜索词处理，不会把普通查询误吞成路径。
+fn extend_bare_path(raw: &str, start: usize, mut stop: usize) -> usize {
+    if !is_path_value(raw[start..stop].trim_end_matches([':', '：'])) {
+        return stop;
+    }
+    loop {
+        let rest = &raw[stop..];
+        let Some(first) = rest.chars().next() else {
+            return stop;
+        };
+        if !first.is_whitespace() {
+            return stop;
+        }
+        let trimmed = rest.trim_start_matches(char::is_whitespace);
+        if trimmed.is_empty() {
+            return stop;
+        }
+        let word_len = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        let next_stop = raw.len() - trimmed.len() + word_len;
+        let candidate = raw[start..next_stop].trim_end_matches([':', '：']);
+        if !candidate.is_empty() && std::path::Path::new(candidate).exists() {
+            stop = next_stop;
+        } else {
+            return stop;
+        }
+    }
+}
+
 fn parse_path_from(
     raw: &str,
     start: usize,
@@ -484,10 +515,12 @@ fn parse_path_from(
         (rest[..close].to_string(), i + 1 + close + 1, true)
     } else {
         // 裸值：到空白为止（冒号不能截断——盘符 `D:` 里也有冒号）。
+        // B7：若空格后的词能拼成真实存在的路径，则把空格并入路径。
         let stop = raw[i..]
             .find(char::is_whitespace)
             .map(|offset| i + offset)
             .unwrap_or(raw.len());
+        let stop = extend_bare_path(raw, i, stop);
         if stop == i {
             // `path:` 后直接是空白/行尾：还没给值。
             return Err(None);
@@ -1882,6 +1915,26 @@ mod tests {
             out.paths,
             vec![PathBuf::from("D:\\a"), PathBuf::from("E:\\b")]
         );
+    }
+
+    #[test]
+    fn bare_path_with_spaces_extends_only_when_path_exists() {
+        // B7：`path:C:\Program Files` 未打引号时，整串若真实存在就整体作为
+        // 路径；不存在则保持「空格后是搜索词」的原语义。
+        let root = std::env::temp_dir().join("lstr-cond-space-path");
+        let dir = root.join("Program Files");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let input = format!("path:{} ", dir.display());
+        let out = extract(&input);
+        assert_eq!(out.paths, vec![dir.clone()], "{input:?}");
+        assert_eq!(out.cleaned, "");
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+
+        let out = extract("path:D:\\work 报告");
+        assert_eq!(out.paths, vec![PathBuf::from("D:\\work")]);
+        assert_eq!(out.cleaned, "报告");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
