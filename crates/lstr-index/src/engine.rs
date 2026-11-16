@@ -780,6 +780,9 @@ impl Engine {
         }
         // 后台 compact 期间同样冻结修改类消息(与保存一致):任务持有 fork 快照,
         // 换血前引擎列的 slot/排序必须保持不变。控制帧重建/清空同卷时中止任务。
+        // 注意冻结是全局的(不止 compact 的那一卷):300 万条的卷后台重排约 2~3s,
+        // 这段时间所有卷的增量都排在 deferred_msgs,换血后 200 条/轮按序重放。
+        // 取舍:保住 slot 稳定性,代价是 USN 更新最多延迟一个 compact 窗口。
         if let Some(compact_guid) = self.compact_guid() {
             match &msg {
                 EngineMsg::UsnWatch { .. } | EngineMsg::WorkerLost => {}
