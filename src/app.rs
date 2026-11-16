@@ -1514,6 +1514,9 @@ pub struct LstrApp {
     entries: Vec<Entry>,
     selected: usize,
     total: usize,
+    /// B5:纯过滤查询(空输入 + 筛选条件)的 total 是下界(引擎计数到预算即停)。
+    /// 页脚显示成「N+」并提示输入关键词可缩小范围。
+    total_rough: bool,
     elapsed_ms: f32,
     /// 全链路耗时(请求发出 → 结果回到 UI 帧,含排队/IPC/帧等待)。
     /// 与 elapsed_ms(引擎纯执行)并列显示,定位「引擎快但手感慢」。
@@ -1796,6 +1799,7 @@ impl LstrApp {
             entries: Vec::new(),
             selected: 0,
             total: 0,
+            total_rough: false,
             elapsed_ms: 0.0,
             ui_total_ms: None,
             error: None,
@@ -2403,6 +2407,7 @@ impl LstrApp {
                 self.bookmark_folders = self.service.bookmark_folders();
                 self.note_folders = self.service.note_folders();
                 self.total = response.total;
+                self.total_rough = response.total_rough;
                 self.elapsed_ms = response.elapsed_ms;
                 self.error = response.error;
                 if was_more {
@@ -8165,15 +8170,22 @@ impl LstrApp {
         } else {
             // total 计数在 10 万处截断(见 query::TOTAL_CAP),显示为近似值;
             // 被截断时明确提示,避免用户把「10万+」当成完整结果集(评审 P1-7)。
+            // B5:空输入 + 筛选条件走纯过滤路径,total 是预算内下界(20k 即停),
+            // 显示「N+」并提示输入关键词;避免假装精确。
             // 总=按键请求发出到结果上屏(含排队/IPC/帧等待);引擎=worker 内纯执行。
             let capped = self.total >= 100_000;
+            let rough = self.total_rough && self.total > 0 && !capped;
             let total_text = if capped {
                 "10万+".to_string()
+            } else if rough {
+                format!("{}+", self.total)
             } else {
                 self.total.to_string()
             };
             let cap_note = if capped {
                 " · 已截断，输入更精确的条件可缩小范围"
+            } else if rough {
+                " · 筛选较宽，结果数为下限；输入关键词可缩小范围"
             } else {
                 ""
             };

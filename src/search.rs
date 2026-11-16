@@ -118,6 +118,9 @@ pub struct Response {
     pub generation: u64,
     pub entries: Vec<Entry>,
     pub total: usize,
+    /// B5:纯过滤(空输入 + 筛选条件)查询的 total 是下界(计数到预算即停)。
+    /// UI 显示成「N+」并提示输入关键词可缩小范围。
+    pub total_rough: bool,
     pub elapsed_ms: f32,
     pub error: Option<String>,
 }
@@ -323,6 +326,7 @@ impl SearchService {
                         generation: u64::MAX,
                         entries: Vec::new(),
                         total: 0,
+                        total_rough: false,
                         elapsed_ms: 0.0,
                         error: Some(format!("搜索服务异常退出：{detail}")),
                     });
@@ -1845,6 +1849,7 @@ fn browse_response(
         generation: request.generation,
         entries,
         total,
+        total_rough: false,
         elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
         error: None,
     }
@@ -1909,6 +1914,7 @@ fn notes_response(
         generation: request.generation,
         entries,
         total,
+        total_rough: false,
         elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
         error: None,
     }
@@ -2444,6 +2450,7 @@ fn run_worker(args: WorkerArgs) {
                 generation: request.generation,
                 entries,
                 total,
+                total_rough: false,
                 elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
                 error: None,
             });
@@ -2932,7 +2939,11 @@ fn run_worker(args: WorkerArgs) {
         let diag_finalize =
             (t_finalize.elapsed().as_secs_f32() * 1000.0 - diag_meta).max(0.0);
         let diag_total = started.elapsed().as_secs_f32() * 1000.0;
-        if (diag_total > 15.0 || profile_queries()) && !request.query.text.is_empty() {
+        // B5:空输入 + 筛选(纯过滤)路径此前完全不打 stage 日志,排障时看不到
+        // split 耗时;把「有筛选条件」也纳入记录条件。
+        if (diag_total > 15.0 || profile_queries())
+            && (!request.query.text.is_empty() || !request.filters.is_empty())
+        {
             lstr_index::snapshot::debug_log(&format!(
                 "search: stage gen={} split={:.1}ms apps={:.1}ms bm={:.1}ms notes={:.1}ms exact={:.1}ms finalize={:.1}ms meta={:.1}ms total={:.1}ms text={:?}",
                 request.generation,
@@ -2948,10 +2959,16 @@ fn run_worker(args: WorkerArgs) {
             ));
         }
 
+        // B5:空输入 + 筛选条件走引擎「纯过滤」路径,total 是计数预算内的
+        // 下界(见 query.rs FILTER_ONLY_TOTAL_CAP);UI 显示「N+」并提示。
+        let total_rough = request.query.text.trim().is_empty()
+            && !request.filters.is_empty()
+            && total >= lstr_index::query::FILTER_ONLY_TOTAL_CAP;
 send_response(&tx, &request, Response {
             generation: request.generation,
             entries,
             total,
+            total_rough,
             elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
             error,
         });
