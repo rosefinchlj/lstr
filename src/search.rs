@@ -1956,6 +1956,16 @@ fn run_worker(args: WorkerArgs) {
     }
     let mut dir_cache = browse::DirCache::new();
     let (uwp_tx, uwp_rx) = mpsc::channel::<Vec<Entry>>();
+    // B3：索引 TTL 重建放到后台线程。应用目录解析 ~几十 ms，书签/笔记要读 JSON/
+    // SQLite，最长可达数百 ms；旧实现直接在搜索线程里 load，TTL 到点的那一次查询
+    // 会被加载阻塞。这里只发「重载请求」，主循环收到新索引再替换（替换是瞬时的）。
+    let (apps_reload_tx, apps_reload_rx) = mpsc::channel::<apps::AppIndex>();
+    let (bookmarks_reload_tx, bookmarks_reload_rx) =
+        mpsc::channel::<bookmarks::BookmarkIndex>();
+    let (notes_reload_tx, notes_reload_rx) = mpsc::channel::<notes::NoteIndex>();
+    let mut apps_reloading = false;
+    let mut bookmarks_reloading = false;
+    let mut notes_reloading = false;
     // UWP 枚举要走 PowerShell（Get-StartApps，冷启动 ~2s）。
     // 懒加载：只在第一次真正需要应用结果时才启动 PowerShell；
     // 只用文件/文件夹搜索的用户，PowerShell 永远不会被拉起。
@@ -2145,17 +2155,58 @@ fn run_worker(args: WorkerArgs) {
         while let Ok(uwp_entries) = uwp_rx.try_recv() {
             apps.append_uwp(uwp_entries);
         }
-        // 应用索引时效：TTL 到点或「重新加载」信号到了就重建。
-        // 重载后 UWP 懒加载标志复位，下次需要应用结果时重新枚举。
-        let forced = apps_dirty.swap(false, Ordering::Relaxed);
-        if forced || apps_loaded.elapsed() > APPS_RELOAD_INTERVAL {
-            apps = apps::AppIndex::load();
+        // B3：后台重载完成 → 原位替换（不阻塞查询）。
+        while let Ok(next) = apps_reload_rx.try_recv() {
+            apps = next;
             uwp_started = false;
             apps_loaded = Instant::now();
+            apps_reloading = false;
+        }
+        while let Ok(next) = bookmarks_reload_rx.try_recv() {
+            bookmarks = next;
+            bookmarks_loaded = Instant::now();
+            bookmarks_stamp = bookmarks::source_stamp();
+            bookmarks_reloading = false;
+            publish_bookmark_folders(&bookmark_folders, &bookmarks);
+            lstr_index::snapshot::debug_log(&format!(
+                "bookmarks: reloaded {} entries",
+                bookmarks.count()
+            ));
+        }
+        while let Ok(next) = notes_reload_rx.try_recv() {
+            notes = next;
+            notes_loaded = Instant::now();
+            notes_stamp = notes::source_stamp();
+            notes_reloading = false;
+            publish_note_folders(&note_folders, &notes);
+            lstr_index::snapshot::debug_log(&format!(
+                "notes: reloaded {} entries",
+                notes.count()
+            ));
+        }
+        // 应用索引时效：TTL 到点或「重新加载」信号到了就重建（后台线程）。
+        // 重载后 UWP 懒加载标志复位，下次需要应用结果时重新枚举。
+        let forced = apps_dirty.swap(false, Ordering::Relaxed);
+        if !apps_reloading && (forced || apps_loaded.elapsed() > APPS_RELOAD_INTERVAL) {
+            let tx = apps_reload_tx.clone();
+            let spawned = std::thread::Builder::new()
+                .name("lstr-apps-reload".to_string())
+                .spawn(move || {
+                    let _ = tx.send(apps::AppIndex::load());
+                });
+            if spawned.is_ok() {
+                apps_reloading = true;
+            } else {
+                // 线程创建失败（极端资源紧张）：退回同步加载，保证功能不断。
+                apps = apps::AppIndex::load();
+                uwp_started = false;
+                apps_loaded = Instant::now();
+            }
         }
         // 书签索引：「重新加载」立即重建；平时按 TTL + 源文件 mtime 判断，
         // 浏览器没改书签就不重复解析。
-        if forced || bookmarks_loaded.elapsed() > BOOKMARKS_RELOAD_INTERVAL {
+        if !bookmarks_reloading && (forced || bookmarks_loaded.elapsed() > BOOKMARKS_RELOAD_INTERVAL)
+        {
             let enabled = bookmarks_enabled.load(Ordering::Relaxed);
             let stamp = bookmarks::source_stamp();
             if !enabled {
@@ -2165,20 +2216,26 @@ fn run_worker(args: WorkerArgs) {
                 bookmarks_loaded = Instant::now();
                 publish_bookmark_folders(&bookmark_folders, &bookmarks);
             } else if forced || stamp != bookmarks_stamp {
-                bookmarks = bookmarks::BookmarkIndex::load();
-                bookmarks_stamp = stamp;
-                bookmarks_loaded = Instant::now();
-                publish_bookmark_folders(&bookmark_folders, &bookmarks);
-                lstr_index::snapshot::debug_log(&format!(
-                    "bookmarks: reloaded {} entries",
-                    bookmarks.count()
-                ));
+                let tx = bookmarks_reload_tx.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("lstr-bookmarks-reload".to_string())
+                    .spawn(move || {
+                        let _ = tx.send(bookmarks::BookmarkIndex::load());
+                    });
+                if spawned.is_ok() {
+                    bookmarks_reloading = true;
+                } else {
+                    bookmarks = bookmarks::BookmarkIndex::load();
+                    bookmarks_stamp = stamp;
+                    bookmarks_loaded = Instant::now();
+                    publish_bookmark_folders(&bookmark_folders, &bookmarks);
+                }
             } else {
                 bookmarks_loaded = Instant::now();
             }
         }
         // 笔记索引：同书签，TTL + 主库/WAL mtime；开关关闭立即清空。
-        if forced || notes_loaded.elapsed() > NOTES_RELOAD_INTERVAL {
+        if !notes_reloading && (forced || notes_loaded.elapsed() > NOTES_RELOAD_INTERVAL) {
             let enabled = notes_enabled.load(Ordering::Relaxed);
             let stamp = notes::source_stamp();
             if !enabled {
@@ -2187,14 +2244,20 @@ fn run_worker(args: WorkerArgs) {
                 notes_loaded = Instant::now();
                 publish_note_folders(&note_folders, &notes);
             } else if forced || stamp != notes_stamp {
-                notes = notes::NoteIndex::load();
-                notes_stamp = stamp;
-                notes_loaded = Instant::now();
-                publish_note_folders(&note_folders, &notes);
-                lstr_index::snapshot::debug_log(&format!(
-                    "notes: reloaded {} entries",
-                    notes.count()
-                ));
+                let tx = notes_reload_tx.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("lstr-notes-reload".to_string())
+                    .spawn(move || {
+                        let _ = tx.send(notes::NoteIndex::load());
+                    });
+                if spawned.is_ok() {
+                    notes_reloading = true;
+                } else {
+                    notes = notes::NoteIndex::load();
+                    notes_stamp = stamp;
+                    notes_loaded = Instant::now();
+                    publish_note_folders(&note_folders, &notes);
+                }
             } else {
                 notes_loaded = Instant::now();
             }
