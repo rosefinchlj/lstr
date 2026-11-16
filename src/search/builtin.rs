@@ -736,7 +736,7 @@ fn effective_vol_mask(
 
 /// worker 收到 Shutdown 后的退出等待上限:worker 要 join 各卷线程(对账批次
 /// 间检查 stop)、写 clean-exit 标记后才释放管道;超时即放弃 —— 协议容忍
-/// 半开,残留 worker 由自身的 idle 超时与 clean-exit 降级机制兜底。
+/// 半开,残留 worker 由自身的 idle 超时与 clean-exit 标记/P1-5 逐卷窗口校验兜底。
 const WORKER_EXIT_WAIT: Duration = Duration::from_secs(3);
 
 /// client 线程任何退出路径都置位 `client_done`:run_worker 据此确认

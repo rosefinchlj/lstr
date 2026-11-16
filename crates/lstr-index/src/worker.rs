@@ -202,10 +202,14 @@ const MIN_POLL_MS: u64 = 100;
 /// clean-exit 标记文件名(位于 %APPDATA%\lstr\index\)。
 ///
 /// 崩溃自保护:worker 优雅退出时写,启动时「检查即消费」。启动时缺失 =
-/// 上次非正常退出(崩溃/被杀/断电)→ 本次 session 强制纯 dirscan(等价
-/// builtin,零 USN FSCTL),日志说明原因;正常退出后自动恢复。
-/// 防误伤:worker 被杀(用户关机/升级)属常见 —— 只降级一次 session,
-/// 不永久锁死(降级 session 正常退出即重写标记)。
+/// 上次非正常退出(崩溃/被杀/断电)。
+///
+/// P1-5:缺失时不再把整个 session 降级成纯 dirscan。快照 tmp+rename 原子、
+/// 旁车载入会截掉撕裂块,而 [`plan_volume_session`] 还会逐卷校验 journal
+/// 窗口(journal_id 一致且快照游标落在 [first_usn, next_usn] 内);任何
+/// 不可信状态都自动回退该卷全量扫描。整体降级会让「强杀后再启动」把所有
+/// 卷重扫一遍(几十秒),远重于上述已经存在的逐卷兜底。
+/// 只在 engine.log 记录告警,便于排障;正常退出后自动恢复标记。
 const CLEAN_EXIT_FLAG: &str = "worker_clean_exit";
 
 /// clean-exit 标记所在目录(与快照/engine.log 同一状态目录)。
@@ -213,6 +217,15 @@ fn clean_exit_flag_dir() -> Option<std::path::PathBuf> {
     std::env::var("APPDATA")
         .ok()
         .map(|base| std::path::PathBuf::from(base).join("lstr").join("index"))
+}
+
+/// P1-5:上次非正常退出(clean-exit 标记缺失)后,是否把整个 session 降级成
+/// 纯 dirscan(零 USN FSCTL)。保持 `false`:快照原子落盘 + 旁车载入校验 +
+/// [`plan_volume_session`] 的逐卷 journal 窗口校验已经能回退不可信卷;整体
+/// 降级会把「强杀 lstr 后下次启动」变成全卷重扫(几十秒),收益不成比例。
+/// 保留此函数为单点策略开关,并让回归测试可以明确断言当前行为。
+fn unclean_exit_downgrades_journal() -> bool {
+    false
 }
 
 /// 检查并清除标记(检查即消费:本次会话结束无论好坏都要重写)。
@@ -338,18 +351,23 @@ pub fn worker_main() -> i32 {
         }
     }
     let mode = parsed.scan_mode;
-    // clean-exit 自保护(见模块下方 CLEAN_EXIT_FLAG 文档):上次非正常退出
-    // → 本次 session 强制纯 dirscan(等价 builtin,零 USN FSCTL),只降级一次。
+    // clean-exit 自保护(见 CLEAN_EXIT_FLAG 文档):上次非正常退出时只记录
+    // 告警,仍启用 USN 增量。快照原子落盘 + 旁车载入校验 + 逐卷 journal
+    // 窗口校验(plan_volume_session 不匹配即回退 Full)负责兜底;整体降级
+    // 为纯 dirscan 会把强杀后的下次启动变成全卷重扫(P1-5)。
     if parsed.journal {
         let unclean = clean_exit_flag_dir()
             .map(|dir| !take_clean_exit_flag(&dir))
-            .unwrap_or(false); // 无法定位状态目录时不降级(防环境问题误伤)
+            .unwrap_or(false); // 无法定位状态目录时按正常处理(防环境问题误伤)
         if unclean {
             crate::snapshot::debug_log(
-                "worker: clean-exit flag missing (last exit unclean) \
-                 → journal disabled this session (pure dirscan)",
+                "worker: clean-exit flag missing (last exit unclean); \
+                 journal kept enabled — per-volume journal window validation \
+                 falls back to full scan when the snapshot cursor is untrusted",
             );
-            parsed.journal = false;
+            if unclean_exit_downgrades_journal() {
+                parsed.journal = false;
+            }
         }
     }
     let journal = parsed.journal;
@@ -1712,7 +1730,7 @@ mod tests {
         assert_eq!(plan_dir_usn_session(None, live), DirUsnPlan::FullScan { sync: false });
     }
 
-    /// clean-exit 标记语义:缺失=上次非正常退出(降级);写→存在;检查即消费。
+    /// clean-exit 标记语义:缺失=上次非正常退出(仅告警,不再整体降级);写→存在;检查即消费。
     #[test]
     fn clean_exit_flag_take_once() {
         let dir = std::env::temp_dir().join(format!("lstr-worker-flag-{}", std::process::id()));
@@ -1720,7 +1738,16 @@ mod tests {
         assert!(!take_clean_exit_flag(&dir), "缺失 → 按上次非正常退出处理");
         write_clean_exit_flag(&dir);
         assert!(take_clean_exit_flag(&dir), "优雅退出写回 → 本 session 信任 USN");
-        assert!(!take_clean_exit_flag(&dir), "消费后必须消失:worker 被杀 → 下次降级一次");
+        assert!(!take_clean_exit_flag(&dir), "消费后必须消失:worker 被杀 → 下次告警一次");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-5:强杀/崩溃后不再整体降级为全卷 dirscan,依赖逐卷 journal 窗口校验。
+    #[test]
+    fn unclean_exit_keeps_journal_enabled() {
+        assert!(
+            !unclean_exit_downgrades_journal(),
+            "P1-5:上次非正常退出不应关闭 journal(全卷重扫代价过大)"
+        );
     }
 }
