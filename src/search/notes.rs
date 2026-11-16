@@ -321,6 +321,12 @@ fn load_one(
         }
         drop(conn);
         let _ = fs::remove_dir_all(&tmp);
+    } else {
+        // B16：整条笔记源静默为空时，至少留一条可诊断日志。
+        lstr_index::snapshot::debug_log(&format!(
+            "notes: skipped {} (open direct/temp copy failed; client may be writing or DB locked)",
+            db.display()
+        ));
     }
 }
 

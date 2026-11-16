@@ -189,9 +189,17 @@ struct RawBookmark {
 
 fn load_chromium_file(path: &Path, raw: &mut Vec<RawBookmark>) {
     let Ok(text) = fs::read_to_string(path) else {
+        lstr_index::snapshot::debug_log(&format!(
+            "bookmarks: read failed: {}",
+            path.display()
+        ));
         return;
     };
     let Ok(root) = serde_json::from_str::<Value>(&text) else {
+        lstr_index::snapshot::debug_log(&format!(
+            "bookmarks: invalid JSON: {}",
+            path.display()
+        ));
         return;
     };
     let Some(roots) = root.get("roots").and_then(Value::as_object) else {
@@ -354,7 +362,17 @@ fn load_firefox_db(db: &Path, raw: &mut Vec<RawBookmark>) {
                     }
                 }
             }
+        } else {
+            lstr_index::snapshot::debug_log(&format!(
+                "bookmarks: firefox copy open failed: {}",
+                db.display()
+            ));
         }
+    } else {
+        lstr_index::snapshot::debug_log(&format!(
+            "bookmarks: firefox places copy failed: {}",
+            db.display()
+        ));
     }
     let _ = fs::remove_dir_all(&tmp);
 }
