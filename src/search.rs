@@ -970,6 +970,26 @@ mod pin_tests {
         assert_eq!(count, 5, "同名候选不得被丢弃（总数与列表条数一致）");
     }
 
+    /// B4：meta 缓存命中后不再探测 FS —— 文件被删掉，TTL 内第二次调用仍返回
+    /// 首次的缓存值；清缓存后才按真实 FS 返回 None。锁内只做小表操作。
+    #[test]
+    fn meta_cache_serves_recent_results_without_fs() {
+        clear_meta_cache();
+        let dir = std::env::temp_dir().join(format!("lstr-meta-cache-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("probe.txt");
+        std::fs::write(&file, b"lstr").expect("write probe file");
+        let path = file.to_string_lossy().to_string();
+        let first = find_meta_cached(&path);
+        assert!(first.is_some(), "存在的文件应返回元数据");
+        std::fs::remove_file(&file).expect("remove probe file");
+        let second = find_meta_cached(&path);
+        assert_eq!(second, first, "TTL 内应命中缓存，而不是重新探测已删除文件");
+        clear_meta_cache();
+        assert!(find_meta_cached(&path).is_none(), "清缓存后应反映文件已删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 回归：用户搜 `ucrtbase.dll`，索引里 147 条同名文件（C 60 / D 80 / E 6），
     /// 旧实现按「精确同名每种最多 6 条」砍到只剩 6 条 C 盘（再加 2 条子串命中），
     /// 状态栏却显示 147 —— D 盘命中一条都看不到。精确同名必须不设上限。
@@ -1325,6 +1345,45 @@ impl PendingMeta {
     }
 }
 
+/// B4：`fill_one_meta` 的短期元数据缓存。
+///
+/// 键入过程中前缀相同（"u"→"us"→"use"→"useb"）的连续查询会反复对同一批候选
+/// 调 `GetFileAttributesExW`；冷缓存下 meta 阶段可达 10~230ms。这里按
+/// 「小写路径 + 3s TTL」缓存元数据（含失败结果，减少对已删/无权限路径的重复
+/// 探测），只缓存最终候选这一小撮，512 条封顶，命中即零 FS。
+const META_CACHE_TTL: Duration = Duration::from_secs(3);
+const META_CACHE_CAP: usize = 512;
+/// `(size, modified, is_dir)`。
+type MetaValue = (u64, i64, bool);
+type MetaCache = HashMap<String, (Instant, Option<MetaValue>)>;
+thread_local! {
+    static META_CACHE: std::cell::RefCell<MetaCache> = std::cell::RefCell::new(HashMap::new());
+}
+
+fn find_meta_cached(path_str: &str) -> Option<MetaValue> {
+    let key = path_str.to_lowercase();
+    META_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((at, value)) = cache.get(&key) {
+            if at.elapsed() < META_CACHE_TTL {
+                return *value;
+            }
+            cache.remove(&key);
+        }
+        let value = lstr_index::win::find_meta(path_str);
+        if cache.len() >= META_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, (Instant::now(), value));
+        value
+    })
+}
+
+#[cfg(test)]
+fn clear_meta_cache() {
+    META_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 /// 单条最终候选的元数据填充 + 漂移校正;None = 旧路径同样会丢弃。
 /// `correct_kind=false` 用于精确同名补齐(旧 `search_exact` 不校正类型),
 /// 只填 size/mtime。
@@ -1346,7 +1405,7 @@ fn fill_one_meta(entry: Entry, correct_kind: bool) -> Option<Entry> {
         return Some(entry);
     };
     let path_str = path.to_string_lossy();
-    let Some((size, modified, fs_dir)) = lstr_index::win::find_meta(&path_str) else {
+    let Some((size, modified, fs_dir)) = find_meta_cached(&path_str) else {
         return None;
     };
     // 候选阶段按索引 attrs 定的 kind:Folder ⇔ 索引说 is_dir。
@@ -4083,3 +4142,5 @@ mod tests {
         assert_eq!(names, vec!["Beta", "Delta", "Alpha", "Gamma"]);
     }
 }
+
+
