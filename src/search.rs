@@ -1223,67 +1223,18 @@ impl PendingMeta {
 /// 一次索引扫描后又被修改),这是刻意取舍:排序要避免每个候选一次 FS
 /// 调用,展示则要求时间新鲜。索引 mtime 为 0(未知)时,本函数从 FS 拿到
 /// 的值仍可补上,从而不影响展示。
-#[cfg(test)]
+///
+/// 这里**始终逐条** `GetFileAttributesExW`,不做同父目录批量枚举:
+/// 内置索引只收固定 NTFS 本地卷,逐条查询实测 ~17µs/条;而一次整目录
+/// 枚举(旧的 `list_dir_meta` 批量层)对 1.7 万文件的图标目录要 ~20ms
+/// (冷缓存 200ms+)。旧批量层从同目录第 2 条候选就触发,`useb` 命中 8 个
+/// 图标文件时把 meta 阶段从 <1ms 推到 233ms(2026-11-16 日志实锤)。
 fn fill_one_meta(entry: Entry, correct_kind: bool) -> Option<Entry> {
-    // 单条入口(测试 oracle 与无批量上下文用):fresh filler 首个候选必逐条,
-    // 行为与旧实现逐字节一致。生产路径走 fill_one_meta_with(共享 filler)。
-    fill_one_meta_with(entry, correct_kind, &mut MetaFiller::default())
-}
-
-/// 惰性元数据填充的批量优化:同一父目录第 2 个候选起改用一次
-/// `list_dir_meta` 目录枚举批量取 size/mtime,取代逐条 `GetFileAttributesExW`
-/// (load more 到数千条、结果集中在少数目录时收益明显)。首个候选仍逐条,
-/// 避免为单个条目枚举巨型目录;枚举失败/名字歧义一律回退逐条,语义不变。
-#[derive(Default)]
-struct MetaFiller {
-    dirs: HashMap<String, DirMetaState>,
-}
-
-enum DirMetaState {
-    /// 只见过一个候选:尚未枚举(逐条查)。
-    SeenOnce,
-    /// 已枚举(可能失败=None);后续候选按名取,取不到回退逐条。
-    Batched(Option<lstr_index::win::DirMeta>),
-}
-
-impl MetaFiller {
-    fn find(&mut self, path: &str) -> Option<(u64, i64, bool)> {
-        let p = std::path::Path::new(path);
-        let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
-            return lstr_index::win::find_meta(path);
-        };
-        let parent = parent.to_string_lossy().into_owned();
-        let name = name.to_string_lossy().into_owned();
-        use std::collections::hash_map::Entry;
-        match self.dirs.entry(parent) {
-            Entry::Vacant(v) => {
-                v.insert(DirMetaState::SeenOnce);
-                lstr_index::win::find_meta(path)
-            }
-            Entry::Occupied(mut o) => {
-                if matches!(o.get(), DirMetaState::SeenOnce) {
-                    let dm = lstr_index::win::list_dir_meta(o.key());
-                    o.insert(DirMetaState::Batched(dm));
-                }
-                let dm = match o.get() {
-                    DirMetaState::Batched(d) => d.as_ref(),
-                    DirMetaState::SeenOnce => None,
-                };
-                match dm.and_then(|d| d.get(&name)) {
-                    Some(m) => Some((m.size, m.mtime, m.is_dir)),
-                    None => lstr_index::win::find_meta(path),
-                }
-            }
-        }
-    }
-}
-
-fn fill_one_meta_with(entry: Entry, correct_kind: bool, filler: &mut MetaFiller) -> Option<Entry> {
     let Some(path) = entry.path.as_ref() else {
         return Some(entry);
     };
     let path_str = path.to_string_lossy();
-    let Some((size, modified, fs_dir)) = filler.find(&path_str) else {
+    let Some((size, modified, fs_dir)) = lstr_index::win::find_meta(&path_str) else {
         return None;
     };
     // 候选阶段按索引 attrs 定的 kind:Folder ⇔ 索引说 is_dir。
@@ -1417,8 +1368,7 @@ fn finalize_entries_with_pending(
         let mut non_exact = 0usize;
         // 同一 id 的 split/exact 副本按出现顺序消费 PendingMeta 里的语义。
         let mut pending_uses: HashMap<String, usize> = HashMap::new();
-        // 跨候选共享的元数据填充器:同父目录批量枚举(见 MetaFiller)。
-        let mut filler = MetaFiller::default();
+        // 候选阶段零 FS,这里只对最终候选逐条取元数据(单条 ~17µs)。
         for entry in entries {
             let name_lower = entry.name.to_lowercase();
             let is_exact = !needle_lower.is_empty()
@@ -1453,7 +1403,7 @@ fn finalize_entries_with_pending(
                 continue;
             }
             let filled = match mode {
-                Some(correct_kind) => fill_one_meta_with(entry, correct_kind, &mut filler),
+                Some(correct_kind) => fill_one_meta(entry, correct_kind),
                 None => Some(entry),
             };
             let Some(entry) = filled else { continue };
