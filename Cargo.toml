@@ -43,6 +43,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_NetManagement",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_Security",
