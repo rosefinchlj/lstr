@@ -122,6 +122,23 @@ pub struct Response {
     pub error: Option<String>,
 }
 
+/// B18：输入框的盘符条件（`c:`）与位置/盘符 chip 求交后没有剩任何卷时，
+/// 返回可诊断提示（否则用户只看到 0 条，以为是「没有文件」）。
+fn drive_mask_conflict_note(
+    query_mask: Option<u32>,
+    filter_mask: Option<u32>,
+) -> Option<String> {
+    let mask = filters::intersect_drive_masks(query_mask, filter_mask)?;
+    if mask != 0 {
+        return None;
+    }
+    Some(
+        "盘符条件互相冲突或排除了所有卷（例如输入 c: 但位置筛选选了 D 盘），\
+         当前没有任何可查卷；请清掉其中一个后重试"
+            .to_string(),
+    )
+}
+
 /// 诊断：响应发出时距请求发出的总耗时（含排队）。仅慢查询写 engine.log。
 /// 与 UI 侧 `search: ui total=` 对照可区分「worker 慢」与「UI 帧等待慢」。
 fn send_response(tx: &Sender<Response>, request: &Request, response: Response) {
@@ -838,6 +855,19 @@ mod pin_tests {
             base_folder: None,
             browse_root: None,
         }
+    }
+
+    #[test]
+    fn drive_mask_conflict_is_diagnosed() {
+        // B18：`c:` + 位置 D 盘 → 掩码求交为空，必须给可诊断提示而不是静默 0 条。
+        let c = 1u32 << 2;
+        let d = 1u32 << 3;
+        assert!(drive_mask_conflict_note(Some(c), Some(d)).is_some());
+        assert!(drive_mask_conflict_note(Some(c), Some(c)).is_none());
+        assert!(drive_mask_conflict_note(Some(c), None).is_none());
+        assert!(drive_mask_conflict_note(None, None).is_none());
+        // 手动把全部卷都排除（含 0 卷掩码）同样提示。
+        assert!(drive_mask_conflict_note(None, Some(0)).is_some());
     }
 
     #[test]
@@ -2730,10 +2760,12 @@ fn run_worker(args: WorkerArgs) {
         // 盘符过滤兜底：内置引擎已按卷掩码查询；历史等其余来源的
         // 路径条目在这里统一裁掉（应用/命令无盘符，不受影响）。
         // 查询文本里的盘符 token 与输入框盘符 chip 求交。
-        if let Some(mask) = filters::intersect_drive_masks(
-            request.query.drive_mask(),
-            request.filters.drive_mask(),
-        ) {
+        let query_drive_mask = request.query.drive_mask();
+        let filter_drive_mask = request.filters.drive_mask();
+        if error.is_none() {
+            error = drive_mask_conflict_note(query_drive_mask, filter_drive_mask);
+        }
+        if let Some(mask) = filters::intersect_drive_masks(query_drive_mask, filter_drive_mask) {
             entries.retain(|e| {
                 let Some(path) = &e.path else { return true };
                 filters::path_in_drive_mask(path, mask)
