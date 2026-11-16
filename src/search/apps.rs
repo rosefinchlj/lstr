@@ -45,6 +45,16 @@ const COMMON: [(&str, i32); 10] = [
     ("计算器", 60),
 ];
 
+/// Windows 自带页面的口语别名：开始菜单里叫「设置」，用户常打「系统设置」。
+/// 只参与搜索命中与排序，不改显示名；拼音也算（xtsz → 系统设置）。
+fn name_aliases(name: &str) -> &'static [&'static str] {
+    match name {
+        "设置" => &["系统设置", "windows设置", "windows 设置", "settings"],
+        "控制面板" => &["控制台"],
+        _ => &[],
+    }
+}
+
 fn common_boost(lower_name: &str) -> i32 {
     COMMON
         .iter()
@@ -113,18 +123,28 @@ impl AppIndex {
                 };
                 let py_prefix = py.split(' ').any(|token| token.starts_with(&needle));
                 let py_contains = py.split(' ').any(|token| token.contains(&needle));
+                // 口语别名：开始菜单里叫「设置」，用户常打「系统设置」。
+                // 别名只参与命中与排序（排在名字命中之后、拼音之前），不改显示名。
+                let alias_hit = name_aliases(&entry.name).iter().any(|alias| {
+                    alias.starts_with(&needle)
+                        || pinyin::keys(alias)
+                            .split(' ')
+                            .any(|token| token.starts_with(&needle))
+                });
                 let rank = if name.starts_with(&needle) {
                     0
                 } else if name.contains(&needle) {
                     1
-                } else if py_prefix {
+                } else if alias_hit {
                     2
-                } else if py_contains {
+                } else if py_prefix {
                     3
+                } else if py_contains {
+                    4
                 } else if fuzzy::score_gated(&entry.name, &needle).is_some() {
                     // 子序列模糊：vsc → Visual Studio Code（逐字符闸门：
                     // 散字母伪匹配如 rust → Blend for Visual Studio 直接拒绝）。
-                    4
+                    5
                 } else {
                     // 拼音容错（wxin → weixin）：中文名的「首字母串」「全拼串」
                     // 逐段密度匹配。纯 ASCII 名的 pinyin key 只是名字小写无空格
@@ -146,7 +166,7 @@ impl AppIndex {
                         .split(' ')
                         .any(|token| fuzzy::score_dense(token, &needle).is_some());
                     if ok {
-                        4
+                        5
                     } else {
                         return None;
                     }
@@ -700,6 +720,35 @@ mod tests {
         assert_ne!(super::name_key("微信"), super::name_key("WeChat"));
         assert_ne!(super::name_key("微信输入法"), super::name_key("微信"));
     }
+
+    /// 系统页面按口语名字也能搜到：开始菜单里只有「设置」，用户常打「系统设置」。
+    #[test]
+    fn builtin_settings_match_colloquial_names() {
+        let mut index = sample();
+        index.apps.extend(super::system_entries());
+        for query in ["系统设置", "设置", "settings", "xtsz", "windows设置"] {
+            let hits = index.search(query, 10);
+            assert!(
+                hits.iter().any(|entry| entry.name == "设置"),
+                "「{query}」应能找到「设置」，实际: {:?}",
+                hits.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+            );
+        }
+        // 别名不该把「系统属性 / 系统信息」挤到前面。
+        let hits = index.search("系统设置", 10);
+        assert_eq!(hits[0].name, "设置");
+    }
+
+    /// 系统工具的内置条目都带可启动目标（ms-settings:/cpl/msc/exe 之类）。
+    #[test]
+    fn system_entries_all_have_launch_targets() {
+        for entry in super::system_entries() {
+            let Some(path) = entry.path.as_ref() else {
+                panic!("{} 缺少启动目标", entry.name);
+            };
+            assert!(!path.as_os_str().is_empty(), "{} 目标为空", entry.name);
+        }
+    }
 }
 
 
@@ -712,6 +761,10 @@ fn system_entries() -> Vec<Entry> {
         ("卸载程序", "appwiz.cpl", ""),
         ("程序和功能", "appwiz.cpl", ""),
         ("应用和功能", "ms-settings:appsfeatures", ""),
+        // 「设置」在开始菜单里是 UWP 条目，加载要比这慢一截（Get-StartApps ~2s）；
+        // 内置一份让「设置 / 系统设置」在 UWP 并入前就能搜到，同名 UWP 条目会被
+        // name_key 去重掉。
+        ("设置", "ms-settings:", ""),
         ("设备管理器", "devmgmt.msc", ""),
         ("磁盘管理", "diskmgmt.msc", ""),
         ("服务", "services.msc", ""),
