@@ -64,6 +64,7 @@ pub(crate) struct CompactTask {
     parent: Vec<u32>,
     attrs: Vec<u16>,
     mtime: Vec<u32>,
+    size: Vec<u64>,
     frn: Vec<u64>,
     cols_cursor: usize,
     offs: Vec<u32>,
@@ -112,6 +113,7 @@ impl CompactTask {
             parent: Vec::new(),
             attrs: Vec::new(),
             mtime: Vec::new(),
+            size: Vec::new(),
             frn: Vec::new(),
             cols_cursor: 0,
             offs: Vec::new(),
@@ -340,6 +342,7 @@ impl CompactTask {
             self.parent.reserve(self.by_frn.len());
             self.attrs.reserve(self.by_frn.len());
             self.mtime.reserve(self.by_frn.len());
+            self.size.reserve(self.by_frn.len());
             self.frn.reserve(self.by_frn.len());
         }
         let mut n = 0usize;
@@ -351,6 +354,10 @@ impl CompactTask {
                 .push(if p == NO_PARENT { NO_PARENT } else { self.remap[p as usize] });
             self.attrs.push(store.attrs[old as usize] & !ATTR_INTERNAL);
             self.mtime.push(store.mtime[old as usize]);
+            // size 列与 mtime 同语义:按旧 slot 取值,写入新 slot 序。
+            // 漏掉这一列会让 `size:` 过滤指向别的文件(UI 由逐条 find_meta
+            // 覆盖,肉眼不易发现),且错位列会被快照持久化。
+            self.size.push(store.size[old as usize]);
             self.frn.push(store.frn[old as usize]);
             n += 1;
             if n % CHECK_EVERY == 0 && Instant::now() >= deadline {
@@ -450,6 +457,7 @@ impl CompactTask {
         store.parent = std::mem::take(&mut self.parent);
         store.attrs = std::mem::take(&mut self.attrs);
         store.mtime = std::mem::take(&mut self.mtime);
+        store.size = std::mem::take(&mut self.size);
         store.char_mask = std::mem::take(&mut self.mask);
         store.off_index = store
             .name_off
@@ -482,6 +490,7 @@ impl CompactTask {
         store.reindex_mark.clear();
         store.reindex_mark.resize((store.name_off.len() + 63) / 64, 0);
         store.rebuild_mtime_pending();
+        store.rebuild_size_pending();
         if store.children_built {
             store.rebuild_children();
         }
@@ -720,6 +729,7 @@ mod tests {
         assert_eq!(a.parent, b.parent, "parent");
         assert_eq!(a.attrs, b.attrs, "attrs");
         assert_eq!(a.mtime, b.mtime, "mtime");
+        assert_eq!(a.size, b.size, "size");
         assert_eq!(a.char_mask, b.char_mask, "char_mask");
         assert_eq!(a.base_len, b.base_len, "base_len");
         assert_eq!(a.dead_count, b.dead_count, "dead_count");
@@ -760,7 +770,31 @@ mod tests {
         assert!(slices > 0, "极小预算下必须分片执行");
         assert_same_cols(&sync_store, &paged);
         assert_same_queries(&sync_store, &paged);
-        assert!(paged.ngram.is_some(), "测试构建强制建倒排（阈值 0）");
+        assert!(paged.ngram.is_some(), "测试构建强制建倒排（阈值 1）");
+    }
+
+    /// P1 回归:分片 compact 必须重排 size 列。同步 `compact` 会按新 slot 序
+    /// 重建 size,而 `CompactTask` 曾漏掉这一列 —— slot 按 FRN 重排后
+    /// `size[slot]` 指向别的文件,`size:` 过滤静默命中错误条目(UI 由逐条
+    /// find_meta 覆盖,肉眼不易发现),错位列还会被快照持久化。
+    #[test]
+    fn paged_compact_permutes_size_column() {
+        let mut sync_store = churned_store();
+        let mut paged = churned_store();
+        // 灌可区分的真实 size(u64::MAX 是「待回填」标记,用它测不出错位)。
+        for (i, s) in sync_store.size.iter_mut().enumerate() {
+            *s = (i as u64 + 1) * 4096;
+        }
+        for (i, s) in paged.size.iter_mut().enumerate() {
+            *s = (i as u64 + 1) * 4096;
+        }
+
+        sync_store.compact();
+        let mut task = CompactTask::new(&paged).expect("有待归并工作");
+        while !task.advance(&mut paged, Duration::from_micros(50)) {}
+
+        assert_eq!(sync_store.size, paged.size, "size 列必须随 slot 重排");
+        assert_eq!(paged.size.len(), paged.len(), "size 列必须与 live 列等长");
     }
 
     /// 逐名折叠与整缓冲折叠必须逐字节一致（分片构建 names_lc 的前提）。

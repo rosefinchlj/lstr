@@ -3684,6 +3684,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 首扫收尾现在走后台 compact:size 列必须随 slot 重排,否则 `size:`
+    /// 过滤会命中错误文件(CompactTask 曾漏掉 size 列;UI 有逐条 find_meta
+    /// 兜底,肉眼很难发现,错位列还会被快照持久化)。
+    #[test]
+    fn first_scan_background_compact_keeps_size_column() {
+        const N: u64 = 30_000;
+        let dir = temp_index_dir("first-scan-size-col");
+        let guid = 0x5151u128;
+        let mut engine = engine_with(&dir);
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'C',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: N,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        // 乱序下发(7919 与 30000 互素 → 是 0..N 的置换):compact 后的 slot
+        // 顺序按 FRN 排,必然与插入序不同;size 取 FRN 的倍数便于逐槽校验。
+        let recs: Vec<Rec> = (0..N)
+            .map(|i| {
+                let frn = 1_000 + (i * 7_919) % N;
+                Rec {
+                    frn,
+                    parent_frn: 0,
+                    attrs: 0,
+                    op: Op::Upsert,
+                    name: format!("f{frn}.txt"),
+                    mtime: 0,
+                    size: frn * 10,
+                }
+            })
+            .collect();
+        engine.handle(EngineMsg::Records { guid, recs, next_usn: 100 });
+        engine.handle(EngineMsg::VolumeReady {
+            guid,
+            journal_id: 7,
+            next_usn: 110,
+            count: N as u32,
+        });
+        assert!(
+            engine.compact_in_progress(),
+            "3 万条的首扫收尾应交给真后台线程"
+        );
+        settle_compact(&mut engine);
+
+        let store = engine.volumes[0].store.as_ref().unwrap();
+        assert_eq!(store.size.len(), store.len(), "size 列必须与 live 列等长");
+        for slot in 0..store.len() as u32 {
+            assert_eq!(
+                store.size[slot as usize],
+                store.frn[slot as usize] * 10,
+                "size 列与 slot 错位(slot {slot})"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A 步:启动加载快照后,worker 只用 DirSync 逐批 patch;本轮没见到的条目
     /// 视为离线期间被删除,DirSyncEnd(ok=true) 后消失;中途停止(ok=false)
     /// 绝不能删条目。
