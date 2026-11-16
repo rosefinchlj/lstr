@@ -6,7 +6,8 @@
 //! - 本模块用 `WH_KEYBOARD_LL` 低级钩子，是唯一能**吞键**的通道。
 //!
 //! 安全边界（这是全局钩子，判定错了会吃掉用户正常打字）：
-//! 1. 只有 `config.explorer_typing = true` 时才由 app 启动（默认关闭，设置页可开）；
+//! 1. 只有 `config.explorer_typing = true` 时才由 app 启动（**默认关闭**,
+//!    设置页显式开启；P0-5 隐私：诊断日志不记录字符内容）；
 //! 2. 只在前台窗口类属于 Explorer/桌面白名单时生效；
 //! 3. 焦点落在任何编辑框（地址栏、搜索框、重命名框）时放行；
 //! 4. Ctrl / Alt / Win 组合、IME 组合键（VK_PROCESSKEY）一律放行；
@@ -379,9 +380,12 @@ unsafe fn classify(kb: &KBDLLHOOKSTRUCT) -> Option<char> {
         return None;
     }
     let ch = vk_to_char(kb.vkCode, MOD_SHIFT.load(Ordering::Relaxed))?;
+    // P0-5（隐私）：诊断日志绝不落盘实际字符。旧版这里写 `capture: ch=s`，
+    // 会把用户在资源管理器里敲下的每个字母明文写进 %APPDATA%\lstr\typing.log
+    // （默认开启的全局钩子）。只保留窗口类名，排障足够、且不含用户输入。
     log_decision(|| {
         format!(
-            "capture: ch={ch} class={} focus={}",
+            "capture: foreground={} focus={}",
             foreground_class_name(),
             focus_class_name()
         )

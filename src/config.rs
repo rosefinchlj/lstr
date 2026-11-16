@@ -58,10 +58,17 @@ pub struct Config {
     #[serde(default)]
     pub commands: Vec<CommandDef>,
     // —— P0-2 / P0-3 开关 ——
-    /// Explorer 内「直接键入搜索」：全局低级键盘钩子，默认关闭（需设置页显式开启）。
-    /// 判定严格：仅 Explorer 前台 + 非编辑框 + 无修饰键/IME；设置页可随时关闭。
+    /// Explorer 内「直接键入搜索」：全局低级键盘钩子，**默认关闭**（隐私优先，
+    /// 需设置页显式开启）。判定严格：仅 Explorer 前台 + 非编辑框 + 无修饰键/IME；
+    /// 设置页可随时关闭。
     #[serde(default)]
     pub explorer_typing: bool,
+
+    /// 内部迁移标记（P0-5 隐私修正）：v0.1.x 把 `explorer_typing` 默认写成
+    /// true 并落盘；升级后第一次 load 用本标记一次性关掉它，避免「默认监听
+    /// 键盘」延续到老用户。写进 config.toml，不参与任何 UI。
+    #[serde(default)]
+    pub privacy_v2: bool,
 
     /// 自研索引引擎（设置面板「搜索」页）。
     #[serde(default)]
@@ -555,7 +562,9 @@ impl Default for Config {
             hidden_apps: Vec::new(),
             actions: Vec::new(),
             commands: Vec::new(),
-            explorer_typing: true,
+            // P0-5：默认不安装全局键盘钩子（需要用户在设置页显式开启）。
+            explorer_typing: false,
+            privacy_v2: true,
             index: IndexConfig::default(),
         }
     }
@@ -647,10 +656,12 @@ impl Config {
                 let seeded_before = cfg.index.noise_seeded;
                 cfg.migrate_noise_list();
                 let migrated = !seeded_before;
+                // P0-5：老配置默认开着全局键盘钩子，升级后一次性关掉。
+                let privacy_reset = cfg.migrate_privacy();
                 // 唤起热键：手写 config.toml 的非法值（如裸字母）回退默认，
                 // 避免静默变成「永不生效」或全局吞键。
                 cfg.hotkey = crate::hotkey::normalize_hotkey_or_default(&cfg.hotkey);
-                if migrated {
+                if migrated || privacy_reset {
                     let _ = cfg.save();
                 }
                 cfg
@@ -660,6 +671,23 @@ impl Config {
                 Self::default()
             }
         }
+    }
+
+    /// P0-5（隐私）：老版本默认开启「资源管理器键入即搜」并把它持久化成
+    /// `explorer_typing = true`。升级后第一次 load 一次性关闭，让「默认不监听
+    /// 键盘」对存量用户也成立；用户要开仍可在设置页显式打开。
+    ///
+    /// 返回是否改动了配置（需要立即落盘）。幂等：`privacy_v2` 置位后不再动。
+    pub fn migrate_privacy(&mut self) -> bool {
+        if self.privacy_v2 {
+            return false;
+        }
+        self.privacy_v2 = true;
+        if self.explorer_typing {
+            self.explorer_typing = false;
+            return true;
+        }
+        false
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -678,7 +706,10 @@ impl Config {
 
 pub fn parse_hex(input: &str) -> Option<[u8; 3]> {
     let s = input.trim().trim_start_matches('#');
-    if s.len() != 6 {
+    // P1-3：必须先确认是 6 个 ASCII 十六进制字符，再按字节切片。
+    // 旧代码只查了 `s.len() == 6`——`accent = "红色"`（UTF-8 下恰好 6 字节）
+    // 会在 `&s[0..2]` 处按字符边界切开 panic（设置页一改主题就崩）。
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -866,13 +897,57 @@ mod tests {
         );
     }
 
+    /// P1-3：非法/多字节 accent 必须安全返回 None，不能按字节中间切片 panic。
+    #[test]
+    fn parse_hex_rejects_multibyte_and_bad_input() {
+        assert_eq!(parse_hex("#A78BFA"), Some([0xA7, 0x8B, 0xFA]));
+        assert_eq!(parse_hex(" a78bfa "), Some([0xA7, 0x8B, 0xFA]));
+        assert_eq!(parse_hex("红色"), None, "6 字节但非 ASCII 十六进制");
+        assert_eq!(parse_hex("红色ab"), None);
+        assert_eq!(parse_hex("#GGGGGG"), None);
+        assert_eq!(parse_hex(""), None);
+        assert_eq!(parse_hex("12345"), None);
+        // 兜底：[0] 开头但越界的输入也不 panic。
+        for input in ["ééé", "#中文字符", "\u{1F600}\u{1F600}\u{1F600}", "A7 8B FA"] {
+            assert!(parse_hex(input).is_none(), "不应解析: {input:?}");
+        }
+    }
+
+    /// P0-5：老配置里 explorer_typing=true 且没有 privacy_v2 标记时，
+    /// load 迁移只关一次，之后用户显式开启不会被再次关掉。
+    #[test]
+    fn legacy_explorer_typing_is_disabled_once() {
+        assert!(!Config::default().explorer_typing);
+        assert!(Config::default().privacy_v2, "新配置已带迁移标记");
+
+        let mut value = toml::Value::try_from(Config::default()).expect("config → toml value");
+        let table = value.as_table_mut().expect("table");
+        table.remove("privacy_v2");
+        table.insert("explorer_typing".to_string(), toml::Value::Boolean(true));
+        let text = toml::to_string(&value).expect("serialize legacy config");
+        let mut cfg: Config = toml::from_str(&text).expect("deserialize legacy config");
+        assert!(cfg.explorer_typing);
+        assert!(!cfg.privacy_v2);
+
+        assert!(cfg.migrate_privacy(), "首次迁移应关闭旧默认值");
+        assert!(!cfg.explorer_typing);
+        assert!(cfg.privacy_v2);
+        assert!(!cfg.migrate_privacy(), "已迁移后不再改动");
+
+        // 用户之后在设置页重新开启：不会在下一次 load 被再次关闭。
+        cfg.explorer_typing = true;
+        assert!(!cfg.migrate_privacy());
+        assert!(cfg.explorer_typing);
+    }
+
     #[test]
     fn default_config_round_trips_through_toml() {
         let text = toml::to_string(&Config::default()).expect("serialize config");
         let parsed: Config = toml::from_str(&text).expect("deserialize config");
         assert!(parsed.height.is_none());
         assert_eq!(parsed.theme.mode, "frost");
-        assert!(parsed.explorer_typing);
+        assert!(!parsed.explorer_typing, "默认不安装全局键盘钩子");
+        assert!(parsed.privacy_v2);
         assert!(parsed.favorites.is_empty());
         assert!(parsed.hidden_apps.is_empty());
     }

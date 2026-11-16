@@ -4870,10 +4870,15 @@ impl LstrApp {
                     rect.set_height(height);
                 }
                 let painter = ui.painter().clone();
+                // P1-2：亚克力不可用时的兜底必须跟随主题。旧实现固定深底
+                // (24,28,34,246)，浅色主题（frost）下深底 + 深字对比度约
+                // 1.03:1，等于整窗看不见。兜底用主题背景的近似不透明色。
                 let bg = if self.acrylic_ok {
                     theme.bg
+                } else if theme.light {
+                    Color32::from_rgba_unmultiplied(238, 240, 243, 252)
                 } else {
-                    Color32::from_rgba_unmultiplied(24, 28, 34, 246)
+                    Color32::from_rgba_unmultiplied(24, 28, 34, 252)
                 };
                 painter.rect_filled(rect, CornerRadius::same(theme.radius), bg);
                 painter.rect_stroke(
