@@ -70,6 +70,12 @@ pub struct Config {
     #[serde(default)]
     pub privacy_v2: bool,
 
+    /// 是否已经看过首启欢迎引导。默认 false：新装用户第一次打开会看到
+    /// 「双击 Ctrl / 首次索引 / 托盘」三行提示 + 「开始使用」按钮，点掉后
+    /// 不再出现（老配置升级也会看一次，属于可接受的一次性引导）。
+    #[serde(default)]
+    pub onboarded: bool,
+
     /// 自研索引引擎（设置面板「搜索」页）。
     #[serde(default)]
     pub index: IndexConfig,
@@ -565,6 +571,8 @@ impl Default for Config {
             // P0-5：默认不安装全局键盘钩子（需要用户在设置页显式开启）。
             explorer_typing: false,
             privacy_v2: true,
+            // P0-2：新装默认展示一次首启引导。
+            onboarded: false,
             index: IndexConfig::default(),
         }
     }
@@ -938,6 +946,32 @@ mod tests {
         cfg.explorer_typing = true;
         assert!(!cfg.migrate_privacy());
         assert!(cfg.explorer_typing);
+    }
+
+    /// P0-2：首启引导默认未看过；用户点掉后写入 config 并持久化。
+    #[test]
+    fn onboarded_defaults_false_and_round_trips() {
+        let cfg = Config::default();
+        assert!(!cfg.onboarded, "新装用户应看到首启引导");
+        let text = toml::to_string(&cfg).expect("serialize config");
+        let parsed: Config = toml::from_str(&text).expect("deserialize config");
+        assert!(!parsed.onboarded);
+
+        let dismissed = Config {
+            onboarded: true,
+            ..Config::default()
+        };
+        let text = toml::to_string(&dismissed).expect("serialize config");
+        let parsed: Config = toml::from_str(&text).expect("deserialize config");
+        assert!(parsed.onboarded, "引导看过标记必须持久化");
+
+        // 老配置没有 onboarded 字段：serde(default) 回落 false（看一次引导），不报错。
+        let value = toml::Value::try_from(Config::default()).expect("config → toml");
+        let mut table = value.as_table().expect("table").clone();
+        table.remove("onboarded");
+        let text = toml::to_string(&table).expect("serialize legacy config");
+        let parsed: Config = toml::from_str(&text).expect("legacy config 必须可读");
+        assert!(!parsed.onboarded);
     }
 
     #[test]

@@ -18,6 +18,16 @@ use crate::search::entrymeta::{initial_of, kept_in_scope, kind_of, tone_for};
 use crate::search::filters::SearchFilters;
 use crate::search::pinyin;
 
+/// P0-2：UI 里的「重新授权」入口。用户拒绝过 UAC 后 client 线程会记住
+/// `launch_declined` 并且不再弹窗（防骚扰）；点这个标志后线程在下一次
+/// 循环里重置拒绝状态、给足 UAC 等待时间并重新 runas 拉起 worker。
+pub(crate) static RELAUNCH_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// 请求重新拉起提权 worker（用户点击「重新授权」按钮时调用）。
+pub fn request_worker_relaunch() {
+    RELAUNCH_REQUESTED.store(true, Ordering::SeqCst);
+}
+
 /// UI 聚合状态:索引构建进度。
 #[derive(Clone, Debug)]
 pub struct IndexUiStatus {
@@ -746,6 +756,13 @@ pub fn spawn_client_thread(
                     }
                     return;
                 }
+                // P0-2：用户在 Fallback 横幅里点了「重新授权」——重置拒绝
+                // 状态并给足 UAC 时间（首连 60s），下一次迭代重新 runas 拉起。
+                if RELAUNCH_REQUESTED.swap(false, Ordering::SeqCst) {
+                    launch_declined = false;
+                    first_connect = true;
+                    last_launch = std::time::Instant::now() - Duration::from_secs(60);
+                }
                 // 先拉起 worker 再连接(UAC 一次/会话);已提权常驻时秒连。
                 // 用户拒绝过 UAC 就不再弹(防骚扰),保持 Fallback 等下次启动。
                 // 守卫还要求距上次拉起 >1s:worker 启动后要一点时间建管道,
@@ -796,6 +813,11 @@ pub fn spawn_client_thread(
                 for _ in 0..40 {
                     if shutdown.load(Ordering::Relaxed) {
                         return;
+                    }
+                    // P0-2：用户点了「重新授权」时别等满 20s 退避，立刻回到
+                    // 循环重拉（否则按钮点下去最多要等 20s 才弹 UAC）。
+                    if RELAUNCH_REQUESTED.load(Ordering::Relaxed) {
+                        break;
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 }
@@ -2307,6 +2329,20 @@ mod tests {
         assert!(!kept_in_scope(Scope::Program, Kind::File));
         assert!(kept_in_scope(Scope::File, Kind::File));
         assert!(!kept_in_scope(Scope::File, Kind::Program));
+    }
+
+    #[test]
+    fn relaunch_request_is_consumed_once() {
+        // P0-2：「重新授权」只触发一次拉起：client 线程 swap 消费后标志归零，
+        // 不会因为下一轮循环又弹一次 UAC。
+        RELAUNCH_REQUESTED.store(false, Ordering::SeqCst);
+        assert!(!RELAUNCH_REQUESTED.swap(false, Ordering::SeqCst));
+        request_worker_relaunch();
+        assert!(RELAUNCH_REQUESTED.swap(false, Ordering::SeqCst));
+        assert!(
+            !RELAUNCH_REQUESTED.swap(false, Ordering::SeqCst),
+            "消费后必须归零"
+        );
     }
 
     #[test]

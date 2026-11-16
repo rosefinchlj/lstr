@@ -276,6 +276,10 @@ const HELP_GROUP_GAP: f32 = 8.0;
 /// 顶左，拖到端点时圆点会跟着跳一下。
 const DRIVE_WEIGHT_W: f32 = 160.0;
 
+/// P0-2：首启欢迎卡片的高度（与 `paint_welcome` 的排版一致）。新装用户
+/// 第一次唤出时替代「搜索技巧」面板；点「开始使用」后永久切回技巧面板。
+const WELCOME_H: f32 = 196.0;
+
 /// 搜索框左侧条件 chip 的宽度（不绘制）。`label` 为空 = 紧凑模式（只画值）。
 /// `dense` = 多个条件时的缩小版（字号/内边距/高度都更小）。
 fn condition_chip_width(painter: &egui::Painter, label: &str, value: &str, dense: bool) -> f32 {
@@ -1523,6 +1527,9 @@ pub struct LstrApp {
     index_note: Option<String>,
     /// 状态行首次出现时间(>300ms 才显示,避免闪烁)。
     index_note_since: Option<std::time::Instant>,
+    /// 索引是否处于 Fallback（未授权/worker 未运行）：P0-2 的「重新授权」
+    /// 按钮与首启引导里的失败提示都据此显示。
+    index_fallback: bool,
     /// 设置页「索引卷」候选盘缓存:(枚举时刻, 升序盘符)。
     /// 枚举一次固定卷要跑 26 组 GetDriveType/GetVolumeInformation,不能每帧调。
     index_drives: Option<(Instant, Vec<char>)>,
@@ -1759,6 +1766,7 @@ impl LstrApp {
             condition_error: None,
             index_note: None,
             index_note_since: None,
+            index_fallback: false,
             index_drives: None,
             pending_gen,
             search_sent_at: None,
@@ -3750,7 +3758,12 @@ impl LstrApp {
                 self.help_tips_active(search::query::parse(&self.input, self.scope).is_empty());
             if tips_active {
                 let content_w = (width - PAD - if self.preview_open { 216.0 } else { 0.0 }).max(1.0);
-                list_h = list_h.max(help_panel_height(content_w));
+                // P0-2：首启引导卡片用固定高度；点过「开始使用」后才是技巧面板。
+                list_h = list_h.max(if self.cfg.onboarded {
+                    help_panel_height(content_w)
+                } else {
+                    WELCOME_H
+                });
             }
             let banner_h = self.banner_height();
             let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
@@ -4721,6 +4734,7 @@ impl LstrApp {
     fn poll_index_status(&mut self, ctx: &egui::Context) {
         let status = self.service.index_status.lock().unwrap().clone();
         let mut note = None;
+        let mut fallback = false;
         if let Some(st) = &status {
             // L2:进度百分比由后台线程推着走,但 UI 只在阶段变化时被唤醒,
             // 不主动重绘的话横幅会停在第一次拿到的数字上。
@@ -4757,6 +4771,7 @@ impl LstrApp {
                         .to_string(),
                 );
             } else if st.phase == lstr_index::Phase::Fallback {
+                fallback = true;
                 note = Some(
                     "内置索引不可用（未获管理员授权或 worker 未运行），暂时没有搜索结果"
                         .to_string(),
@@ -4783,6 +4798,7 @@ impl LstrApp {
                 }
             }
         }
+        self.index_fallback = fallback;
         match &note {
             Some(_) => {
                 if self.index_note_since.is_none() {
@@ -4834,9 +4850,14 @@ impl LstrApp {
             // 帮助面板显示时按面板真实高度算：底部提示条（文件对话框/
             // 错误条）用 list_h 定位，按空列表的 120 算会叠在帮助内容中间。
             if self.help_tips_active(query.is_empty()) {
-                help_panel_height(
-                    (self.last_width.max(self.theme.width) - PAD - preview_w).max(1.0),
-                )
+                // P0-2：没看过欢迎页时用固定高度（paint_welcome 的排版高度）。
+                if self.cfg.onboarded {
+                    help_panel_height(
+                        (self.last_width.max(self.theme.width) - PAD - preview_w).max(1.0),
+                    )
+                } else {
+                    WELCOME_H
+                }
             } else {
                 120.0
             }
@@ -5355,13 +5376,57 @@ impl LstrApp {
                             3.0,
                             theme.sub,
                         );
-                        painter.text(
-                            egui::pos2(banner.left() + 21.0, banner.center().y),
-                            Align2::LEFT_CENTER,
-                            note,
-                            ui::text_font(11.5),
-                            theme.sub,
-                        );
+                        // P0-2：Fallback 时右侧给「重新授权」按钮——旧版用户拒绝
+                        // 过一次 UAC 后整个会话都没有再试入口（README 写的「手工
+                        // 重建索引」UI 里并不存在）。
+                        let text_right = if self.index_fallback {
+                            let label = "重新授权";
+                            let btn_w = 72.0;
+                            let btn = Rect::from_min_size(
+                                egui::pos2(banner.right() - btn_w - 8.0, banner.center().y - 9.0),
+                                egui::vec2(btn_w, 18.0),
+                            );
+                            let resp = ui.interact(
+                                btn,
+                                egui::Id::new("index-reauth"),
+                                egui::Sense::click(),
+                            );
+                            painter.rect_filled(
+                                btn,
+                                CornerRadius::same(5),
+                                theme.amber.gamma_multiply(if resp.hovered() { 0.95 } else { 0.8 }),
+                            );
+                            painter.text(
+                                btn.center(),
+                                Align2::CENTER_CENTER,
+                                label,
+                                ui::text_font(11.0),
+                                Color32::WHITE,
+                            );
+                            if resp.clicked() {
+                                crate::search::builtin::request_worker_relaunch();
+                                self.toast(
+                                    ui.ctx(),
+                                    "已请求管理员授权：请在系统弹窗里点「是」".to_string(),
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            banner.right() - btn_w - 20.0
+                        } else {
+                            banner.right() - 8.0
+                        };
+                        painter
+                            .with_clip_rect(Rect::from_min_max(
+                                banner.left_top(),
+                                egui::pos2(text_right, banner.bottom()),
+                            ))
+                            .text(
+                                egui::pos2(banner.left() + 21.0, banner.center().y),
+                                Align2::LEFT_CENTER,
+                                note,
+                                ui::text_font(11.5),
+                                theme.sub,
+                            );
                         extra_top += 30.0;
                     }
                 }
@@ -6756,6 +6821,127 @@ impl LstrApp {
         }
     }
 
+    /// P0-2：首启欢迎卡片。lstr 启动时窗口在屏幕外、没有欢迎窗也没有托盘
+    /// 气泡，用户第一次双击 Ctrl 只看到一个空白搜索框 + 索引进度，很容易
+    /// 判断成「没反应/闪退」。这里在空查询时补一屏：怎么唤出、能搜什么、
+    /// 首次索引要等多久，以及拒绝 UAC 后的「重新授权」入口。
+    fn paint_welcome(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        list_top: f32,
+    ) {
+        let theme = self.theme;
+        self.needle_target = 0.0;
+        self.scrollable = false;
+        let x = rect.left() + 26.0;
+        let mut y = list_top + 14.0;
+        painter.text(
+            egui::pos2(x, y),
+            Align2::LEFT_TOP,
+            "欢迎使用 lstr",
+            ui::text_font(17.0),
+            theme.text,
+        );
+        // 「开始使用」：右上角。点掉后写 config，之后永久回到搜索技巧面板。
+        let start = Rect::from_min_size(
+            egui::pos2(rect.right() - 26.0 - 88.0, list_top + 12.0),
+            egui::vec2(88.0, 26.0),
+        );
+        let start_resp = ui.interact(start, egui::Id::new("welcome-start"), egui::Sense::click());
+        painter.rect_filled(
+            start,
+            CornerRadius::same(7),
+            theme.amber.gamma_multiply(if start_resp.hovered() { 1.0 } else { 0.85 }),
+        );
+        painter.text(
+            start.center(),
+            Align2::CENTER_CENTER,
+            "开始使用",
+            ui::text_font(12.0),
+            Color32::WHITE,
+        );
+        if start_resp.clicked() {
+            self.cfg.onboarded = true;
+            let _ = self.cfg.save();
+            self.toast(ui.ctx(), "双击 Ctrl 随时唤出；托盘图标右键可打开设置".to_string());
+            ui.ctx().request_repaint();
+        }
+        y += 27.0;
+        painter.text(
+            egui::pos2(x, y),
+            Align2::LEFT_TOP,
+            "本地优先的启动器：输入即搜文件、应用、命令（不联网）。",
+            ui::text_font(11.5),
+            theme.dim,
+        );
+        y += 24.0;
+        let key_w = 76.0;
+        let rows = [
+            ("双击 Ctrl", "随时唤出 / 收起；托盘图标右键可打开设置或退出。"),
+            ("输入即搜", "Enter 打开；Ctrl+Enter 打开所在目录；Shift+Enter 动作菜单。"),
+            ("首次索引", "需同意一次管理员授权，约 1~3 分钟；期间可先搜已收录结果。"),
+        ];
+        for (key, desc) in rows {
+            painter.text(
+                egui::pos2(x + 4.0, y),
+                Align2::LEFT_TOP,
+                key,
+                ui::mono_font(11.5),
+                theme.sub,
+            );
+            painter.text(
+                egui::pos2(x + 4.0 + key_w, y),
+                Align2::LEFT_TOP,
+                desc,
+                ui::text_font(11.5),
+                theme.dim,
+            );
+            y += 21.0;
+        }
+        y += 4.0;
+        if self.index_fallback {
+            painter.text(
+                egui::pos2(x + 4.0, y),
+                Align2::LEFT_TOP,
+                "内置索引暂不可用：需要管理员授权（拒绝过一次也可随时重试）。",
+                ui::text_font(11.5),
+                theme.amber,
+            );
+            let retry = Rect::from_min_size(
+                egui::pos2(x + 4.0, y + 17.0),
+                egui::vec2(96.0, 22.0),
+            );
+            let resp = ui.interact(retry, egui::Id::new("welcome-reauth"), egui::Sense::click());
+            painter.rect_filled(
+                retry,
+                CornerRadius::same(6),
+                theme.amber.gamma_multiply(if resp.hovered() { 1.0 } else { 0.85 }),
+            );
+            painter.text(
+                retry.center(),
+                Align2::CENTER_CENTER,
+                "重新授权",
+                ui::text_font(11.0),
+                Color32::WHITE,
+            );
+            if resp.clicked() {
+                crate::search::builtin::request_worker_relaunch();
+                self.toast(ui.ctx(), "已请求管理员授权：请在系统弹窗里点「是」".to_string());
+                ui.ctx().request_repaint();
+            }
+        } else {
+            painter.text(
+                egui::pos2(x + 4.0, y),
+                Align2::LEFT_TOP,
+                "提示：Esc 收起（再唤出保留输入）；设置里可调整索引卷。",
+                ui::text_font(11.5),
+                theme.dim,
+            );
+        }
+    }
+
     fn paint_rows(
         &mut self,
         ui: &mut egui::Ui,
@@ -6773,6 +6959,12 @@ impl LstrApp {
         // 「拼音 size >= 104857601B」这类错误提示。
         let display_text = self.results_query_text.clone();
         if entries.is_empty() {
+            // P0-2：没看过首启引导时，空查询先显示欢迎卡片；点「开始使用」
+            // 后写 config，之后才是搜索技巧面板。
+            if self.help_tips_active(query.is_empty()) && !self.cfg.onboarded {
+                self.paint_welcome(ui, painter, rect, list_top);
+                return;
+            }
             // 空查询（还没开始搜索）：分类两列的搜索技巧面板。
             if self.help_tips_active(query.is_empty()) {
                 self.needle_target = 0.0;
