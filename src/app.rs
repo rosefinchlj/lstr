@@ -1720,7 +1720,7 @@ impl LstrApp {
                 None
             }
         };
-        let dialog_watch = match crate::win::dialogwatch::DialogWatch::start() {
+        let dialog_watch = match crate::win::dialogwatch::DialogWatch::start(&cc.egui_ctx) {
             Ok(watch) => Some(watch),
             Err(err) => {
                 eprintln!("lstr: 对话框监视启动失败: {err}");
@@ -1728,6 +1728,8 @@ impl LstrApp {
             }
         };
         let tray = crate::win::tray::create().ok();
+        // 托盘事件唤醒器：隐藏态靠事件驱动，不再每 250ms 轮询（P1-12）。
+        crate::win::tray::install_wake(&cc.egui_ctx);
         // P0-2：只有显式开启才安装全局低级键盘钩子。
         let typing = if cfg.explorer_typing {
             match crate::win::typing::TypingWatch::start(cc.egui_ctx.clone()) {
@@ -2213,6 +2215,7 @@ impl LstrApp {
                 }
             }
             Some(TrayAction::Settings) => self.open_settings(ctx),
+            Some(TrayAction::Menu) => {} // 右键菜单在 TrayState::poll 内部弹出
             Some(TrayAction::Quit) => {
                 self.exit_reason = "tray";
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -11444,10 +11447,11 @@ impl eframe::App for LstrApp {
         }
 
         if self.hidden {
-            // 键入即搜安装后降到 60ms 兜底节拍（钩子本身已 request_repaint，
-            // 这里只是防止某些窗口过程丢通知），否则维持 250ms 省电节拍。
-            let idle_ms = if self.typing.is_some() { 60 } else { 250 };
-            ctx.request_repaint_after(Duration::from_millis(idle_ms));
+            // 隐藏态改成事件驱动：托盘点击、对话框 WinEvent、热键、单实例
+            // 激活、键入钩子都会在自己的线程里 request_repaint 唤醒主循环。
+            // 这里只留 2s 保险丝（防漏网的周期任务），空闲 CPU 从 4 次/秒
+            // 全量重绘降到 0.5 次/秒（评审 P1-12：实测空闲 3.85% 单核）。
+            ctx.request_repaint_after(Duration::from_secs(2));
             return;
         }
 

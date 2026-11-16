@@ -884,6 +884,60 @@ impl VolumeStore {
         self.attrs[slot as usize] & ATTR_INTERNAL == 0
     }
 
+    /// watch 整目录刷新(DirChildren)入口的噪声判定:父目录 `parent_slot` 之下的
+    /// 整批子项是否应被排除。返回 `(hard, soft)`:
+    /// - `hard`:父链落在硬噪声(段名/锚点/已判噪祖先/锚定路径)下 → 子项全部不可见,
+    ///   调用方可以整帧丢弃(不 apply、不进旁车),避免构建产物/依赖目录的高 churn
+    ///   把旁车顶到 32768 条触发 62MB 全量保存;
+    /// - `soft`:父链只命中构建产物段 → 目录与可执行文件仍可见,其余文件排除;
+    /// - 两者皆 false:不需要过滤。
+    ///
+    /// 与 [`Self::classify_chain`] 的语义一致,但判定对象是「子项」而不是父目录
+    /// 自身,所以从 parent_slot **自身**开始上溯(命中父目录自己的段名即排除其子项)。
+    /// 槽位越界/父未解析时返回 (false, false),交由后续 apply 走原路径。
+    pub fn parent_noise_kind(&self, parent_slot: u32) -> (bool, bool) {
+        if parent_slot as usize >= self.attrs.len() {
+            return (false, false);
+        }
+        let has_anchored = self.exclude.has_anchored();
+        // 锚定路径需要根优先的祖先链;最近祖先在前的暂存,末尾 reverse。
+        let mut chain: Vec<&[u8]> = Vec::new();
+        let mut hard = false;
+        let mut soft = false;
+        let mut cur = parent_slot;
+        let mut hops = 0;
+        while cur != NO_PARENT && hops < 64 {
+            let name_lc = self.name_lc(cur);
+            if self.exclude.is_segment(name_lc)
+                || self.noise_anchors.contains(&self.frn[cur as usize])
+            {
+                if is_build_output_segment(name_lc) {
+                    // 软噪声不能提前收手:外层可能还包着 node_modules 等硬噪声。
+                    soft = true;
+                } else {
+                    hard = true;
+                    break;
+                }
+            } else if self.attrs[cur as usize] & ATTR_NOISE != 0 {
+                // 祖先已判噪(其父链可能已断),子孙必然同判。
+                hard = true;
+                break;
+            }
+            if has_anchored {
+                chain.push(name_lc);
+            }
+            cur = self.parent[cur as usize];
+            hops += 1;
+        }
+        if !hard && has_anchored && hops > 0 {
+            chain.reverse();
+            if self.exclude.chain_anchored(&chain, self.letter) {
+                hard = true;
+            }
+        }
+        (hard, soft)
+    }
+
     /// 存活(未删)。NOISE 槽位对 USN 定位仍然存在(父链解析需要),只是查询不可见。
     fn alive(&self, slot: u32) -> bool {
         self.attrs[slot as usize] & ATTR_DEAD == 0
@@ -2079,6 +2133,40 @@ mod tests {
         assert_eq!(total, 1, "全局搜 app.exe 必须命中构建产物");
         let (_, total, _) = crate::query::query_volume(&s, &spec("app.rlib"), 100);
         assert_eq!(total, 0, "中间产物(.rlib)不该出现在结果里");
+    }
+
+    /// watch 刷新入口的噪声判定:软噪声(构建产物)只留目录+可执行文件,
+    /// 硬噪声(依赖/缓存目录)整帧丢弃,普通目录不过滤。
+    #[test]
+    fn parent_noise_kind_classifies_watch_refresh() {
+        let mut raws: Vec<String> = crate::noise::builtin_patterns();
+        raws.push("dist".to_string());
+        let mut s = VolumeStore::new(crate::noise::ExcludeRules::build(&raws), 'E');
+        insert(&mut s, 5, 0, 0x10, "proj");
+        insert(&mut s, 10, 5, 0x10, "target");
+        insert(&mut s, 11, 10, 0x10, "release");
+        insert(&mut s, 20, 5, 0x10, "node_modules");
+        insert(&mut s, 30, 5, 0x10, "src");
+        s.compact();
+        let slot = |frn: u64| s.find_slot(frn).expect("slot");
+        assert_eq!(s.parent_noise_kind(slot(30)), (false, false), "普通目录不过滤");
+        assert_eq!(
+            s.parent_noise_kind(slot(10)),
+            (false, true),
+            "target:靠软噪声只留目录与可执行文件"
+        );
+        assert_eq!(
+            s.parent_noise_kind(slot(11)),
+            (false, true),
+            "软噪声沿祖先链继承"
+        );
+        assert_eq!(
+            s.parent_noise_kind(slot(20)),
+            (true, false),
+            "node_modules:整帧丢弃"
+        );
+        assert_eq!(s.parent_noise_kind(NO_PARENT), (false, false), "未解析父安全回退");
+        assert_eq!(s.parent_noise_kind(u32::MAX - 1), (false, false), "越界槽位安全回退");
     }
 
     #[test]

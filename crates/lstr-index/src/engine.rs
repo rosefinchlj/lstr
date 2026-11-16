@@ -94,6 +94,9 @@ pub struct VolumeState {
     sidecar_cursor: i64,
     /// 内存日志与旁车文件不一致(有待写盘)。
     sidecar_pending: bool,
+    /// 在飞旁车写任务的序号:写盘已交给 `lstr-sidecar-write` 线程,该笔的
+    /// ack 回来前不再为空追加(避免日志乱序);`None` 表示没有在飞写。
+    sidecar_inflight: Option<u64>,
     /// 下次允许旁车写盘的时间(节流;失败按同间隔重试,写盘毫秒级,退避无必要)。
     sidecar_retry_at: Option<Instant>,
     /// 内存日志里已追加进文件的前缀条数:追加式写盘只写
@@ -348,6 +351,100 @@ pub struct SplitOutcome {
 /// 挑选,200 条足够覆盖常见宽查询;builtin 侧再截到展示预算。
 const PREFIX_SUPPLEMENT_CAP: usize = 200;
 
+/// 投递给旁车写线程的一笔写任务。
+struct SidecarJob {
+    seq: u64,
+    dir: PathBuf,
+    guid: u128,
+    letter: char,
+    base: (u64, i64),
+    cursor: i64,
+    /// 投递时内存旁车日志的总条数(ack 回来后作为已落盘前缀)。
+    total: usize,
+    ops: Vec<SidecarOp>,
+}
+
+/// 旁车写线程回来的完成回执。
+struct SidecarDone {
+    seq: u64,
+    guid: u128,
+    base: (u64, i64),
+    total: usize,
+    result: Result<(), String>,
+}
+
+/// 旁车写盘线程:把 open / write / `sync_data` 全部搬离搜索线程。
+///
+/// 背景(评审 P1-1):旧实现在 maintain 中同步调 `sidecar::append`,其内
+/// `f.sync_data()` 在杀软/文件过滤驱动在场时单次可卡 1–12s(engine.log 实测
+/// 139 条 `sidecar vol ... took`,max 11938ms;紧邻的 `idle maintenance` max
+/// 15259ms)——用户看到「输入后列表卡几秒」。内存旁车日志是权威副本,写失败
+/// 下一轮重试即可,所以整笔写盘交给这个线程,搜索线程只做入队与收 ack。
+struct SidecarWriter {
+    tx: Option<mpsc::Sender<SidecarJob>>,
+    done: Receiver<SidecarDone>,
+    join: Option<std::thread::JoinHandle<()>>,
+    next_seq: u64,
+}
+
+impl SidecarWriter {
+    fn spawn() -> Self {
+        let (tx, rx) = mpsc::channel::<SidecarJob>();
+        let (done_tx, done) = mpsc::channel::<SidecarDone>();
+        let join = std::thread::Builder::new()
+            .name("lstr-sidecar-write".to_string())
+            .spawn(move || {
+                for job in rx {
+                    let started = Instant::now();
+                    let result = sidecar::append(
+                        &job.dir,
+                        job.guid,
+                        job.base,
+                        job.cursor,
+                        &job.ops,
+                    )
+                    .map_err(|e| e.to_string());
+                    let ms = started.elapsed().as_millis();
+                    if ms > 100 {
+                        // 诊断日志:异步后不再直接卡搜索线程,但慢盘/AV 环境
+                        // 仍需能看出「写盘本身慢」而不是「搜索慢」。
+                        snapshot::debug_log(&format!(
+                            "sidecar vol {} took {ms}ms ({} ops, async)",
+                            job.letter,
+                            job.ops.len()
+                        ));
+                    }
+                    let _ = done_tx.send(SidecarDone {
+                        seq: job.seq,
+                        guid: job.guid,
+                        base: job.base,
+                        total: job.total,
+                        result,
+                    });
+                }
+            })
+            .expect("spawn lstr-sidecar-write thread");
+        Self {
+            tx: Some(tx),
+            done,
+            join: Some(join),
+            next_seq: 1,
+        }
+    }
+}
+
+impl Drop for SidecarWriter {
+    fn drop(&mut self) {
+        // 先关队列让写线程收尾(已入队的任务仍会执行),再等它退出:搜索引擎
+        // 被丢弃时最后一笔旁车不能丢。worker 退出走 `process::exit` 不跑
+        // Drop,那条路径靠 `flush_all` 末尾的 `wait_sidecar_idle` 兜。
+        self.tx.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 pub struct Engine {
     cfg: EngineConfig,
     pub volumes: Vec<VolumeState>,
@@ -382,6 +479,8 @@ pub struct Engine {
     /// 运行中的真后台 compact(同一时刻至多一卷;期间修改类消息进 deferred)。
     /// 查询线程只做 channel 轮询/换血,不再执行任何 compact 切片。
     bg_compact: Option<BackgroundCompact>,
+    /// 旁车日志异步写盘线程(见 [`SidecarWriter`] 的说明)。
+    sidecar_writer: SidecarWriter,
 }
 
 /// 一次后台 compact:在独立线程里对 fork 出的 store 快照重排,完成后把
@@ -437,6 +536,7 @@ impl Engine {
             ),
             compact_idle_gap: COMPACT_IDLE_GAP,
             bg_compact: None,
+            sidecar_writer: SidecarWriter::spawn(),
         };
         let t_load = Instant::now();
         engine.load_snapshots();
@@ -495,6 +595,7 @@ impl Engine {
             sidecar_base,
             sidecar_cursor,
             sidecar_pending: false,
+            sidecar_inflight: None,
             sidecar_retry_at: None,
             capture_on: true,
             usn_watch: UsnWatchState::Off,
@@ -677,6 +778,7 @@ impl Engine {
                 sidecar_base: (0, 0),
                 sidecar_cursor: 0,
                 sidecar_pending: false,
+                sidecar_inflight: None,
                 sidecar_retry_at: None,
                 capture_on: false,
                 usn_watch: UsnWatchState::Off,
@@ -1048,6 +1150,30 @@ impl Engine {
                 let Some(i) = self.volumes.iter().position(|v| v.guid == guid) else {
                     return;
                 };
+                let mut recs = recs;
+                // 噪声子树入口短路(P0-4):watch 每收到一个变更就枚举整个父目录并
+                // 整批送进来,构建产物/依赖目录的 churn 会把这个帧顶到数万条,把旁车
+                // 挤到 32768 条上限后每 60s 触发一次 62MB 全量重写。
+                // 硬噪声父链:子项全部不可见,整帧丢弃;软噪声(构建产物):只保留
+                // 目录与可执行文件(与 store 的 classify 语义一致),其余不进索引/旁车。
+                if parent_frn != ROOT_FRN {
+                    if let Some(store) = &self.volumes[i].store {
+                        if let Some(parent_slot) = store.find_slot(parent_frn) {
+                            let (hard, soft) = store.parent_noise_kind(parent_slot);
+                            if hard {
+                                return;
+                            }
+                            if soft {
+                                recs.retain(|r| {
+                                    r.attrs & 0x10 != 0
+                                        || crate::noise::is_exec_name(
+                                            r.name.to_ascii_lowercase().as_bytes(),
+                                        )
+                                });
+                            }
+                        }
+                    }
+                }
                 let (added, removed) = {
                     let Some(store) = &mut self.volumes[i].store else {
                         return;
@@ -2122,6 +2248,9 @@ impl Engine {
     /// 空闲维护:需要的卷 compact + 落盘(旁车优先,全量降频)。
     /// 返回是否做了事(调用方可据此让路)。
     pub fn maintain(&mut self) -> bool {
+        // 先收异步旁车写盘的回执:ack 只改旁车记账(不动 store),放在最前
+        // 保证本轮后续的节流判断看到最新「已落盘前缀」。
+        self.drain_sidecar_acks();
         // 0. 后台 compact 完成?先换血再让路:换血后的下一步(分轮回放冻结
         //    消息/保存)放到下一轮,避免同一次 maintain 把查询堵住。
         if self.poll_background_compact() {
@@ -2431,10 +2560,14 @@ impl Engine {
         v.save_retry_at = Some(Instant::now() + Duration::from_secs(secs));
     }
 
-    /// 写旁车文件(内存日志新增部分 → 追加块)。成功推进已落盘前缀并进入
-    /// 节流窗口;失败保留待写部分(内存日志是权威副本),下轮再试(写盘毫秒级,
-    /// 固定间隔重试即可,无需退避)。
+    /// 把旁车日志新增部分交给写盘线程(异步)。返回是否已受理/已推进:
+    /// 单测里会等这笔 ack 回来,保持「maintain 返回即落盘」的旧断言语义;
+    /// 生产路径立即返回,`sync_data` 的秒级卡顿不再阻塞搜索线程。
     fn write_sidecar(&mut self, i: usize) -> bool {
+        if self.volumes[i].sidecar_inflight.is_some() {
+            // 上一笔还没落盘:等它 ack 再追加,避免文件块顺序与 seq 乱序。
+            return false;
+        }
         let (guid, letter, base, cursor, ops, total) = {
             let v = &self.volumes[i];
             let from = v.sidecar_flushed.min(v.sidecar_ops.len());
@@ -2454,12 +2587,67 @@ impl Engine {
             v.sidecar_retry_at = Some(Instant::now() + SIDECAR_SAVE_INTERVAL);
             return true;
         }
+        let Some(tx) = self.sidecar_writer.tx.as_ref() else {
+            // 写线程已退出(只可能是 Engine 正在 Drop):回退同步写。
+            return self.write_sidecar_sync(i, guid, base, cursor, &ops, total);
+        };
+        let seq = self.sidecar_writer.next_seq;
+        self.sidecar_writer.next_seq = self.sidecar_writer.next_seq.wrapping_add(1);
+        let job = SidecarJob {
+            seq,
+            dir: self.cfg.index_dir.clone(),
+            guid,
+            letter,
+            base,
+            cursor,
+            total,
+            ops,
+        };
+        if tx.send(job).is_err() {
+            let v = &mut self.volumes[i];
+            v.sidecar_retry_at = Some(Instant::now() + SIDECAR_SAVE_INTERVAL);
+            return false;
+        }
+        {
+            let v = &mut self.volumes[i];
+            v.sidecar_inflight = Some(seq);
+            v.sidecar_retry_at = Some(Instant::now() + SIDECAR_SAVE_INTERVAL);
+        }
+        // 单测里,既有断言假设「maintain/flush_all 返回即旁车文件就位」。
+        // 测例量级很小(几十条),同步等这一笔完成不影响测试时长;生产路径
+        // 绝不等待 —— 这正是本次改动要消除的搜索线程卡顿。
+        #[cfg(test)]
+        {
+            while self.volumes[i].sidecar_inflight.is_some() {
+                if !self.recv_sidecar_ack(Duration::from_secs(30)) {
+                    break;
+                }
+            }
+            self.volumes[i].sidecar_flushed >= total
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
+    /// 写盘线程已退出时的同步回退(仅 Drop 窗口可能走到)。
+    fn write_sidecar_sync(
+        &mut self,
+        i: usize,
+        guid: u128,
+        base: (u64, i64),
+        cursor: i64,
+        ops: &[SidecarOp],
+        total: usize,
+    ) -> bool {
         let started = Instant::now();
-        let result = sidecar::append(&self.cfg.index_dir, guid, base, cursor, &ops);
+        let result = sidecar::append(&self.cfg.index_dir, guid, base, cursor, ops);
         let ms = started.elapsed().as_millis();
         if ms > 100 {
             crate::snapshot::debug_log(&format!(
-                "sidecar vol {letter} took {}ms ({} ops)",
+                "sidecar vol {} took {}ms ({} ops, sync fallback)",
+                self.volumes[i].letter,
                 ms,
                 ops.len()
             ));
@@ -2474,10 +2662,74 @@ impl Engine {
             }
             Err(err) => {
                 eprintln!("lstr-index: save sidecar failed: {err}");
-                crate::snapshot::debug_log(&format!("sidecar {guid:032x} failed: {err}"));
                 v.sidecar_retry_at = Some(Instant::now() + SIDECAR_SAVE_INTERVAL);
                 false
             }
+        }
+    }
+
+    /// 收掉所有已完成的旁车写回执(不阻塞)。
+    fn drain_sidecar_acks(&mut self) {
+        let mut acked: Vec<SidecarDone> = Vec::new();
+        while let Ok(done) = self.sidecar_writer.done.try_recv() {
+            acked.push(done);
+        }
+        for done in acked {
+            self.apply_sidecar_ack(done);
+        }
+    }
+
+    /// 处理一笔回执:清在飞标记;基线已变(全量保存清空日志/换基线)的 ack
+    /// 视为陈旧直接丢弃;成功推进已落盘前缀,失败保留待写部分下轮重试。
+    fn apply_sidecar_ack(&mut self, done: SidecarDone) {
+        let Some(i) = self.volumes.iter().position(|v| v.guid == done.guid) else {
+            return;
+        };
+        let v = &mut self.volumes[i];
+        if v.sidecar_inflight != Some(done.seq) {
+            return;
+        }
+        v.sidecar_inflight = None;
+        if v.sidecar_base != done.base {
+            // 全量保存已清空日志并推进基线:这笔 ack 对应的内容已被快照覆盖。
+            return;
+        }
+        match done.result {
+            Ok(()) => {
+                v.sidecar_flushed = done.total;
+                v.sidecar_pending = v.sidecar_flushed < v.sidecar_ops.len();
+                v.sidecar_retry_at = Some(Instant::now() + SIDECAR_SAVE_INTERVAL);
+            }
+            Err(err) => {
+                eprintln!("lstr-index: save sidecar failed: {err}");
+                snapshot::debug_log(&format!("sidecar {:032x} failed: {err}", v.guid));
+                v.sidecar_retry_at = Some(Instant::now() + SIDECAR_SAVE_INTERVAL);
+            }
+        }
+    }
+
+    /// 阻塞等一笔回执(仅单测/退出路径用);超时/线程关闭返回 false。
+    fn recv_sidecar_ack(&mut self, timeout: Duration) -> bool {
+        match self.sidecar_writer.done.recv_timeout(timeout) {
+            Ok(done) => {
+                self.apply_sidecar_ack(done);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// 退出路径:有界等待在飞旁车写入完成。worker 走 `process::exit` 不跑
+    /// Drop,必须显式等,否则最后一笔 async 写可能丢(最多 5s 增量,重启由
+    /// journal 回放补齐,能等就等)。
+    pub fn wait_sidecar_idle(&mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.volumes.iter().any(|v| v.sidecar_inflight.is_some()) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let _ = self.recv_sidecar_ack(left.min(Duration::from_millis(100)));
         }
     }
 
@@ -2660,6 +2912,9 @@ impl Engine {
             self.volumes[i].save_retry_at = None;
             let _ = self.save_volume(i);
         }
+        // 旁车写盘已异步化:退出前有界等待在飞那一笔完成(worker 进程随后
+        // 走 process::exit,不跑 Drop,不能指望析构兜底)。
+        self.wait_sidecar_idle(Duration::from_secs(5));
     }
 
     pub fn cfg(&self) -> &EngineConfig {
@@ -3271,6 +3526,75 @@ mod tests {
         assert!(store2.find_slot(15).is_some(), "新增子项应恢复");
         assert!(store2.find_slot(12).is_none(), "替换语义:未出现在刷新里的子项应标死");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4:watch 刷新整目录时,噪声子树在入口短路——硬噪声整帧丢弃(不 apply、
+    /// 不进旁车),软噪声(构建产物)只保留目录与可执行文件。这是 62MB 全量重写
+    /// (53GB/天)与搜索卡顿的主因之一:构建期间 target/ 的每个变更都会把整目录
+    /// 子项塞进旁车,几秒就能击穿 32768 条上限。
+    #[test]
+    fn dir_children_under_noise_is_skipped_at_entry() {
+        let dir = temp_index_dir("noise-short-circuit");
+        let guid = 0xb1u128;
+        let mut engine = engine_with(&dir);
+        const DIR: u32 = 0x10;
+        let recs = vec![
+            rec(10, 0, DIR, "proj"),
+            rec(20, 10, DIR, "target"),
+            rec(21, 20, DIR, "release"),
+            rec(22, 10, DIR, "node_modules"),
+            rec(23, 10, DIR, "src"),
+            rec(24, 23, 0, "main.rs"),
+        ];
+        let count = recs.len() as u32;
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'E',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: count as u64,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        engine.handle(EngineMsg::Records { guid, recs, next_usn: 100 });
+        engine.handle(EngineMsg::VolumeReady { guid, journal_id: 7, next_usn: 100, count });
+        assert!(engine.maintain());
+        // watch 刷新只会在首次 compact 之后才有 FRN→slot 索引(生产上稳态即如此)。
+        engine.volumes[0].store.as_mut().unwrap().compact();
+        assert!(engine.volumes[0].store.as_ref().unwrap().find_slot(20).is_some());
+        assert!(engine.volumes[0].store.as_ref().unwrap().find_slot(22).is_some());
+
+        // 软噪声:target 下只保留目录与可执行文件,中间产物不进旁车。
+        let before = engine.volumes[0].sidecar_ops.len();
+        engine.handle(EngineMsg::DirChildren {
+            guid,
+            parent_frn: 20,
+            recs: vec![
+                rec(30, 20, 0, "app.exe"),
+                rec(31, 20, 0, "app.rlib"),
+                rec(32, 20, DIR, "deps"),
+            ],
+        });
+        assert_eq!(
+            engine.volumes[0].sidecar_ops.len(),
+            before + 1,
+            "软噪声只捕获过滤后的整帧(一次 Children 操作)"
+        );
+        let store = engine.volumes[0].store.as_ref().unwrap();
+        assert!(store.find_slot(30).is_some(), "构建出来的 exe 应保留可搜");
+        assert!(store.find_slot(31).is_none(), "中间产物 rlib 不应落库");
+        assert!(store.find_slot(32).is_some(), "目录必须保留(路径靠父链解析)");
+
+        // 硬噪声:node_modules 整帧丢弃,不进 store、不进旁车。
+        let before = engine.volumes[0].sidecar_ops.len();
+        engine.handle(EngineMsg::DirChildren {
+            guid,
+            parent_frn: 22,
+            recs: vec![rec(40, 22, 0, "dep.txt"), rec(41, 22, DIR, "pkg")],
+        });
+        assert_eq!(engine.volumes[0].sidecar_ops.len(), before, "硬噪声整帧不进旁车");
+        let store = engine.volumes[0].store.as_ref().unwrap();
+        assert!(store.find_slot(40).is_none() && store.find_slot(41).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

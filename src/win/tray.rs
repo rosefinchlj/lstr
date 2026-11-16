@@ -1,3 +1,6 @@
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+
 use tray_icon::menu::accelerator::Accelerator;
 use tray_icon::menu::{ContextMenu, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -12,6 +15,60 @@ pub enum TrayAction {
     Show,
     Settings,
     Quit,
+    /// 右键:由 `poll` 在 owner 窗口上弹原生菜单(不返回给 App)。
+    Menu,
+}
+
+/// 事件队列:托盘/菜单事件在 `install_wake` 注册的全局 handler 里入队并
+/// `request_repaint`,主循环 `poll` 消费 —— 隐藏态不再靠周期重绘轮询托盘。
+fn pending() -> &'static Mutex<VecDeque<TrayAction>> {
+    static PENDING: OnceLock<Mutex<VecDeque<TrayAction>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn push(action: TrayAction) {
+    if let Ok(mut queue) = pending().lock() {
+        queue.push_back(action);
+    }
+}
+
+/// 安装托盘事件唤醒器:托盘点击/菜单项一来就 `request_repaint`(窗口隐藏时
+/// 也能立即响应),同时把事件转成 [`TrayAction`] 入队。
+///
+/// 注意:`tray-icon` 的 `set_event_handler` 与 `receiver()` 互斥 —— 装了
+/// handler 之后接收通道不再有事件,所以消费路径统一走本队列。
+pub fn install_wake(ctx: &eframe::egui::Context) {
+    let ctx_tray = ctx.clone();
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        if let TrayIconEvent::Click {
+            button,
+            button_state,
+            ..
+        } = &event
+        {
+            if *button_state == MouseButtonState::Up {
+                match button {
+                    MouseButton::Left => push(TrayAction::Show),
+                    MouseButton::Right => push(TrayAction::Menu),
+                    _ => {}
+                }
+            }
+        }
+        ctx_tray.request_repaint();
+    }));
+    let ctx_menu = ctx.clone();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        let action = match event.id.0.as_str() {
+            "tray.show" => Some(TrayAction::Show),
+            "tray.settings" => Some(TrayAction::Settings),
+            "tray.quit" => Some(TrayAction::Quit),
+            _ => None,
+        };
+        if let Some(action) = action {
+            push(action);
+        }
+        ctx_menu.request_repaint();
+    }));
 }
 
 pub fn create() -> Result<TrayState, String> {
@@ -35,34 +92,16 @@ pub fn create() -> Result<TrayState, String> {
 }
 
 impl TrayState {
-    /// 处理托盘事件；右键时在 owner 窗口上弹出原生菜单。
+    /// 处理已入队的托盘事件；右键时在 owner 窗口上弹出原生菜单。
     pub fn poll(&self, owner_hwnd: isize) -> Option<TrayAction> {
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::Click {
-                button,
-                button_state,
-                ..
-            } = event
-            {
-                if button_state == MouseButtonState::Up {
-                    match button {
-                        MouseButton::Left => return Some(TrayAction::Show),
-                        MouseButton::Right => {
-                            unsafe {
-                                self.menu.show_context_menu_for_hwnd(owner_hwnd, None);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            match event.id.0.as_str() {
-                "tray.show" => return Some(TrayAction::Show),
-                "tray.settings" => return Some(TrayAction::Settings),
-                "tray.quit" => return Some(TrayAction::Quit),
-                _ => {}
+        loop {
+            let action = pending().lock().ok().and_then(|mut queue| queue.pop_front());
+            let Some(action) = action else { break };
+            match action {
+                TrayAction::Menu => unsafe {
+                    self.menu.show_context_menu_for_hwnd(owner_hwnd, None);
+                },
+                other => return Some(other),
             }
         }
         None

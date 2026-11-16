@@ -28,6 +28,8 @@ const OBJID_WINDOW: i32 = 0;
 const CHILDID_SELF: i32 = 0;
 
 static EVENT_TX: OnceLock<Sender<isize>> = OnceLock::new();
+/// UI 唤醒器:hook 事件一到就 `request_repaint`,隐藏窗口无需周期重绘。
+static WAKE_CTX: OnceLock<eframe::egui::Context> = OnceLock::new();
 
 /// 对话框自动唤出监听器；Drop 时反挂 hook 并结束线程。
 pub struct DialogWatch {
@@ -37,7 +39,8 @@ pub struct DialogWatch {
 }
 
 impl DialogWatch {
-    pub fn start() -> Result<Self, String> {
+    pub fn start(ctx: &eframe::egui::Context) -> Result<Self, String> {
+        let _ = WAKE_CTX.set(ctx.clone());
         let (tx, rx) = mpsc::channel();
         let _ = EVENT_TX.set(tx);
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -156,6 +159,10 @@ unsafe extern "system" fn win_event_proc(
         }
         if let Some(tx) = EVENT_TX.get() {
             let _ = tx.send(hwnd.0 as isize);
+        }
+        // 事件线程直接唤醒 UI：隐藏态不再依赖主循环的周期重绘。
+        if let Some(ctx) = WAKE_CTX.get() {
+            ctx.request_repaint();
         }
     }));
 }
