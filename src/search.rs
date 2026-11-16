@@ -102,6 +102,11 @@ struct Request {
     show_history: bool,
     /// P0-1：收藏列表（Quick Switch 数据源）。
     favorites: Vec<crate::assets::Favorite>,
+    /// 手动隐藏的应用路径（小写）：空输入的应用页里默认不出现，
+    /// 输入名字仍能搜到（Ctrl+H 可临时全部列出）。
+    hidden: Vec<String>,
+    /// Ctrl+H：把已隐藏的应用也列出来（排最前，UI 标「已隐藏」）。
+    show_hidden: bool,
     /// P0-2：「Explorer 内键入即搜」锁定的当前目录（None = 全局搜索）。
     base_folder: Option<PathBuf>,
     /// 深路径浏览模式的当前目录：输入框只放过滤词，worker 直接列这个目录。
@@ -164,6 +169,10 @@ pub struct SearchService {
     keywords: Vec<KeywordConfig>,
     /// P0-1：收藏列表，新增收藏后由 UI 同步进来。
     favorites: Vec<crate::assets::Favorite>,
+    /// 已隐藏的应用路径（小写，空输入应用页过滤用）。
+    hidden: Vec<String>,
+    /// Ctrl+H「显示已隐藏」开关。
+    show_hidden: bool,
     /// 「重新加载」命令置位，worker 下一请求立即重建应用索引。
     apps_dirty: Arc<AtomicBool>,
     /// 浏览器书签索引开关（设置页即时生效）：worker 每轮维护读取，
@@ -273,6 +282,12 @@ impl SearchService {
             last: None,
             keywords: config.keywords,
             favorites: config.favorites,
+            hidden: config
+                .hidden_apps
+                .iter()
+                .map(|hidden| hidden.path.to_lowercase())
+                .collect(),
+            show_hidden: false,
             apps_dirty,
             bookmarks_enabled,
             bookmark_folders,
@@ -456,6 +471,8 @@ impl SearchService {
                 rank: rank.clone(),
                 show_history,
                 favorites: self.favorites.clone(),
+                hidden: self.hidden.clone(),
+                show_hidden: self.show_hidden,
                 base_folder,
                 browse_root,
             })
@@ -508,6 +525,19 @@ impl SearchService {
     /// P0-1：收藏变更后同步给 worker，Quick Switch 立即生效，无需重载配置。
     pub fn set_favorites(&mut self, favorites: Vec<crate::assets::Favorite>) {
         self.favorites = favorites;
+    }
+
+    /// 隐藏列表变更后同步给 worker（空输入的应用页立即少掉这些条目）。
+    pub fn set_hidden(&mut self, hidden: &[crate::config::HiddenApp]) {
+        self.hidden = hidden
+            .iter()
+            .map(|entry| entry.path.to_lowercase())
+            .collect();
+    }
+
+    /// Ctrl+H：显示/收起已隐藏的应用（下一次查询生效）。
+    pub fn set_show_hidden(&mut self, show: bool) {
+        self.show_hidden = show;
     }
 
     /// 应用索引立刻重建：新装/卸载应用后不想等 TTL 就执行「重新加载」命令。
@@ -753,6 +783,8 @@ mod pin_tests {
             rank: RankConfig::default(),
             show_history: true,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         }
@@ -2319,6 +2351,9 @@ fn run_worker(args: WorkerArgs) {
             );
             total = keyword_rows.len();
         } else if request.query.is_empty() && request.filters.is_empty() {
+            // 应用页/书签页的「真实总数」：条目只交付首屏 take 条，
+            // total 必须是完整条数，UI 才会在滚到底时续拉。
+            let mut scope_total: Option<usize> = None;
             if request.show_history {
                 if let Ok(history) = history.lock() {
                     entries = history.recent_entries(request.limit.max(8));
@@ -2339,41 +2374,55 @@ fn run_worker(args: WorkerArgs) {
             // 空查询 = 纯「最近使用」：清空历史后就是空列表，不再补常用应用
             // （补位会让用户以为历史没清掉）；想看已安装应用去「应用」标签。
             if request.query.scope == Scope::App {
-                entries = apps.top(request.limit);
-                // 收藏的应用置顶：文件夹 Quick Switch 不再收应用，这里
-                // 是它们唯一的入口（空输入即见，Enter 启动）。
-                let mut pinned: Vec<Entry> = request
-                    .favorites
-                    .iter()
-                    .map(crate::assets::favorite_entry)
-                    .filter(|entry| entry.kind == Kind::App)
-                    .collect();
-                pinned.retain(|entry| !entries.iter().any(|e| e.id == entry.id));
-                if !pinned.is_empty() {
-                    let room = request.limit.saturating_sub(pinned.len());
-                    entries.truncate(room);
-                    pinned.append(&mut entries);
-                    entries = pinned;
-                }
+                // 排序权重来自使用历史（frecency）：微信用得多就排前面，
+                // 内置的「常见应用」表只在没有历史时兜底。rank_snapshot 一次
+                // 读出全部 history 行，逐条查 id 的代价可以忽略。
+                let usage: HashMap<String, f32> = history
+                    .lock()
+                    .ok()
+                    .map(|history| {
+                        let snapshot = history.rank_snapshot("");
+                        apps.all()
+                            .iter()
+                            .filter_map(|app| {
+                                let score = snapshot.score(&app.id);
+                                (score > 0.0).then(|| (app.id.clone(), score))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // 取 deliver 而不是 limit：应用页也能滚到底「加载更多」，
+                // 首屏 100 条 > 窗口行数，UI 才滚得动（同书签页）。
+                // 已到设置的「加载更多上限」时一次给全：应用总共只有几百条，
+                // 上限调小（如 100）也不该把后面的应用永远藏起来。
+                let take = if request.deliver >= config.max_load_results {
+                    usize::MAX
+                } else {
+                    request.deliver.max(request.limit)
+                };
+                let (rows, count) = app_scope_entries(
+                    &apps,
+                    &request.favorites,
+                    &usage,
+                    &request.hidden,
+                    request.show_hidden,
+                    take,
+                );
+                entries = rows;
+                scope_total = Some(count);
             } else if request.query.scope == Scope::Command {
                 entries = commands("", &config.commands);
             } else if request.query.scope == Scope::Bookmark {
                 // 书签页空输入 = 按名称列出全部书签（与应用页「空输入列应用」一致）；
                 // 取 deliver 而不是 limit：几百条书签也能滚到底「加载更多」。
                 entries = if bookmarks_enabled.load(Ordering::Relaxed) {
+                    scope_total = Some(bookmarks.count());
                     bookmarks.top(request.deliver.max(request.limit))
                 } else {
                     Vec::new()
                 };
             }
-            total = entries.len();
-            // 书签页空输入的 total 用真实总数：UI 只在 entries.len() < total
-            // 时才发「加载更多」，否则 482 条书签只能看到首屏 100 条。
-            if request.query.scope == Scope::Bookmark
-                && bookmarks_enabled.load(Ordering::Relaxed)
-            {
-                total = bookmarks.count();
-            }
+            total = scope_total.unwrap_or(entries.len());
         } else {
             match request.query.scope {
                 Scope::App => {
@@ -2762,6 +2811,83 @@ fn scope_matches(scope: Scope, entry: &Entry) -> bool {
     }
 }
 
+/// 同一条启动目标：收藏的 id 是 `fav:<path>`、索引条目是 `app:<path>`，
+/// 只比 id 会让同一条 .lnk 在应用页出现两次（截图里的两行「微信」）。
+/// Windows 路径大小写不敏感，统一按路径比较。
+fn same_target(a: &Entry, b: &Entry) -> bool {
+    if a.id == b.id {
+        return true;
+    }
+    match (a.path.as_deref(), b.path.as_deref()) {
+        (Some(pa), Some(pb)) => pa
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&pb.to_string_lossy()),
+        _ => false,
+    }
+}
+
+/// 应用页空输入的列表：收藏的应用置顶（文件夹 Quick Switch 不再收应用，
+/// 这里是它们唯一的入口），其余按 `AppIndex::ranked`（使用历史 → 常见名单
+/// → 名字）排序。返回 `(首屏条目, 完整条数)`：`total` 给 UI 的「加载更多」
+/// 用真实总数，滚动到底才能把剩下的应用续拉出来。
+///
+/// `hidden` 是手动隐藏的应用路径（小写）：默认不出现（隐藏优先于收藏），
+/// 但 `show_hidden`（Ctrl+H）时排在最前，让用户一眼看到藏了哪些。
+fn app_scope_entries(
+    apps: &apps::AppIndex,
+    favorites: &[crate::assets::Favorite],
+    usage: &HashMap<String, f32>,
+    hidden: &[String],
+    show_hidden: bool,
+    take: usize,
+) -> (Vec<Entry>, usize) {
+    let is_hidden = |entry: &Entry| {
+        let path = entry.full_path().to_lowercase();
+        hidden.contains(&path)
+    };
+    let mut rest = apps.ranked(usage);
+    if !show_hidden {
+        rest.retain(|app| !is_hidden(app));
+    }
+    let mut pinned: Vec<Entry> = Vec::new();
+    for favorite in favorites {
+        let stored = crate::assets::favorite_entry(favorite);
+        if stored.kind != Kind::App {
+            continue;
+        }
+        // 收藏是保存时的旧快照（没有拼音/图标色调）：索引里有同一条就换成
+        // 索引条目，显示才和正文里的应用一致，同时避免重复行。
+        let entry = rest
+            .iter()
+            .find(|app| same_target(app, &stored))
+            .cloned()
+            .unwrap_or(stored);
+        // 手动隐藏优先于收藏：藏起来的应用不置顶。
+        if is_hidden(&entry) {
+            continue;
+        }
+        if pinned.iter().any(|pin| same_target(pin, &entry)) {
+            continue;
+        }
+        rest.retain(|app| !same_target(app, &entry));
+        pinned.push(entry);
+    }
+    let mut rows = pinned;
+    if show_hidden {
+        // Ctrl+H：已隐藏的排最前（按这个键就是想看/恢复它们）。
+        let (mut hidden_rows, visible): (Vec<Entry>, Vec<Entry>) =
+            rest.into_iter().partition(|entry| is_hidden(entry));
+        hidden_rows.append(&mut rows);
+        hidden_rows.extend(visible);
+        rows = hidden_rows;
+    } else {
+        rows.extend(rest);
+    }
+    let total = rows.len();
+    rows.truncate(take);
+    (rows, total)
+}
+
 /// 历史条目是否已失效（空查询展示前过滤）：
 /// - 文件/文件夹/程序：目标不存在（删除/移动/改名）即失效；UNC 路径不做
 ///   存在性检查——死掉的 SMB 路径 `exists()` 会阻塞数秒，宁可留着旧条目。
@@ -3053,6 +3179,8 @@ mod tests {
             rank: RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -3100,6 +3228,8 @@ mod tests {
             rank: RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -3640,5 +3770,132 @@ mod tests {
                 entry.full_path()
             );
         }
+    }
+
+    fn app_row(id: &str, name: &str, path: &str) -> Entry {
+        Entry {
+            id: id.to_string(),
+            kind: Kind::App,
+            name: name.to_string(),
+            path: Some(std::path::PathBuf::from(path)),
+            size: None,
+            modified: None,
+            pinyin: None,
+            initial: String::new(),
+            tone: 0,
+        }
+    }
+
+    /// 应用页：收藏与索引里的同一条 .lnk 只出现一次（旧版按 id 去重，
+    /// `fav:<path>` 与 `app:<path>` 不相等 → 截图里的两行「微信」），
+    /// 且收藏换成索引条目（保留拼音/图标色调）。
+    #[test]
+    fn app_scope_dedupes_favorite_against_index_entry() {
+        let index = apps::AppIndex {
+            apps: vec![
+                app_row("app:C:\\Start\\微信.lnk", "微信", "C:\\Start\\微信.lnk"),
+                app_row(
+                    "app:C:\\Start\\Notepad.lnk",
+                    "Notepad",
+                    "C:\\Start\\Notepad.lnk",
+                ),
+            ],
+        };
+        // 收藏保存的是旧快照，路径大小写也可能不同。
+        let favorites = vec![crate::assets::Favorite {
+            name: "微信".to_string(),
+            path: "c:\\start\\微信.lnk".to_string(),
+        }];
+        let (rows, total) = app_scope_entries(&index, &favorites, &HashMap::new(), &[], false, 10);
+        assert_eq!(total, 2, "去重后总条数");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "微信");
+        assert_eq!(
+            rows[0].id, "app:C:\\Start\\微信.lnk",
+            "收藏命中索引时应换成索引条目"
+        );
+        assert_eq!(
+            rows.iter().filter(|entry| entry.name == "微信").count(),
+            1,
+            "同一条 .lnk 不能出现两次"
+        );
+        assert_eq!(rows[1].name, "Notepad");
+    }
+
+    /// 应用页首屏只交付 deliver 条，但 total 是完整条数：UI 靠
+    /// `entries.len() < total` 才会在滚到底时发「加载更多」。
+    #[test]
+    fn app_scope_total_counts_all_apps_for_load_more() {
+        let apps_vec: Vec<Entry> = (0..250)
+            .map(|i| {
+                app_row(
+                    &format!("app:C:\\{i}.lnk"),
+                    &format!("App {i:03}"),
+                    &format!("C:\\{i}.lnk"),
+                )
+            })
+            .collect();
+        let index = apps::AppIndex { apps: apps_vec };
+        let (rows, total) = app_scope_entries(&index, &[], &HashMap::new(), &[], false, MIN_DELIVER);
+        assert_eq!(rows.len(), MIN_DELIVER);
+        assert_eq!(total, 250);
+        assert!(
+            rows.len() < total,
+            "首屏少于总数，UI 才能续拉剩下的应用"
+        );
+    }
+
+    /// 隐藏的应用：空列表里不出现（收藏置顶的也一起藏），总数随之减少；
+    /// Ctrl+H（show_hidden=true）时回来并排在最前。
+    #[test]
+    fn app_scope_filters_hidden_apps_unless_revealed() {
+        let index = apps::AppIndex {
+            apps: vec![
+                app_row("app:C:\\Start\\微信.lnk", "微信", "C:\\Start\\微信.lnk"),
+                app_row(
+                    "app:C:\\Start\\Notepad.lnk",
+                    "Notepad",
+                    "C:\\Start\\Notepad.lnk",
+                ),
+                app_row(
+                    "app:C:\\Start\\Everything.lnk",
+                    "Everything",
+                    "C:\\Start\\Everything.lnk",
+                ),
+            ],
+        };
+        // 微信同时是收藏：隐藏优先于收藏置顶。
+        let favorites = vec![crate::assets::Favorite {
+            name: "微信".to_string(),
+            path: "C:\\Start\\微信.lnk".to_string(),
+        }];
+        let hidden = vec!["c:\\start\\微信.lnk".to_string()];
+
+        let (rows, total) = app_scope_entries(&index, &favorites, &HashMap::new(), &hidden, false, 10);
+        assert_eq!(total, 2, "隐藏项不计入总数");
+        let names: Vec<&str> = rows.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["Everything", "Notepad"]);
+
+        let (rows, total) = app_scope_entries(&index, &favorites, &HashMap::new(), &hidden, true, 10);
+        assert_eq!(total, 3);
+        assert_eq!(rows[0].name, "微信", "Ctrl+H 显示时隐藏项排最前");
+        assert_eq!(rows.len(), 3);
+    }
+
+    /// Ctrl+H 排序：多个隐藏项排前面，其余照原顺序跟在后面。
+    #[test]
+    fn app_scope_revealed_hidden_rows_come_first() {
+        let index = apps::AppIndex {
+            apps: vec![
+                app_row("app:C:\\A.lnk", "Alpha", "C:\\A.lnk"),
+                app_row("app:C:\\B.lnk", "Beta", "C:\\B.lnk"),
+                app_row("app:C:\\C.lnk", "Gamma", "C:\\C.lnk"),
+                app_row("app:C:\\D.lnk", "Delta", "C:\\D.lnk"),
+            ],
+        };
+        let hidden = vec!["c:\\b.lnk".to_string(), "c:\\d.lnk".to_string()];
+        let (rows, _total) = app_scope_entries(&index, &[], &HashMap::new(), &hidden, true, 10);
+        let names: Vec<&str> = rows.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["Beta", "Delta", "Alpha", "Gamma"]);
     }
 }

@@ -4,6 +4,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+/// 手动隐藏的应用：`path` 是匹配键（Windows 路径大小写不敏感），`name` 只
+/// 用于设置页/提示里认出是哪一条；写进 `config.toml` 的 `[[hidden_app]]`。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HiddenApp {
+    pub name: String,
+    pub path: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub hotkey: String,
@@ -39,6 +47,10 @@ pub struct Config {
     /// 收藏的文件夹/文件，Quick Switch 与菜单的数据源。
     #[serde(default)]
     pub favorites: Vec<Favorite>,
+    /// 手动隐藏的应用：空输入的应用页里不出现（输入名字仍能搜到，
+    /// Ctrl+H 可临时全部列出）。写入 `config.toml` 的 `[[hidden_apps]]`。
+    #[serde(default)]
+    pub hidden_apps: Vec<HiddenApp>,
     /// 自定义动作：作用于选中的搜索结果，支持 {action_path}。
     #[serde(default)]
     pub actions: Vec<ActionDef>,
@@ -540,6 +552,7 @@ impl Default for Config {
             keywords: default_keywords(),
             rank: RankConfig::default(),
             favorites: Vec::new(),
+            hidden_apps: Vec::new(),
             actions: Vec::new(),
             commands: Vec::new(),
             explorer_typing: true,
@@ -861,6 +874,7 @@ mod tests {
         assert_eq!(parsed.theme.mode, "frost");
         assert!(parsed.explorer_typing);
         assert!(parsed.favorites.is_empty());
+        assert!(parsed.hidden_apps.is_empty());
     }
 
     #[test]

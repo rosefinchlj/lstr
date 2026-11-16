@@ -1764,6 +1764,8 @@ mod tests {
             rank: crate::config::RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -1850,6 +1852,8 @@ mod tests {
             rank: crate::config::RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -1940,6 +1944,8 @@ mod tests {
             rank: crate::config::RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -2027,6 +2033,8 @@ mod tests {
             rank: crate::config::RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -2135,6 +2143,8 @@ mod tests {
             rank: crate::config::RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };

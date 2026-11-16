@@ -1589,6 +1589,8 @@ pub struct LstrApp {
     more_pending: bool,
     /// 本次查询已加载到后端给不出更多（或到上限），滚到底不再空转。
     more_exhausted: bool,
+    /// Ctrl+H：应用页临时把手动隐藏的应用也列出来（排最前，标「已隐藏」）。
+    show_hidden: bool,
     /// 筛选条选择：位置 / 时间 / 类型（按钮操作，不输入查询语法）。
     filters: SearchFilters,
     /// 搜索栏盘符权重滑块的查询节流：拖拽中最多每 180ms 重查一次。
@@ -1802,6 +1804,7 @@ impl LstrApp {
             scroll_to_selection: false,
             more_pending: false,
             more_exhausted: false,
+            show_hidden: false,
             filters: SearchFilters::default(),
             drive_query_at: None,
             system_drive: crate::config::system_drive_letter(),
@@ -4069,6 +4072,22 @@ impl LstrApp {
             return;
         }
 
+        // Ctrl+H：应用页显示/收起手动隐藏的应用（列在最前，标「已隐藏」）。
+        if self.scope == Scope::App && ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::H)) {
+            self.show_hidden = !self.show_hidden;
+            self.service.set_show_hidden(self.show_hidden);
+            self.selected = 0;
+            self.trigger(ctx);
+            let count = self.cfg.hidden_apps.len();
+            let message = match (self.show_hidden, count) {
+                (true, 0) => "没有隐藏的应用".to_string(),
+                (true, n) => format!("已显示 {n} 个隐藏的应用（Ctrl+H 收起）"),
+                (false, n) => format!("已收起隐藏的应用（{n} 个）"),
+            };
+            self.toast(ctx, message);
+            return;
+        }
+
         // Ctrl+L：浏览模式下把当前目录放回输入框，切回可编辑完整路径。
         if self.in_browse() && ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::L)) {
             self.edit_browse_path(ctx);
@@ -4673,6 +4692,7 @@ impl LstrApp {
                 // 应用索引（开始菜单/App Paths/UWP）立刻重建：新装或卸载应用后
                 // 执行「重新加载」即可生效，不用重启。
                 self.service.set_bookmarks_enabled(self.cfg.index.bookmarks);
+                self.service.set_hidden(&self.cfg.hidden_apps);
                 self.service.invalidate_apps();
                 self.preview_open = self.cfg.preview;
                 self.trigger(ctx);
@@ -6803,6 +6823,7 @@ impl LstrApp {
                             ("Esc", "收起（再唤出保留输入）"),
                             ("Ctrl+G", "对话框搜索并填入"),
                             ("Shift+F10", "动作菜单（文件夹也可）"),
+                            ("Ctrl+H", "显示/收起已隐藏的应用"),
                             ("Del", "删除到回收站（需确认）"),
                             ("双击 Ctrl", "唤出"),
                         ],
@@ -7016,6 +7037,13 @@ impl LstrApp {
         // 收藏置顶视觉标记:收藏过的条目副标题加 ★(每帧构建一次集合)。
         let fav_set: std::collections::HashSet<String> =
             self.cfg.favorites.iter().map(|f| f.path.to_lowercase()).collect();
+        // 手动隐藏的应用：副标题标「已隐藏」（Ctrl+H 显示时列出，搜索时也照常出现）。
+        let hidden_set: std::collections::HashSet<String> = self
+            .cfg
+            .hidden_apps
+            .iter()
+            .map(|h| h.path.to_lowercase())
+            .collect();
         // 学习徽标:查询词变化时刷新一次(每帧查 HashMap,不重复 SQL)。
         if self.learn_for != display_text {
             self.learn_badges = self
@@ -7197,6 +7225,9 @@ impl LstrApp {
             }
             if is_path_row && fav_set.contains(&full_path.to_lowercase()) {
                 lead = format!("★ {lead}");
+            }
+            if entry.kind == Kind::App && hidden_set.contains(&full_path.to_lowercase()) {
+                lead = format!("已隐藏 · {lead}");
             }
             let time_text = if is_path_row {
                 entry
@@ -7675,12 +7706,22 @@ impl LstrApp {
             "正在输入日期/大小/路径/盘符条件 · 冒号或回车提交".to_string()
         } else if query.is_empty() && self.filters.is_empty() {
             format!(
-                "{} 项{}",
+                "{} 项{}{}",
                 entries.len(),
                 if query.scope == Scope::All && self.cfg.show_history {
                     " · 最近使用"
                 } else {
                     ""
+                },
+                if query.scope == Scope::App {
+                    match (self.show_hidden, self.cfg.hidden_apps.len()) {
+                        (true, 0) => " · Ctrl+H 收起".to_string(),
+                        (true, n) => format!(" · 已显示 {n} 个隐藏项 · Ctrl+H 收起"),
+                        (false, 0) => String::new(),
+                        (false, n) => format!(" · 已隐藏 {n} 个 · Ctrl+H 显示"),
+                    }
+                } else {
+                    String::new()
                 }
             )
         } else {
@@ -8092,13 +8133,19 @@ impl LstrApp {
         });
     }
 
+    /// 这条应用是否被手动隐藏（动作菜单标签与行内「已隐藏」标记共用）。
+    fn entry_hidden(&self, entry: &Entry) -> bool {
+        entry.kind == Kind::App && crate::assets::is_hidden(&self.cfg, &entry.full_path())
+    }
+
     fn menu_step(&mut self, delta: i32) {
         let Some(entry) = self.entries.get(self.selected) else {
             self.menu_open = false;
             return;
         };
         let actions = self.cfg.actions.clone();
-        let items = menu_items(entry, &actions, self.menu_in_history);
+        let hidden = self.entry_hidden(entry);
+        let items = menu_items_with(entry, &actions, self.menu_in_history, hidden);
         if items.is_empty() {
             self.menu_open = false;
             return;
@@ -8120,7 +8167,8 @@ impl LstrApp {
             return;
         };
         let actions = self.cfg.actions.clone();
-        let items = menu_items(entry, &actions, self.menu_in_history);
+        let hidden = self.entry_hidden(entry);
+        let items = menu_items_with(entry, &actions, self.menu_in_history, hidden);
         if let Some(item) = items.get(self.menu_index) {
             if item.enabled {
                 let action = item.action;
@@ -8148,6 +8196,35 @@ impl LstrApp {
                         self.toast(ctx, "已加入收藏".to_string());
                     }
                     Ok(false) => self.toast(ctx, "已在收藏中".to_string()),
+                    Err(err) => self.toast(ctx, err),
+                }
+                self.trigger(ctx);
+            }
+            MenuAction::ToggleHide => {
+                let Some(entry) = self.entries.get(self.selected).cloned() else {
+                    return;
+                };
+                if entry.kind != Kind::App {
+                    return;
+                }
+                let path = entry.full_path();
+                let hiding = !crate::assets::is_hidden(&self.cfg, &path);
+                let changed = if hiding {
+                    crate::assets::hide_app(&mut self.cfg, &entry.name, &path)
+                } else {
+                    crate::assets::unhide_app(&mut self.cfg, &path)
+                };
+                match changed {
+                    Ok(_) => {
+                        // 隐藏列表变化后立刻重发查询：空列表里这条马上消失。
+                        self.service.set_hidden(&self.cfg.hidden_apps);
+                        let message = if hiding {
+                            format!("已隐藏「{}」，Ctrl+H 可查看", entry.name)
+                        } else {
+                            format!("已取消隐藏「{}」", entry.name)
+                        };
+                        self.toast(ctx, message);
+                    }
                     Err(err) => self.toast(ctx, err),
                 }
                 self.trigger(ctx);
@@ -8481,7 +8558,8 @@ impl LstrApp {
             self.menu_open = false;
             return;
         };
-        let items = menu_items(&entry, &self.cfg.actions, self.menu_in_history);
+        let hidden = self.entry_hidden(&entry);
+        let items = menu_items_with(&entry, &self.cfg.actions, self.menu_in_history, hidden);
         let theme = self.theme;
         let item_h = 30.0;
         let width = 236.0;
@@ -9606,6 +9684,7 @@ impl LstrApp {
         if changed {
             let _ = self.cfg.save();
             self.service.set_favorites(self.cfg.favorites.clone());
+            self.service.set_hidden(&self.cfg.hidden_apps);
             self.trigger(ctx);
         }
     }
@@ -10747,6 +10826,8 @@ enum MenuAction {
     OpenTerminal,
     RemoveHistory,
     AddFavorite,
+    /// 手动隐藏 / 取消隐藏当前应用（空列表里默认不出现）。
+    ToggleHide,
     DeleteToRecycleBin,
     CustomAction(usize),
 }
@@ -10896,7 +10977,18 @@ struct MenuItem {
     action: MenuAction,
 }
 
+#[cfg(test)]
 fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef], in_history: bool) -> Vec<MenuItem> {
+    menu_items_with(entry, actions, in_history, false)
+}
+
+/// `hidden` = 这条应用当前是否被手动隐藏（决定菜单显示「隐藏」还是「取消隐藏」）。
+fn menu_items_with(
+    entry: &Entry,
+    actions: &[crate::assets::ActionDef],
+    in_history: bool,
+    hidden: bool,
+) -> Vec<MenuItem> {
     let is_command = entry.kind == Kind::Command;
     let is_program = entry.kind == Kind::Program;
     let is_file = entry.kind == Kind::File;
@@ -10971,6 +11063,20 @@ fn menu_items(entry: &Entry, actions: &[crate::assets::ActionDef], in_history: b
         enabled: !is_command && !is_link,
         action: MenuAction::AddFavorite,
     });
+    // 应用可以「藏起来」：空列表里不出现，输入名字仍能搜到，Ctrl+H 可看全部。
+    if entry.kind == Kind::App {
+        items.push(MenuItem {
+            label: if hidden {
+                "取消隐藏此应用"
+            } else {
+                "隐藏此应用"
+            }
+            .to_string(),
+            shortcut: "",
+            enabled: true,
+            action: MenuAction::ToggleHide,
+        });
+    }
     if can_delete {
         items.push(MenuItem {
             label: "删除到回收站…".to_string(),
