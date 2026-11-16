@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 /// P1-11：旧实现直接 `{:?}` 写 `SystemTime { intervals: ... }`，用户/支持人员
 /// 无法判断崩溃发生在什么时候。这里用 Howard Hinnant 的 civil-from-days
 /// 自己换算成公历（不为一个时间戳引入 chrono 依赖）。
-fn format_utc(now: std::time::SystemTime) -> String {
+pub(crate) fn format_utc(now: std::time::SystemTime) -> String {
     let Ok(duration) = now.duration_since(std::time::UNIX_EPOCH) else {
         return format!("{now:?} (pre-epoch)");
     };

@@ -1521,6 +1521,9 @@ pub struct LstrApp {
     error: Option<String>,
     /// 正则模式下的编译错误（不触发搜索，单独提示）。
     regex_error: Option<String>,
+    /// P3/B20：正则校验缓存（pattern, case_sensitive, 错误）。病态表达式
+    /// 每帧编译会拖慢 UI，这里只在输入变化时重新编译。
+    regex_cache: Option<(String, bool, Option<String>)>,
     /// 输入框日期/大小条件解析错误（非法日期/单位/空区间等，保留原文不提交）。
     condition_error: Option<String>,
     /// 自研索引状态行(渐进启动:构建中/未启用提示;错误条优先)。
@@ -1530,6 +1533,11 @@ pub struct LstrApp {
     /// 索引是否处于 Fallback（未授权/worker 未运行）：P0-2 的「重新授权」
     /// 按钮与首启引导里的失败提示都据此显示。
     index_fallback: bool,
+    /// P1-11：会话存活标记文件路径；启动时存在=上次非正常退出。
+    session_marker: std::path::PathBuf,
+    /// P1-11：上次异常退出的提示（启动时若发现标记文件则填，展示一次后清除）。
+    unclean_note: Option<String>,
+    unclean_until: Option<Instant>,
     /// 设置页「索引卷」候选盘缓存:(枚举时刻, 升序盘符)。
     /// 枚举一次固定卷要跑 26 组 GetDriveType/GetVolumeInformation,不能每帧调。
     index_drives: Option<(Instant, Vec<char>)>,
@@ -1756,6 +1764,28 @@ impl LstrApp {
             .map(|r| r.pattern.clone())
             .collect();
 
+        // P1-11：上次异常退出检测。标记文件在启动时写入、正常退出时删除；
+        // 启动时若已存在，说明上次被杀/崩溃/断电，索引可能未完整落盘。
+        let session_marker = crate::config::attach_dir().join("app_running");
+        let unclean_note = std::fs::read_to_string(&session_marker)
+            .ok()
+            .map(|started| {
+                let started = started.trim();
+                // 标记内容形如 `2026-11-16T15:26:00.123Z (unix 1794…)`，
+                // 横幅里只保留可读时间，别把 unix 秒也塞进去占宽度。
+                let started = started.split(" (unix").next().unwrap_or(started);
+                format!(
+                    "上次 lstr 异常退出（启动于 {started}）；索引已自动校验，若结果异常可在设置→维护重建"
+                )
+            });
+        let unclean_until = unclean_note
+            .as_ref()
+            .map(|_| Instant::now() + Duration::from_secs(20));
+        let _ = std::fs::write(
+            &session_marker,
+            crate::format_utc(std::time::SystemTime::now()),
+        );
+
         Self {
             cfg,
             theme,
@@ -1770,10 +1800,14 @@ impl LstrApp {
             ui_total_ms: None,
             error: None,
             regex_error: None,
+            regex_cache: None,
             condition_error: None,
             index_note: None,
             index_note_since: None,
             index_fallback: false,
+            session_marker,
+            unclean_note,
+            unclean_until,
             index_drives: None,
             pending_gen,
             service_restarts: 0,
@@ -2239,18 +2273,35 @@ impl LstrApp {
         }
         // 正则先在 UI 侧编译：非法表达式不发给 worker，避免“空结果=没找到”的误导。
         if self.filters.matches.regex {
-            let pattern = self.input.trim();
-            self.regex_error = if pattern.is_empty() {
-                None
-            } else {
-                lstr_index::query::validate_regex(pattern, self.filters.matches.case_sensitive)
-                    .err()
-                    .map(|err| {
-                        // regex 的错误带多行源码指针，这里压成单行，避免撑破 24px 提示条。
-                        let detail = err.split_whitespace().collect::<Vec<_>>().join(" ");
-                        format!("正则无效: {detail}")
-                    })
+            let pattern = self.input.trim().to_string();
+            let case_sensitive = self.filters.matches.case_sensitive;
+            // P3/B20：同一 pattern 不重复编译——旧实现每帧 validate_regex，
+            // 病态表达式会把 UI 帧拖慢。
+            let cached = self
+                .regex_cache
+                .as_ref()
+                .filter(|(p, cs, _)| p == &pattern && *cs == case_sensitive)
+                .map(|(_, _, err)| err.clone());
+            let regex_error = match cached {
+                Some(err) => err,
+                None => {
+                    let err = if pattern.is_empty() {
+                        None
+                    } else {
+                        lstr_index::query::validate_regex(&pattern, case_sensitive)
+                            .err()
+                            .map(|err| {
+                                // regex 的错误带多行源码指针，这里压成单行，避免撑破 24px 提示条。
+                                let detail =
+                                    err.split_whitespace().collect::<Vec<_>>().join(" ");
+                                format!("正则无效: {detail}")
+                            })
+                    };
+                    self.regex_cache = Some((pattern, case_sensitive, err.clone()));
+                    err
+                }
             };
+            self.regex_error = regex_error;
             if self.regex_error.is_some() {
                 self.dirty_at = None;
                 self.waiting = false;
@@ -3783,8 +3834,9 @@ impl LstrApp {
         if self.regex_error.is_some() || self.condition_error.is_some() {
             count += 1;
         }
-        // 索引状态提示只在没有错误横幅时显示（见绘制处的 gate）。
-        if count == 0 && self.index_note.is_some() {
+        // 索引状态提示只在没有错误横幅时显示（见绘制处的 gate）；
+        // P1-11 的异常退出提示占用同一个位置。
+        if count == 0 && (self.unclean_note.is_some() || self.index_note.is_some()) {
             count = 1;
         }
         count as f32 * 30.0
@@ -4905,6 +4957,27 @@ impl LstrApp {
         }
     }
 
+    /// P1-11：异常退出后一键重启。直接 spawn 会撞单实例互斥体，所以用
+    /// `cmd /C timeout & start` 延迟拉起；CREATE_NO_WINDOW 避免闪黑框。
+    fn relaunch_self(&mut self, ctx: &egui::Context) {
+        if let Ok(exe) = std::env::current_exe() {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    &format!(
+                        "timeout /t 2 /nobreak >nul & start \"\" \"{}\"",
+                        exe.display()
+                    ),
+                ])
+                .creation_flags(0x0800_0000)
+                .spawn();
+        }
+        lstr_index::snapshot::debug_log("ui: restart requested");
+        self.exit_reason = "restart";
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
     fn toast(&mut self, ctx: &egui::Context, message: String) {
         self.toast = Some((message, Instant::now() + Duration::from_millis(1300)));
         ctx.request_repaint_after(Duration::from_millis(1330));
@@ -5453,7 +5526,58 @@ impl LstrApp {
                 let banner_top = list_top + list_h.min(view_h) + LIST_GAP;
                 let mut extra_top = banner_top;
                 if self.error.is_none() && self.regex_error.is_none() && self.condition_error.is_none() {
-                    if let Some(note) = self.index_note.clone() {
+                    if let Some(note) = self.unclean_note.clone() {
+                        // P1-11：上次异常退出提示 + 一键重启（崩溃后用户不必
+                        // 自己去找托盘再双击）。
+                        let banner = Rect::from_min_size(
+                            egui::pos2(rect.left() + PAD, extra_top),
+                            egui::vec2(rect.width() - 2.0 * PAD, 24.0),
+                        );
+                        painter.rect_filled(banner, CornerRadius::same(7), theme.amber_soft);
+                        painter.circle_filled(
+                            egui::pos2(banner.left() + 11.0, banner.center().y),
+                            3.0,
+                            theme.amber,
+                        );
+                        let btn_w = 56.0;
+                        let btn = Rect::from_min_size(
+                            egui::pos2(banner.right() - btn_w - 8.0, banner.center().y - 9.0),
+                            egui::vec2(btn_w, 18.0),
+                        );
+                        let resp = ui.interact(
+                            btn,
+                            egui::Id::new("unclean-restart"),
+                            egui::Sense::click(),
+                        );
+                        painter.rect_filled(
+                            btn,
+                            CornerRadius::same(5),
+                            theme.amber.gamma_multiply(if resp.hovered() { 0.95 } else { 0.8 }),
+                        );
+                        painter.text(
+                            btn.center(),
+                            Align2::CENTER_CENTER,
+                            "重启",
+                            ui::text_font(11.0),
+                            Color32::WHITE,
+                        );
+                        if resp.clicked() {
+                            self.relaunch_self(ui.ctx());
+                        }
+                        painter
+                            .with_clip_rect(Rect::from_min_max(
+                                banner.left_top(),
+                                egui::pos2(banner.right() - btn_w - 20.0, banner.bottom()),
+                            ))
+                            .text(
+                                egui::pos2(banner.left() + 21.0, banner.center().y),
+                                Align2::LEFT_CENTER,
+                                note,
+                                ui::text_font(11.5),
+                                theme.text,
+                            );
+                        extra_top += 30.0;
+                    } else if let Some(note) = self.index_note.clone() {
                         let banner = Rect::from_min_size(
                             egui::pos2(rect.left() + PAD, extra_top),
                             egui::vec2(rect.width() - 2.0 * PAD, 24.0),
@@ -11508,6 +11632,8 @@ impl eframe::App for LstrApp {
     /// 旧 worker(实测多次出现怪状态)。这里同步发关闭指令并等其退出(有
     /// 超时);worker 收到 Shutdown 后走 write_clean_exit_flag 优雅退出。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // P1-11：正常退出才删除存活标记；下次启动若仍存在即判定异常退出。
+        let _ = std::fs::remove_file(&self.session_marker);
         // 退出原因落 engine.log：下次出现「窗口突然消失」可直接定性，
         // 不用再靠时间线推断（window=关窗/Esc 等未标记路径，tray=托盘退出）。
         lstr_index::snapshot::debug_log(&format!("ui exit reason={}", self.exit_reason));
@@ -11516,6 +11642,13 @@ impl eframe::App for LstrApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // P1-11：异常退出提示只展示一次（20s 或用户操作后清除）。
+        if let Some(until) = self.unclean_until {
+            if Instant::now() >= until {
+                self.unclean_note = None;
+                self.unclean_until = None;
+            }
+        }
         if !self.effects_applied {
             if let Some(hwnd) = window::hwnd_of_frame(frame) {
                 self.hwnd = Some(hwnd);
