@@ -6083,6 +6083,12 @@ impl LstrApp {
         // PathTyping 下筛选不生效；Browse 下位置由面包屑决定，其余筛选可用。
         let typing = self.path_mode();
         let browse = self.in_browse();
+        // B15：应用/书签/笔记/命令页不经过文件筛选，chip 一律置灰，
+        // 避免「点了没反应」的假交互。
+        let non_file = matches!(
+            self.scope,
+            Scope::App | Scope::Bookmark | Scope::Note | Scope::Command
+        );
         let mut x = rect.left() + PAD;
 
         let chips: [(FilterMenuKind, String, bool); 4] = [
@@ -6139,8 +6145,10 @@ impl LstrApp {
 
         let mut clicked = None;
         for (kind, label, active) in chips {
-            // PathTyping 全部禁用；Browse 只禁用「位置」（由面包屑决定）。
-            let disabled = typing || (browse && kind == FilterMenuKind::Location);
+            // PathTyping 全部禁用；Browse 只禁用「位置」（由面包屑决定）；
+            // 非文件页（应用/书签/笔记/命令）全部禁用。
+            let disabled =
+                typing || non_file || (browse && kind == FilterMenuKind::Location);
             let color = if disabled {
                 theme.dim
             } else if active {
