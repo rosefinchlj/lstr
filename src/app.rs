@@ -11637,8 +11637,13 @@ impl eframe::App for LstrApp {
         // 退出原因落 engine.log：下次出现「窗口突然消失」可直接定性，
         // 不用再靠时间线推断（window=关窗/Esc 等未标记路径，tray=托盘退出）。
         lstr_index::snapshot::debug_log(&format!("ui exit reason={}", self.exit_reason));
-        self.service
-            .graceful_shutdown(std::time::Duration::from_secs(6));
+        // B22：worker 已异常退出时 graceful_shutdown 只会白等满 6s；用短超时。
+        let timeout = if self.service.worker_panicked() {
+            std::time::Duration::from_millis(300)
+        } else {
+            std::time::Duration::from_secs(6)
+        };
+        self.service.graceful_shutdown(timeout);
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {

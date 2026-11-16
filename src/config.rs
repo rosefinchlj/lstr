@@ -495,6 +495,29 @@ impl RankConfig {
             .insert(letter.to_string(), weight.min(100));
     }
 
+    /// 手写 config.toml 的归一化：评分档位/历史/加成/噪声强度夹到安全区间。
+    /// 避免 `exact = 2147483647` 这类手写值让所有匹配分数溢出、排序错乱。
+    /// 不改变档位之间的相对顺序（用户可自行调档），只做上下界约束。
+    pub fn sanitize(&mut self) {
+        const SCORE_MAX: i32 = 10_000;
+        for score in [
+            &mut self.exact,
+            &mut self.prefix,
+            &mut self.substring,
+            &mut self.tokens,
+            &mut self.normalized,
+            &mut self.pinyin_prefix,
+            &mut self.pinyin_substring,
+            &mut self.fuzzy,
+            &mut self.path_only,
+        ] {
+            *score = (*score).clamp(0, SCORE_MAX);
+        }
+        self.history_cap = self.history_cap.clamp(0, 2_000);
+        self.recent_boost = self.recent_boost.clamp(0, 500);
+        self.noise_strength = self.noise_strength.clamp(0, 200);
+    }
+
     /// 手写 config.toml 的归一化：键统一成大写单字母、值夹到 0..=100，
     /// 非法键直接丢弃（不阻断整份配置加载）。
     pub fn normalize_drive_weights(&mut self) {
@@ -661,6 +684,8 @@ impl Config {
             Ok(mut cfg) => {
                 cfg.rank.backfill_missing_noise_rules();
                 cfg.rank.normalize_drive_weights();
+                // B21：手写 config.toml 里的极端分值/强度夹到安全区间。
+                cfg.rank.sanitize();
                 cfg.max_load_results = normalize_max_load_results(cfg.max_load_results);
                 cfg.index.normalize_volumes();
                 cfg.index.normalize();
@@ -1038,5 +1063,24 @@ mod tests {
             .map(|rule| rule.penalty)
             .collect();
         assert_eq!(hits, vec![42], "用户调过的强度必须保留且不重复追加");
+    }
+
+    #[test]
+    fn rank_config_sanitize_clamps_out_of_range_values() {
+        // B21：手写 config.toml 的极端值必须被夹到安全区间，否则排名分数可溢出。
+        let mut cfg = RankConfig {
+            exact: i32::MAX,
+            prefix: -7,
+            history_cap: 99_999,
+            recent_boost: -1,
+            noise_strength: 999,
+            ..RankConfig::default()
+        };
+        cfg.sanitize();
+        assert_eq!(cfg.exact, 10_000);
+        assert_eq!(cfg.prefix, 0);
+        assert_eq!(cfg.history_cap, 2_000);
+        assert_eq!(cfg.recent_boost, 0);
+        assert_eq!(cfg.noise_strength, 200);
     }
 }
