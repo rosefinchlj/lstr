@@ -725,6 +725,12 @@ impl Engine {
         let mut out = Vec::with_capacity(affected.len());
         for i in affected {
             let letter = self.volumes[i].letter;
+            // 该卷的后台 compact 若还在跑,必须先中止:fork 基于旧噪声规则,
+            // 清空 store 之后它若完成换血会把旧列复活(complete=false 的僵尸
+            // 卷),要等到下一次 ScanBegin 才纠正。
+            if self.compact_guid() == Some(self.volumes[i].guid) {
+                self.abort_compact("noise rules reset");
+            }
             let v = &mut self.volumes[i];
             v.store = None;
             v.complete = false;
@@ -1810,7 +1816,13 @@ impl Engine {
                 return CompactStart::Skipped;
             };
             // 未完成的首扫不在这里压:列还会继续追加,由 VolumeReady 收尾。
-            let need = (store.is_scanning() && complete) || store.needs_compact();
+            // 注意不能只看 needs_compact():扫描中也可能攒够死槽,而 install
+            // 会把 scan_mode 提前关掉,后续扫描就跑进增量路径了。
+            let need = if store.is_scanning() {
+                complete
+            } else {
+                store.needs_compact()
+            };
             (need, store.len(), self.volumes[i].guid, self.volumes[i].letter)
         };
         if !need {
@@ -1823,29 +1835,7 @@ impl Engine {
         }
 
         if len < COMPACT_BACKGROUND_MIN_LEN {
-            let Some(mut task) = self.volumes[i].store.as_ref().and_then(CompactTask::new) else {
-                return CompactStart::Skipped;
-            };
-            let started = Instant::now();
-            let store = self.volumes[i].store.as_mut().expect("compact store");
-            while !task.advance(store, Duration::from_secs(60)) {}
-            // 小卷同步路径:与旧行为一致,立即失效旧 Hit/拼音。
-            if task.installed() {
-                self.bump_generation(i);
-                if let Some(store) = &self.volumes[i].store {
-                    self.pinyin[i] = PinyinCache::rebuild(store);
-                }
-                self.volumes[i].dirty = true;
-            }
-            let ms = started.elapsed().as_millis();
-            if ms > 100 {
-                snapshot::debug_log(&format!(
-                    "compact vol {letter} (inline) done wall={ms}ms busy={}ms slices={}",
-                    task.busy().as_millis(),
-                    task.slices()
-                ));
-            }
-            return CompactStart::Inline;
+            return self.compact_inline(i);
         }
 
         // 大卷:名字区 Arc 共享,其余列浅拷贝(毫秒级);任务在独立线程跑,
@@ -1902,15 +1892,46 @@ impl Engine {
             });
         if let Err(err) = spawn {
             snapshot::debug_log(&format!(
-                "compact vol {letter} (background) spawn failed: {err}"
+                "compact vol {letter} (background) spawn failed: {err}; falling back to inline"
             ));
-            return CompactStart::Skipped;
+            // 线程起不来就退回同线程整卷重排:宁可这一次卡住查询线程,也不能
+            // 让卷停在扫描态(后续保存还要再同步 compact 一次,更慢)。
+            return self.compact_inline(i);
         }
         snapshot::debug_log(&format!(
             "compact vol {letter} (background) begin len={len} fork={fork_ms}ms"
         ));
         self.bg_compact = Some(BackgroundCompact { guid, started, cancel, rx });
         CompactStart::Background
+    }
+
+    /// 在引擎线程内同步跑完整卷 compact(小卷主路径;大卷后台线程创建失败
+    /// 时的回退)。小卷毫秒级,大卷回退会卡一次查询 —— 前者常态、后者罕见。
+    fn compact_inline(&mut self, i: usize) -> CompactStart {
+        let letter = self.volumes[i].letter;
+        let Some(mut task) = self.volumes[i].store.as_ref().and_then(CompactTask::new) else {
+            return CompactStart::Skipped;
+        };
+        let started = Instant::now();
+        let store = self.volumes[i].store.as_mut().expect("compact store");
+        while !task.advance(store, Duration::from_secs(60)) {}
+        // 小卷同步路径:与旧行为一致,立即失效旧 Hit/拼音。
+        if task.installed() {
+            self.bump_generation(i);
+            if let Some(store) = &self.volumes[i].store {
+                self.pinyin[i] = PinyinCache::rebuild(store);
+            }
+            self.volumes[i].dirty = true;
+        }
+        let ms = started.elapsed().as_millis();
+        if ms > 100 {
+            snapshot::debug_log(&format!(
+                "compact vol {letter} (inline) done wall={ms}ms busy={}ms slices={}",
+                task.busy().as_millis(),
+                task.slices()
+            ));
+        }
+        CompactStart::Inline
     }
 
     /// 轮询后台 compact:完成则换血。返回是否真的安装了一版新列。
@@ -1942,6 +1963,16 @@ impl Engine {
             // 卷已移除:结果直接丢弃(后台线程持有的 fork 随 drop 释放)。
             return;
         };
+        // 冻结窗口里卷可能已被清空/重置(噪声规则重置、控制帧先到):此时的
+        // fork 基于旧列,换血会把已丢弃的 store 复活成 complete=false 的僵尸
+        // 卷,直到下一次 ScanBegin 才纠正。校验不过就丢弃结果。
+        if self.volumes[i].store.is_none() || !self.volumes[i].complete {
+            snapshot::debug_log(&format!(
+                "compact vol {} (background) discarded: store reset during compaction",
+                self.volumes[i].letter
+            ));
+            return;
+        }
         let letter = self.volumes[i].letter;
         self.volumes[i].store = Some(outcome.store);
         self.pinyin[i] = outcome.pinyin;
@@ -1959,6 +1990,9 @@ impl Engine {
 
     /// 中止后台 compact(控制帧要重建/清空同一卷)。线程只置取消位并 detach;
     /// 它持有的是独立 fork,不会再碰引擎列,结果经已断开的 channel 丢弃。
+    /// 立即回放 deferred 也不会触发 fork 里 names 的 Arc::make_mut 深拷贝:
+    /// 除退出超时外,所有中止路径随后都会替换/清空该卷 store,旧 Arc 不再
+    /// 与引擎共享;退出路径只落盘,不再改列。
     fn abort_compact(&mut self, reason: &str) {
         let Some(job) = self.bg_compact.take() else { return };
         job.cancel.store(true, Ordering::Relaxed);
@@ -2569,6 +2603,20 @@ impl Engine {
             self.finish_compact_sync();
             self.flush_deferred();
             rounds += 1;
+        }
+        // 兜底:轮数用尽仍有积压(回放本身可能又启动一轮 compact)时,退出前
+        // 再无条件收一轮。否则这些已越过 USN 游标的增量消息会静默丢失,下次
+        // 启动只能靠全量重扫找回。
+        if !self.deferred_msgs.is_empty() || self.bg_compact.is_some() {
+            self.finish_compact_sync();
+            self.flush_deferred();
+            self.finish_compact_sync();
+            if !self.deferred_msgs.is_empty() {
+                snapshot::debug_log(&format!(
+                    "flush_all: {} deferred messages still pending at exit",
+                    self.deferred_msgs.len()
+                ));
+            }
         }
         // 退出路径没有查询压力:把进行中的分段保存一次跑完(复用同一状态机),
         // 再处理积压消息,避免把半成品 tmp 留在盘上等下次启动清理。
@@ -5872,6 +5920,42 @@ mod tests {
         engine.handle(EngineMsg::JournalReset { guid });
         assert!(!engine.compact_in_progress(), "控制帧必须中止后台 compact");
         assert!(engine.volumes[0].store.is_none(), "JournalReset 已清空 store");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 噪声规则重置会清空 store:同样必须中止后台 compact,否则任务完成时
+    /// 会把旧规则下 fork 的整卷 store 又装回去(install 守卫也会拒绝,但先
+    /// 中止能立刻释放线程与内存,语义也更直白)。
+    #[test]
+    fn reset_volumes_for_noise_aborts_background_compact() {
+        let dir = temp_index_dir("bg-compact-noise-reset");
+        let guid = 0x7bu128;
+        let mut engine = engine_with(&dir);
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'C',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: 125_000,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        let recs: Vec<Rec> = (0..125_000)
+            .map(|i| rec(1_000 + i, 0, 0, &format!("n{i}.txt")))
+            .collect();
+        engine.handle(EngineMsg::Records { guid, recs, next_usn: 100 });
+        engine.handle(EngineMsg::VolumeReady {
+            guid,
+            journal_id: 7,
+            next_usn: 100,
+            count: 125_000,
+        });
+        assert!(engine.compact_in_progress(), "大卷首扫收尾应交给后台线程");
+
+        let affected = engine.reset_volumes_for_noise(Some(&['C']));
+        assert_eq!(affected, vec!['C']);
+        assert!(!engine.compact_in_progress(), "重置必须中止后台 compact");
+        assert!(engine.volumes[0].store.is_none(), "重置已清空 store");
+        assert!(!engine.volumes[0].complete, "重置后卷回到未就绪");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
