@@ -4809,29 +4809,55 @@ impl LstrApp {
             if st.phase == lstr_index::Phase::Scanning {
                 let total: u32 = st.volumes.iter().map(|v| v.count).sum();
                 let complete = st.volumes.iter().filter(|v| v.complete).count();
+                let elapsed = st.since.elapsed().as_secs_f32();
                 let pcts: Vec<f32> = st.volumes.iter().filter_map(|v| v.pct).collect();
-                // 目录枚举模式没有总条数(est=0),只有「已扫条数」:
-                // 此时用「已完成卷数/总卷数」表达进度,别拿单卷 100% 平均成 99%。
-                let progress = if !pcts.is_empty() && pcts.len() == st.volumes.len() {
-                    format!(
-                        "{:.0}%",
-                        (pcts.iter().sum::<f32>() / pcts.len() as f32 * 100.0).min(99.0)
-                    )
+                // P1-9：阶段化进度。有百分比时给 ETA；目录枚举模式没有总条数
+                // （est=0），用「已完成卷数 + 已收录条数」表达，不能长期停在 0%。
+                let (progress, eta) = if !pcts.is_empty() && pcts.len() == st.volumes.len() {
+                    let avg = (pcts.iter().sum::<f32>() / pcts.len() as f32).min(0.99);
+                    let eta = if avg > 0.02 && elapsed > 1.0 {
+                        let remain = elapsed * (1.0 - avg) / avg;
+                        if (1.0..3600.0).contains(&remain) {
+                            Some(format!(" · 预计剩余 {}s", remain.round() as u64))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    (format!("{:.0}%", avg * 100.0), eta)
                 } else {
-                    format!("({}/{})", complete, st.volumes.len())
+                    (
+                        format!("({}/{} 卷)", complete, st.volumes.len().max(1)),
+                        None,
+                    )
+                };
+                // 早期阶段用户最需要「不是卡死」的信号：给出可先做什么。
+                // 首扫完成前应用/命令/书签已经可用，这个降级路径必须写出来。
+                let hint = if total < 20_000 {
+                    " · 可先搜应用/命令"
+                } else {
+                    "（结果暂不完整）"
                 };
                 note = Some(format!(
-                    "正在构建索引 {} · 已收录 {} 万项（结果暂不完整）",
-                    progress,
+                    "正在构建索引 {progress}{} · 已收录 {} 万项{hint}",
+                    eta.as_deref().unwrap_or(""),
                     total / 10_000,
                 ));
             } else if st.phase == lstr_index::Phase::Loading {
                 // 主界面不显示任何提示时，用户会以为「卡住了」：等 UAC、等 worker
                 // 连管道都可能停在这一阶段（旧 worker 占管道时甚至永久停住）。
-                note = Some(
-                    "索引准备中：等待管理员授权 / worker 连接（首次构建约 1~3 分钟）"
-                        .to_string(),
-                );
+                // P1-9：给出已等待秒数；超时后提示自救路径（托盘退出重试）。
+                let waited = st.since.elapsed().as_secs();
+                note = Some(if waited >= 60 {
+                    "索引准备中：等待管理员授权 / worker 连接已超过 1 分钟。\
+                     若一直无反应：托盘右键「退出并停止索引服务」后重新打开"
+                        .to_string()
+                } else {
+                    format!(
+                        "索引准备中 {waited}s：等待管理员授权 / worker 连接（首次约 1~3 分钟）"
+                    )
+                });
             } else if st.phase == lstr_index::Phase::Fallback {
                 fallback = true;
                 note = Some(
@@ -10972,6 +10998,52 @@ impl LstrApp {
             self.apply_size(ctx);
             self.toast(ctx, "窗口大小已重置".to_string());
         }
+        y += ROW;
+
+        Self::settings_label(painter, &theme, area.left(), y, "索引服务");
+        let index_btn = if self.index_fallback {
+            "重新授权"
+        } else {
+            "重建索引"
+        };
+        if button(
+            ui,
+            painter,
+            &theme,
+            Rect::from_min_size(egui::pos2(area.left() + 130.0, y), egui::vec2(140.0, 26.0)),
+            index_btn,
+            self.index_fallback,
+        ) {
+            if self.index_fallback {
+                // P1-10：维护页也要能自救——拒绝 UAC 后不必重启 lstr。
+                crate::search::builtin::request_worker_relaunch();
+                self.toast(ctx, "已请求管理员授权：请在系统弹窗里点「是」".to_string());
+                ctx.request_repaint();
+            } else {
+                // 与噪声页「立即重建」同一路径：更新排除规则后删旧快照重扫。
+                let patterns = self
+                    .cfg
+                    .rank
+                    .noise_rules
+                    .iter()
+                    .filter(|r| r.exclude)
+                    .map(|r| r.pattern.clone())
+                    .collect();
+                self.service.rebuild_noise_index(patterns);
+                self.toast(ctx, "正在重建索引（后台进行，完成即生效）".to_string());
+            }
+        }
+        painter.text(
+            egui::pos2(area.left() + 300.0, y + 13.0),
+            Align2::LEFT_CENTER,
+            if self.index_fallback {
+                "未连接：需要管理员授权"
+            } else {
+                "运行中"
+            },
+            ui::mono_font(10.0),
+            if self.index_fallback { theme.amber } else { theme.dim },
+        );
         y += ROW;
 
         Self::settings_label(painter, &theme, area.left(), y, "使用历史");

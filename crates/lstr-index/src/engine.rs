@@ -109,6 +109,10 @@ pub struct VolumeState {
     watch_added: u64,
     watch_removed: u64,
     watch_log_at: Option<Instant>,
+    /// P1-4：自上次全量保存/compact 以来新建或改名的 slot，待下一轮 maintain
+    /// 局部刷进拼音缓存。此前只有全量保存（最长 30min）才刷新，中文名新建/
+    /// 改名后拼音搜不到或搜错。
+    pinyin_dirty: Vec<u32>,
     /// 捕获开关:全量保存成功后武装;对账/重扫/重置窗口内关闭 —— 这些变更
     /// 的持久化走全量快照,不进旁车(关闭期间的位点推进由 journal 回放兜底)。
     capture_on: bool,
@@ -172,6 +176,12 @@ impl VolumeState {
 /// p90=512ms;稳态 0.4ms)。按 ~512 条(约 0.2-1ms 工作量)切块,块间让宿主
 /// 线程回去服务查询,打字期间的单次等待从「一整轮」降到「一块」。
 const DEFAULT_APPLY_CHUNK: usize = 512;
+
+/// P1-4 拼音缓存待刷新队列的单卷上限。
+///
+/// 稳态 watch 变更量很小；极端 churn（解压/构建）时队列可能暴涨，超出部分
+/// 丢弃即可——下一次全量保存会整体刷新，不会长期失真。
+const PINYIN_DIRTY_CAP: usize = 65_536;
 
 /// 整卷 compact 前需要的连续空闲时长。大卷 compact 现在跑在独立线程上,
 /// 不再占用查询线程;但重排本身会抢 CPU、放大内存带宽,用户连续打字时仍
@@ -604,6 +614,7 @@ impl Engine {
             watch_added: 0,
             watch_removed: 0,
             watch_log_at: None,
+            pinyin_dirty: Vec::new(),
         }
     }
 
@@ -787,6 +798,7 @@ impl Engine {
                 watch_added: 0,
                 watch_removed: 0,
                 watch_log_at: None,
+                pinyin_dirty: Vec::new(),
             });
             self.pinyin.push(PinyinCache::empty());
             let i = self.volumes.len() - 1;
@@ -1194,6 +1206,20 @@ impl Engine {
                 if self.volumes[i].sidecar_capture_ready() {
                     self.volumes[i]
                         .capture(SidecarOp::Children { parent_frn, recs: recs.clone() }, None);
+                }
+                // P1-4：本帧新建/改名条目立即排进拼音缓存刷新队列，下一轮
+                // maintain 局部刷新（此前要等全量保存，最长 30 分钟）。
+                if !recs.is_empty() {
+                    let slots: Vec<u32> = match &self.volumes[i].store {
+                        Some(store) => recs
+                            .iter()
+                            .filter_map(|rec| store.find_slot(rec.frn))
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    let v = &mut self.volumes[i];
+                    let room = PINYIN_DIRTY_CAP.saturating_sub(v.pinyin_dirty.len());
+                    v.pinyin_dirty.extend(slots.into_iter().take(room));
                 }
                 if added > 0 || removed > 0 {
                     self.note_watch_event(i, added, removed);
@@ -2251,6 +2277,10 @@ impl Engine {
         // 先收异步旁车写盘的回执:ack 只改旁车记账(不动 store),放在最前
         // 保证本轮后续的节流判断看到最新「已落盘前缀」。
         self.drain_sidecar_acks();
+        // P1-4：把上一轮 watch 收集到的新建/改名 slot 局部刷进拼音缓存。
+        // 放在 compact/保存之前:此时 store 未冻结；若随后触发 compact，
+        // 完成时会整卷 rebuild，增量刷新只是提前生效。
+        self.flush_pinyin_dirty();
         // 0. 后台 compact 完成?先换血再让路:换血后的下一步(分轮回放冻结
         //    消息/保存)放到下一轮,避免同一次 maintain 把查询堵住。
         if self.poll_background_compact() {
@@ -2676,6 +2706,35 @@ impl Engine {
         }
         for done in acked {
             self.apply_sidecar_ack(done);
+        }
+    }
+
+    /// P1-4：把上次全量保存以来新建/改名的 slot 局部刷进拼音缓存。
+    ///
+    /// `PinyinCache::refresh_slots` 只重算这些 slot（中文名占比 <1%），
+    /// 千级 slot 是微秒级；相比整卷 rebuild（C 卷实测 58–62ms）可以放在
+    /// maintain 里做。刷新后新文件/改名文件立即可用拼音命中，不再等最长
+    /// [`FULL_SAVE_INTERVAL_SECS`] 的保存窗口。
+    fn flush_pinyin_dirty(&mut self) {
+        for i in 0..self.volumes.len() {
+            if self.volumes[i].pinyin_dirty.is_empty() {
+                continue;
+            }
+            let dirty = std::mem::take(&mut self.volumes[i].pinyin_dirty);
+            let Some(store) = self.volumes[i].store.as_ref() else {
+                continue;
+            };
+            let started = Instant::now();
+            self.pinyin[i].refresh_slots(store, &dirty);
+            let ms = started.elapsed().as_millis();
+            if ms >= 20 {
+                crate::snapshot::debug_log(&format!(
+                    "pinyin: refreshed {} slots in {}ms (vol {})",
+                    dirty.len(),
+                    ms,
+                    self.volumes[i].letter
+                ));
+            }
         }
     }
 
@@ -3595,6 +3654,69 @@ mod tests {
         assert_eq!(engine.volumes[0].sidecar_ops.len(), before, "硬噪声整帧不进旁车");
         let store = engine.volumes[0].store.as_ref().unwrap();
         assert!(store.find_slot(40).is_none() && store.find_slot(41).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-4:watch 新建/改名的中文条目必须在下一轮 maintain 就进拼音缓存，
+    /// 不能等到最长 30min 的全量保存窗口。
+    #[test]
+    fn p1_4_chinese_watch_entry_hits_pinyin_within_maintain() {
+        let dir = temp_index_dir("p14-pinyin-fresh");
+        let guid = 0xe1u128;
+        let mut engine = engine_with(&dir);
+        const DIR: u32 = 0x10;
+        engine.handle(EngineMsg::VolumeMeta {
+            guid,
+            letter: 'C',
+            journal_id: 7,
+            next_usn: 100,
+            est_records: 2,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid, resume_frn: 0 });
+        engine.handle(EngineMsg::Records {
+            guid,
+            recs: vec![rec(10, 0, DIR, "docs"), rec(11, 10, 0, "alpha.txt")],
+            next_usn: 100,
+        });
+        engine.handle(EngineMsg::VolumeReady {
+            guid,
+            journal_id: 7,
+            next_usn: 100,
+            count: 2,
+        });
+        engine.maintain();
+        engine.volumes[0].store.as_mut().unwrap().compact();
+        assert!(engine.volumes[0].store.as_ref().unwrap().find_slot(11).is_some());
+
+        // watch:新建中文文件 + 把已有文件改名为中文名。
+        engine.handle(EngineMsg::DirChildren {
+            guid,
+            parent_frn: 10,
+            recs: vec![rec(12, 10, 0, "报告.docx"), rec(11, 10, 0, "文件.txt")],
+        });
+        engine.maintain();
+
+        let store = engine.volumes[0].store.as_ref().unwrap();
+        let hits: Vec<u32> = engine.pinyin[0]
+            .search(store, &[b"bg".to_vec()], 100)
+            .collect();
+        assert!(
+            hits.contains(&store.find_slot(12).unwrap()),
+            "新建中文名应立即拼音可搜"
+        );
+        let hits: Vec<u32> = engine.pinyin[0]
+            .search(store, &[b"wenjian".to_vec()], 100)
+            .collect();
+        assert_eq!(
+            hits,
+            vec![store.find_slot(11).unwrap()],
+            "改名后的中文名应立即生效"
+        );
+        assert_eq!(
+            store.name_lc(store.find_slot(11).unwrap()),
+            "文件.txt".as_bytes(),
+            "store 内改名已生效"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

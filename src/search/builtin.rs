@@ -69,6 +69,8 @@ fn farewell(client: windows::Win32::Foundation::HANDLE) {
 pub struct IndexUiStatus {
     pub phase: lstr_index::Phase,
     pub volumes: Vec<lstr_index::VolumeProgress>,
+    /// 当前阶段开始时间：P1-9 用它估算 ETA / 显示已等待秒数。
+    pub since: std::time::Instant,
 }
 
 pub struct BuiltinProvider {
@@ -132,6 +134,7 @@ impl BuiltinProvider {
         IndexUiStatus {
             phase: st.phase,
             volumes: st.volumes,
+            since: st.since,
         }
     }
 
