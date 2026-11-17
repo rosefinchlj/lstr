@@ -516,7 +516,7 @@ pub struct Engine {
     last_query_at: std::cell::Cell<Instant>,
     /// 允许 compact 前需要连续空闲多久;测试可调到 0。
     compact_idle_gap: Duration,
-    /// 运行中的真后台 compact(同一时刻至多一卷;期间修改类消息进 deferred)。
+    /// 运行中的真后台 compact(同一时刻至多一卷;只冻结该卷的修改类消息)。
     /// 查询线程只做 channel 轮询/换血,不再执行任何 compact 切片。
     bg_compact: Option<BackgroundCompact>,
     /// 旁车日志异步写盘线程(见 [`SidecarWriter`] 的说明)。
@@ -903,6 +903,26 @@ impl Engine {
             .collect()
     }
 
+    /// 消息作用卷(纯状态帧/全局帧返回 None)。后台 compact 的冻结范围用它
+    /// 精确到单卷:其他卷的增量不必等换血后重放。
+    fn message_guid(msg: &EngineMsg) -> Option<u128> {
+        match msg {
+            EngineMsg::VolumeMeta { guid, .. }
+            | EngineMsg::ScanBegin { guid, .. }
+            | EngineMsg::ScanProgress { guid, .. }
+            | EngineMsg::Records { guid, .. }
+            | EngineMsg::DirSyncBegin { guid }
+            | EngineMsg::DirSyncEnd { guid, .. }
+            | EngineMsg::DirChildren { guid, .. }
+            | EngineMsg::UsnWatch { guid, .. }
+            | EngineMsg::VolumeReady { guid, .. }
+            | EngineMsg::JournalReset { guid }
+            | EngineMsg::VolumeGone { guid }
+            | EngineMsg::VolumeAppeared { guid, .. } => Some(*guid),
+            EngineMsg::WorkerLost => None,
+        }
+    }
+
     pub fn handle(&mut self, msg: EngineMsg) {
         // 保存期间 store 必须冻结(快照按启动时的冻结视图写列);修改类消息
         // 按到达顺序排队,保存收尾后原序重放。查询不走 EngineMsg,不受影响。
@@ -926,11 +946,11 @@ impl Engine {
                 }
             }
         }
-        // 后台 compact 期间同样冻结修改类消息(与保存一致):任务持有 fork 快照,
-        // 换血前引擎列的 slot/排序必须保持不变。控制帧重建/清空同卷时中止任务。
-        // 注意冻结是全局的(不止 compact 的那一卷):300 万条的卷后台重排约 2~3s,
-        // 这段时间所有卷的增量都排在 deferred_msgs,换血后 200 条/轮按序重放。
-        // 取舍:保住 slot 稳定性,代价是 USN 更新最多延迟一个 compact 窗口。
+        // 后台 compact 期间只冻结**被 compact 卷**的修改类消息:任务持有该卷的
+        // fork 快照(names 列与引擎共享 Arc),换血前它的 slot/排序必须保持不变。
+        // 其他卷的 fork 与列互不相干,增量可以立即生效 —— 否则 300 万条卷在
+        // 后台重排的 2~3s 里,全机所有卷的 USN/watcher 都停在旧态(评审 A4)。
+        // 控制帧重建/清空同卷时中止任务。
         if let Some(compact_guid) = self.compact_guid() {
             match &msg {
                 EngineMsg::UsnWatch { .. } | EngineMsg::WorkerLost => {}
@@ -942,10 +962,12 @@ impl Engine {
                     self.abort_compact("control message superseded background compact");
                     self.flush_deferred();
                 }
-                _ => {
+                _ if Self::message_guid(&msg) == Some(compact_guid) => {
                     self.deferred_msgs.push_back(msg);
                     return;
                 }
+                // 其他卷的修改类消息:不冻结,直接落到下面的 apply 分支。
+                _ => {}
             }
         }
         match msg {
@@ -6458,10 +6480,47 @@ mod tests {
         engine.handle(EngineMsg::Records { guid, recs: removes, next_usn: 120 });
         engine.set_compact_idle_gap(Duration::ZERO);
 
+        // 第二卷:不在 compact 范围内,它的增量不应被冻结(A4)。
+        let other = 0x7Bu128;
+        engine.handle(EngineMsg::VolumeMeta {
+            guid: other,
+            letter: 'D',
+            journal_id: 8,
+            next_usn: 1,
+            est_records: 100,
+        });
+        engine.handle(EngineMsg::ScanBegin { guid: other, resume_frn: 0 });
+        engine.handle(EngineMsg::Records {
+            guid: other,
+            recs: (0..100).map(|i| rec(5_000 + i, 0, 0, &format!("d{i}.txt"))).collect(),
+            next_usn: 1,
+        });
+        engine.handle(EngineMsg::VolumeReady {
+            guid: other,
+            journal_id: 8,
+            next_usn: 1,
+            count: 100,
+        });
+
         engine.maintain(); // 推进/轮询真后台 compact
         assert!(
             engine.compact_in_progress(),
             "12 万条在后台线程内不可能瞬间压完"
+        );
+        // 冻结只针对 C 卷:另一卷的新文件必须立即进索引、可搜到。
+        engine.handle(EngineMsg::Records {
+            guid: other,
+            recs: vec![rec(9_500_000, 0, 0, "other_volume_update.txt")],
+            next_usn: 2,
+        });
+        let other_spec = QuerySpec {
+            tokens: vec!["other_volume_update".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            engine.query(&other_spec).total,
+            1,
+            "非 compact 卷的增量不得被全局冻结(A4)"
         );
         // 冻结期间的查询照常走旧列。
         let old_spec = QuerySpec {
