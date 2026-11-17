@@ -1066,6 +1066,8 @@ pub fn make_engine(
     } else {
         crate::config::attach_dir().join("index")
     };
+    // P1-8: 倒排是引擎堆里最大的一块可选项(大卷 60~70MB/卷),按配置开关。
+    lstr_index::store::set_ngram_enabled(cfg.ngram);
     Engine::new(EngineConfig {
         index_dir,
         noise,

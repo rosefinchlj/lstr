@@ -13,6 +13,7 @@
 //!   scan_mode 与 base_len 解耦:空卷 compact 后 base_len 仍为 0,但已 ready。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::noise::{is_build_output_segment, is_exec_name};
@@ -62,6 +63,16 @@ const COMPACT_DEAD: u32 = 4096;
 const NGRAM_MIN_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(test)]
 const NGRAM_MIN_BYTES: usize = 1;
+
+/// 运行时 ngram 开关(P1-8):`[index] ngram = false` → 不建 trigram 倒排,
+/// 大卷可省 60~70MB/卷常驻堆,查询回落 memmem 扫描(等价性有测试保证)。
+/// 进程级;由主进程 `make_engine` 在构造引擎前设置,worker 不建倒排。
+static NGRAM_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// 设置 ngram 倒排是否可用(进程级;在卷 compact/加载建索引前调用)。
+pub fn set_ngram_enabled(enabled: bool) {
+    NGRAM_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 /// n-gram 字母表大小:可打印非空格 ASCII(0x21..=0x7E)。
 /// 空格与非 ASCII 视为分隔符(切分 run):全字母表 token 的子串出现必然
@@ -781,7 +792,8 @@ impl VolumeStore {
             return;
         }
         // 小卷不建倒排:省 trigram 固定表(~6.6MB/卷),memmem 扫描已足够快。
-        if self.names_lc.len() < NGRAM_MIN_BYTES {
+        // 用户显式关闭 ngram 时一律不建(P1-8 内存开关)。
+        if !NGRAM_ENABLED.load(Ordering::Relaxed) || self.names_lc.len() < NGRAM_MIN_BYTES {
             return;
         }
         self.ngram = Some(NgramIndex::build(&self.names_lc, &self.name_off));
