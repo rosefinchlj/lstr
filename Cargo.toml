@@ -8,6 +8,11 @@ description = "A fast, quiet Windows launcher backed by a built-in file index"
 [workspace]
 members = ["crates/lstr-index"]
 
+[features]
+# P1-8 内存归因：计数分配器 + 周期统计日志，仅测量构建使用。
+# 默认关闭，发布版零开销；用法见 src/alloc_stats.rs。
+alloc-stats = []
+
 [dependencies]
 lstr-index = { path = "crates/lstr-index" }
 eframe = { version = "=0.32.3", default-features = false, features = ["glow", "default_fonts"] }

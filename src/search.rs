@@ -1973,10 +1973,14 @@ fn run_worker(args: WorkerArgs) {
     let (engine_tx, engine_rx) = mpsc::sync_channel::<EngineMsg>(16);
     let handshake_slot: Arc<Mutex<Vec<(u128, u64, i64, u64, bool)>>> =
         Arc::new(Mutex::new(Vec::new()));
+    #[cfg(feature = "alloc-stats")]
+    crate::alloc_stats::log_phase("worker-start");
     let mut engine = builtin::make_engine(
         &config.index,
         lstr_index::engine::NoiseRules::from_slot(Arc::clone(&noise_slot)),
     );
+    #[cfg(feature = "alloc-stats")]
+    crate::alloc_stats::log_phase("after-engine-load");
     // 分批 apply 的块间让路检查:对账/首扫的记录按块消化,块间发现
     // 等待中的查询(QUERY_INFLIGHT>0)立即收手,让主循环出队服务。
     engine.set_query_yield_hook(Some(Box::new(|| {

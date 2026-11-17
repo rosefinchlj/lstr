@@ -145,8 +145,10 @@ pub struct IndexConfig {
     pub keep_worker_alive: bool,
     /// 构建 trigram 倒排加速 2+ 字符（英文/数字）子串搜索（P1-8）：
     /// 大卷每卷约 60~70MB 常驻堆；关闭后退回 memmem 扫描（仍亚秒级）。
-    /// 适合 8GB 内存机型；改 `config.toml` 的 `[index] ngram` 后重启生效，默认开。
-    #[serde(default = "default_true")]
+    /// **默认关闭**：启动内存更小、快照加载约快 2.6×（实测 private −127MB /
+    /// WS −129MB）；需要更快的宽泛子串搜索时设 `[index] ngram = true`，
+    /// 重启生效。
+    #[serde(default)]
     pub ngram: bool,
 }
 
@@ -173,7 +175,7 @@ impl Default for IndexConfig {
             bookmarks: true,
             notes: true,
             keep_worker_alive: true,
-            ngram: true,
+            ngram: false,
         }
     }
 }

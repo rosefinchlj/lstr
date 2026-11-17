@@ -13,8 +13,16 @@ mod search;
 mod ui;
 mod win;
 
+#[cfg(feature = "alloc-stats")]
+mod alloc_stats;
+
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+
+/// P1-8 内存归因：仅 `--features alloc-stats` 构建时安装计数分配器。
+#[cfg(feature = "alloc-stats")]
+#[global_allocator]
+static GLOBAL_ALLOC: crate::alloc_stats::CountingAlloc = crate::alloc_stats::CountingAlloc;
 
 /// 把 `SystemTime` 格式化成可读的 UTC 时间 + unix 秒：
 /// `2026-11-16T14:47:01.123Z (unix 1794800000)`。
@@ -118,6 +126,10 @@ fn main() -> eframe::Result<()> {
     // panic 钩子必须先装:--index-worker 分支也要留下崩溃证据,
     // 否则提权 worker 在 release 下挂掉时没有任何日志可查。
     install_panic_logger();
+    // P1-8 内存归因构建：LSTR_ALLOC_STATS=1 时周期把 Rust 侧常驻分配写入
+    // engine.log（与 VirtualQueryEx 区域采样配合拆分 private）。
+    #[cfg(feature = "alloc-stats")]
+    crate::alloc_stats::start_periodic_logging();
     // --index-worker:提权数据泵,不走单实例、不进 UI
     if std::env::args().any(|a| a == "--index-worker") {
         // 提权进程的键盘钩子能看到发往管理员窗口的按键：用它中继唤起热键，

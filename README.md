@@ -252,7 +252,7 @@ C = 50   # 0 = 不检索；100 = 与其它盘同等
 
 首次运行会生成：
 
-- `%APPDATA%\lstr\config.toml`：热键、窗口尺寸、主题、强调色、行高、一屏结果数（`max_results`）、滚动加载上限（`max_load_results`，100–3000）、历史开关（`show_history`）、`[[keyword]]` 自定义关键字、`[rank]` 排序权重与噪声规则、`[index]` 实时层/卷/浏览器书签开关（`bookmarks`）/倒排内存开关（`ngram`）
+- `%APPDATA%\lstr\config.toml`：热键、窗口尺寸、主题、强调色、行高、一屏结果数（`max_results`）、滚动加载上限（`max_load_results`，100–3000）、历史开关（`show_history`）、`[[keyword]]` 自定义关键字、`[rank]` 排序权重与噪声规则、`[index]` 实时层/卷/浏览器书签开关（`bookmarks`）/倒排内存开关（`ngram`，默认关）
 - 空查询 = 纯「最近使用」：清空历史后列表为空，不补常用应用；已安装应用看「应用」标签
 - `%APPDATA%\lstr\history.db`：打开历史（SQLite，WAL 模式；删除即重置常用排序。老版本的 history.json 首次启动自动迁移并改名 .bak）
 
@@ -265,8 +265,11 @@ volumes = []            # 空 = 全部本机固定 NTFS 卷；如 ["C","D"]
 exclude_noise = true    # 排除 node_modules/.git/target 等
 candidate_cap = 2000    # 单次查询候选收集上限
 journal_poll_ms = 500   # USN 轮询间隔，最小 100
-ngram = true            # trigram 倒排：大卷 +60~70MB/卷内存换 2+ 字符搜索更快；关掉省内存
+ngram = false           # trigram 倒排（默认关）：大卷 +60~70MB/卷内存换 2+ 字符子串搜索更快；开启后内存与快照加载时间都会上升
 ```
+
+> 内存测量构建：`cargo build --release --features alloc-stats`，设置 `LSTR_ALLOC_STATS=1` 启动后每 10s 向 `engine.log` 写一行 `alloc: live=… peak=… buckets=…`（Rust 侧常驻分配按大小档统计），配合 VirtualQueryEx 区域采样定位内存去向；默认发布版不含该开销。
+
 
 主题内置 **Frost（浅色，默认）** 和 Obsidian（暗色）；设置浮层可切换，或改 `config.toml` 的 `theme.mode`。
 

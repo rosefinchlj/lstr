@@ -1828,6 +1828,8 @@ impl LstrApp {
                 session_marker.display()
             ));
         }
+        #[cfg(feature = "alloc-stats")]
+        crate::alloc_stats::log_phase("app-new");
 
         Self {
             cfg,
@@ -11753,6 +11755,8 @@ impl eframe::App for LstrApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        #[cfg(feature = "alloc-stats")]
+        crate::alloc_stats::count_frame();
         // P1-11：异常退出提示只展示一次（20s 或用户操作后清除）。
         // P2-1：20s 从首次可见起算，避免隐藏启动期间就过期。
         if self.unclean_note.is_some() {
