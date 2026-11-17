@@ -6013,7 +6013,7 @@ impl LstrApp {
                     .x
             })
             .collect();
-        let sep_w = 14.0;
+        let sep_w = 16.0;
         let total: f32 = widths.iter().sum::<f32>()
             + sep_w * items.len().saturating_sub(1) as f32;
         let avail = max_right - (rect.left() + PAD);
@@ -6058,12 +6058,18 @@ impl LstrApp {
         let mut more_clicked = false;
         for (n, part) in parts.iter().enumerate() {
             if n > 0 {
-                painter.text(
-                    egui::pos2(x, y + height * 0.5),
-                    Align2::LEFT_CENTER,
-                    "›",
-                    ui::text_font(11.0),
-                    theme.dim,
+                // 层级分隔：手绘小箭头（比 "›" 字形更稳、更醒目），
+                // 让「此电脑 › E: › 目录 › 子目录」的从属关系一眼可读。
+                let cx = x + sep_w * 0.5;
+                let cy = y + height * 0.5;
+                let arrow = Stroke::new(1.4_f32, theme.dim);
+                painter.line_segment(
+                    [egui::pos2(cx - 2.0, cy - 4.0), egui::pos2(cx + 1.5, cy)],
+                    arrow,
+                );
+                painter.line_segment(
+                    [egui::pos2(cx + 1.5, cy), egui::pos2(cx - 2.0, cy + 4.0)],
+                    arrow,
                 );
                 x += sep_w;
             }
@@ -6072,9 +6078,20 @@ impl LstrApp {
                     let (label, path) = &items[*idx];
                     let w = widths[*idx];
                     let crumb = Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, height));
-                    let response =
-                        ui.interact(crumb, Id::new(("lstr-crumb", *idx)), Sense::click());
+                    // 命中区比文字略宽，悬停时画胶囊底色，明确「可点」。
+                    let response = ui.interact(
+                        crumb.expand2(egui::vec2(3.0, 1.0)),
+                        Id::new(("lstr-crumb", *idx)),
+                        Sense::click(),
+                    );
                     let active = *idx == items.len() - 1;
+                    if response.hovered() {
+                        painter.rect_filled(
+                            crumb.expand2(egui::vec2(4.0, 1.0)),
+                            CornerRadius::same(4),
+                            theme.hover,
+                        );
+                    }
                     let color = if active {
                         theme.text
                     } else if response.hovered() {
@@ -6098,6 +6115,9 @@ impl LstrApp {
                 Part::Ellipsis => {
                     let r = Rect::from_min_size(egui::pos2(x, y), egui::vec2(18.0, height));
                     let response = ui.interact(r, Id::new("lstr-crumb-more"), Sense::click());
+                    if response.hovered() {
+                        painter.rect_filled(r, CornerRadius::same(4), theme.hover);
+                    }
                     let color = if response.hovered() {
                         theme.amber
                     } else {
