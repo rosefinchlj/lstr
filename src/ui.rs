@@ -64,13 +64,23 @@ impl Theme {
                 light,
             }
         } else {
+            // C10：暗色亚克力下，桌面亮色会透上来把底色抬亮；原先
+            // `opacity*0.55` 在默认 0.84 时只有 0.462，sub 文本实测算下来
+            // 对比度 ~1.5:1（不可读）。这里给暗色底设置 0.78 的 alpha 下限，
+            // 并把 sub/dim 各提亮一档：默认值在纯白桌面上也 ≥4.5:1 / 3:1。
+            let dark_bg_alpha = (cfg.theme.opacity.clamp(0.6, 1.0) * 0.85).clamp(0.78, 0.95);
             Self {
-                bg: Color32::from_rgba_unmultiplied(24, 28, 34, (cfg.theme.opacity.clamp(0.6, 1.0) * 255.0 * 0.55) as u8),
+                bg: Color32::from_rgba_unmultiplied(
+                    24,
+                    28,
+                    34,
+                    (dark_bg_alpha * 255.0).round() as u8,
+                ),
                 surface_hi: Color32::from_rgb(36, 41, 50),
                 hover: Color32::from_rgb(32, 37, 45),
                 text: Color32::from_rgb(232, 230, 225),
-                sub: Color32::from_rgb(138, 144, 153),
-                dim: Color32::from_rgb(95, 103, 114),
+                sub: Color32::from_rgb(196, 200, 207),
+                dim: Color32::from_rgb(152, 158, 168),
                 amber,
                 amber_soft: Color32::from_rgba_unmultiplied(accent[0], accent[1], accent[2], 26),
                 hair: Color32::from_white_alpha(20),
@@ -892,6 +902,54 @@ mod tests {
             .filter(|section| section.format.underline.width > 0.0)
             .count();
         assert_eq!(count, 1, "重复 token 不应叠加下划线分段");
+    }
+
+    fn srgb_channel_to_linear(c: f32) -> f32 {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn relative_luminance(rgb: [u8; 3]) -> f32 {
+        let [r, g, b] = rgb.map(|c| srgb_channel_to_linear(c as f32 / 255.0));
+        0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    /// 把半透明颜色合成到不透明底色上，返回合成后的 RGB。
+    fn composite(fg: Color32, under: [u8; 3]) -> [u8; 3] {
+        let a = fg.a() as f32 / 255.0;
+        let blend = |f: u8, u: u8| (f as f32 * a + u as f32 * (1.0 - a)).round() as u8;
+        [
+            blend(fg.r(), under[0]),
+            blend(fg.g(), under[1]),
+            blend(fg.b(), under[2]),
+        ]
+    }
+
+    /// 前景色与「半透明窗口底叠在桌面上」的对比度。
+    fn contrast_over_desktop(fg: Color32, glass: Color32, desktop: [u8; 3]) -> f32 {
+        let bg = composite(glass, desktop);
+        let l_fg = relative_luminance([fg.r(), fg.g(), fg.b()]);
+        let l_bg = relative_luminance(bg);
+        (l_fg.max(l_bg) + 0.05) / (l_fg.min(l_bg) + 0.05)
+    }
+
+    #[test]
+    fn obsidian_sub_text_is_readable_on_bright_desktop() {
+        // C10 回归：暗色（obsidian）底在默认不透明度下 alpha 只有 ~0.46，
+        // 纯白桌面透上来把底色抬到 ~#4A；旧 sub (#8A9099) 实测对比度 ~1.5:1。
+        // 现在暗色底 alpha 有下限，且 sub/dim 各提亮一档。
+        let mut cfg = crate::config::Config::default();
+        cfg.theme.mode = "obsidian".to_string();
+        let theme = Theme::from_config(&cfg);
+        assert!(!theme.light);
+        let desktop = [255, 255, 255];
+        let sub = contrast_over_desktop(theme.sub, theme.bg, desktop);
+        assert!(sub >= 4.5, "sub 文本对比度 {sub:.2}:1，低于 AA 4.5:1");
+        let dim = contrast_over_desktop(theme.dim, theme.bg, desktop);
+        assert!(dim >= 3.0, "dim 文本对比度 {dim:.2}:1，低于大字号 3:1");
     }
 
     #[test]

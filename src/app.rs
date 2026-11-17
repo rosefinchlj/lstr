@@ -1615,11 +1615,6 @@ pub struct LstrApp {
     /// 键盘上下键选择后的短时间内不允许 hover 抢选中：鼠标移动事件和按键
     /// 落在同一帧时，光标正好停在第三行会把「下移一格」覆盖成第三行。
     hover_suppress_until: Instant,
-    /// 进入目录后的短暂点击屏蔽：双击文件夹时第一击已经切到新列表，
-    /// 第二击会落在新列表同坐标的行上，不挡住就会连跳两层（甚至误开文件）。
-    /// 只挡「同一位置的连击」，进入后点别的行不受影响。
-    click_suppress_until: Instant,
-    click_suppress_at: Option<egui::Pos2>,
     dialog: Option<DialogInfo>,
     settings_open: bool,
     preview_open: bool,
@@ -1682,6 +1677,13 @@ pub struct LstrApp {
     dialog_retry_until: Option<Instant>,
     /// 设置面板当前分页。
     settings_tab: SettingsTab,
+    /// C5：设置页各分页的滚动偏移（按 SettingsTab 下标）。8 个分页共用
+    /// 一套手绘布局，滚动时把内容区整体上移并裁剪；噪声/学习页自带滚动
+    /// 容器，不走这里。
+    settings_scroll: [f32; 8],
+    /// C5：上一帧各分页的内容高度（像素），用于把滚动偏移 clamp 在
+    /// [0, content_h - viewport_h]，避免滚出空白。
+    settings_content_h: [f32; 8],
     /// 中文输入法是否处于组合态（Preedit 未上屏）：此时不消费任何快捷键，
     /// 回车/Esc/方向键都交给输入法与 TextEdit。
     ime_composing: bool,
@@ -1906,8 +1908,6 @@ impl LstrApp {
             needle_ready: false,
             mouse_moved: false,
             hover_suppress_until: Instant::now(),
-            click_suppress_until: Instant::now(),
-            click_suppress_at: None,
             dialog: None,
             settings_open: false,
             preview_open,
@@ -1944,6 +1944,8 @@ impl LstrApp {
             menu_in_history: false,
             dialog_retry_until: None,
             settings_tab: SettingsTab::Appearance,
+            settings_scroll: [0.0; 8],
+            settings_content_h: [0.0; 8],
             ime_composing: false,
             last_width: 0.0,
             center_frames: 0,
@@ -2573,13 +2575,20 @@ impl LstrApp {
     }
 
     /// 日期/大小/路径等条件是否在当前上下文解析：正则、PathTyping、应用/命令/
-    /// 书签页、以及网络搜索模式都不解析；浏览模式生效（与时间/类型筛选一致）。
+    /// 书签/笔记页、以及网络搜索模式都不解析；浏览模式生效（与时间/类型筛选一致）。
+    ///
+    /// B6：笔记页此前只排除 App/Bookmark/Command，导致 `date>…`/`size>…`/`path:…`/
+    /// 盘符 chip 在笔记页被 commit 但 `notes_response` 不读 filters（静默无效）。
+    /// 笔记检索只支持关键词，这里统一排除，chip 置灰（`chip_inactive`）。
     fn conditions_apply(&self, scope: Scope) -> bool {
         !self.filters.matches.regex
             && !self.path_mode()
             // 搜索模式：输入框里的一切都是搜索词（包括 `date>…`、`a ` 这些）。
             && self.filters.keyword.is_none()
-            && !matches!(scope, Scope::App | Scope::Bookmark | Scope::Command)
+            && !matches!(
+                scope,
+                Scope::App | Scope::Bookmark | Scope::Note | Scope::Command
+            )
     }
 
     /// 输入框条件 chip 的描述列表（绘制与按键处理共用同一顺序）：
@@ -4782,6 +4791,16 @@ impl LstrApp {
             self.run_command(ctx, &entry);
             return;
         }
+        // C9：普通模式下「打开文件夹」= 就地进入浏览（与双击同一动作），
+        // 不再另开资源管理器窗口；想用 Explorer 打开走 Ctrl+Enter。
+        // 从 Explorer 唤起的局部上下文（typing_folder 且非全局）例外：那里
+        // 的用户意图就是让原窗口跳过去。
+        if entry.kind == Kind::Folder
+            && (self.typing_folder.is_none() || self.typing_global)
+            && self.descend_index(ctx, index)
+        {
+            return;
+        }
         // P0-2：从 Explorer 唤起时，文件夹结果让原窗口直接跳过去，
         // 而不是 shell::open_entry 再开一个新资源管理器窗口。
         if entry.kind == Kind::Folder && self.typing_folder.is_some() && !self.typing_global {
@@ -5095,8 +5114,41 @@ impl LstrApp {
     }
 
     fn toast(&mut self, ctx: &egui::Context, message: String) {
-        self.toast = Some((message, Instant::now() + Duration::from_millis(1300)));
-        ctx.request_repaint_after(Duration::from_millis(1330));
+        // C8：1300ms 对中文提示偏短（"已开始重建索引（后台重扫，完成即生效）"
+        // 这种长句没读完就消失），放宽到 2600ms。
+        self.toast = Some((message, Instant::now() + Duration::from_millis(2600)));
+        ctx.request_repaint_after(Duration::from_millis(2630));
+    }
+
+    /// C8：设置页的 toast 覆盖层（设置页没有结果页脚，默认 toast 不可见）。
+    fn paint_settings_toast(&self, painter: &egui::Painter, rect: Rect) {
+        let Some((message, until)) = &self.toast else {
+            return;
+        };
+        if Instant::now() >= *until {
+            return;
+        }
+        let pad_x = 12.0;
+        let pad_y = 6.0;
+        let max_text_w = (rect.width() - 48.0).max(120.0);
+        let galley = painter.layout(
+            message.clone(),
+            ui::text_font(11.0),
+            Color32::from_rgb(24, 26, 30),
+            max_text_w,
+        );
+        let w = (galley.size().x + pad_x * 2.0).min(rect.width() - 24.0);
+        let h = galley.size().y + pad_y * 2.0;
+        let pill = Rect::from_min_size(
+            egui::pos2(rect.center().x - w / 2.0, rect.bottom() - h - 12.0),
+            egui::vec2(w, h),
+        );
+        painter.rect_filled(pill, CornerRadius::same(10), self.theme.amber);
+        painter.galley(
+            egui::pos2(pill.left() + pad_x, pill.top() + pad_y),
+            galley,
+            Color32::from_rgb(24, 26, 30),
+        );
     }
 
     fn animate(&mut self, ctx: &egui::Context) {
@@ -5200,6 +5252,9 @@ impl LstrApp {
                     // 设置面板也能拖：标题整条 44px 都可拖，关闭按钮后注册会优先命中。
                     self.paint_drag_strip(ui, &painter, rect, 44.0);
                     self.paint_settings(ui, ctx, rect);
+                    // C8：toast 原来只画在结果页脚，设置页里点「重建索引」
+                    // 等操作完全看不到反馈；在设置面板底部叠一层同样的胶囊。
+                    self.paint_settings_toast(&painter, rect);
                     return;
                 }
 
@@ -7659,10 +7714,11 @@ impl LstrApp {
             {
                 hovered = Some(index);
             }
-            // 单击只做「聚焦选中」，打开/进入走双击或 Enter：单击即打开时，
-            // 想先看一眼预览、或在列表上挪鼠标都很容易误开文件。
-            let click_ok = self.shown_at.elapsed() > Duration::from_millis(120)
-                && !self.click_suppressed(ui.ctx());
+            // C9：统一「单击=选中，双击/Enter=打开｜进入」。旧实现对文件夹
+            // 单击即进入、文件单击只选中，还要靠 500ms 屏蔽吞掉双击的第二击，
+            // 两种语义混在一起（用户以为点了没反应）。现在单击对所有类型都
+            // 只聚焦选中；进入文件夹和打开文件都走双击或 Enter。
+            let click_ok = self.shown_at.elapsed() > Duration::from_millis(120);
             if response.clicked() && click_ok {
                 clicked = Some(index);
             }
@@ -8179,20 +8235,12 @@ impl LstrApp {
         if let Some(index) = clicked {
             self.menu_open = false;
             // 对话框模式：单击即选（填路径 / 跳到文件夹），这是用户在对话框里
-            // 的主操作，多一步双击反而慢。普通模式才按「单击=聚焦」处理。
+            // 的主操作，多一步双击反而慢。普通模式按「单击=聚焦选中」处理，
+            // 打开/进入交给双击或 Enter（C9 统一两种类型的行为）。
             if self.dialog.is_some() {
                 self.activate_index(ui.ctx(), index);
             } else {
                 self.selected = index;
-                // 文件夹单击直接进入浏览；文件/应用/书签/命令只高亮。
-                if self.entries.get(index).is_some_and(|e| e.kind == Kind::Folder)
-                    && self.descend_index(ui.ctx(), index)
-                {
-                    // 500ms（系统双击阈值）+ 同一位置才算连击：慢双击也能挡住，
-                    // 而进入目录后去点别的行不会被打断。
-                    self.click_suppress_until = Instant::now() + Duration::from_millis(500);
-                    self.click_suppress_at = ui.ctx().input(|i| i.pointer.interact_pos());
-                }
             }
         }
         if let Some(index) = activated {
@@ -8383,7 +8431,7 @@ impl LstrApp {
         } else {
             vec![
                 ("↑↓", "选择"),
-                ("↵", "打开"),
+                ("↵", if selected_is_folder { "进入" } else { "打开" }),
                 ("→", if selected_is_folder { "进入" } else { "动作" }),
                 ("Esc", "关闭"),
             ]
@@ -8530,20 +8578,6 @@ impl LstrApp {
 
     /// 文件夹结果：进入深路径浏览模式。输入框清空为过滤词，当前目录写进
     /// browse_root（不再把整条路径塞进输入框）。返回 false 表示不是文件夹。
-    /// 刚「单击文件夹进入」后，同一位置的连击是否要忽略（双击的第二击）。
-    fn click_suppressed(&self, ctx: &egui::Context) -> bool {
-        if Instant::now() >= self.click_suppress_until {
-            return false;
-        }
-        match (
-            self.click_suppress_at,
-            ctx.input(|i| i.pointer.interact_pos()),
-        ) {
-            (Some(entered), Some(now)) => entered.distance(now) < 8.0,
-            _ => false,
-        }
-    }
-
     fn descend_index(&mut self, ctx: &egui::Context, index: usize) -> bool {
         let Some(entry) = self.entries.get(index) else {
             return false;
@@ -9479,6 +9513,12 @@ impl LstrApp {
             egui::vec2(22.0, 22.0),
         );
         let close = ui.interact(close_rect, Id::new("lstr-settings-close"), Sense::click());
+        // C6：无障碍树里标识关闭按钮，并允许键盘（Tab 聚焦 + Enter/Space）关闭。
+        close.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "关闭设置"));
+        let close_keys = close.has_focus()
+            && ui.input(|i| {
+                i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)
+            });
         if close.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
@@ -9490,7 +9530,7 @@ impl LstrApp {
             ui::text_font(14.0),
             if close.hovered() { theme.text } else { theme.sub },
         );
-        if close.clicked() {
+        if close.clicked() || close_keys {
             self.settings_open = false;
             // 关掉设置面板时退出热键录制态，避免录制提示残留到下次打开。
             self.hotkey_recording = None;
@@ -9530,8 +9570,29 @@ impl LstrApp {
             if response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-
+            // C6：手绘导航也要暴露给无障碍树（accesskit 已启用）。
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::SelectableLabel,
+                    true,
+                    self.settings_tab == tab,
+                    label,
+                )
+            });
+            // C6：Tab 聚焦后 Enter/Space 激活（原先只有鼠标 click 生效）。
+            let keys_activate = response.has_focus()
+                && ui.input(|i| {
+                    i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)
+                });
             let active = self.settings_tab == tab;
+            if response.has_focus() {
+                painter.rect_stroke(
+                    item,
+                    CornerRadius::same(7),
+                    Stroke::new(1.0_f32, theme.amber),
+                    StrokeKind::Inside,
+                );
+            }
             if active {
                 painter.rect_filled(item, CornerRadius::same(7), theme.amber_soft);
                 painter.rect_filled(
@@ -9552,7 +9613,7 @@ impl LstrApp {
                 ui::text_font(12.5),
                 if active { theme.text } else { theme.sub },
             );
-            if response.clicked() {
+            if response.clicked() || keys_activate {
                 self.settings_tab = tab;
             }
             y += 34.0;
@@ -9570,15 +9631,71 @@ impl LstrApp {
             egui::pos2(rect.left() + SIDEBAR_W + 24.0, rect.top() + 52.0),
             egui::pos2(rect.right() - 24.0, rect.bottom() - 16.0),
         );
-        match self.settings_tab {
-            SettingsTab::Appearance => self.paint_settings_appearance(ui, &painter, area),
-            SettingsTab::Search => self.paint_settings_search(ui, ctx, &painter, area),
-            SettingsTab::Behavior => self.paint_settings_behavior(ui, ctx, &painter, area),
-            SettingsTab::Ranking => self.paint_settings_ranking(ui, ctx, &painter, area),
-            SettingsTab::Noise => self.paint_settings_noise(ui, ctx, &painter, area),
-            SettingsTab::Maintenance => self.paint_settings_maintenance(ui, ctx, &painter, area),
-            SettingsTab::Assets => self.paint_settings_assets(ui, ctx, &painter, area),
-            SettingsTab::Learning => self.paint_settings_learning(ui, ctx, &painter, area),
+        // C5：8 个设置页共用绝对坐标手绘布局，窗口不够高时底部内容会被裁掉
+        // 且无法滚动（搜索页 V≥4 尤其明显）。这里统一做「手动滚动」：把内容
+        // 区整体上移 scroll 像素、裁剪到可见区，并用上一帧量出的内容高度把
+        // 偏移 clamp 在 [0, content_h - viewport_h]，避免滚出空白。
+        let tab = self.settings_tab;
+        let tab_idx = tab as usize;
+        let viewport_h = area.height();
+        let content_h = self.settings_content_h[tab_idx];
+        let max_scroll = (content_h - viewport_h).max(0.0);
+        if ui.rect_contains_pointer(area) {
+            let dy = ui.input(|i| i.smooth_scroll_delta.y);
+            if dy != 0.0 {
+                self.settings_scroll[tab_idx] =
+                    (self.settings_scroll[tab_idx] - dy).clamp(0.0, max_scroll);
+            }
+        }
+        let scroll = self.settings_scroll[tab_idx].clamp(0.0, max_scroll);
+        self.settings_scroll[tab_idx] = scroll;
+        let scrolled = Rect::from_min_max(
+            egui::pos2(area.left(), area.top() - scroll),
+            egui::pos2(area.right(), area.bottom() - scroll),
+        );
+        let prev_clip = ui.clip_rect();
+        ui.set_clip_rect(area);
+        let clipped = painter.with_clip_rect(area);
+        let content_height = match tab {
+            SettingsTab::Appearance => self.paint_settings_appearance(ui, &clipped, scrolled),
+            SettingsTab::Search => self.paint_settings_search(ui, ctx, &clipped, scrolled),
+            SettingsTab::Behavior => self.paint_settings_behavior(ui, ctx, &clipped, scrolled),
+            SettingsTab::Ranking => self.paint_settings_ranking(ui, ctx, &clipped, scrolled),
+            SettingsTab::Maintenance => {
+                self.paint_settings_maintenance(ui, ctx, &clipped, scrolled)
+            }
+            // 噪声/学习/资产页内部各有自己的滚动区域或固定布局，外层不再套。
+            SettingsTab::Noise => {
+                self.paint_settings_noise(ui, ctx, &painter, area);
+                viewport_h
+            }
+            SettingsTab::Assets => {
+                self.paint_settings_assets(ui, ctx, &painter, area);
+                viewport_h
+            }
+            SettingsTab::Learning => {
+                self.paint_settings_learning(ui, ctx, &painter, area);
+                viewport_h
+            }
+        };
+        ui.set_clip_rect(prev_clip);
+        self.settings_content_h[tab_idx] = content_height;
+
+        // 滚动条：只有内容真的溢出时才画，给滚轮一个可见反馈。
+        if content_h > viewport_h + 0.5 {
+            let bar = Rect::from_min_max(
+                egui::pos2(area.right() + 3.0, area.top()),
+                egui::pos2(area.right() + 6.0, area.bottom()),
+            );
+            painter.rect_filled(bar, CornerRadius::same(2), theme.hair);
+            let thumb_h = (viewport_h * viewport_h / content_h).max(24.0);
+            let travel = (viewport_h - thumb_h).max(0.0);
+            let t = if max_scroll > 0.0 { scroll / max_scroll } else { 0.0 };
+            let thumb = Rect::from_min_size(
+                egui::pos2(bar.left(), area.top() + t * travel),
+                egui::vec2(bar.width(), thumb_h),
+            );
+            painter.rect_filled(thumb, CornerRadius::same(2), theme.sub);
         }
     }
 
@@ -9834,7 +9951,7 @@ impl LstrApp {
         ui: &mut egui::Ui,
         painter: &egui::Painter,
         area: Rect,
-    ) {
+    ) -> f32 {
         let theme = self.theme;
         Self::settings_heading(painter, &theme, area, "外观", "主题、强调色与窗口质感，改动即时生效");
         let mut y = area.top() + 62.0;
@@ -9985,6 +10102,7 @@ impl LstrApp {
             self.preview_open = preview;
             let _ = self.cfg.save();
         }
+        y + 22.0 + 16.0
     }
 
     fn paint_settings_behavior(
@@ -9993,7 +10111,7 @@ impl LstrApp {
         ctx: &egui::Context,
         painter: &egui::Painter,
         area: Rect,
-    ) {
+    ) -> f32 {
         let theme = self.theme;
         Self::settings_heading(painter, &theme, area, "行为", "唤起热键、一屏行数/滚动加载、对话框联动与开机启动");
         let mut y = area.top() + 62.0;
@@ -10252,20 +10370,24 @@ impl LstrApp {
             if keep_worker { theme.sub } else { theme.dim },
         );
 
+        // C5：提示语改为跟随内容流（原先把它们钉在 area.bottom，设置页滚动后
+        // 会悬在半空/被裁掉）；内容高度也据此返回给外层滚动容器。
+        let hint_y = y + 26.0;
         painter.text(
-            egui::pos2(area.left(), area.bottom() - 40.0),
+            egui::pos2(area.left(), hint_y),
             Align2::LEFT_TOP,
             "键入即搜：资源管理器内直接打字，无需先唤出 lstr",
             ui::mono_font(10.0),
             theme.dim,
         );
         painter.text(
-            egui::pos2(area.left(), area.bottom() - 24.0),
+            egui::pos2(area.left(), hint_y + 16.0),
             Align2::LEFT_TOP,
             "收藏 / 动作 / 命令见 config.toml 的 [[favorite]] [[action]] [[command]]",
             ui::mono_font(10.0),
             theme.dim,
         );
+        hint_y + 16.0 + 16.0
     }
 
     /// 设置页「资产」：收藏 / 动作 / 命令的可视化增删改。
@@ -10303,7 +10425,7 @@ impl LstrApp {
         ctx: &egui::Context,
         painter: &egui::Painter,
         area: Rect,
-    ) {
+    ) -> f32 {
         let theme = self.theme;
         Self::settings_heading(
             painter,
@@ -10385,9 +10507,12 @@ impl LstrApp {
             );
         }
 
-        // 恢复默认（右下角，避免压住顺序文字）
+        // C5：「恢复默认」跟随内容流排在顺序文字下面（原先钉在 area.bottom，
+        // 设置页一旦滚动会漂到半空或压住顺序文字）。
+        let ladder_lines = ladder.chunks(5).count() as f32;
+        let reset_y = y + 18.0 + ladder_lines * 15.0 + 10.0;
         let reset = Rect::from_min_size(
-            egui::pos2(area.right() - 96.0, area.bottom() - 30.0),
+            egui::pos2(area.right() - 96.0, reset_y),
             egui::vec2(92.0, 24.0),
         );
         let response = ui.interact(reset, Id::new("lstr-rank-reset"), Sense::click());
@@ -10419,6 +10544,7 @@ impl LstrApp {
             let _ = self.cfg.save();
             self.trigger(ctx);
         }
+        reset_y + 24.0 + 12.0
     }
 
     /// 「噪声」页:统一规则列表。每行一个行为——排除(整树不索引,重建后
@@ -10713,7 +10839,7 @@ impl LstrApp {
         ctx: &egui::Context,
         painter: &egui::Painter,
         area: Rect,
-    ) {
+    ) -> f32 {
         let theme = self.theme;
         Self::settings_heading(painter, &theme, area, "搜索", "文件索引引擎与候选策略");
         let mut y = area.top() + 62.0;
@@ -11136,7 +11262,11 @@ impl LstrApp {
             theme.sub,
             area.width(),
         );
+        let help_h = galley.size().y;
         painter.galley(egui::pos2(area.left(), y + 8.0), galley, theme.sub);
+        // C5：把真实内容高度交给设置页外层滚动容器（原先固定区域，底部
+        // 帮助文字在窗口不高时被裁掉且无法滚动）。
+        y + 8.0 + help_h + 16.0
     }
 
     fn cfg_index_incremental(&self) -> &'static str {
@@ -11190,7 +11320,7 @@ impl LstrApp {
         ctx: &egui::Context,
         painter: &egui::Painter,
         area: Rect,
-    ) {
+    ) -> f32 {
         let theme = self.theme;
         Self::settings_heading(painter, &theme, area, "维护", "配置文件、窗口与历史数据");
         let mut y = area.top() + 62.0;
@@ -11336,8 +11466,10 @@ impl LstrApp {
             }
         }
 
+        // C5：页脚跟随内容流（原先钉在 area.bottom，设置页滚动后会漂走）。
+        let foot_y = y + 10.0;
         painter.text(
-            egui::pos2(area.left(), area.bottom() - 46.0),
+            egui::pos2(area.left(), foot_y),
             Align2::LEFT_TOP,
             format!(
                 "配置文件：{}",
@@ -11347,7 +11479,7 @@ impl LstrApp {
             theme.dim,
         );
         painter.text(
-            egui::pos2(area.left(), area.bottom() - 28.0),
+            egui::pos2(area.left(), foot_y + 18.0),
             Align2::LEFT_TOP,
             format!(
                 "lstr {} · 排序规则可在「排序规则」页调整",
@@ -11356,6 +11488,7 @@ impl LstrApp {
             ui::mono_font(10.0),
             theme.dim,
         );
+        foot_y + 18.0 + 14.0
     }
 
     /// 顶部拖动条：主界面 12px，设置面板放到 44px（标题整条都能拖）。

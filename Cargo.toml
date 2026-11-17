@@ -15,7 +15,7 @@ alloc-stats = []
 
 [dependencies]
 lstr-index = { path = "crates/lstr-index" }
-eframe = { version = "=0.32.3", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "=0.32.3", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 # 浏览器书签的网站图标来自 Favicons/favicons.sqlite 里的 PNG/ICO blob；
 # eframe 已间接依赖 image，这里只补解码特性。
 image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg"] }

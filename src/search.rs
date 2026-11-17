@@ -2870,8 +2870,13 @@ fn run_worker(args: WorkerArgs) {
                         // P2-4：不再用 min(120) 封顶——All 页滚过 120 条后
                         // 这三类也要能继续增长（各自索引总量都很小）。
                         let source_take = request.deliver.max(request.limit);
+                        // B11：严格匹配（大小写/全词）必须先取全量再复核，
+                        // 否则「前 N 条候选被 retain 掉」会误报 0 结果——而第
+                        // N+1 条可能本来匹配。非文件来源总量小，全量代价可忽略。
+                        let strict_matches = !request.filters.matches.is_default();
+                        let source_fetch = if strict_matches { usize::MAX } else { source_take };
                         let t_apps = Instant::now();
-                        let mut app_hits = apps.search(&request.query.text, source_take);
+                        let mut app_hits = apps.search(&request.query.text, source_fetch);
                         app_hits.retain(|entry| {
                             app_matches_options(
                                 &entry.name,
@@ -2881,6 +2886,7 @@ fn run_worker(args: WorkerArgs) {
                         });
                         diag_apps = t_apps.elapsed().as_secs_f32() * 1000.0;
                         total += app_hits.len();
+                        app_hits.truncate(source_take);
                         entries.append(&mut app_hits);
                         // 内置命令也参与“全部”搜索（打开设置等）。
                         let mut command_hits = commands(&request.query.text, &config.commands);
@@ -2890,7 +2896,7 @@ fn run_worker(args: WorkerArgs) {
                         if bookmarks_enabled.load(Ordering::Relaxed) {
                             let t_bookmarks = Instant::now();
                             let mut bookmark_hits =
-                                bookmarks.search(&request.query.text, source_take);
+                                bookmarks.search(&request.query.text, source_fetch);
                             // 严格匹配（大小写/全词）同样约束书签：拼音/模糊/
                             // 纯 URL 命中都要按名字复核，否则「区分大小写」失效。
                             bookmark_hits.retain(|entry| {
@@ -2902,6 +2908,7 @@ fn run_worker(args: WorkerArgs) {
                             });
                             diag_bookmarks = t_bookmarks.elapsed().as_secs_f32() * 1000.0;
                             total += bookmark_hits.len();
+                            bookmark_hits.truncate(source_take);
                             entries.append(&mut bookmark_hits);
                         }
                         // 有道云笔记：只并入「名称命中」；文件夹命中留给
@@ -2911,14 +2918,14 @@ fn run_worker(args: WorkerArgs) {
                             let (mut note_hits, _) = match history.lock() {
                                 Ok(history) => notes.search(
                                     &request.query.text,
-                                    source_take,
+                                    source_fetch,
                                     false,
                                     Some(&history),
                                     &request.rank,
                                 ),
                                 Err(_) => notes.search(
                                     &request.query.text,
-                                    source_take,
+                                    source_fetch,
                                     false,
                                     None,
                                     &request.rank,
@@ -2934,6 +2941,7 @@ fn run_worker(args: WorkerArgs) {
                             });
                             diag_notes = t_notes.elapsed().as_secs_f32() * 1000.0;
                             total += note_hits.len();
+                            note_hits.truncate(source_take);
                             entries.append(&mut note_hits);
                         }
                     }
