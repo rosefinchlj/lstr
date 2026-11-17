@@ -4290,8 +4290,9 @@ impl LstrApp {
 
     /// 贴角浮层选中项的完整路径（文件夹 = 自身路径；文件 = 父目录 + 文件名）。
     ///
-    /// 右侧路径列只有一列宽，长路径必须中段省略；选中/悬停时用底部状态行把
-    /// 「完整路径」补出来，这样才不用为了看全路径去切回资源管理器。
+    /// 行内路径列显示的是**相对当前文件夹**的层级，只有一列宽，长路径必须中段
+    /// 省略；选中/悬停且该路径真被省略时，用顶部状态行把「完整绝对路径」补出来，
+    /// 这样才不用为了看全路径去切回资源管理器。
     fn attach_status_text(&self, ctx: &egui::Context) -> Option<String> {
         // 停靠条没有状态行：它只有一两百像素高，路径列省略时点条子就能接管
         // 搜索、结果行本身也够看，不需要再挤一行完整路径。
@@ -4300,6 +4301,13 @@ impl LstrApp {
         }
         let entry = self.entries.get(self.selected)?;
         let parent = entry.path.as_deref()?.parent()?.display().to_string();
+        // 行的路径列画的是「相对当前文件夹」的文本（见 paint_rows 的贴角分支），
+        // 所以这里也用同一串文本判断是否真的被折叠——否则会出现「行里已省略、
+        // 顶部却没有完整路径」或反过来的不一致。
+        let shown = Self::relative_to_base(&parent, self.attach_path_base());
+        if shown.is_empty() {
+            return None;
+        }
         let name_w = ctx.fonts(|fonts| {
             fonts
                 .layout_no_wrap(
@@ -4314,12 +4322,53 @@ impl LstrApp {
         let available = Self::attach_path_available(ATTACH_W, name_w);
         let measured = ctx.fonts(|fonts| {
             fonts
-                .layout_no_wrap(parent, ui::text_font(ATTACH_PATH_FONT), self.theme.dim)
+                .layout_no_wrap(shown, ui::text_font(ATTACH_PATH_FONT), self.theme.dim)
                 .size()
                 .x
         });
         // 路径列放得下就不显示：完整路径只在真被折叠时才需要看。
         (measured > available).then(|| entry.full_path())
+    }
+
+    /// 贴角浮层路径列的显示基准：当前资源管理器文件夹；全局搜索（typing_global）
+    /// 的结果遍布各盘、没有共同基准，用 `None` 表示「按绝对路径显示」。
+    fn attach_path_base(&self) -> Option<&std::path::Path> {
+        if self.typing_global {
+            None
+        } else {
+            self.typing_folder.as_deref()
+        }
+    }
+
+    /// 把绝对路径按基准目录折成相对路径：`D:\root\model\a` + `D:\root` → `model\a`；
+    /// 落在基准目录本身时返回空串（没有可显示的层级）。
+    ///
+    /// 只认「按分隔符对齐」的前缀：`D:\foo` 不会把 `D:\foobar\x` 当子路径。
+    /// 不在基准下（全局搜索、网络路径、收藏夹里的失效路径）原样返回，绝不丢信息。
+    fn relative_to_base(path: &str, base: Option<&std::path::Path>) -> String {
+        let Some(base) = base else {
+            return path.to_string();
+        };
+        let base = base.to_string_lossy();
+        let base = base.trim_end_matches(['\\', '/']);
+        if base.is_empty() {
+            return path.to_string();
+        }
+        if path.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(base) {
+            return String::new();
+        }
+        let aligned = path
+            .get(..base.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(base))
+            && path
+                .as_bytes()
+                .get(base.len())
+                .is_some_and(|b| *b == b'\\' || *b == b'/');
+        if aligned {
+            path[base.len() + 1..].to_string()
+        } else {
+            path.to_string()
+        }
     }
 
     /// 贴角行右侧路径列的宽度：文件名占多少，剩下的全给路径（尽量完整显示），
@@ -8755,11 +8804,18 @@ impl LstrApp {
                 const NAME_X: f32 = ATTACH_NAME_X;
                 let name_start = row_rect.left() + NAME_X;
                 let right = row_rect.right() - ATTACH_PATH_RIGHT_PAD;
+                // 路径列显示「相对当前资源管理器文件夹」的层级（`model\jqplot`），
+                // 不显示 `D:\…\金太阳教育软件客户端\model\jqplot` 这种绝对路径：
+                // 基准就是用户正看着的那个文件夹，重复前两段只是噪音。
+                // 完整绝对路径留给顶部状态行（见 attach_status_text）。
+                // 全局搜索（typing_global）没有共同基准，回落绝对路径。
                 let parent = entry
                     .path
                     .as_deref()
                     .and_then(|p| p.parent())
                     .map(|p| p.display().to_string())
+                    .filter(|p| !p.is_empty())
+                    .map(|p| Self::relative_to_base(&p, self.attach_path_base()))
                     .filter(|p| !p.is_empty());
                 let name_font = ui::text_font(ATTACH_NAME_FONT);
                 let mut title_job = ui::text_job_case(
@@ -13320,6 +13376,59 @@ mod path_layout_tests {
     fn split_at_chars_handles_out_of_range_counts() {
         assert_eq!(split_at_chars("abc", 0), (String::new(), "abc".to_string()));
         assert_eq!(split_at_chars("abc", 99), ("abc".to_string(), String::new()));
+    }
+
+    #[test]
+    fn relative_to_base_strips_the_current_folder() {
+        let base = std::path::Path::new(r"D:\方直金太阳\model");
+        assert_eq!(
+            LstrApp::relative_to_base(r"D:\方直金太阳\model\jqplot", Some(base)),
+            r"jqplot"
+        );
+        assert_eq!(
+            LstrApp::relative_to_base(r"D:\方直金太阳\model\jqplot\css", Some(base)),
+            r"jqplot\css"
+        );
+        // 盘符根做基准时只去掉盘符：`D:\` 不会被当成「整段前缀」丢掉 a。
+        assert_eq!(
+            LstrApp::relative_to_base(r"D:\a\b", Some(std::path::Path::new(r"D:\"))),
+            r"a\b"
+        );
+    }
+
+    #[test]
+    fn relative_to_base_returns_empty_for_the_base_itself() {
+        let base = std::path::Path::new(r"D:\work");
+        assert_eq!(LstrApp::relative_to_base(r"D:\work", Some(base)), "");
+        assert_eq!(LstrApp::relative_to_base(r"D:\work\", Some(base)), "");
+        // Windows 路径大小写不敏感
+        assert_eq!(LstrApp::relative_to_base(r"d:\WORK", Some(base)), "");
+    }
+
+    #[test]
+    fn relative_to_base_respects_the_separator_boundary() {
+        let base = std::path::Path::new(r"D:\foo");
+        // D:\foobar 不是 D:\foo 的子目录，不能被折成 bar\x
+        assert_eq!(
+            LstrApp::relative_to_base(r"D:\foobar\x", Some(base)),
+            r"D:\foobar\x"
+        );
+    }
+
+    #[test]
+    fn relative_to_base_falls_back_to_the_absolute_path() {
+        let base = std::path::Path::new(r"D:\work");
+        // 别的盘（全局搜索 / 收藏夹里的路径）原样返回，绝不丢信息。
+        assert_eq!(
+            LstrApp::relative_to_base(r"E:\other\x", Some(base)),
+            r"E:\other\x"
+        );
+        assert_eq!(
+            LstrApp::relative_to_base(r"\\server\share\a", Some(base)),
+            r"\\server\share\a"
+        );
+        // 没有基准（typing_global）：绝对路径。
+        assert_eq!(LstrApp::relative_to_base(r"D:\a\b", None), r"D:\a\b");
     }
 
     /// 等宽字体的近似宽度：ASCII 10px，中文/全角 20px。
