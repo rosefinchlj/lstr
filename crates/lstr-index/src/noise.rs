@@ -60,9 +60,19 @@ pub const NOISE_SEGMENTS: &[&str] = &[
 
 /// 兼容旧调用点(内置默认段名判定)。生产分类走 [`ExcludeRules`]。
 pub fn is_noise_segment(name_lc: &[u8]) -> bool {
-    std::str::from_utf8(name_lc)
-        .map(|s| NOISE_SEGMENTS.binary_search(&s).is_ok())
-        .unwrap_or(false)
+    let Ok(s) = std::str::from_utf8(name_lc) else {
+        return false;
+    };
+    NOISE_SEGMENTS.binary_search(&s).is_ok()
+        || compound_tail(s).is_some_and(|tail| NOISE_SEGMENTS.binary_search(&tail).is_ok())
+}
+
+/// A14:构建工具常把段名拼成复合名(`cargo-target`、`node-build`、`.next-turbo`),
+/// 精确匹配会漏掉。取最后一个 `-`/`_` 之后的后缀再比一次;仅用于判定,不改规则表。
+fn compound_tail(name: &str) -> Option<&str> {
+    let cut = name.rfind(['-', '_'])?;
+    let tail = &name[cut + 1..];
+    (!tail.is_empty()).then_some(tail)
 }
 
 /// 构建产物段名(小写、有序):这些目录若被用户/默认排除表判为噪声,
@@ -73,10 +83,13 @@ pub fn is_noise_segment(name_lc: &[u8]) -> bool {
 pub const BUILD_OUTPUT_SEGMENTS: &[&str] = &["bin", "build", "dist", "out", "target"];
 
 /// 是否为构建产物段名。`name_lc` 必须是小写名字。
+/// A14:复合名(`cargo-target`)按后缀也认定为构建产物段。
 pub fn is_build_output_segment(name_lc: &[u8]) -> bool {
-    std::str::from_utf8(name_lc)
-        .map(|s| BUILD_OUTPUT_SEGMENTS.binary_search(&s).is_ok())
-        .unwrap_or(false)
+    let Ok(s) = std::str::from_utf8(name_lc) else {
+        return false;
+    };
+    BUILD_OUTPUT_SEGMENTS.binary_search(&s).is_ok()
+        || compound_tail(s).is_some_and(|tail| BUILD_OUTPUT_SEGMENTS.binary_search(&tail).is_ok())
 }
 
 /// 是否为可直接运行/安装的产物扩展名(小写名字比对)。
@@ -90,7 +103,8 @@ pub fn is_exec_name(name_lc: &[u8]) -> bool {
 /// 快照 header 存的是 [`ExcludeRules::hash`],语义改了要换哈希,否则旧快照
 /// 会带着旧分类继续用、看不到新保留的条目。
 /// - v2(2026-11-14):构建产物子树保留目录 + 可执行文件。
-const SEMANTICS_VERSION: u64 = 2;
+/// - v3(2026-11-17):A14 段名支持复合名后缀匹配(`cargo-target` → `target`)。
+const SEMANTICS_VERSION: u64 = 3;
 
 /// 语义版本混入哈希的乘数(奇数,避免把版本号消掉)。
 const SEMANTICS_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -175,9 +189,16 @@ impl ExcludeRules {
 
     /// 段名快查(热路径:逐条目逐祖先调用)。
     pub fn is_segment(&self, name_lc: &[u8]) -> bool {
-        std::str::from_utf8(name_lc)
-            .map(|s| self.segments.binary_search(&s.to_string()).is_ok())
-            .unwrap_or(false)
+        let Ok(s) = std::str::from_utf8(name_lc) else {
+            return false;
+        };
+        let hit = |needle: &str| {
+            self.segments
+                .binary_search_by(|seg| seg.as_str().cmp(needle))
+                .is_ok()
+        };
+        // A14:先精确匹配;失败再按复合名的最后一段重试(`cargo-target` → `target`)。
+        hit(s) || compound_tail(s).is_some_and(hit)
     }
 
     /// 锚定匹配:祖先链(从卷根起、不含盘符段)是否落在某个锚定模式之下。
@@ -292,11 +313,30 @@ mod tests {
 
     #[test]
     fn matches_common_noise() {
-        let r = ExcludeRules::build(&["node_modules".into(), ".git".into()]);
+        let r = ExcludeRules::build(&[
+            "node_modules".into(),
+            ".git".into(),
+            "target".into(),
+            "build".into(),
+        ]);
         assert!(r.is_segment(b"node_modules"));
         assert!(r.is_segment("Node_Modules".to_lowercase().as_bytes()));
         assert!(!r.is_segment(b"my-project"));
         assert!(!r.is_segment(b"targeted")); // 只匹配整段名
+        // A14:复合段名按最后一段匹配
+        assert!(r.is_segment(b"cargo-target"));
+        assert!(r.is_segment(b"node-build"));
+        assert!(r.path_excluded("e:/proj/cargo-target/debug/x.pdb"));
+        assert!(!r.path_excluded("e:/proj/cargo-target")); // 目录自身可见
+    }
+
+    #[test]
+    fn build_output_segment_matches_compound_names() {
+        assert!(is_build_output_segment(b"target"));
+        assert!(is_build_output_segment(b"cargo-target"));
+        assert!(is_build_output_segment(b"rust-build"));
+        assert!(!is_build_output_segment(b"my-targets"));
+        assert!(!is_build_output_segment(b"targeted"));
     }
 
     #[test]

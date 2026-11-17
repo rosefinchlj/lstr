@@ -226,6 +226,12 @@ pub const MTIME_BACKFILL_PER_ROUND: usize = 128;
 /// 正常路径(旁车完好)崩溃恢复完全不受影响。对账收尾/优雅退出仍立即全量。
 const FULL_SAVE_INTERVAL_SECS: u64 = 1800;
 
+/// A15:首扫中卷的断点保存间隔。扫描中的卷列布局未定型(offs 为空、delta
+/// 为全部),只能走同步 compact+整卷写盘;旧值 20s 在百万条级首扫里会反复
+/// 阻塞索引线程(每次几百 ms~秒级)。60s 把这份开销降到 1/3,崩溃最多多扫
+/// 40s,仍远小于全量重扫的几十秒~分钟级代价。
+const SCAN_CHECKPOINT_INTERVAL_SECS: u64 = 60;
+
 /// 旁车写盘节流:USN 轮询 500ms 一批,变更按序积压在内存日志,合并 5s 追加
 /// 写一次(只写新增块,几 KB)。崩溃最多丢一个节流窗口的日志 —— 游标以旁车
 /// 文件里的为准,缺口由 journal 回放补齐,不存在丢数据。
@@ -1719,6 +1725,11 @@ impl Engine {
             }
             out.hits.append(&mut hits);
         }
+        // A8：把「total 是不是下界」显式交给调用方——扫描在计数预算
+        // (TOTAL_CAP / FILTER_ONLY_TOTAL_CAP)处提前停止时 total 不再精确。
+        if !out.aborted {
+            out.total_capped = crate::query::total_is_lower_bound(spec, out.total);
+        }
         out
     }
 
@@ -3005,13 +3016,14 @@ impl Engine {
         }
     }
 
-    /// 两次**全量**落盘的最小间隔:扫描中的卷保留 20s 粒度作为断点(崩溃后
-    /// 最多重扫 20s);就绪卷降频到 [`FULL_SAVE_INTERVAL_SECS`] —— 稳态增量由
-    /// 旁车游标承载(毫秒级写盘),全量快照只做阶段归档(见常量注释)。
+    /// 两次**全量**落盘的最小间隔:扫描中的卷保留 60s 粒度作为断点(崩溃后
+    /// 最多重扫 60s,A15:旧值 20s 在首扫期反复同步写整卷);就绪卷降频到
+    /// [`FULL_SAVE_INTERVAL_SECS`] —— 稳态增量由旁车游标承载(毫秒级写盘),
+    /// 全量快照只做阶段归档(见常量注释)。
     fn save_interval(v: &VolumeState) -> Duration {
         let scanning = v.store.as_ref().map(|s| s.is_scanning()).unwrap_or(false);
         if scanning {
-            Duration::from_secs(20)
+            Duration::from_secs(SCAN_CHECKPOINT_INTERVAL_SECS)
         } else {
             Duration::from_secs(FULL_SAVE_INTERVAL_SECS)
         }

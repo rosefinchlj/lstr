@@ -46,6 +46,26 @@ pub const NO_PARENT: u32 = u32::MAX;
 /// compact 250 万条,CPU 单核打满、查询被饿死。根目录必须当作 NO_PARENT。
 pub const ROOT_FRN: u64 = 5;
 
+/// A11：名字区用 u32 偏移寻址，容量上限 `u32::MAX` 字节；超过后
+/// `as u32` 会静默截断、写坏索引。500 万条目规模（名字区约 100MB）远达
+/// 不到上限，但插入/改名路径必须显式拒绝而不是悄悄出错。
+const NAME_SPACE_LIMIT: usize = u32::MAX as usize;
+
+fn name_space_fits(len: usize) -> bool {
+    len <= NAME_SPACE_LIMIT
+}
+
+/// A11：名字区溢出告警只记一次（否则每条记录都会刷 engine.log）。
+static NAME_OVERFLOW_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn log_name_space_overflow() {
+    if !NAME_OVERFLOW_LOGGED.swap(true, Ordering::Relaxed) {
+        crate::snapshot::debug_log(
+            "store: name space overflow (>4GiB-1), refusing further inserts/renames",
+        );
+    }
+}
+
 /// compact 触发阈值:delta 新 slot 数(同样用作 reindex overlay 阈值)。
 pub(crate) const COMPACT_DELTA: usize = 32_768;
 /// compact 触发阈值:死 slot 占比(分子)。
@@ -1057,7 +1077,30 @@ impl VolumeStore {
     /// 构建索引,之后由 insert_meta/compact 精确维护。
     pub fn apply_children(&mut self, parent_slot: u32, recs: &[Rec]) -> (usize, usize) {
         if parent_slot == NO_PARENT {
-            self.clear_seen();
+            // A10:父项未解析(例如 watcher 先看到新子项、父目录记录还没到)时,
+            // 仍可借 `unresolved` 映射做删除对账:同一父 FRN 下的旧条目,本次
+            // 刷新没出现就是已删除。卷根刷新(parent_frn==ROOT_FRN)不走这里,
+            // 由 apply_root_children 按 ATTR_ROOT_CHILD 处理。
+            let reconcile_parent = match recs.first().map(|r| r.parent_frn) {
+                Some(p) if p != 0 && p != ROOT_FRN => Some(p),
+                _ => None,
+            };
+            let mut existing: Vec<u32> = Vec::new();
+            if let Some(pfrn) = reconcile_parent {
+                existing = self
+                    .unresolved
+                    .iter()
+                    .filter(|&(_, &p)| p == pfrn)
+                    .map(|(&slot, _)| slot)
+                    .collect();
+                for &slot in &existing {
+                    if self.alive(slot) {
+                        self.attrs[slot as usize] &= !ATTR_SEEN;
+                    }
+                }
+            } else {
+                self.clear_seen();
+            }
             let mut added = 0usize;
             for r in recs {
                 if self.insert_meta(r.frn, r.parent_frn, r.attrs, r.name.as_bytes(), r.mtime, r.size) {
@@ -1067,8 +1110,32 @@ impl VolumeStore {
                     self.attrs[slot as usize] |= ATTR_SEEN;
                 }
             }
-            self.clear_seen();
-            return (added, 0);
+            let Some(_pfrn) = reconcile_parent else {
+                self.clear_seen();
+                return (added, 0);
+            };
+            let mut removed = 0usize;
+            for slot in existing {
+                if !self.alive(slot) {
+                    continue;
+                }
+                let a = self.attrs[slot as usize];
+                if a & ATTR_SEEN == 0 {
+                    self.attrs[slot as usize] = a | ATTR_DEAD;
+                    removed += 1;
+                    self.unresolved.remove(&slot);
+                } else {
+                    self.attrs[slot as usize] = a & !ATTR_SEEN;
+                }
+            }
+            // 本次刷新到的新槽不在 existing 里,同样清掉临时 SEEN 位。
+            for r in recs {
+                if let Some(slot) = self.find_slot(r.frn) {
+                    self.attrs[slot as usize] &= !ATTR_SEEN;
+                }
+            }
+            self.dead_count = self.dead_count.saturating_add(removed as u32);
+            return (added, removed);
         }
         if !self.children_built {
             self.rebuild_children();
@@ -1113,9 +1180,14 @@ impl VolumeStore {
     /// [`NO_PARENT`],必须靠 [`ATTR_ROOT_CHILD`] 与「父未消解」条目区分开;
     /// 否则不敢删除,根目录下的删除要等下次启动对账。
     pub fn apply_root_children(&mut self, recs: &[Rec]) -> (usize, usize) {
+        // A9:旧实现对全表扫两遍(清 SEEN 一遍、标 DEAD 一遍)。合并成
+        // 「一次全表扫描收集根子项」+「只遍历根子项收尾」,大卷(百万级)下
+        // 省掉第二遍 O(全表)。
+        let mut existing: Vec<u32> = Vec::new();
         for slot in 0..self.attrs.len() {
             let a = self.attrs[slot];
             if a & ATTR_ROOT_CHILD != 0 && a & ATTR_DEAD == 0 {
+                existing.push(slot as u32);
                 self.attrs[slot] = a & !ATTR_SEEN;
             }
         }
@@ -1129,15 +1201,22 @@ impl VolumeStore {
             }
         }
         let mut removed = 0usize;
-        for slot in 0..self.attrs.len() {
-            let a = self.attrs[slot];
-            if a & ATTR_ROOT_CHILD != 0 && a & ATTR_DEAD == 0 {
-                if a & ATTR_SEEN == 0 {
-                    self.attrs[slot] = a | ATTR_DEAD;
-                    removed += 1;
-                } else {
-                    self.attrs[slot] = a & !ATTR_SEEN;
-                }
+        for slot in existing {
+            let a = self.attrs[slot as usize];
+            if a & ATTR_ROOT_CHILD == 0 || a & ATTR_DEAD != 0 {
+                continue;
+            }
+            if a & ATTR_SEEN == 0 {
+                self.attrs[slot as usize] = a | ATTR_DEAD;
+                removed += 1;
+            } else {
+                self.attrs[slot as usize] = a & !ATTR_SEEN;
+            }
+        }
+        // 本次刷新到的新槽同样清掉临时 SEEN 位。
+        for r in recs {
+            if let Some(slot) = self.find_slot(r.frn) {
+                self.attrs[slot as usize] &= !ATTR_SEEN;
             }
         }
         self.dead_count = self.dead_count.saturating_add(removed as u32);
@@ -1233,6 +1312,11 @@ impl VolumeStore {
                     self.ancestry_dirty = true;
                 }
                 if !same_name {
+                    // A11：名字区用 u32 偏移，追加新名字前必须确认放得下。
+                    if !name_space_fits(self.names.len().saturating_add(name.len() + 1)) {
+                        log_name_space_overflow();
+                        return false;
+                    }
                     self.renames += 1;
                     let name_lc = fold_case(name);
                     self.name_off[old as usize] = self.names.len() as u32;
@@ -1281,6 +1365,11 @@ impl VolumeStore {
                 }
                 return true;
             }
+        }
+        // A11：新槽要往名字区追加 `name + NUL`，name_off 用 u32 偏移。
+        if !name_space_fits(self.names.len().saturating_add(name.len() + 1)) {
+            log_name_space_overflow();
+            return false;
         }
         let slot = self.name_off.len() as u32;
         let off = self.names.len() as u32;
@@ -2288,5 +2377,43 @@ mod tests {
         let (_, removed) = s.apply_children(b2, &[]);
         assert_eq!(removed, 1, "compact 后索引重建,刷新 dirB 为空应删 c1");
         assert!(s.find_slot(100).is_none());
+    }
+
+    /// A10:父项仍未被解析时,watcher 对该父的刷新也要能删除子项
+    /// (旧实现只做 upsert,删除要等下次启动对账)。
+    #[test]
+    fn unresolved_parent_refresh_reconciles_deleted_children() {
+        use crate::usn::{Op, Rec};
+        let rec = |frn: u64, parent_frn: u64, name: &str| Rec {
+            frn,
+            parent_frn,
+            attrs: 0,
+            op: Op::Upsert,
+            name: name.to_string(),
+            mtime: 0,
+            size: u64::MAX,
+        };
+        let mut s = VolumeStore::new(Default::default(), 'C');
+        assert!(s.insert_meta(100, 900, 0, b"a.txt", 0, u64::MAX));
+        assert!(s.insert_meta(101, 900, 0, b"b.txt", 0, u64::MAX));
+        assert_eq!(s.unresolved_pairs().len(), 2);
+        // compact 建 FRN→slot 索引(否则 apply 路径按「新插入」处理,重复计数)
+        s.compact();
+        let (added, removed) = s.apply_children(NO_PARENT, &[rec(100, 900, "a.txt")]);
+        assert_eq!((added, removed), (0, 1));
+        assert!(s.find_slot(100).is_some());
+        assert!(s.find_slot(101).is_none());
+        assert_eq!(s.unresolved_pairs().len(), 1, "被删子项应从 unresolved 移除");
+        // 根刷新不应受「未解析父」对账影响
+        let (_, removed) = s.apply_root_children(&[]);
+        assert_eq!(removed, 0);
+    }
+
+    /// A11:名字区容量上限守卫(超过 u32 偏移空间时拒绝插入,而不是静默截断)。
+    #[test]
+    fn name_space_guard_rejects_overflow() {
+        assert!(name_space_fits(0));
+        assert!(name_space_fits(NAME_SPACE_LIMIT));
+        assert!(!name_space_fits(NAME_SPACE_LIMIT + 1));
     }
 }

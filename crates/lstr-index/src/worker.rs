@@ -21,10 +21,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::IO::CancelSynchronousIo;
+use windows::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_TERMINATE};
 
 use crate::proto::{self, Frame, TOKEN_LEN};
 use crate::scan::{self, JournalError};
@@ -1399,6 +1401,52 @@ fn write_all(h: HANDLE, mut buf: &[u8]) -> bool {
     }
     true
 }
+
+/// A13:带超时的帧写入(客户端 → worker 的所有写路径)。
+///
+/// 管道写在对端卡死(对端不读/半开)时会无限阻塞,旧实现会把 GUI/搜索线程
+/// 一并拖住。这里把写挪到一次性线程,主线程最多等 `timeout`;超时用
+/// `CancelSynchronousIo` 取消该线程挂起的写并返回 false(调用方按连接失效
+/// 处理)。worker 侧的写帧(worker→client)仍走阻塞实现 —— 背压是设计。
+pub fn write_frame_timed(client: HANDLE, frame: &Frame, timeout: Duration) -> bool {
+    let bytes = frame.encode();
+    let raw = SendHandle(client.0 as isize);
+    let (done_tx, done_rx) = mpsc::channel::<bool>();
+    let tid = Arc::new(AtomicU32::new(0));
+    let tid_in = Arc::clone(&tid);
+    let spawned = std::thread::Builder::new()
+        .name("lstr-pipe-write".to_string())
+        .spawn(move || {
+            let h = HANDLE(raw.0 as *mut core::ffi::c_void);
+            tid_in.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+            let ok = write_all(h, &bytes);
+            let _ = done_tx.send(ok);
+        });
+    if spawned.is_err() {
+        // 起不了线程就退回阻塞写(宁可有极小概率卡住,也不能静默丢帧)。
+        let bytes = frame.encode();
+        return write_all(client, &bytes);
+    }
+    match done_rx.recv_timeout(timeout) {
+        Ok(ok) => ok,
+        Err(_) => {
+            let id = tid.load(Ordering::Acquire);
+            if id != 0 {
+                if let Ok(thread) = unsafe { OpenThread(THREAD_TERMINATE, false, id) } {
+                    unsafe {
+                        let _ = CancelSynchronousIo(thread);
+                        let _ = CloseHandle(thread);
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+/// 跨线程传递句柄的裸值包装(句柄本身是进程内值,跨线程只读使用是安全的)。
+struct SendHandle(isize);
+unsafe impl Send for SendHandle {}
 
 pub fn read_frame_pub(client: HANDLE, timeout: Duration) -> Option<Frame> {
     let deadline = std::time::Instant::now() + timeout;

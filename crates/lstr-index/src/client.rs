@@ -9,6 +9,10 @@ use windows::Win32::Foundation::HANDLE;
 use crate::proto::{Frame, TOKEN_LEN};
 use crate::win;
 
+/// A13:客户端 → worker 的单帧写超时。管道对端卡死(半开/不读)时,阻塞写
+/// 会把 GUI 线程或搜索线程无限拖住;超过该时限即按连接失效处理。
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// 本进程会话令牌:每次启动生成一次,worker 由我们用同一令牌经 runas 拉起。
 /// 固定管道名 + 只比 exe 名的 `verify_peer` 挡不住同用户的其它进程,令牌让
 /// 它们即便连上管道也会被 worker 拒绝。
@@ -116,7 +120,7 @@ pub fn connect_and_handshake_at(
                     token,
                     volumes: handshake.clone(),
                 };
-                if !crate::worker::write_frame_pub(client, &hello) {
+                if !crate::worker::write_frame_timed(client, &hello, WRITE_TIMEOUT) {
                     win::close(client);
                     return Err("handshake write failed".into());
                 }
@@ -148,9 +152,9 @@ pub fn read_frame(client: HANDLE, timeout: Duration) -> Option<Frame> {
     crate::worker::read_frame_pub(client, timeout)
 }
 
-/// 写一帧。
+/// 写一帧。A13:走带超时的实现 —— 半开管道上的阻塞写会把 GUI 线程卡死。
 pub fn write_frame(client: HANDLE, frame: &Frame) -> bool {
-    crate::worker::write_frame_pub(client, frame)
+    crate::worker::write_frame_timed(client, frame, WRITE_TIMEOUT)
 }
 
 /// 等待 worker 进程退出:轮询管道探活,实例消失(或超时)即返回。

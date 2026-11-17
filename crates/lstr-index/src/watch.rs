@@ -12,9 +12,10 @@
 //! - 若通知缓冲溢出(`ERROR_NOTIFY_ENUM_DIR`),退化为整卷对账(DirSync),
 //!   保证不丢事件。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_NOTIFY_ENUM_DIR, ERROR_OPERATION_ABORTED};
@@ -32,6 +33,18 @@ use crate::proto::Frame;
 
 const NOTIFY_BUF: usize = 64 << 10;
 const WAIT_MS: u32 = 500;
+/// A12:枚举父目录被拒(权限/暂时不可访问)后的冷却时间。期间同一目录的
+/// 后续通知直接跳过,不反复重试、不重复写日志;冷却结束再试一次。
+const DENIED_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+/// A12:被拒目录冷却表的容量上限,超过后整体清空(避免长跑无限增长)。
+const DENIED_MAP_CAP: usize = 1024;
+
+/// A12:该目录是否仍在「拒绝访问」冷却期内。
+fn denied_recently(denied: &HashMap<String, Instant>, path: &str, now: Instant) -> bool {
+    denied
+        .get(path)
+        .is_some_and(|&at| now.saturating_duration_since(at) < DENIED_RETRY_COOLDOWN)
+}
 
 fn notify_filter() -> windows::Win32::Storage::FileSystem::FILE_NOTIFY_CHANGE {
     FILE_NOTIFY_CHANGE_FILE_NAME
@@ -121,6 +134,7 @@ fn refresh_parent(
     parent_rel: &str,
     tx: &SyncSender<Frame>,
     stop: &AtomicBool,
+    denied: &mut HashMap<String, Instant>,
 ) {
     if stop.load(Ordering::Relaxed) {
         return;
@@ -134,11 +148,22 @@ fn refresh_parent(
         };
         (path, frn)
     };
+    // A12:该目录刚被拒绝过,冷却期内直接跳过,避免每个通知都重试+刷日志。
+    if denied_recently(denied, &dir_path, Instant::now()) {
+        return;
+    }
     match dirscan::enumerate_children(&dir_path, parent_frn, stop) {
         Ok(recs) => {
+            denied.remove(&dir_path);
             let _ = tx.send(Frame::DirChildren { guid, parent_frn, recs });
         }
-        Err(err) => crate::snapshot::debug_log(&format!("watch refresh {dir_path}: {err}")),
+        Err(err) => {
+            if denied.len() >= DENIED_MAP_CAP {
+                denied.clear();
+            }
+            denied.insert(dir_path.clone(), Instant::now());
+            crate::snapshot::debug_log(&format!("watch refresh {dir_path}: {err}"));
+        }
     }
 }
 
@@ -180,6 +205,8 @@ pub fn watch_volume(letter: char, guid: u128, tx: &SyncSender<Frame>, stop: &Ato
         }
     };
     let mut buf = vec![0u8; NOTIFY_BUF];
+    // A12:被拒目录的冷却表(只记录最近一次拒绝时间)。
+    let mut denied: HashMap<String, Instant> = HashMap::new();
     crate::snapshot::debug_log(&format!("watch {letter}: started"));
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -243,7 +270,7 @@ pub fn watch_volume(letter: char, guid: u128, tx: &SyncSender<Frame>, stop: &Ato
         }
         let paths = parse_notify(&buf[..got as usize]);
         for parent in parents_to_refresh(&paths) {
-            refresh_parent(letter, guid, &parent, tx, stop);
+            refresh_parent(letter, guid, &parent, tx, stop, &mut denied);
         }
     }
     let _ = unsafe { CloseHandle(event) };
@@ -271,6 +298,19 @@ mod tests {
     fn parses_single_notification() {
         let buf = notify_entry(1, "a\\b.txt");
         assert_eq!(parse_notify(&buf), vec!["a\\b.txt".to_string()]);
+    }
+
+    /// A12:被拒目录在冷却期内应跳过,冷却结束后再重试。
+    #[test]
+    fn denied_directories_are_skipped_during_cooldown() {
+        let mut denied: HashMap<String, Instant> = HashMap::new();
+        let now = Instant::now();
+        assert!(!denied_recently(&denied, "C:\\a", now));
+        denied.insert("C:\\a".to_string(), now);
+        assert!(denied_recently(&denied, "C:\\a", now));
+        assert!(!denied_recently(&denied, "C:\\b", now));
+        let later = now + DENIED_RETRY_COOLDOWN;
+        assert!(!denied_recently(&denied, "C:\\a", later));
     }
 
     #[test]

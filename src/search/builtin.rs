@@ -153,6 +153,9 @@ impl BuiltinProvider {
         }
     }
 
+    /// 测试辅助:生产路径走 [`Self::search_with_bounds`](A8 需要下界标志),
+    /// 这里只为对拍/验收测试保留旧二元组签名。
+    #[cfg(test)]
     pub fn search(
         &self,
         query: &Query,
@@ -160,6 +163,24 @@ impl BuiltinProvider {
         limit: usize,
         weights: &EffectiveWeights,
     ) -> Result<(Vec<Entry>, usize), String> {
+        let (entries, total, _lower_bound) = self.search_with_bounds(
+            query,
+            filters,
+            limit,
+            weights,
+        )?;
+        Ok((entries, total))
+    }
+
+    /// 与 [`Self::search`] 相同,但额外返回「total 是否为计数预算内下界」
+    /// (A8:宽查询扫描到 TOTAL_CAP 就停,total 不再精确;UI 据此显示「N+」)。
+    pub fn search_with_bounds(
+        &self,
+        query: &Query,
+        filters: &SearchFilters,
+        limit: usize,
+        weights: &EffectiveWeights,
+    ) -> Result<(Vec<Entry>, usize, bool), String> {
         // 单分类作用域(文件夹/程序/文件)必须在这里按 kind 过滤:引擎侧过滤
         // 负责候选,keep 再兜底类型漂移。8e2e208 把 kind 抽成 run 的参数后,
         // 这里一度误传 KindFilter::All + 全放行,导致三个分类 tab 都返回
@@ -190,6 +211,7 @@ impl BuiltinProvider {
                 kind != Kind::Folder
             }
         }, weights)
+        .map(|(entries, total, _lower_bound)| (entries, total))
     }
 
     /// 旧元数据路径(逐条 find_meta)的双路 oracle:只用于 release 基准对照
@@ -323,10 +345,10 @@ impl BuiltinProvider {
             files,
             folder_total: outcome.total_folders,
             all_total: outcome.total_all,
-            // P2-7：与引擎停扫谓词完全一致（空 token && 非 regex && 撞预算）。
-            total_rough: spec.tokens.is_empty()
-                && spec.regex.is_none()
-                && outcome.total_all >= lstr_index::query::FILTER_ONLY_TOTAL_CAP,
+            // A8：total 是否为下界——与引擎停扫谓词完全一致（宽查询在
+            // TOTAL_CAP 停扫、空 token 纯过滤在 FILTER_ONLY_TOTAL_CAP 停扫）。
+            total_rough: lstr_index::query::total_is_lower_bound(&spec, outcome.total_all)
+                || lstr_index::query::total_is_lower_bound(&spec, outcome.total_folders),
             exact,
             prefix,
             exact_ms,
@@ -363,14 +385,14 @@ impl BuiltinProvider {
         kind_filter: KindFilter,
         keep: impl Fn(Kind) -> bool,
         weights: &EffectiveWeights,
-    ) -> Result<(Vec<Entry>, usize), String> {
+    ) -> Result<(Vec<Entry>, usize, bool), String> {
         let mut spec = build_spec(query, filters, weights);
         spec.kind = kind_filter;
         let outcome = self.query_spec(&spec);
         let ordered = self.ordered_hits(&outcome.hits, weights);
         let mut entries = Vec::with_capacity(ordered.len().min(limit));
         self.collect_entries(&ordered, query, limit, keep, &mut entries);
-        Ok((entries, outcome.total))
+        Ok((entries, outcome.total, outcome.total_capped))
     }
 
     /// 多卷命中按盘符权重公平交织（返回按「该先看谁」排好的序列）。

@@ -483,12 +483,22 @@ pub const TOTAL_CAP: usize = 100_000;
 pub const FILTER_ONLY_TOTAL_CAP: usize = 20_000;
 
 /// 本次查询的计数预算:B5 的纯过滤查询用更小的 `FILTER_ONLY_TOTAL_CAP`。
-fn total_budget_for(spec: &QuerySpec) -> usize {
+pub fn total_budget_for(spec: &QuerySpec) -> usize {
     if spec.tokens.is_empty() && spec.regex.is_none() {
         FILTER_ONLY_TOTAL_CAP
     } else {
         TOTAL_CAP
     }
+}
+
+/// A8:本次查询的 `total` 是否只是**下界**——扫描在计数预算处提前停止,
+/// 后面可能还有命中没数。空 token 纯过滤查询用
+/// [`FILTER_ONLY_TOTAL_CAP`](B5),其余用 [`TOTAL_CAP`];`exact` 查询不限量、
+/// 始终精确(与 `query_volume_cancel` 的 `unbounded` 判定一致)。
+pub fn total_is_lower_bound(spec: &QuerySpec, total: usize) -> bool {
+    let has_tokens = spec.tokens.iter().any(|t| !t.is_empty());
+    let unbounded = has_tokens && spec.exact.is_some();
+    !unbounded && total >= total_budget_for(spec)
 }
 
 #[inline]
@@ -601,6 +611,12 @@ pub struct Hit {
 pub struct QueryOutcome {
     pub hits: Vec<Hit>,
     pub total: usize,
+    /// A8:total 是「计数预算内下界」——扫描在 [`TOTAL_CAP`] /
+    /// [`FILTER_ONLY_TOTAL_CAP`] 处提前停止,total 不再精确。调用方应把它
+    /// 当作「N+」展示,而不是把下界当精确值(可用
+    /// [`total_is_lower_bound`] 复核)。`capped` 仍表示收集被
+    /// candidate_cap 截断。
+    pub total_capped: bool,
     /// 因 candidate_cap 提前截断(total 仍精确,仅收集截断)。
     pub capped: bool,
     /// 新查询已到达,本次查询被提前中止(hits/total 均为部分结果,调用方应丢弃)。

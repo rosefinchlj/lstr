@@ -2971,9 +2971,11 @@ fn run_worker(args: WorkerArgs) {
                     let mut needs_exact = false;
                     if let Some(b) = &builtin {
                         let fetch = fetch_count(&request.query, request.limit, request.deliver);
-                        match b.search(&request.query, &request.filters, fetch, &drive_weights) {
-                            Ok((mut files, count)) => {
+                        match b.search_with_bounds(&request.query, &request.filters, fetch, &drive_weights) {
+                            Ok((mut files, count, lower_bound)) => {
                                 total = count;
+                                // A8：宽查询/纯过滤查询的 total 可能只是下界。
+                                total_rough |= lower_bound;
                                 needs_exact = count > files.len();
                                 pending_meta.mark(&files, true);
                                 entries.append(&mut files);
