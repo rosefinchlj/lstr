@@ -544,6 +544,11 @@ fn condition_enter_text(input: &str) -> String {
     if trimmed.ends_with(':') || trimmed.ends_with('：') {
         return input.to_string();
     }
+    // P2-5：裸路径的终结冒号补在路径 token 末尾（而不是整段末尾），
+    // 这样 `path:D:\work 报告` 回车后「报告」仍是搜索词。
+    if let Some(fixed) = crate::search::conditions::terminate_last_path(trimmed) {
+        return fixed;
+    }
     let probe = format!("{trimmed}:");
     let before = crate::search::conditions::extract(trimmed).paths.len();
     let after = crate::search::conditions::extract(&probe).paths.len();
@@ -3495,7 +3500,10 @@ impl LstrApp {
             return true;
         }
         if !text.ends_with(':') && !text.ends_with('：') {
-            text.push(':');
+            // P2-5：裸路径的终结冒号补在路径 token 末尾（`path:D:\work: 报告`），
+            // 其余情况仍补在整段末尾。
+            text = crate::search::conditions::terminate_last_path(&text)
+                .unwrap_or_else(|| format!("{text}:"));
         }
         self.input = text;
         self.commit_conditions(ctx);
@@ -12364,6 +12372,11 @@ mod path_layout_tests {
         assert_eq!(
             condition_enter_text(r"report path:D:\work"),
             r"report path:D:\work:"
+        );
+        // P2-5：路径后面还有搜索词时，冒号补在路径 token 末尾而不是整段末尾。
+        assert_eq!(
+            condition_enter_text(r"path:D:\work 报告"),
+            r"path:D:\work: 报告"
         );
     }
 

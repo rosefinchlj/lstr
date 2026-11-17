@@ -97,6 +97,9 @@ pub struct VolumeState {
     /// 在飞旁车写任务的序号:写盘已交给 `lstr-sidecar-write` 线程,该笔的
     /// ack 回来前不再为空追加(避免日志乱序);`None` 表示没有在飞写。
     sidecar_inflight: Option<u64>,
+    /// P2-14:旁车日志世代。全量保存成功/清空日志时 +1,使在飞写任务的
+    /// ack 失效(watch/dir 模式 base 恒 (0,0),不能只靠基线判断陈旧)。
+    sidecar_epoch: u64,
     /// 下次允许旁车写盘的时间(节流;失败按同间隔重试,写盘毫秒级,退避无必要)。
     sidecar_retry_at: Option<Instant>,
     /// 内存日志里已追加进文件的前缀条数:追加式写盘只写
@@ -372,6 +375,11 @@ struct SidecarJob {
     /// 投递时内存旁车日志的总条数(ack 回来后作为已落盘前缀)。
     total: usize,
     ops: Vec<SidecarOp>,
+    /// P2-14:投递时的日志世代;ack 回来时世代不符则丢弃。
+    epoch: u64,
+    /// P2-14:true 表示删除该卷旁车文件(与 append 在同一线程串行,
+    /// 避免全量保存清理与在飞 append 的 open/create 竞态)。
+    remove: bool,
 }
 
 /// 旁车写线程回来的完成回执。
@@ -381,6 +389,8 @@ struct SidecarDone {
     base: (u64, i64),
     total: usize,
     result: Result<(), String>,
+    /// P2-14:投递时的日志世代,用于识别已被全量保存清空/换基线的陈旧 ack。
+    epoch: u64,
 }
 
 /// 旁车写盘线程:把 open / write / `sync_data` 全部搬离搜索线程。
@@ -405,6 +415,19 @@ impl SidecarWriter {
             .name("lstr-sidecar-write".to_string())
             .spawn(move || {
                 for job in rx {
+                    if job.remove {
+                        // P2-14:删除也走这个线程,保证与 append 串行。
+                        sidecar::remove(&job.dir, job.guid);
+                        let _ = done_tx.send(SidecarDone {
+                            seq: job.seq,
+                            guid: job.guid,
+                            base: job.base,
+                            total: 0,
+                            result: Ok(()),
+                            epoch: job.epoch,
+                        });
+                        continue;
+                    }
                     let started = Instant::now();
                     let result = sidecar::append(
                         &job.dir,
@@ -430,6 +453,7 @@ impl SidecarWriter {
                         base: job.base,
                         total: job.total,
                         result,
+                        epoch: job.epoch,
                     });
                 }
             })
@@ -606,6 +630,7 @@ impl Engine {
             sidecar_cursor,
             sidecar_pending: false,
             sidecar_inflight: None,
+            sidecar_epoch: 0,
             sidecar_retry_at: None,
             capture_on: true,
             usn_watch: UsnWatchState::Off,
@@ -790,6 +815,7 @@ impl Engine {
                 sidecar_cursor: 0,
                 sidecar_pending: false,
                 sidecar_inflight: None,
+            sidecar_epoch: 0,
                 sidecar_retry_at: None,
                 capture_on: false,
                 usn_watch: UsnWatchState::Off,
@@ -853,6 +879,8 @@ impl Engine {
             v.sidecar_flushed = 0;
             v.sidecar_pending = false;
             v.sidecar_overflowed = false;
+            // P2-14:清空日志即换代,在飞写的 ack 不得再把 flushed 抬回来。
+            v.sidecar_epoch = v.sidecar_epoch.wrapping_add(1);
             self.pinyin[i] = PinyinCache::empty();
             self.bump_generation(i);
             out.push(letter);
@@ -967,6 +995,8 @@ impl Engine {
                         v.sidecar_overflowed = false;
                         v.sidecar_cursor = v.next_usn;
                         v.sidecar_base = (v.journal_id, v.next_usn);
+                        // P2-14:重扫窗口清空日志,在飞 ack 按世代丢弃。
+                        v.sidecar_epoch = v.sidecar_epoch.wrapping_add(1);
                     }
                     // 重扫会重建/原地更新 slot,旧 Hit 必须失效(H8)
                     self.bump_generation(i);
@@ -1263,6 +1293,7 @@ impl Engine {
                         v.sidecar_overflowed = false;
                         v.sidecar_base = (0, 0);
                         v.sidecar_cursor = 0;
+                        v.sidecar_epoch = v.sidecar_epoch.wrapping_add(1);
                         // 状态显示字段一并重置:旧断点/旧游标时间对已清空的
                         // 卷没有意义(pct 进度条、游标 age 会显示陈旧值)。
                         v.resume_frn = 0;
@@ -1273,20 +1304,22 @@ impl Engine {
                     self.pinyin[i] = PinyinCache::empty();
                     let dir = self.cfg.index_dir.clone();
                     let _ = std::fs::remove_file(snapshot::snapshot_path(&dir, guid));
-                    sidecar::remove(&dir, guid);
+                    // P2-14:删除也排队,避免与在飞 append 竞态留下旧基线文件。
+                    self.enqueue_sidecar_remove(i);
                 }
             }
             EngineMsg::VolumeGone { guid } => {
                 if let Some(i) = self.volumes.iter().position(|v| v.guid == guid) {
                     // 未消化的分批缓冲随卷丢弃
                     self.pending_applies.retain(|p| p.guid != guid);
+                    // P2-14:卷移除前把旁车删除排进写线程队列。
+                    self.enqueue_sidecar_remove(i);
                     // swap_remove:O(1) 收尾。代次跨卷唯一,旧 Hit 的 (vol,generation)
                     // 要么越界、要么代次不符,由访问器的校验拒绝(H8)。
                     self.volumes.swap_remove(i);
                     self.pinyin.swap_remove(i);
                     let dir = self.cfg.index_dir.clone();
                     let _ = std::fs::remove_file(snapshot::snapshot_path(&dir, guid));
-                    sidecar::remove(&dir, guid);
                 }
             }
             EngineMsg::VolumeAppeared { guid, letter } => {
@@ -2588,22 +2621,27 @@ impl Engine {
             }
         }
         let next_at = Instant::now() + Self::save_interval(&self.volumes[i]);
-        let dir = self.cfg.index_dir.clone();
-        let v = &mut self.volumes[i];
-        v.dirty = false;
-        v.save_backoff = 0;
-        v.save_retry_at = Some(next_at);
-        // 全量快照已覆盖全部变更:清旁车日志、基线推进到本次游标、
-        // 删旁车文件(基线守卫兜底删除失败的情形,双保险)。
-        v.sidecar_base = (v.journal_id, v.next_usn);
-        v.sidecar_cursor = v.next_usn;
-        v.sidecar_ops = Vec::new();
-        v.sidecar_flushed = 0;
-        v.sidecar_pending = false;
-        v.sidecar_retry_at = None;
-        v.sidecar_overflowed = false;
-        v.capture_on = true;
-        sidecar::remove(&dir, v.guid);
+        {
+            let v = &mut self.volumes[i];
+            v.dirty = false;
+            v.save_backoff = 0;
+            v.save_retry_at = Some(next_at);
+            // 全量快照已覆盖全部变更:清旁车日志、基线推进到本次游标、
+            // 删旁车文件(基线守卫兜底删除失败的情形,双保险)。
+            v.sidecar_base = (v.journal_id, v.next_usn);
+            v.sidecar_cursor = v.next_usn;
+            v.sidecar_ops = Vec::new();
+            v.sidecar_flushed = 0;
+            v.sidecar_pending = false;
+            v.sidecar_retry_at = None;
+            v.sidecar_overflowed = false;
+            // P2-14:世代 +1,在飞写任务的 ack 归来时按世代丢弃,避免
+            // watch/dir 模式(base 恒 (0,0))下把 flushed 抬回旧值。
+            v.sidecar_epoch = v.sidecar_epoch.wrapping_add(1);
+            v.capture_on = true;
+        }
+        // P2-14:删除也排进写线程队列,避免与在飞 append 的 open/create 竞态。
+        self.enqueue_sidecar_remove(i);
     }
 
     /// 保存失败:保留 dirty,指数退避(H6)。tmp 由 SaveTask::drop 清掉。
@@ -2620,6 +2658,45 @@ impl Engine {
         v.save_retry_at = Some(Instant::now() + Duration::from_secs(secs));
     }
 
+    /// P2-14:把「删除旁车文件」排进写线程队列,与 append 串行执行。
+    ///
+    /// 全量保存清空日志时,写线程可能正拿着旧基线文件做 open/create;
+    /// 若在引擎线程直接 remove,写线程随后的写会把旧文件重新建出来,
+    /// 启动时 base 校验(尤其 watch/dir 模式恒 (0,0))会接受并回放旧 ops。
+    /// 只有写线程已退出(Engine Drop 窗口)才回退直接删除。
+    fn enqueue_sidecar_remove(&mut self, i: usize) {
+        let dir = self.cfg.index_dir.clone();
+        let guid = self.volumes[i].guid;
+        // 单测里没有真实在飞写与并发,直接删以免测试必须等异步 ack。
+        #[cfg(test)]
+        {
+            sidecar::remove(&dir, guid);
+        }
+        #[cfg(not(test))]
+        {
+            let letter = self.volumes[i].letter;
+            let epoch = self.volumes[i].sidecar_epoch;
+            let seq = self.sidecar_writer.next_seq;
+            self.sidecar_writer.next_seq = seq.wrapping_add(1);
+            let Some(tx) = self.sidecar_writer.tx.as_ref() else {
+                sidecar::remove(&dir, guid);
+                return;
+            };
+            let _ = tx.send(SidecarJob {
+                seq,
+                dir,
+                guid,
+                letter,
+                base: (0, 0),
+                cursor: 0,
+                total: 0,
+                ops: Vec::new(),
+                epoch,
+                remove: true,
+            });
+        }
+    }
+
     /// 把旁车日志新增部分交给写盘线程(异步)。返回是否已受理/已推进:
     /// 单测里会等这笔 ack 回来,保持「maintain 返回即落盘」的旧断言语义;
     /// 生产路径立即返回,`sync_data` 的秒级卡顿不再阻塞搜索线程。
@@ -2628,7 +2705,7 @@ impl Engine {
             // 上一笔还没落盘:等它 ack 再追加,避免文件块顺序与 seq 乱序。
             return false;
         }
-        let (guid, letter, base, cursor, ops, total) = {
+        let (guid, letter, base, cursor, ops, total, epoch) = {
             let v = &self.volumes[i];
             let from = v.sidecar_flushed.min(v.sidecar_ops.len());
             (
@@ -2638,6 +2715,7 @@ impl Engine {
                 v.sidecar_cursor,
                 v.sidecar_ops[from..].to_vec(),
                 v.sidecar_ops.len(),
+                v.sidecar_epoch,
             )
         };
         if ops.is_empty() {
@@ -2662,6 +2740,8 @@ impl Engine {
             cursor,
             total,
             ops,
+            epoch,
+            remove: false,
         };
         if tx.send(job).is_err() {
             let v = &mut self.volumes[i];
@@ -2779,13 +2859,20 @@ impl Engine {
             return;
         }
         v.sidecar_inflight = None;
+        if done.epoch != v.sidecar_epoch {
+            // P2-14:全量保存已清空日志并推进世代:这笔 ack 对应的内容已被快照
+            // 覆盖。watch/dir 模式 base 恒 (0,0),不能只靠基线识别陈旧 ack。
+            return;
+        }
         if v.sidecar_base != done.base {
             // 全量保存已清空日志并推进基线:这笔 ack 对应的内容已被快照覆盖。
             return;
         }
         match done.result {
             Ok(()) => {
-                v.sidecar_flushed = done.total;
+                // 防御:P2-14 起把已落盘前缀夹在当前日志长度内,杜绝
+                // 「flushed > ops.len()」导致 from 切空、再也不写盘。
+                v.sidecar_flushed = done.total.min(v.sidecar_ops.len());
                 v.sidecar_pending = v.sidecar_flushed < v.sidecar_ops.len();
                 v.sidecar_retry_at = Some(Instant::now() + SIDECAR_SAVE_INTERVAL);
             }
@@ -3802,6 +3889,57 @@ mod tests {
             "陈旧旁车不得回放"
         );
         assert!(!sidecar::path(&dir, guid).exists(), "陈旧旁车应被删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2-14:全量保存换代后在飞的旁车 ack 不得把 flushed 抬回旧值。
+    ///
+    /// watch/dir 模式 base 恒 (0,0),旧实现只靠 base 判断陈旧;若 append 在飞
+    /// 时全量保存完成,ack 会把 flushed 抬到旧 total(>新 ops.len()),此后
+    /// `from = flushed.min(len)` 切空 → 既不写盘也不触发全量保存。
+    #[test]
+    fn stale_sidecar_ack_is_discarded_by_epoch() {
+        let dir = temp_index_dir("sidecar-epoch");
+        let guid = 0xa6u128;
+        let mut engine = engine_with(&dir);
+        feed_ready(&mut engine, guid, 'C');
+        assert!(engine.maintain());
+
+        {
+            let v = &mut engine.volumes[0];
+            v.sidecar_ops = vec![SidecarOp::Journal {
+                recs: vec![rec_file(100, 10, "a.txt")],
+            }];
+            v.sidecar_flushed = 0;
+            v.sidecar_base = (0, 0);
+            v.sidecar_inflight = Some(7);
+            v.sidecar_epoch = 3;
+        }
+        engine.apply_sidecar_ack(SidecarDone {
+            seq: 7,
+            guid,
+            base: (0, 0),
+            total: 1,
+            result: Ok(()),
+            epoch: 2, // 全量保存已把世代推进到 3
+        });
+        assert_eq!(
+            engine.volumes[0].sidecar_flushed, 0,
+            "旧世代 ack 不得把 flushed 抬回"
+        );
+        assert_eq!(engine.volumes[0].sidecar_inflight, None, "ack 仍应清在飞标记");
+
+        // 防御:同世代但 total 超长时夹到当前日志长度。
+        engine.volumes[0].sidecar_inflight = Some(8);
+        engine.apply_sidecar_ack(SidecarDone {
+            seq: 8,
+            guid,
+            base: (0, 0),
+            total: 99,
+            result: Ok(()),
+            epoch: 3,
+        });
+        assert_eq!(engine.volumes[0].sidecar_flushed, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

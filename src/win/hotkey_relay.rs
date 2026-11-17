@@ -17,8 +17,8 @@ use windows::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, OpenEventW, OpenProcess, OpenProcessToken, SetEvent, WaitForSingleObject,
-    EVENT_MODIFY_STATE, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateEventW, GetCurrentProcess, OpenEventW, OpenProcess, OpenProcessToken, SetEvent,
+    WaitForSingleObject, EVENT_MODIFY_STATE, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -230,4 +230,31 @@ pub(crate) fn foreground_is_elevated() -> bool {
         let _ = CloseHandle(token);
         queried && elevation.TokenIsElevated != 0
     }
+}
+
+/// P2-15：本进程是否以提权身份运行（结果缓存）。
+///
+/// 提权进程安装的 LL 钩子不受 UIPI 限制，「前台是管理员窗口」对它不是合法
+/// 失明理由；只有普通进程才需要套用前台豁免。该查询只在 watchdog tick
+/// （30s 级）里用一次，缓存避免重复开令牌。
+pub(crate) fn process_is_elevated() -> bool {
+    static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ELEVATED.get_or_init(|| unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut size = 0u32;
+        let queried = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        queried && elevation.TokenIsElevated != 0
+    })
 }

@@ -10,8 +10,11 @@
 //! - compact（要求后面有空白，空格后提交）：
 //!   `date:>2026-11-10 ` / `dm:2026-11-01..2026-11-30 ` / `size:>10M `
 //! - 路径（收成路径 chip，走索引递归搜子树）：
-//!   `path:D:\work ` / `path:D:\work:`（空格或冒号提交）、
-//!   `path:"C:\Program Files"`（带空格用引号，右引号即提交）。
+//!   `path:D:\work:`（冒号提交）/ 回车提交（冒号补在路径 token 末尾，
+//!   其后的词仍作为搜索词）；`path:"C:\Program Files"`（带空格用引号，
+//!   右引号即提交）。
+//!   P2-5：裸路径不再用空格提交——逐字输入时无法区分「路径里的空格」
+//!   与「搜索词分界」（`path:C:\Program ` 后还会继续打 `Files`）。
 //! - 字段别名：date / dm / mtime / 日期 / 时间 / 修改时间；
 //!   size / 大小 / 文件大小。
 //! - 日期格式：`YYYY-MM-DD`（也接受 `/`、`.` 分隔）；大小单位
@@ -385,7 +388,7 @@ pub fn composing_hint(raw: &str) -> &'static str {
         }
         Some((_, _, _, FieldKind::Size)) => "冒号或回车提交；单位 B/KB/MB/GB/TB，如 10M、1.5GB",
         Some((_, _, _, FieldKind::Path)) => {
-            "空格或回车提交；路径可写成 path:D:\\work，带空格用 path:\"C:\\Program Files\""
+            "回车或冒号提交；带空格可写成 path:\"C:\\Program Files\"，未加引号时回车会按已存在路径补齐"
         }
         None => "冒号或回车提交，例如 date>2026-11-10: / size>10M: / C:",
     }
@@ -454,7 +457,9 @@ fn parse_from(
 /// 解析一条路径条件：`path:D:\work` / `path:D:\work:` / `path:"C:\Program Files"`。
 ///
 /// 提交规则（与日期/大小的“打到一半不收”一致）：
-/// - 裸路径：后面必须跟空白或终结冒号才提交，行尾不提交（用户可能还在补字）；
+/// - 裸路径：只有终结冒号才提交；空格/行尾都不提交（用户可能还在补字，
+///   例如 `path:C:\Program ` 后面还会打 `Files`）。回车由 UI 调
+///   [`terminate_last_path`] 把冒号补到路径 token 末尾；
 /// - 引号路径：右引号本身就是终结符（可再跟空白/冒号），行尾直接提交。
 ///
 /// 空值/未闭合引号返回 `Err(None)`（= 仍在输入，配合 `is_composing` 暂停查询）；
@@ -539,10 +544,11 @@ fn parse_path_from(
         }
     };
 
-    // 还没终结：后面必须是空白或终结冒号（冒号并入片段）；行尾仍算输入中。
+    // 还没终结：只有终结冒号能提交（P2-5：裸路径不再用空格提交——逐字
+    // 输入 `path:C:\Program ` 时后续还会补 `Files`；回车由
+    // [`terminate_last_path`] 把冒号补到路径 token 末尾）。行尾仍算输入中。
     if !terminated {
         match raw[end..].chars().next() {
-            Some(c) if c.is_whitespace() => terminated = true,
             Some(':') | Some('：') => {
                 end += colon_len(raw, end).unwrap_or(0);
                 terminated = true;
@@ -563,6 +569,62 @@ fn parse_path_from(
         )));
     }
     Ok((end, PathBuf::from(value)))
+}
+
+/// P2-5：回车提交时，把终结冒号插到最后一个裸路径 token 的末尾，而不是
+/// 整段输入末尾。这样 `path:D:\work 报告` 回车得到 `path:D:\work: 报告`
+///（路径 chip + 搜索词「报告」），既不会把冒号留进后面的搜索词，也不会
+/// 在只打了 `path:C:\Program ` 时把半截路径收掉。
+///
+/// 返回 `None` = 不需要/无法补冒号（引号路径、token 末尾已经带冒号、只打
+/// 了 `path:`、或补了也解析不出新路径）。
+pub fn terminate_last_path(raw: &str) -> Option<String> {
+    // 找最后一个 `path:` 紧凑字段。条件通常打在末尾附近；与 extract 用
+    // 同一套边界/字段扫描，保证「补了冒号确实多解析出一条路径」。
+    let mut found: Option<usize> = None; // 裸路径 token 末尾
+    for (idx, _) in raw.char_indices() {
+        if !is_boundary(raw, idx) {
+            continue;
+        }
+        let Some((field_len, compact, FieldKind::Path)) = field_at(raw, idx) else {
+            continue;
+        };
+        if !compact {
+            continue;
+        }
+        let Some(colon) = colon_len(raw, idx + field_len) else {
+            continue;
+        };
+        let value_start = idx + field_len + colon;
+        // 引号路径右引号即终结符，不需要补。
+        if raw[value_start..].starts_with('"') {
+            continue;
+        }
+        let stop = raw[value_start..]
+            .find(char::is_whitespace)
+            .map(|offset| value_start + offset)
+            .unwrap_or(raw.len());
+        let stop = extend_bare_path(raw, value_start, stop);
+        if stop == value_start {
+            continue;
+        }
+        let token = &raw[value_start..stop];
+        if token.ends_with([':', '：']) {
+            continue;
+        }
+        let trimmed = token.trim_end_matches([':', '：']);
+        if trimmed.is_empty() || !is_path_value(trimmed) {
+            continue;
+        }
+        found = Some(stop);
+    }
+    let stop = found?;
+    let mut candidate = String::with_capacity(raw.len() + 1);
+    candidate.push_str(&raw[..stop]);
+    candidate.push(':');
+    candidate.push_str(&raw[stop..]);
+    // 只有确实因此多解析出一条路径才采用，避免动到 `path:` 半截字段。
+    (extract(&candidate).paths.len() > extract(raw).paths.len()).then_some(candidate)
 }
 
 /// 路径条件只收本地盘符路径（`D:` / `D:\...`）与 UNC（`\\server\share`）：
@@ -1891,12 +1953,14 @@ mod tests {
 
     #[test]
     fn path_condition_parses_with_terminator() {
-        // 空格 / 终结冒号都提交；片段从输入里删除。
+        // P2-5：裸路径不再用空格提交（逐字输入 `path:C:\Program ` 后
+        // 还可能继续打 `Files`）；空格后的输入保持 composing。
         let out = extract("path:D:\\work ");
-        assert_eq!(out.paths, vec![PathBuf::from("D:\\work")]);
-        assert_eq!(out.cleaned, "");
+        assert!(out.paths.is_empty());
         assert!(out.errors.is_empty());
+        assert!(is_composing("path:D:\\work "));
 
+        // 终结冒号提交；片段从输入里删除。
         let out = extract("path:D:\\work:");
         assert_eq!(out.paths, vec![PathBuf::from("D:\\work")]);
         assert_eq!(out.cleaned, "");
@@ -1911,12 +1975,12 @@ mod tests {
         assert_eq!(out.paths, vec![PathBuf::from("C:\\Program Files")]);
 
         // 与其它查询词共存：只删自己的片段（ext: 由 query::parse 负责，不动）。
-        let out = extract("report path:D:\\work ext:rs");
+        let out = extract("report path:D:\\work: ext:rs");
         assert_eq!(out.paths, vec![PathBuf::from("D:\\work")]);
         assert_eq!(out.cleaned, "report ext:rs");
 
         // 多个 path：按出现顺序全部收下，由 UI 取最后一个（后者覆盖）。
-        let out = extract("path:D:\\a path:E:\\b ");
+        let out = extract("path:D:\\a: path:E:\\b:");
         assert_eq!(
             out.paths,
             vec![PathBuf::from("D:\\a"), PathBuf::from("E:\\b")]
@@ -1925,33 +1989,78 @@ mod tests {
 
     #[test]
     fn bare_path_with_spaces_extends_only_when_path_exists() {
-        // B7：`path:C:\Program Files` 未打引号时，整串若真实存在就整体作为
-        // 路径；不存在则保持「空格后是搜索词」的原语义。
+        // B7/P2-5：`path:C:\Program Files` 未打引号时，整串若真实存在就整体
+        // 作为路径（冒号提交）；只打空格不再提前收 chip，整串不存在的尾词
+        // 仍按搜索词处理。
         let root = std::env::temp_dir().join("lstr-cond-space-path");
         let dir = root.join("Program Files");
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        let input = format!("path:{} ", dir.display());
+        let input = format!("path:{}:", dir.display());
         let out = extract(&input);
         assert_eq!(out.paths, vec![dir.clone()], "{input:?}");
         assert_eq!(out.cleaned, "");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
 
-        let out = extract("path:D:\\work 报告");
+        // 空白后的词拼不成真实路径 → 不并入路径，保持搜索词。
+        let out = extract("path:D:\\work: 报告");
         assert_eq!(out.paths, vec![PathBuf::from("D:\\work")]);
         assert_eq!(out.cleaned, "报告");
+        // 没有终结冒号时仍 composing（P2-5：空格不再提交）。
+        assert!(extract("path:D:\\work 报告").paths.is_empty());
+        assert!(is_composing("path:D:\\work 报告"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
+    fn terminate_last_path_inserts_colon_after_bare_path() {
+        // P2-5：回车时冒号补在裸路径 token 末尾，后面的词仍作为搜索词。
+        let root = std::env::temp_dir().join("lstr-cond-enter-path");
+        let dir = root.join("Program Files");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let input = format!("path:{} 报告", dir.display());
+        let fixed = terminate_last_path(&input).expect("terminate");
+        assert_eq!(fixed, format!("path:{}: 报告", dir.display()));
+        let out = extract(&fixed);
+        assert_eq!(out.paths, vec![dir.clone()]);
+        assert_eq!(out.cleaned, "报告");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 不存在的尾词同样只补在已识别 token 末尾。
+        let fixed = terminate_last_path("path:D:\\work 报告").expect("terminate");
+        assert_eq!(fixed, "path:D:\\work: 报告");
+        let out = extract(&fixed);
+        assert_eq!(out.paths, vec![PathBuf::from("D:\\work")]);
+        assert_eq!(out.cleaned, "报告");
+        // 路径在中间、后面还有其它查询词。
+        assert_eq!(
+            terminate_last_path("report path:D:\\work ext:rs").expect("terminate"),
+            "report path:D:\\work: ext:rs"
+        );
+
+        // 引号路径/已带终结冒号/半截字段都不需要补。
+        assert!(terminate_last_path("path:\"C:\\Program Files\"").is_none());
+        assert!(terminate_last_path("path:D:\\work:").is_none());
+        assert!(terminate_last_path("path:").is_none());
+    }
+
+    #[test]
     fn path_condition_is_composing_until_terminated() {
-        // 还在输入（无终结符）→ 暂停查询，不产生 chip。
-        for input in ["path:", "PATH:", "C: path:", "path:D:\\work", "path:\"C:\\Program"] {
+        // 还在输入（无终结符）→ 暂停查询，不产生 chip。P2-5：空白也不再提交。
+        for input in [
+            "path:",
+            "PATH:",
+            "C: path:",
+            "path:D:\\work",
+            "path:D:\\work ",
+            "path:D:\\work 报告",
+            "path:\"C:\\Program",
+        ] {
             assert!(is_composing(input), "{input:?} 应暂停查询");
             assert!(extract(input).paths.is_empty(), "{input:?} 不应提交");
         }
         // 提交后不再暂停。
-        for input in ["path:D:\\work ", "path:D:\\work:", "path:\"C:\\Program Files\""] {
+        for input in ["path:D:\\work:", "path:\"C:\\Program Files\""] {
             assert!(!is_composing(input), "{input:?} 不应暂停");
         }
         // 没给终结符时值不完整也不报错（可能还在打）。
@@ -1960,14 +2069,14 @@ mod tests {
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert!(is_composing("path:work"));
         // 明确写错（已终结但不是本地路径/UNC）→ 错误态，原文保留。
-        let out = extract("path:work ");
+        let out = extract("path:work:");
         assert!(out.paths.is_empty());
         assert!(out.errors[0].contains("路径无效"), "{:?}", out.errors);
-        assert!(!is_composing("path:work "));
+        assert!(!is_composing("path:work:"));
 
         assert_eq!(
             composing_hint("path:"),
-            "空格或回车提交；路径可写成 path:D:\\work，带空格用 path:\"C:\\Program Files\""
+            "回车或冒号提交；带空格可写成 path:\"C:\\Program Files\"，未加引号时回车会按已存在路径补齐"
         );
     }
 
