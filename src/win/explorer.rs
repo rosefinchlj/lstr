@@ -8,19 +8,24 @@
 //! 不用「窗口标题 ≈ 目录名」猜——同名目录（两个 src）会串错，而 HWND 不会。
 
 use std::mem::ManuallyDrop;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use windows::core::{Interface, BSTR};
+use windows::core::{Interface, BSTR, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, RPC_E_CHANGED_MODE};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
-    IDispatch,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IServiceProvider, CLSCTX_ALL,
+    COINIT_APARTMENTTHREADED, IDispatch,
 };
 use windows::Win32::System::Variant::{
     VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4,
 };
-use windows::Win32::UI::Shell::{IShellWindows, IWebBrowser2, ShellWindows};
+use windows::Win32::UI::Shell::{
+    IFolderView, IShellBrowser, IShellFolder, IShellWindows, IWebBrowser2, SHParseDisplayName,
+    ShellWindows, SBSP_ABSOLUTE, SID_STopLevelBrowser, SVGIO_BACKGROUND, SVSI_DESELECTOTHERS,
+    SVSI_ENSUREVISIBLE, SVSI_SELECT,
+};
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetForegroundWindow, GetWindowTextW,
 };
@@ -59,34 +64,33 @@ pub fn active_explorer_folder() -> Option<PathBuf> {
     last_folder().lock().ok().and_then(|guard| guard.clone())
 }
 
-/// 前台 Explorer 窗口的目录：先按 HWND 精确匹配 ShellWindows，
-/// 匹配不到再按窗口标题兜底；仍失败返回 None（表示退到全局搜索，不用旧缓存）。
-/// 只在「键入即搜」吞下第一个字符时调用一次，此时前台还是资源管理器。
-pub fn foreground_explorer_folder() -> Option<PathBuf> {
+/// 前台 Explorer 的锚点：窗口句柄 + 当前目录（贴角浮层用）。
+///
+/// 只在「键盘钩子吞下第一个字符」的那一刻调用：此刻前台还是资源管理器，
+/// 一旦 lstr 抢到前台，`GetForegroundWindow` 就变成 lstr 自己，锚点窗口
+/// 再也找不回来。
+///
+/// 返回的 HWND 用于：浮层贴右下角的几何锚定、跟随窗口移动，以及收起时
+/// 把前台交还给它。目录解析失败（此电脑/回收站/控制面板等虚拟位置）时
+/// 返回 None，退化回普通居中启动器。
+pub fn foreground_explorer_anchor() -> Option<(isize, PathBuf)> {
     let handle = unsafe { GetForegroundWindow() };
     let hwnd = handle.0 as isize;
     if hwnd == 0 {
-        log_explorer("no foreground window");
-        return active_explorer_folder();
+        log_explorer("anchor: no foreground window");
+        return None;
     }
     let title = window_title(handle);
     let resolved = with_com(|| unsafe { resolve_foreground(hwnd, &title) }).flatten();
-    if let Some((matched_hwnd, folder)) = resolved {
-        log_explorer(&format!(
-            "resolved hwnd={matched_hwnd} folder={}",
-            folder.display()
-        ));
-        remember(matched_hwnd, &folder);
-        return Some(folder);
-    }
-    // 「此电脑」/回收站/控制面板等虚拟位置以及桌面都没有真实目录。
-    // 这里绝不能回退到 LAST_FOLDER 缓存：那会把上一次浏览的路径冒充当前路径，
-    // 让键入即搜显示错误的目录提示、还按旧目录过滤结果。缓存只服务于
-    // 对话框模式（前台已不是 Explorer 时的 Ctrl+G / Quick Switch）。
+    let (matched_hwnd, folder) = resolved?;
     log_explorer(&format!(
-        "no match (hwnd={hwnd}, title={title}) -> global search"
+        "anchor hwnd={hwnd} matched={matched_hwnd} folder={}",
+        folder.display()
     ));
-    None
+    remember(matched_hwnd, &folder);
+    // 用 ShellWindows 匹配到的 HWND 而不是 GetForegroundWindow 的返回值：
+    // 少数情况下前台是 Explorer 的子窗口/弹层，只有前者是能贴边的 frame。
+    Some((matched_hwnd, folder))
 }
 
 /// 从 Explorer 窗口标题解析「活动标签名」。
@@ -192,15 +196,29 @@ fn log_explorer(line: &str) {
 /// 让「原来那个」资源管理器窗口导航到指定文件夹，不新开窗口。
 /// 找不到窗口（已关闭 / 桌面 / 虚拟位置）时返回 Err，由调用方降级为普通打开。
 pub fn navigate_active_to(folder: &str) -> Result<(), String> {
-    let Some(hwnd) = active_hwnd_slot()
-        .lock()
-        .ok()
-        .and_then(|guard| *guard)
-    else {
-        log_explorer("navigate failed: no active Explorer HWND recorded");
-        return Err("没有记录的资源管理器窗口".to_string());
+    navigate_to(None, folder)
+}
+
+/// 让**指定** HWND 的资源管理器窗口就地跳到 `folder`（贴角浮层专用）。
+///
+/// 贴角模式在触发那一刻就拿到了锚点窗口的 HWND（`foreground_explorer_anchor`），
+/// 直接按它匹配，不再依赖「上次记录的活动窗口」——用户中途点过别的资源管理器
+/// 也不会跳错窗口。
+pub fn navigate_hwnd_to(hwnd: isize, folder: &str) -> Result<(), String> {
+    navigate_to(Some(hwnd), folder)
+}
+
+fn navigate_to(target_hwnd: Option<isize>, folder: &str) -> Result<(), String> {
+    let hwnd = match target_hwnd {
+        Some(hwnd) => hwnd,
+        None => match active_hwnd_slot().lock().ok().and_then(|guard| *guard) {
+            Some(hwnd) => hwnd,
+            None => {
+                log_explorer("navigate failed: no active Explorer HWND recorded");
+                return Err("没有记录的资源管理器窗口".to_string());
+            }
+        },
     };
-    let url = path_to_file_url(folder);
     // 记录时的活动目录：标签页窗口里用它挑出「活动标签」那个浏览器
     // （同 HWND 的多个标签共享顶层窗口，只按 HWND 取第一个会跳到非活动标签）。
     let remembered = last_folder().lock().ok().and_then(|guard| guard.clone());
@@ -252,16 +270,225 @@ pub fn navigate_active_to(folder: &str) -> Result<(), String> {
         let Ok(browser): Result<IWebBrowser2, _> = dispatch.cast() else {
             return Err("目标资源管理器窗口已关闭".to_string());
         };
-        let target = BSTR::from(url.as_str());
-        let result = browser
-            .Navigate(&target, None, None, None, None)
-            .map_err(|err| format!("资源管理器跳转失败: {err}"));
+        // 首选 shell 命名空间的 BrowseObject(PIDL)：绕开 URL 编码层。
+        // IWebBrowser2::Navigate 的 %XX 转义在 explorer 里按 ANSI 代码页解码，
+        // 中文目录会变成乱码并弹出「无法找到 file:///…」（实测
+        // D:\Program Files (x86)\方直金太阳教师版…），结果落到新开窗口兜底。
+        // PIDL 是 shell 原生标识，任意 Unicode 都原样命中，也不会新开窗口。
+        let result = match browse_object_to(&browser, Path::new(folder)) {
+            Ok(()) => Ok(()),
+            Err(browse_err) => {
+                log_explorer(&format!(
+                    "navigate browse failed: {browse_err}; fallback to raw url"
+                ));
+                navigate_raw_url(&browser, folder)
+            }
+        };
         log_explorer(&format!(
-            "navigate hwnd={hwnd} tab={chosen} url={url} result={result:?}"
+            "navigate hwnd={hwnd} tab={chosen} folder={folder} result={result:?}"
         ));
         result
     })
     .unwrap_or_else(|| Err("COM 初始化失败".to_string()))
+}
+
+/// 用 PIDL 让指定资源管理器窗口就地跳转（贴角浮层 / Ctrl+G 共用）。
+unsafe fn browse_object_to(browser: &IWebBrowser2, folder: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = folder
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+    SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None)
+        .map_err(|err| format!("SHParseDisplayName 失败: {err}"))?;
+    if pidl.is_null() {
+        return Err("SHParseDisplayName 返回空 PIDL".to_string());
+    }
+    let outcome = (|| {
+        let provider: IServiceProvider = browser
+            .cast()
+            .map_err(|err| format!("IServiceProvider 失败: {err}"))?;
+        let shell_browser: IShellBrowser = provider
+            .QueryService(&SID_STopLevelBrowser)
+            .map_err(|err| format!("QueryService 失败: {err}"))?;
+        shell_browser
+            .BrowseObject(pidl, SBSP_ABSOLUTE)
+            .map_err(|err| format!("BrowseObject 失败: {err}"))
+    })();
+    CoTaskMemFree(Some(pidl as *const core::ffi::c_void));
+    outcome
+}
+
+/// 兜底：用**不转义**的 file:// URL 调 Navigate。
+///
+/// 不能用 `path_to_file_url` 的 %XX 形式：explorer 的 Navigate 会按 ANSI 代码页
+/// 解码转义，中文目录变成乱码后弹「无法找到」。BSTR 本身是 UTF-16，未转义的
+/// Unicode 路径能原样送达（#/?/% 等少见字符可能出问题，所以只作兜底）。
+fn navigate_raw_url(browser: &IWebBrowser2, folder: &str) -> Result<(), String> {
+    let url = raw_file_url(folder);
+    // 四个 VARIANT* 必须传真实 VARIANT：IWebBrowser2 跨进程（explorer.exe）
+    // 代理会把 NULL 指针判成坏参数，返回 RPC_X_BAD_STUB_DATA(0x800706F4)，
+    // 跳转就静默失败、结果落到 shell::open_entry 又开出一个新窗口。
+    // 传 VT_EMPTY 的 VARIANT 与「省略参数」语义等价，实测可用。
+    let target = BSTR::from(url.as_str());
+    let empty = VARIANT::default();
+    unsafe {
+        browser
+            .Navigate(
+                &target,
+                Some(&empty as *const VARIANT),
+                Some(&empty as *const VARIANT),
+                Some(&empty as *const VARIANT),
+                Some(&empty as *const VARIANT),
+            )
+            .map_err(|err| format!("资源管理器跳转失败: {err}"))
+    }
+}
+
+/// 让资源管理器活动标签的选中项跟着贴角浮层走（Listary 的联动行为）。
+///
+/// 只同步「当前目录的直接子项」：深层结果在资源管理器里不可见，强行同步只会
+/// 把选中项跳到祖先目录上，反而打断用户。任何一步失败都静默返回 false——
+/// 这是增强项，不能影响输入、打开等主流程。
+pub fn select_in_explorer(hwnd: isize, path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    let name = name.to_string_lossy().to_string();
+    let result = with_com(|| unsafe { select_in_explorer_inner(hwnd, parent, &name) })
+        .unwrap_or(Err("COM 初始化失败"));
+    match result {
+        Ok(()) => {
+            log_explorer(&format!(
+                "select hwnd={hwnd} path={} result=ok",
+                path.display()
+            ));
+            true
+        }
+        Err(reason) => {
+            // 失败路径也记一行：联动是静默降级的，没有日志就没法排查
+            // 「为什么资源管理器没跟着选中」。
+            log_explorer(&format!(
+                "select hwnd={hwnd} path={} result={reason}",
+                path.display()
+            ));
+            false
+        }
+    }
+}
+
+unsafe fn select_in_explorer_inner(
+    hwnd: isize,
+    parent: &Path,
+    name: &str,
+) -> Result<(), &'static str> {
+    let Ok(shell_windows): Result<IShellWindows, _> =
+        CoCreateInstance(&ShellWindows, None, CLSCTX_ALL)
+    else {
+        return Err("no-shellwindows");
+    };
+    // 多标签窗口：同一个 HWND 下每个标签各有一个 IWebBrowser2，只有「正显示
+    // 我们搜索目录」的那个才是活动标签。目录对不上就不动手（用户可能切走了）。
+    let count = shell_windows.Count().unwrap_or(0).max(0);
+    let mut active_browser: Option<IWebBrowser2> = None;
+    for index in 0..count.min(64) {
+        let Ok(dispatch) = shell_windows.Item(&int_variant(index)) else {
+            continue;
+        };
+        let Ok(browser): Result<IWebBrowser2, _> = dispatch.cast() else {
+            continue;
+        };
+        let Ok(window_hwnd) = browser.HWND() else {
+            continue;
+        };
+        if window_hwnd.0 != hwnd {
+            continue;
+        }
+        let Some(folder) = browser
+            .LocationURL()
+            .ok()
+            .and_then(|url| folder_path_from_url(&url.to_string()))
+        else {
+            continue;
+        };
+        if same_folder(&folder, parent) {
+            active_browser = Some(browser);
+            break;
+        }
+    }
+    let Some(browser) = active_browser else {
+        return Err("folder-mismatch");
+    };
+    let Ok(provider) = browser.cast::<IServiceProvider>() else {
+        return Err("no-service-provider");
+    };
+    let Ok(shell_browser) = provider.QueryService::<IShellBrowser>(&SID_STopLevelBrowser) else {
+        return Err("no-shell-browser");
+    };
+    let Ok(view) = shell_browser.QueryActiveShellView() else {
+        return Err("no-shell-view");
+    };
+    let Some(folder_obj) = shell_folder_of(&view) else {
+        return Err("no-shell-folder");
+    };
+    let wide = HSTRING::from(name);
+    let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+    if folder_obj
+        .ParseDisplayName(
+            HWND::default(),
+            None,
+            &wide,
+            None,
+            &mut pidl,
+            std::ptr::null_mut(),
+        )
+        .is_err()
+    {
+        return Err("no-pidl");
+    }
+    if pidl.is_null() {
+        return Err("null-pidl");
+    }
+    // 不带 SVSI_FOCUSED：那会把前台从贴角浮层抢回资源管理器，触发我们自己的
+    // 失焦收起。只改选中项 + 滚入视野，键盘焦点仍留在浮层输入框。
+    let flags = (SVSI_SELECT.0 | SVSI_DESELECTOTHERS.0 | SVSI_ENSUREVISIBLE.0) as u32;
+    let ok = view.SelectItem(pidl, flags).is_ok();
+    CoTaskMemFree(Some(pidl as *const core::ffi::c_void));
+    if ok {
+        Ok(())
+    } else {
+        Err("selectitem-failed")
+    }
+}
+
+/// 从活动视图拿当前文件夹的 IShellFolder。
+///
+/// 正常路径是 `IShellView::GetItemObject(SVGIO_BACKGROUND, IID_IShellFolder)`；
+/// 少数视图（缩略图/预览等非 DefView 包装）上 GetItemObject 会失败，退回
+/// `IFolderView::GetFolder`——两条路拿到的是同一个文件夹对象。
+unsafe fn shell_folder_of(view: &windows::Win32::UI::Shell::IShellView) -> Option<IShellFolder> {
+    if let Ok(folder) = view.GetItemObject::<IShellFolder>(SVGIO_BACKGROUND) {
+        return Some(folder);
+    }
+    let folder_view = view.cast::<IFolderView>().ok()?;
+    folder_view.GetFolder::<IShellFolder>().ok()
+}
+
+/// 目录比较：忽略大小写与结尾分隔符（`F:\C下载` vs `F:\c下载\`）。
+fn same_folder(folder: &str, expected: &Path) -> bool {
+    let normalized = |value: &str| {
+        value
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    };
+    let expected = expected.to_string_lossy();
+    normalized(folder) == normalized(&expected)
 }
 
 /// 每帧调用一次：只有「前台窗口是 Explorer 且窗口标题变化」时才做一次
@@ -392,25 +619,18 @@ fn folder_path_from_url(url: &str) -> Option<String> {
     Some(text.replace('/', "\\"))
 }
 
-/// 本地路径 → file:/// URL（Navigate 用）。逐字节百分号编码，中文/空格都安全。
-/// UNC `\\server\share` 走 `file://server/share` 分支。
-fn path_to_file_url(folder: &str) -> String {
+/// 本地路径 → **不转义**的 file:// URL（Navigate 兜底用）。
+///
+/// 故意不做 %XX 百分号编码：explorer 的 `Navigate` 会按 ANSI 代码页解码转义，
+/// 中文目录会变成乱码并弹「无法找到」；BSTR 本身是 UTF-16，未转义的 Unicode
+/// 路径能原样送达。UNC `\\server\share` 走 `file://server/share` 分支。
+fn raw_file_url(folder: &str) -> String {
     let normalized = folder.replace('\\', "/");
-    let (prefix, rest) = if let Some(share) = normalized.strip_prefix("//") {
-        ("file://", share)
+    if let Some(share) = normalized.strip_prefix("//") {
+        format!("file://{share}")
     } else {
-        ("file:///", normalized.trim_start_matches('/'))
-    };
-    let mut out = String::from(prefix);
-    for byte in rest.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
+        format!("file:///{}", normalized.trim_start_matches('/'))
     }
-    out
 }
 
 /// ShellWindows::Item 只吃 VARIANT 索引，手工构造 VT_I4。
@@ -473,18 +693,13 @@ mod tests {
     }
 
     #[test]
-    fn local_paths_encode_to_file_urls() {
-        assert_eq!(path_to_file_url("E:\\use\\ai"), "file:///E:/use/ai");
+    fn file_urls_keep_unicode_unescaped() {
+        // Navigate 走的是「不转义」URL：转义形式会被 explorer 按 ANSI 代码页解码。
+        assert_eq!(raw_file_url("E:\\use\\ai"), "file:///E:/use/ai");
+        assert_eq!(raw_file_url("C:\\Program Files"), "file:///C:/Program Files");
+        assert_eq!(raw_file_url("D:\\中文"), "file:///D:/中文");
         assert_eq!(
-            path_to_file_url("C:\\Program Files"),
-            "file:///C:/Program%20Files"
-        );
-        assert_eq!(
-            path_to_file_url("D:\\中文"),
-            "file:///D:/%E4%B8%AD%E6%96%87"
-        );
-        assert_eq!(
-            path_to_file_url("\\\\server\\share\\dir"),
+            raw_file_url("\\\\server\\share\\dir"),
             "file://server/share/dir"
         );
     }
@@ -512,5 +727,27 @@ mod tests {
         assert_eq!(active_tab_name("程序和功能"), "程序和功能");
         // 目录名本身含「 和 」但非多标签格式：原样保留
         assert_eq!(active_tab_name("A 和 B"), "A 和 B");
+    }
+
+    #[test]
+    fn same_folder_ignores_case_and_trailing_separator() {
+        let expected = std::path::Path::new("F:\\C下载");
+        assert!(same_folder("F:\\C下载", expected));
+        assert!(same_folder("f:\\c下载", expected));
+        assert!(same_folder("F:\\C下载\\", expected));
+        assert!(!same_folder("F:\\C下载\\子目录", expected));
+        assert!(!same_folder("F:\\C下载2", expected));
+        let drive = std::path::Path::new("H:\\");
+        assert!(same_folder("H:\\", drive));
+        assert!(!same_folder("H:\\子目录", drive));
+        // 大小写不同的目录名在 Windows 上是同一个目录，比较必须同规则。
+        let expected = std::path::Path::new("C:\\Users\\Jun.Liu\\Pictures");
+        assert!(same_folder("C:\\Users\\jun.liu\\Pictures", expected));
+    }
+
+    #[test]
+    fn select_in_explorer_rejects_relative_paths() {
+        // 只有文件名、没有父目录的条目（例如命令/应用结果）不参与资源管理器联动。
+        assert!(!select_in_explorer(0, std::path::Path::new("chrome.exe")));
     }
 }

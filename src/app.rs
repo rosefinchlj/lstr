@@ -303,6 +303,36 @@ const DRIVE_WEIGHT_W: f32 = 160.0;
 /// 第一次唤出时替代「搜索技巧」面板；点「开始使用」后永久切回技巧面板。
 const WELCOME_H: f32 = 196.0;
 
+/// 贴角浮层（Explorer 右下角）几何：按 Listary 文件管理器模式截图实测。
+/// 宽度 440、结果行 32、输入行 40；列表在上、输入行贴底，右侧与底边贴住
+/// Explorer 窗口的可见边缘。普通启动器仍用主题的 row_height/width，互不影响。
+const ATTACH_W: f32 = 440.0;
+const ATTACH_ROW_H: f32 = 32.0;
+const ATTACH_INPUT_H: f32 = 40.0;
+/// 一屏最多显示的候选行数（参考截图 9 行；再多靠滚轮）。
+const ATTACH_MAX_ROWS: usize = 9;
+/// 结果区与输入行之间的 1px 分隔线。
+const ATTACH_DIVIDER: f32 = 1.0;
+/// 贴角模式允许的最小高度（普通启动器是 160）：只有一条结果时应能收成
+/// 一条窄条，而不是留一大片空白。= 1 行 + 分隔线 + 输入行。
+const ATTACH_MIN_H: f32 = ATTACH_ROW_H + ATTACH_DIVIDER + ATTACH_INPUT_H;
+/// 选中项完整路径状态行：路径列只有一列宽、长路径必须省略，选中/悬停时
+/// 用这条可换行的状态行补出完整路径。最多 5 行，避免超长路径把浮层撑高。
+const ATTACH_NAME_FONT: f32 = 13.0;
+const ATTACH_PATH_FONT: f32 = 11.0;
+const ATTACH_STATUS_FONT: f32 = 11.0;
+/// 名称列起点（图标右缘 30px + 8px 间距）。
+const ATTACH_NAME_X: f32 = 38.0;
+/// 右侧路径列与浮层右缘的距离（给滚动条让位）。
+const ATTACH_PATH_RIGHT_PAD: f32 = 12.0;
+/// 贴角行右侧路径列的最小宽度：文件名再长也只挤到这里，路径尽量完整显示。
+const ATTACH_PATH_MIN_W: f32 = 90.0;
+/// 贴角行里文件名列与路径列之间的间距。
+const ATTACH_COL_GAP: f32 = 12.0;
+const ATTACH_STATUS_PAD_TOP: f32 = 4.0;
+const ATTACH_STATUS_PAD_BOTTOM: f32 = 5.0;
+const ATTACH_STATUS_MAX_LINES: usize = 5;
+
 /// 搜索框左侧条件 chip 的宽度（不绘制）。`label` 为空 = 紧凑模式（只画值）。
 /// `dense` = 多个条件时的缩小版（字号/内边距/高度都更小）。
 fn condition_chip_width(painter: &egui::Painter, label: &str, value: &str, dense: bool) -> f32 {
@@ -1715,6 +1745,31 @@ pub struct LstrApp {
     typing_folder: Option<std::path::PathBuf>,
     /// 目录上下文里临时切到全局搜索（Ctrl+Shift+G）。
     typing_global: bool,
+    /// 贴角浮层锚定的 Explorer 顶层窗口句柄（None = 普通居中启动器）。
+    attach_hwnd: Option<isize>,
+    /// 上一次摆放时锚点 Explorer 的可见边框（物理像素）：没变就不重摆。
+    attach_last: Option<[i32; 4]>,
+    /// 上一次摆放用的窗口物理尺寸：结果数变化（高度变化）时也要重摆。
+    attach_px: Option<(i32, i32)>,
+    /// 上一次同步给资源管理器的选中项（结果下标 + 路径）：只在换行时发 COM。
+    attach_sel: Option<(usize, std::path::PathBuf)>,
+    /// 贴角浮层顶部状态行的高度槽位（点）。本次浮层会话内只增不减：
+    /// 窗口尺寸是 SetWindowPos 异步生效的，按选中项逐次改高度会让某一帧
+    /// 「窗口已动、内容还是旧尺寸」，整块内容跳一下再回来（列表晃动）。
+    attach_status_slot: f32,
+    /// 贴角浮层列表行数槽位（行）：本次会话内只增不减。结果数变化（含删到空、
+    /// 换查询）时窗口高度与列表原点都不再变化，避免「输入 c 再删掉」这类
+    /// 尺寸反复变化造成的晃动；代价是结果变少时列表下方留白。
+    attach_rows_floor: usize,
+    /// 上次同步选中项的时刻（节流：快速连按 ↑↓ 时别每帧都敲资源管理器）。
+    attach_sel_at: Option<std::time::Instant>,
+    /// 这次贴角浮层是否真的拿到过键盘焦点。抢前台失败（系统前台锁）时
+    /// egui 会一直报 focused=false，若直接按失焦收起就会「闪一下不见」；
+    /// 只有确实拿到过焦点、之后再丢焦点才收起。
+    attach_focused: bool,
+    /// 仅 debug 构建：无可见桌面时的贴角浮层开发验证钩子（开发用，release 不含）。
+    #[cfg(debug_assertions)]
+    dev: Option<DevHarness>,
     /// 深路径浏览模式的当前目录：输入框只放过滤词，面包屑占 TABS 行。
     browse_root: Option<std::path::PathBuf>,
     /// Alt+↑ 回退时记住离开的子目录，Alt+↓ 可以再回去（后进先出）。
@@ -1855,7 +1910,8 @@ impl LstrApp {
         #[cfg(feature = "alloc-stats")]
         crate::alloc_stats::log_phase("app-new");
 
-        Self {
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+        let mut app = Self {
             cfg,
             theme,
             history,
@@ -1965,10 +2021,23 @@ impl LstrApp {
             browse_forward: Vec::new(),
             crumb_more: false,
             typing_global: false,
+            attach_hwnd: None,
+            attach_last: None,
+            attach_px: None,
+            attach_sel: None,
+        attach_status_slot: 0.0,
+        attach_rows_floor: 0,
+            attach_sel_at: None,
+            attach_focused: false,
+            #[cfg(debug_assertions)]
+            dev: None,
             hotkey_recording: None,
             noise_filter: String::new(),
             noise_filter_keep: None,
-        }
+        };
+        #[cfg(debug_assertions)]
+        app.dev_init();
+        app
     }
 
     /// 设置页开关：即时安装/卸载全局键盘钩子，不必重启程序。
@@ -2033,6 +2102,10 @@ impl LstrApp {
 
     /// P0-2：Explorer 里敲下的第一个字符唤出启动器并写入输入框。
     /// 之后前台不再是 Explorer，钩子自动停止接管，后续输入交回 egui。
+    ///
+    /// 贴角浮层（Listary 文件管理器模式）：解析出前台 Explorer 的 HWND 后
+    /// 进入 attach 模式，浮层贴在它的右下角并与窗口联动；解析失败（此电脑、
+    /// 回收站等虚拟位置）退回普通居中启动器。
     fn poll_typing(&mut self, ctx: &egui::Context) {
         // 一次取走全部字符：快速连打时轮询周期可能跨过多个按键，只保留最后一个会丢字。
         let chars = self
@@ -2043,14 +2116,39 @@ impl LstrApp {
         if chars.is_empty() {
             return;
         }
-        if self.hidden {
+        // 用户在资源管理器里开始打字 → 进入贴角浮层。
+        //
+        // 主启动器已经开着（双击 Ctrl 唤出）时也要切过来：这些字符属于用户
+        // 正在打字的那个 Explorer 窗口，不能喂给屏幕中间那个启动器。解析不出
+        // 目录（此电脑/回收站等虚拟位置）且本来就没开着 → 退回普通居中启动器；
+        // 已经开着的就继续用（保持原有行为）。
+        if self.attach_hwnd.is_none() && !self.settings_open {
             // 必须在 show() 之前取：钩子吞键时前台还是 Explorer，
             // show() 一旦把窗口显示/激活，GetForegroundWindow 就变成 lstr 自己了。
-            let folder = crate::win::explorer::foreground_explorer_folder();
-            self.show(ctx);
-            self.typing_folder = folder;
-            self.typing_global = false;
-            self.scope = Scope::All;
+            let anchor = crate::win::explorer::foreground_explorer_anchor();
+            if let Some((hwnd, folder)) = anchor {
+                self.attach_hwnd = Some(hwnd);
+                self.attach_last = None;
+                self.attach_px = None;
+                self.attach_sel = None;
+                self.attach_sel_at = None;
+                self.attach_status_slot = 0.0;
+                self.attach_rows_floor = 0;
+                self.attach_focused = false;
+                // 贴角浮层与启动器是两套现场：换模式时丢掉旧结果，也不复用
+                // 启动器（或上次贴角浮层）的输入——show() 会按 keep=false 清空。
+                self.entries.clear();
+                self.total = 0;
+                self.selected = 0;
+                self.scroll_y = 0.0;
+                self.resume_input = false;
+                self.show(ctx);
+                self.typing_folder = Some(folder);
+                self.typing_global = false;
+                self.scope = Scope::All;
+            } else if self.hidden {
+                self.show(ctx);
+            }
         }
         self.input.extend(chars);
         Self::reset_input_cursor(ctx);
@@ -3773,9 +3871,16 @@ impl LstrApp {
     /// 外部改写 input 后，TextEdit 的持久光标状态还停在旧位置（通常是 0），
     /// 清掉它，下一帧就会按 cursor_at_end 把光标放到文本末尾。
     fn reset_input_cursor(ctx: &egui::Context) {
-        let id = egui::Id::new("lstr-search-input");
+        // 普通启动器与贴角浮层各有一个输入框 id：两者都清，形态切换后
+        // 光标不会停在上一次搜索的后半截。
+        let ids = [
+            egui::Id::new("lstr-search-input"),
+            egui::Id::new("lstr-attach-input"),
+        ];
         ctx.data_mut(|data| {
-            let _ = data.remove::<egui::widgets::text_edit::TextEditState>(id);
+            for id in ids {
+                let _ = data.remove::<egui::widgets::text_edit::TextEditState>(id);
+            }
         });
     }
 
@@ -3792,11 +3897,14 @@ impl LstrApp {
         self.dialog = None;
         self.settings_open = false;
         self.menu_open = false;
-        self.pending_show = true;
+        // 贴角模式自己按 Explorer 的边框定位：不能走 position_center 的
+        // center_frames/pending_show 重定位链，否则每帧被拽回屏幕中间。
+        let attach = self.attach_hwnd.is_some();
+        self.pending_show = !attach;
         self.pending_dialog = None;
         self.hidden = false;
         self.shown_at = Instant::now();
-        self.center_frames = 3;
+        self.center_frames = if attach { 0 } else { 3 };
         self.focus_requested = true;
         self.mouse_moved = false;
         self.needle_ready = false;
@@ -3827,8 +3935,21 @@ impl LstrApp {
         self.typing_folder = None;
         self.typing_global = false;
         self.apply_size(ctx);
+        if attach {
+            // 贴角模式：窗口最小尺寸要放得下短列表，并且不允许用户拖边改尺寸
+            // （尺寸由结果数决定，跟随 Explorer 的可见矩形重摆）。
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                320.0, ATTACH_MIN_H,
+            )));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+        }
         if let Some(hwnd) = self.hwnd {
-            window::position_center(hwnd);
+            if attach {
+                // 先摆到 Explorer 右下角再显示：避免从屏幕外/上次位置闪一帧。
+                self.place_attached(ctx);
+            } else {
+                window::position_center(hwnd);
+            }
             window::show(hwnd);
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -3907,7 +4028,7 @@ impl LstrApp {
         self.hide_inner(ctx);
     }
 
-    fn hide_inner(&mut self, _ctx: &egui::Context) {
+    fn hide_inner(&mut self, ctx: &egui::Context) {
         if let Some(hwnd) = self.hwnd {
             window::hide(hwnd);
         }
@@ -3918,6 +4039,262 @@ impl LstrApp {
         // 下次在 Explorer 里打字会重新读取当时浏览的目录。
         self.typing_folder = None;
         self.typing_global = false;
+        // 贴角浮层收起：恢复普通启动器的窗口约束，并把前台交还给刚才那扇
+        // Explorer 窗口——用户刚在它里面打字，Esc 关掉浮层后应能继续操作。
+        if let Some(anchor) = self.attach_hwnd.take() {
+            self.attach_last = None;
+            self.attach_px = None;
+            self.attach_sel = None;
+            self.attach_sel_at = None;
+            self.attach_status_slot = 0.0;
+            self.attach_rows_floor = 0;
+            self.attach_focused = false;
+            // 贴角浮层不保留现场：它的输入/结果不能泄漏到下一次双击 Ctrl
+            // 唤出的启动器（两套模式互不影响）。last_width/last_height 必须
+            // 归零：贴角期间尺寸被 SetWindowPos 改写、而 apply_size 早退没
+            // 更新这两个值，不归零的话下次普通唤出会误判「尺寸没变」而不
+            // 重发 InnerSize，窗口就停在 440 宽的贴角尺寸上。
+            self.resume_input = false;
+            self.clear_input_text();
+            self.entries.clear();
+            self.total = 0;
+            self.selected = 0;
+            self.scroll_y = 0.0;
+            self.last_width = 0.0;
+            self.last_height = 0.0;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                420.0, 160.0,
+            )));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+            window::restore_foreground(anchor);
+        }
+    }
+
+    /// 当前模式的行高：贴角浮层用紧凑 32px（对齐 Listary 截图），普通启动器
+    /// 跟主题的 row_height。绘制、定高、滚动/needle 定位必须共用这一处。
+    fn row_h(&self) -> f32 {
+        if self.attach_hwnd.is_some() {
+            ATTACH_ROW_H
+        } else {
+            self.theme.row_h
+        }
+    }
+
+    /// 贴角浮层选中项的完整路径（文件夹 = 自身路径；文件 = 父目录 + 文件名）。
+    ///
+    /// 右侧路径列只有一列宽，长路径必须中段省略；选中/悬停时用底部状态行把
+    /// 「完整路径」补出来，这样才不用为了看全路径去切回资源管理器。
+    fn attach_status_text(&self, ctx: &egui::Context) -> Option<String> {
+        if self.attach_hwnd.is_none() {
+            return None;
+        }
+        let entry = self.entries.get(self.selected)?;
+        let parent = entry.path.as_deref()?.parent()?.display().to_string();
+        let name_w = ctx.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    entry.name.clone(),
+                    ui::text_font(ATTACH_NAME_FONT),
+                    self.theme.text,
+                )
+                .size()
+                .x
+                .min(Self::attach_name_max(ATTACH_W))
+        });
+        let available = Self::attach_path_available(ATTACH_W, name_w);
+        let measured = ctx.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(parent, ui::text_font(ATTACH_PATH_FONT), self.theme.dim)
+                .size()
+                .x
+        });
+        // 路径列放得下就不显示：完整路径只在真被折叠时才需要看。
+        (measured > available).then(|| entry.full_path())
+    }
+
+    /// 贴角行右侧路径列的宽度：文件名占多少，剩下的全给路径（尽量完整显示），
+    /// 但至少保留 `ATTACH_PATH_MIN_W`；最右侧给滚动条留 12px。
+    fn attach_path_available(row_width: f32, name_width: f32) -> f32 {
+        let right = row_width - ATTACH_PATH_RIGHT_PAD;
+        (right - (ATTACH_NAME_X + name_width + ATTACH_COL_GAP)).max(ATTACH_PATH_MIN_W)
+    }
+
+    /// 文件名列的最大宽度：给路径列留下最小宽度后，其余空间都可以给文件名。
+    fn attach_name_max(row_width: f32) -> f32 {
+        let right = row_width - ATTACH_PATH_RIGHT_PAD;
+        (right - ATTACH_COL_GAP - ATTACH_PATH_MIN_W - ATTACH_NAME_X).max(60.0)
+    }
+
+    fn attach_status_job(theme: &Theme, text: &str, wrap_width: f32) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            text,
+            0.0,
+            egui::TextFormat {
+                font_id: ui::text_font(ATTACH_STATUS_FONT),
+                color: theme.sub,
+                ..Default::default()
+            },
+        );
+        job.wrap.max_width = wrap_width;
+        job.wrap.max_rows = ATTACH_STATUS_MAX_LINES;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+        job
+    }
+
+    /// 状态行占用的高度（含上下内边距）；没有结果/没有选中项时为 0。
+    fn attach_status_height(&self, ctx: &egui::Context) -> f32 {
+        let Some(text) = self.attach_status_text(ctx) else {
+            return 0.0;
+        };
+        let wrap = (ATTACH_W - 28.0).max(80.0);
+        let job = Self::attach_status_job(&self.theme, &text, wrap);
+        let text_h = ctx.fonts(|fonts| fonts.layout_job(job).size().y);
+        text_h + ATTACH_STATUS_PAD_TOP + ATTACH_STATUS_PAD_BOTTOM
+    }
+
+    /// 贴角浮层的尺寸槽位刷新（每个浮层会话只增不减）。
+    ///
+    /// - 状态行槽位：当前选中项需要的行数多时抬高；
+    /// - 行数槽位：结果数多时抬高。
+    ///
+    /// 两者都不回落，所以窗口高度只会在本次会话里单调变大；选中项切换、
+    /// 打字/删字（结果数抖动）都不会再改尺寸。窗口尺寸是 SetWindowPos
+    /// 异步生效的，任何一次改尺寸都会让某一帧出现「窗口已动、内容还是
+    /// 旧尺寸」的跳动——不改变尺寸才是根治。
+    fn attach_rows_needed(entries: usize) -> usize {
+        if entries == 0 { 2 } else { entries.min(ATTACH_MAX_ROWS) }
+    }
+
+    fn refresh_attach_status_slot(&mut self, ctx: &egui::Context) {
+        if self.attach_hwnd.is_none() {
+            return;
+        }
+        let needed = self.attach_status_height(ctx);
+        if needed > self.attach_status_slot {
+            self.attach_status_slot = needed;
+        }
+        let rows = Self::attach_rows_needed(self.entries.len());
+        if rows > self.attach_rows_floor {
+            self.attach_rows_floor = rows;
+        }
+    }
+
+    /// 贴角浮层目标高度（点）：结果行（最多 9 行）+ 状态行槽位 + 分隔线 + 输入行。
+    /// 空态按 2 行算，让「输入以搜索」的提示不显得贴边。
+    fn attach_height(&self) -> f32 {
+        let rows = self.attach_rows_floor.max(1) as f32;
+        let list_h = rows * ATTACH_ROW_H;
+        (list_h + self.attach_status_slot + ATTACH_DIVIDER + ATTACH_INPUT_H).max(ATTACH_MIN_H)
+    }
+
+    /// 按锚点 Explorer 的可见边框把窗口摆到右下角（B1：位置 + 尺寸一次
+    /// SetWindowPos）。右侧/底边贴住可见边缘，不额外留缝。
+    fn place_attached(&mut self, ctx: &egui::Context) {
+        let (Some(anchor), Some(hwnd)) = (self.attach_hwnd, self.hwnd) else {
+            return;
+        };
+        let Some(frame) = window::frame_bounds(anchor) else {
+            return;
+        };
+        let ppp = ctx.pixels_per_point();
+        self.refresh_attach_status_slot(ctx);
+        let width = (ATTACH_W * ppp).round() as i32;
+        let height = (self.attach_height() * ppp).round() as i32;
+        if self.attach_last == Some(frame) && self.attach_px == Some((width, height)) {
+            return;
+        }
+        #[cfg(debug_assertions)]
+        if self.dev.is_some() {
+            lstr_index::snapshot::debug_log(&format!(
+                "dev: attach place {}x{} rows={} slot={:.0} entries={} at={:.2}s",
+                width,
+                height,
+                if self.entries.is_empty() { 2 } else { self.entries.len().min(ATTACH_MAX_ROWS) }.max(1),
+                self.attach_status_slot,
+                self.entries.len(),
+                self.shown_at.elapsed().as_secs_f32(),
+            ));
+        }
+        let x = frame[2] - width;
+        let y = frame[3] - height;
+        window::set_rect(hwnd, x, y, width, height);
+        self.attach_last = Some(frame);
+        self.attach_px = Some((width, height));
+    }
+
+    /// 贴角跟随（A1）：每帧廉价轮询锚点边框，变化才重摆；同时 16ms 续帧，
+    /// 让 Explorer 拖动/缩放时浮层基本同帧跟上。A2（SetWinEventHook 事件）
+    /// 留作后续优化——MVP 先保证正确，事件版本再省这点轮询开销。
+    fn poll_attach(&mut self, ctx: &egui::Context) {
+        let Some(anchor) = self.attach_hwnd else {
+            return;
+        };
+        if !window::is_window(anchor) {
+            // Explorer 窗口被关掉：别把浮层留在空中。
+            self.hide_keep(ctx);
+            return;
+        }
+        self.place_attached(ctx);
+        ctx.request_repaint_after(Duration::from_millis(16));
+    }
+
+    /// 贴角浮层失焦即收起（Listary 行为：点回资源管理器/别的应用，浮层消失）。
+    ///
+    /// 刚显示的 150ms 内不做判断：show() 里的 force_foreground 要等系统
+    /// 同步前台，第一帧 egui 可能仍认为没有焦点。
+    fn poll_attach_focus(&mut self, ctx: &egui::Context) {
+        // 开发验证钩子模拟的贴角模式没有真实焦点，别让它自动收起。
+        #[cfg(debug_assertions)]
+        if self.dev.is_some() {
+            return;
+        }
+        if self.attach_hwnd.is_none() || self.hidden || self.settings_open {
+            return;
+        }
+        if self.shown_at.elapsed() < Duration::from_millis(150) {
+            return;
+        }
+        if ctx.input(|i| i.focused) {
+            self.attach_focused = true;
+        } else if self.attach_focused {
+            // 确实拿到过焦点、现在丢了：用户点回资源管理器/切到别的应用 → 收起。
+            // 从未拿到过焦点（抢前台失败）时不收：否则浮层会一闪而过。
+            self.hide_keep(ctx);
+        }
+    }
+
+    /// C 联动：把选中项同步成资源管理器里的选中文件。
+    ///
+    /// 只在「换行」时发一次 COM，且 40ms 节流（按住 ↑↓ 连滚时每帧都敲
+    /// ShellWindows 会明显卡）。同步失败（深层结果、标签页切走、COM 异常）
+    /// 静默忽略——它只是增强，不影响浮层本身。
+    fn sync_attach_selection(&mut self) {
+        let Some(anchor) = self.attach_hwnd else {
+            return;
+        };
+        let Some(entry) = self.entries.get(self.selected) else {
+            return;
+        };
+        let Some(path) = entry.path.clone() else {
+            return;
+        };
+        if self
+            .attach_sel
+            .as_ref()
+            .is_some_and(|(index, last)| *index == self.selected && *last == path)
+        {
+            return;
+        }
+        if let Some(at) = self.attach_sel_at {
+            if at.elapsed() < Duration::from_millis(40) {
+                return;
+            }
+        }
+        self.attach_sel = Some((self.selected, path.clone()));
+        self.attach_sel_at = Some(std::time::Instant::now());
+        crate::win::explorer::select_in_explorer(anchor, &path);
     }
 
     /// 空查询 + 空结果：显示「搜索技巧」帮助面板（paint_rows 里绘制）。
@@ -3972,6 +4349,12 @@ impl LstrApp {
 
     fn apply_size(&mut self, ctx: &egui::Context) {
         if self.resizing {
+            return;
+        }
+        // 贴角模式不走 window 尺寸命令：尺寸由 place_attached 用 SetWindowPos
+        // 和位置一起设（高度随结果数变化，见 attach_height）。设置面板例外——
+        // 它要的是普通启动器的大窗口。
+        if self.attach_hwnd.is_some() && !self.settings_open {
             return;
         }
         let mut width = self
@@ -4803,8 +5186,15 @@ impl LstrApp {
         }
         // P0-2：从 Explorer 唤起时，文件夹结果让原窗口直接跳过去，
         // 而不是 shell::open_entry 再开一个新资源管理器窗口。
+        // 贴角模式有锚点 HWND，按它精确指定窗口；普通局部上下文才退回
+        // 「上次记录的活动窗口」。
         if entry.kind == Kind::Folder && self.typing_folder.is_some() && !self.typing_global {
-            if crate::win::explorer::navigate_active_to(&entry.full_path()).is_ok() {
+            let path = entry.full_path();
+            let navigated = match self.attach_hwnd {
+                Some(anchor) => crate::win::explorer::navigate_hwnd_to(anchor, &path),
+                None => crate::win::explorer::navigate_active_to(&path),
+            };
+            if navigated.is_ok() {
                 self.service.record_open(&entry);
                 if let Ok(mut history) = self.history.lock() {
                     // 浏览模式下输入框只是过滤词，不能当成完整查询记录。
@@ -5173,7 +5563,7 @@ impl LstrApp {
         let theme = self.theme;
         let entries = self.entries.clone();
         let query = search::query::parse(&self.input, self.scope);
-        let row_h = theme.row_h;
+        let row_h = self.row_h();
         let preview_w = if self.preview_open { 216.0 } else { 0.0 };
         let list_h = if entries.is_empty() {
             // 帮助面板显示时按面板真实高度算：底部提示条（文件对话框/
@@ -5197,6 +5587,10 @@ impl LstrApp {
         let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
         let height = if self.settings_open {
             self.settings_height(ctx)
+        } else if self.attach_hwnd.is_some() {
+            // 贴角浮层：底边固定、窗口高度=结果行+状态行槽位+分隔线+输入行（B）。
+            self.refresh_attach_status_slot(ctx);
+            self.attach_height()
         } else {
             (SEARCH_H
                 + TABS_H
@@ -5255,6 +5649,13 @@ impl LstrApp {
                     // C8：toast 原来只画在结果页脚，设置页里点「重建索引」
                     // 等操作完全看不到反馈；在设置面板底部叠一层同样的胶囊。
                     self.paint_settings_toast(&painter, rect);
+                    return;
+                }
+
+                // 贴角浮层：独立紧凑布局（列表在上、输入行贴底），不复用普通
+                // 启动器的搜索框/标签/筛选条/页脚那一套。
+                if self.attach_hwnd.is_some() {
+                    self.paint_attach(ui, ctx, rect);
                     return;
                 }
 
@@ -5919,6 +6320,146 @@ impl LstrApp {
                 self.paint_confirm_delete(ctx, rect);
                 self.paint_drag_resize(ui, &painter, rect);
             });
+    }
+
+    /// 贴角浮层的紧凑布局：顶部是按需出现的完整路径状态行，中间是结果列表，
+    /// 底部 1px 分隔线 + 40px 输入行贴底——对齐 Listary 文件管理器模式的截图。
+    fn paint_attach(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, rect: egui::Rect) {
+        let theme = self.theme;
+        let painter = ui.painter().clone();
+        let entries = self.entries.clone();
+        let query = search::query::parse(&self.input, self.scope);
+        let input_h = ATTACH_INPUT_H;
+        let input_top = rect.bottom() - input_h;
+        // 状态行在列表「上方」：只有路径列放不下时才出现，给出选中项完整路径。
+        // 放顶部而不是底部，
+        // 是因为它只对部分选中项出现、行数也会变；底部插入会让列表整体上下跳，
+        // 顶部则只是窗口顶部向上伸缩，列表行始终锚在输入行一侧。
+        // 先按选中项把槽位抬到所需高度（只增不减），再按槽位排版。
+        self.refresh_attach_status_slot(ctx);
+        let status_h = self.attach_status_slot;
+        let list_bottom = input_top - ATTACH_DIVIDER;
+        // 列表高度只由「可见结果行数」决定，**不再**从窗口实际高度里减状态行：
+        // 窗口尺寸是 SetWindowPos 异步改的，改尺寸那一帧 `rect` 还是旧的，
+        // 若按 `rect.top()` 反推 list_h，状态行 1 行↔2 行时列表会先跳 17px 再弹回
+        // （用户看到的「列表晃动」）。改成底边锚定 + 固定行高后，行位置只与底边
+        // 有关，状态行怎么变都只影响窗口上沿。
+        let rows = self.attach_rows_floor.max(1);
+        let list_h = rows as f32 * ATTACH_ROW_H;
+        let list_rect = Rect::from_min_max(
+            egui::pos2(rect.left(), list_bottom - list_h),
+            egui::pos2(rect.right(), list_bottom),
+        );
+        if entries.is_empty() {
+            // 贴角浮层只有一两百像素高：首启引导 / 帮助面板那套大排版放不下，
+            // 会直接盖到输入行上。空态自己画一行紧凑提示。
+            self.needle_target = 0.0;
+            self.scrollable = false;
+            let hint = if query.is_empty() {
+                match &self.typing_folder {
+                    Some(folder) => {
+                        let name = folder
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| folder.display().to_string());
+                        format!("输入以搜索 · {name}")
+                    }
+                    None => "输入以搜索…".to_string(),
+                }
+            } else {
+                "无匹配结果".to_string()
+            };
+            painter.text(
+                list_rect.center(),
+                Align2::CENTER_CENTER,
+                hint,
+                ui::text_font(13.0),
+                theme.dim,
+            );
+        } else {
+            // 列表复用现成的 paint_rows：滚动、选中、拖出、图标全都已经在里面。
+            self.paint_rows(
+                ui,
+                &painter,
+                list_rect,
+                list_rect.top(),
+                list_h,
+                rect.right(),
+                &entries,
+                &query,
+            );
+        }
+
+        // C 联动：画完列表（选中项可能已因键盘/悬停变化）再同步给资源管理器。
+        self.sync_attach_selection();
+
+        // 状态行：选中/悬停项的完整路径（仅当右侧路径列放不下时出现）。
+        // 夹在窗口顶部与列表顶部之间：换行行数变化的那一帧窗口高度还没生效，
+        // 多出来的行会被裁掉而不是盖到第一条结果上。
+        if status_h > 0.0 {
+            if let Some(text) = self.attach_status_text(ctx) {
+                let wrap = (rect.width() - 28.0).max(80.0);
+                let job = Self::attach_status_job(&theme, &text, wrap);
+                let galley = painter.layout_job(job);
+                let status_clip = Rect::from_min_max(
+                    egui::pos2(rect.left(), rect.top()),
+                    egui::pos2(rect.right(), list_rect.top()),
+                );
+                painter.with_clip_rect(status_clip).galley(
+                    egui::pos2(rect.left() + 14.0, rect.top() + ATTACH_STATUS_PAD_TOP),
+                    galley,
+                    theme.sub,
+                );
+            }
+        }
+
+        let divider_y = input_top - ATTACH_DIVIDER;
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), divider_y),
+                egui::pos2(rect.right(), divider_y),
+            ],
+            Stroke::new(1.0_f32, theme.hair2),
+        );
+
+        // 输入行：贴底、无框；右侧留出放大镜的位置。
+        const ICON_W: f32 = 26.0;
+        let input_rect = Rect::from_min_size(
+            egui::pos2(rect.left() + 14.0, input_top + 8.0),
+            egui::vec2((rect.width() - 28.0 - ICON_W).max(80.0), 24.0),
+        );
+        let response = ui.put(
+            input_rect,
+            egui::TextEdit::singleline(&mut self.input)
+                .frame(false)
+                .margin(egui::Margin::same(0))
+                .font(ui::text_font(13.5))
+                .text_color(theme.text)
+                .hint_text("输入以搜索…")
+                .desired_width(f32::INFINITY)
+                .id(egui::Id::new("lstr-attach-input")),
+        );
+        if response.changed() {
+            self.menu_open = false;
+            self.reset_history_recall();
+            if !self.ime_composing {
+                self.trigger(ctx);
+            }
+        }
+        // 焦点策略与普通启动器一致：唤出即聚焦，失焦由 poll_attach_focus 收起。
+        let window_focused = ctx.input(|i| i.focused);
+        if self.focus_requested || (window_focused && !response.has_focus()) {
+            response.request_focus();
+            self.focus_requested = false;
+        }
+        // 右下角放大镜：纯装饰，对齐截图（输入框本身就是搜索，不再挂第二个入口）。
+        painter.text(
+            egui::pos2(rect.right() - 14.0, input_top + input_h / 2.0),
+            Align2::CENTER_CENTER,
+            "⌕",
+            ui::icon_font(15.0),
+            theme.dim,
+        );
     }
 
     fn paint_tabs(
@@ -7365,6 +7906,8 @@ impl LstrApp {
         query: &crate::model::Query,
     ) {
         let theme = self.theme;
+        // 一行的高度由模式决定：贴角浮层 32px、普通启动器跟主题。
+        let row_h = self.row_h();
         // 行内「拼音 / 模糊 / 关键词高亮」必须用真正产生这批结果的查询词：
         // 条件编辑/联想暂停期间输入框里是半截条件，用它标注会显示成
         // 「拼音 size >= 104857601B」这类错误提示。
@@ -7599,7 +8142,7 @@ impl LstrApp {
             egui::pos2(rect.left(), list_top),
             egui::pos2(rect.right(), list_top + view_h),
         );
-        let total_h = entries.len() as f32 * theme.row_h;
+        let total_h = entries.len() as f32 * row_h;
         let max_scroll = (total_h - view_h).max(0.0);
         // 鼠标滚轮：指针在列表区域内才滚，滚完立即重绘。
         if ui
@@ -7615,11 +8158,11 @@ impl LstrApp {
         // 键盘/hover 改变选择后才把选中行滚回可视区。若每帧都做，
         // 滚轮刚滚下去就会被"保持选中可见"立刻拽回原位。
         if self.scroll_to_selection {
-            let selected_top = self.selected as f32 * theme.row_h;
+            let selected_top = self.selected as f32 * row_h;
             if selected_top < self.scroll_y {
                 self.scroll_y = selected_top;
-            } else if selected_top + theme.row_h > self.scroll_y + view_h {
-                self.scroll_y = selected_top + theme.row_h - view_h;
+            } else if selected_top + row_h > self.scroll_y + view_h {
+                self.scroll_y = selected_top + row_h - view_h;
             }
             self.scroll_to_selection = false;
         }
@@ -7711,14 +8254,27 @@ impl LstrApp {
         )));
         let optical_bias = ((sub_ink.down - sub_plain.down) / 2.0).max(0.0);
         for (index, entry) in entries.iter().enumerate() {
-            let row_top = list_top + index as f32 * theme.row_h - self.scroll_y;
-            if row_top + theme.row_h <= list_top || row_top >= list_top + view_h {
+            let row_top = list_top + index as f32 * row_h - self.scroll_y;
+            if row_top + row_h <= list_top || row_top >= list_top + view_h {
                 continue;
             }
-            let row_rect = Rect::from_min_size(
-                egui::pos2(rect.left() + 8.0, row_top),
-                egui::vec2(rect.width() - 16.0, theme.row_h),
-            );
+            // 贴角浮层的行铺满整宽（参考图里选中底色一直贴到两侧），普通模式留 8px 缩进。
+            let row_rect = if self.attach_hwnd.is_some() {
+                Rect::from_min_size(
+                    egui::pos2(rect.left(), row_top),
+                    egui::vec2(rect.width(), row_h),
+                )
+            } else {
+                Rect::from_min_size(
+                    egui::pos2(rect.left() + 8.0, row_top),
+                    egui::vec2(rect.width() - 16.0, row_h),
+                )
+            };
+            let row_radius = if self.attach_hwnd.is_some() {
+                CornerRadius::ZERO
+            } else {
+                CornerRadius::same(8)
+            };
             let response = ui.interact(
                 row_rect,
                 Id::new(("lstr-row", index)),
@@ -7761,20 +8317,24 @@ impl LstrApp {
             if selected || will_select {
                 painter.rect_filled(
                     row_rect.shrink2(egui::vec2(0.0, 1.0)),
-                    CornerRadius::same(8),
+                    row_radius,
                     theme.sel,
                 );
             } else if response.hovered() {
                 painter.rect_filled(
                     row_rect.shrink2(egui::vec2(0.0, 1.0)),
-                    CornerRadius::same(8),
+                    row_radius,
                     theme.hover,
                 );
             }
 
+            // 贴角浮层行高 32px、文字也比启动器小一号，图标跟着缩到 18px。
+            let attach_row = self.attach_hwnd.is_some();
+            let icon_edge = if attach_row { 18.0 } else { 20.0 };
+            let icon_center_x = if attach_row { 21.0 } else { 24.0 };
             let icon_rect = Rect::from_center_size(
-                egui::pos2(row_rect.left() + 24.0, row_rect.center().y),
-                egui::vec2(20.0, 20.0),
+                egui::pos2(row_rect.left() + icon_center_x, row_rect.center().y),
+                egui::vec2(icon_edge, icon_edge),
             );
             let texture = if entry.kind == Kind::Command {
                 None
@@ -7794,6 +8354,107 @@ impl LstrApp {
                 ui::paint_app_tile(painter, icon_rect, entry);
             } else {
                 ui::paint_file_icon(painter, icon_rect, entry.kind, theme.sub);
+            }
+
+            if attach_row {
+                // 贴角浮层的行高只有 32px，按 Listary 的行式画单行：左列文件名
+                // （命中字符琥珀色高亮），右侧路径列（父目录，暗色右对齐），
+                // 最右留 12px 给滚动条。
+                const NAME_X: f32 = ATTACH_NAME_X;
+                let name_start = row_rect.left() + NAME_X;
+                let right = row_rect.right() - ATTACH_PATH_RIGHT_PAD;
+                let parent = entry
+                    .path
+                    .as_deref()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.display().to_string())
+                    .filter(|p| !p.is_empty());
+                let name_font = ui::text_font(ATTACH_NAME_FONT);
+                let mut title_job = ui::text_job_case(
+                    &entry.name,
+                    &display_text,
+                    &name_font,
+                    theme.text,
+                    theme.amber,
+                    self.filters.matches.case_sensitive,
+                );
+                // 参考图里命中字符只是变色（不加粗、不下划线），这里把普通
+                // 启动器的「加粗 + 下划线」高亮改回纯文字色强调。
+                for section in &mut title_job.sections {
+                    section.format.underline = egui::Stroke::NONE;
+                    section.format.font_id = name_font.clone();
+                }
+                // 文件名先只让到「路径列还剩最小宽度」为止；量完真实宽度后，
+                // 剩下的横向空间全部让给路径列（路径尽量完整、放不下才省略）。
+                title_job.wrap.max_width = if parent.is_some() {
+                    Self::attach_name_max(row_rect.width())
+                } else {
+                    (row_rect.right() - name_start).max(60.0)
+                };
+                title_job.wrap.max_rows = 1;
+                title_job.wrap.break_anywhere = true;
+                title_job.wrap.overflow_character = Some('…');
+                let galley = painter.layout_job(title_job);
+                let path_avail = Self::attach_path_available(row_rect.width(), galley.size().x);
+                let path_left = right - path_avail;
+                // 名称和路径都夹在自己的列内：宽字形（中文/大写）不会探出右边缘，
+                // 也不会压到滚动条上。
+                let name_clip = Rect::from_min_max(
+                    egui::pos2(name_start, row_rect.top()),
+                    egui::pos2(
+                        (path_left - ATTACH_COL_GAP).max(name_start + 20.0),
+                        row_rect.bottom(),
+                    ),
+                );
+                let y = row_rect.center().y - galley.size().y / 2.0;
+                painter
+                    .with_clip_rect(name_clip)
+                    .galley(egui::pos2(name_start, y), galley, theme.text);
+                if let Some(parent) = parent {
+                    // 先按完整父目录量一次真实宽度，再按比例缩字符预算做中段省略。
+                    // 只按「字符数 × 平均宽」估会让宽字形路径探出列外（之前
+                    // 右侧路径会溢出到滚动条下面）。
+                    let path_font = ui::text_font(ATTACH_PATH_FONT);
+                    let mut path_galley = painter.layout_no_wrap(
+                        parent.clone(),
+                        path_font.clone(),
+                        theme.dim,
+                    );
+                    if path_galley.size().x > path_avail {
+                        // middle_ellipsis 的预算是「字符数」：中文字形比 ASCII 宽、
+                        // 且它整段丢的是窄字符，按平均宽估出来的预算仍可能超宽。
+                        // 这里量到真正放得下为止（每轮收 12%），保证收尾是「…」
+                        // 而不是被裁剪成半个词。
+                        let mut budget = (parent.chars().count() as f32
+                            * (path_avail / path_galley.size().x)
+                            * 0.92)
+                            .floor()
+                            .max(8.0) as usize;
+                        loop {
+                            let candidate = ui::middle_ellipsis(&parent, budget);
+                            path_galley = painter
+                                .layout_no_wrap(candidate, path_font.clone(), theme.dim);
+                            if path_galley.size().x <= path_avail || budget <= 8 {
+                                break;
+                            }
+                            budget = ((budget as f32) * 0.88).floor().max(8.0) as usize;
+                        }
+                    }
+                    let x = (right - path_galley.size().x).max(path_left);
+                    let path_clip = Rect::from_min_max(
+                        egui::pos2(path_left, row_rect.top()),
+                        egui::pos2(right, row_rect.bottom()),
+                    );
+                    painter.with_clip_rect(path_clip).galley(
+                        egui::pos2(x, row_rect.center().y - path_galley.size().y / 2.0),
+                        path_galley,
+                        theme.dim,
+                    );
+                }
+                if selected || will_select {
+                    self.needle_target = row_rect.top() + (row_h - NEEDLE_H) / 2.0;
+                }
+                continue;
             }
 
             let pinyin_hit = matches!(entry.kind, Kind::App | Kind::Bookmark | Kind::Note)
@@ -7923,7 +8584,7 @@ impl LstrApp {
             // row_rect.shrink2(0, 1.0)，所以顶边 +1、可用高度 row_h-2。
             let (mut y_title, y_sub) = ui::two_line_offsets(
                 row_rect.top() + 1.0,
-                theme.row_h - 2.0,
+                row_h - 2.0,
                 &title_ink,
                 &sub_ink,
                 optical_bias,
@@ -8173,39 +8834,45 @@ impl LstrApp {
             }
 
             if selected || will_select {
-                self.needle_target = row_rect.top() + (theme.row_h - NEEDLE_H) / 2.0;
+                self.needle_target = row_rect.top() + (row_h - NEEDLE_H) / 2.0;
             }
         }
 
         // 选中行理论上始终可见（上面已自动滚动），这里再兜底算一次，
         // 避免裁剪边界的那一行没被绘制时指针停在旧位置。
-        self.needle_target =
-            list_top + self.selected as f32 * theme.row_h - self.scroll_y
-                + (theme.row_h - NEEDLE_H) / 2.0;
-        if !self.needle_ready {
-            self.needle_y = self.needle_target;
-            self.needle_ready = true;
+        if self.attach_hwnd.is_none() {
+            self.needle_target =
+                list_top + self.selected as f32 * row_h - self.scroll_y
+                    + (row_h - NEEDLE_H) / 2.0;
+            if !self.needle_ready {
+                self.needle_y = self.needle_target;
+                self.needle_ready = true;
+            }
+            let needle_rect = Rect::from_min_size(
+                egui::pos2(rect.left() + 8.0, self.needle_y),
+                egui::vec2(2.0, NEEDLE_H),
+            );
+            painter.rect_filled(
+                needle_rect.expand(4.0),
+                CornerRadius::same(4),
+                theme.amber_soft,
+            );
+            painter.rect_filled(needle_rect, CornerRadius::same(1), theme.amber);
         }
-        let needle_rect = Rect::from_min_size(
-            egui::pos2(rect.left() + 8.0, self.needle_y),
-            egui::vec2(2.0, NEEDLE_H),
-        );
-        painter.rect_filled(
-            needle_rect.expand(4.0),
-            CornerRadius::same(4),
-            theme.amber_soft,
-        );
-        painter.rect_filled(needle_rect, CornerRadius::same(1), theme.amber);
 
-        // 滚动条：贴着窗口右缘的 3px 细条（可拖拽）。
+        // 滚动条：贴着窗口右缘的细条（可拖拽）。贴角浮层与参考图一致
+        // 也画——结果超过 9 行时用户需要知道下面还有内容。贴角模式把条加宽
+        // 到 4px、改用参考图那种浅灰滑块，否则 3px 深色条太不起眼。
         if max_scroll > 0.0 {
+            let attach = self.attach_hwnd.is_some();
+            let (bar_w, bar_gap) = if attach { (4.0, 3.0) } else { (3.0, 2.0) };
             let track = Rect::from_min_max(
-                egui::pos2(scroll_right - 5.0, list_top + 2.0),
-                egui::pos2(scroll_right - 2.0, list_top + view_h - 2.0),
+                egui::pos2(scroll_right - bar_gap - bar_w, list_top + 2.0),
+                egui::pos2(scroll_right - bar_gap, list_top + view_h - 2.0),
             );
             // 命中区比视觉条宽很多；右端停在 -3，避开窗口右缘 3px 的缩放手势。
             let hit = Rect::from_min_max(
-                egui::pos2(scroll_right - 12.0, track.top() - 2.0),
+                egui::pos2(scroll_right - bar_gap - bar_w - 8.0, track.top() - 2.0),
                 egui::pos2(scroll_right - 3.0, track.bottom() + 2.0),
             );
             let response = ui.interact(hit, Id::new("lstr-scrollbar"), Sense::click_and_drag());
@@ -8234,13 +8901,23 @@ impl LstrApp {
                 egui::pos2(track.left(), track.top() + ratio * travel),
                 egui::vec2(track.width(), thumb_h),
             );
+            let resting = if attach {
+                // 参考图的滑块是浅灰：贴角模式不用普通启动器那套深色强调。
+                if theme.light {
+                    egui::Color32::from_rgb(186, 191, 198)
+                } else {
+                    egui::Color32::from_rgb(96, 102, 112)
+                }
+            } else {
+                theme.sub.gamma_multiply(0.7)
+            };
             raw_painter.rect_filled(
                 thumb,
                 CornerRadius::same(2),
                 if response.dragged() || response.hovered() {
                     theme.sub
                 } else {
-                    theme.sub.gamma_multiply(0.7)
+                    resting
                 },
             );
         }
@@ -12003,6 +12680,9 @@ impl eframe::App for LstrApp {
         self.poll_dialog_watch(ctx);
         self.poll_tray(ctx);
         self.poll_search(ctx);
+        self.poll_attach_focus(ctx);
+        #[cfg(debug_assertions)]
+        self.dev_tick(ctx);
         self.icons.drain(ctx);
         self.previews.drain(ctx);
 
@@ -12026,6 +12706,7 @@ impl eframe::App for LstrApp {
         }
 
         self.apply_size(ctx);
+        self.poll_attach(ctx);
         if self.center_frames > 0 {
             if let Some(hwnd) = self.hwnd {
                 window::position_center(hwnd);
@@ -13069,4 +13750,291 @@ mod path_layout_tests {
         assert_eq!(compact.partial_text_for_exit(">"), "size:1MB");
         assert!(!compact.typed_empty());
     }
+}
+
+/// 仅 debug 构建：无可见桌面时的贴角浮层开发验证钩子。
+///
+/// 用环境变量驱动贴角模式并让 egui 自己截图（`ViewportCommand::Screenshot`），
+/// 这样在锁屏/RDP 断开（拿不到桌面画面）时也能核对几何与排版：
+/// - `LSTR_DEV_ATTACH_HWND`：锚点 Explorer 窗口句柄（必填，缺省不启用）
+/// - `LSTR_DEV_INPUT`：预填输入框文本
+/// - `LSTR_DEV_SHOT`：截图保存路径（PNG），同名 `.txt` 写几何信息
+/// - `LSTR_DEV_DELAY_MS`：显示后多久截图（默认 900ms）
+/// - `LSTR_DEV_CYCLE=1`：截图后模拟「收起贴角 → 双击 Ctrl」，另写 `.cycle.txt`
+///   记录普通启动器的窗口尺寸与输入状态（验证模式切换后尺寸/输入已复原）
+///
+/// release 构建不包含这些代码，也不改变正常逻辑。
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct DevHarness {
+    shot: Option<String>,
+    delay: Duration,
+    requested: bool,
+    input: Option<String>,
+    applied_input: bool,
+    /// 截图完成后模拟「收起贴角 → 双击 Ctrl」：验证普通启动器尺寸/输入复原。
+    cycle: bool,
+    shot_saved: bool,
+    cycled: bool,
+    cycle_written: bool,
+    /// 截图前把选中项切到第 N 项（验证「换行后状态行高度变了，列表/窗口是否稳定」）。
+    select: Option<usize>,
+    applied_select: bool,
+    /// 截图前再改一次输入（模拟「打一个字再删掉」），验证高度/列表是否跳动。
+    input2: Option<String>,
+    applied_input2: bool,
+    input3: Option<String>,
+    applied_input3: bool,
+}
+
+#[cfg(debug_assertions)]
+impl LstrApp {
+    fn dev_init(&mut self) {
+        let Ok(raw_anchor) = std::env::var("LSTR_DEV_ATTACH_HWND") else {
+            return;
+        };
+        let Ok(anchor) = raw_anchor.trim().parse::<isize>() else {
+            return;
+        };
+        self.attach_hwnd = Some(anchor);
+        self.typing_global = false;
+        self.scope = Scope::All;
+        let input = std::env::var("LSTR_DEV_INPUT")
+            .ok()
+            .filter(|text| !text.is_empty());
+        self.dev = Some(DevHarness {
+            shot: std::env::var("LSTR_DEV_SHOT").ok(),
+            delay: Duration::from_millis(
+                std::env::var("LSTR_DEV_DELAY_MS")
+                    .ok()
+                    .and_then(|ms| ms.parse::<u64>().ok())
+                    .unwrap_or(900),
+            ),
+            input,
+            cycle: matches!(
+                std::env::var("LSTR_DEV_CYCLE").as_deref(),
+                Ok("1") | Ok("true")
+            ),
+            input2: std::env::var("LSTR_DEV_INPUT2").ok().map(|text| {
+                if text == "<empty>" {
+                    String::new()
+                } else {
+                    text
+                }
+            }),
+            input3: std::env::var("LSTR_DEV_INPUT3").ok().map(|text| {
+                if text == "<empty>" {
+                    String::new()
+                } else {
+                    text
+                }
+            }),
+            select: std::env::var("LSTR_DEV_SELECT")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<usize>().ok()),
+            ..DevHarness::default()
+        });
+    }
+
+    fn dev_tick(&mut self, ctx: &egui::Context) {
+        if self.dev.is_none() || self.hwnd.is_none() {
+            return;
+        }
+        if self.hidden {
+            // 首次进入：直接按贴角形态显示（不需要真实键盘输入）。
+            self.show(ctx);
+            // show() 会清空输入框，预填文本只能等它清完再写。
+            let Some(text) = self.dev.as_ref().and_then(|dev| dev.input.clone()) else {
+                return;
+            };
+            if self.dev.as_ref().is_some_and(|dev| dev.applied_input) {
+                return;
+            }
+            self.input = text;
+            if let Some(dev) = self.dev.as_mut() {
+                dev.applied_input = true;
+            }
+            Self::reset_input_cursor(ctx);
+            self.selected = 0;
+            self.trigger(ctx);
+            return;
+        }
+        // 可选：延迟一段时间后把输入换成 INPUT2（模拟编辑）。
+        if let Some(text) = self.dev.as_ref().and_then(|dev| dev.input2.clone()) {
+            let delay = self.dev.as_ref().map(|dev| dev.delay).unwrap_or_default();
+            if !self.dev.as_ref().is_some_and(|dev| dev.applied_input2)
+                && self.shown_at.elapsed() >= delay / 2
+            {
+                if let Some(dev) = self.dev.as_mut() {
+                    dev.applied_input2 = true;
+                }
+                self.input = text;
+                Self::reset_input_cursor(ctx);
+                self.selected = 0;
+                self.trigger(ctx);
+                ctx.request_repaint();
+                return;
+            }
+        }
+        // 可选：延迟更久后第三次改输入（模拟「打一个字再删掉」）。
+        if let Some(text) = self.dev.as_ref().and_then(|dev| dev.input3.clone()) {
+            let delay = self.dev.as_ref().map(|dev| dev.delay).unwrap_or_default();
+            if !self.dev.as_ref().is_some_and(|dev| dev.applied_input3)
+                && self.shown_at.elapsed() >= delay / 4 * 3
+            {
+                if let Some(dev) = self.dev.as_mut() {
+                    dev.applied_input3 = true;
+                }
+                self.input = text;
+                Self::reset_input_cursor(ctx);
+                self.selected = 0;
+                self.trigger(ctx);
+                ctx.request_repaint();
+                return;
+            }
+        }
+        // 可选：截图前切到指定选中项。
+        if let Some(index) = self.dev.as_ref().and_then(|dev| dev.select) {
+            if !self.dev.as_ref().is_some_and(|dev| dev.applied_select) {
+                if let Some(dev) = self.dev.as_mut() {
+                    dev.applied_select = true;
+                }
+                if index < self.entries.len() {
+                    self.selected = index;
+                    self.scroll_to_selection = true;
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        }
+        if let Some(image) = take_screenshot_event(ctx) {
+            if let Some(path) = self.dev.as_ref().and_then(|dev| dev.shot.clone()) {
+                match save_color_image(&image, std::path::Path::new(&path)) {
+                    Ok(()) => {
+                        let text = self.dev_geometry_text(ctx);
+                        let _ = std::fs::write(format!("{path}.txt"), text);
+                    }
+                    Err(err) => eprintln!("lstr dev: 截图保存失败: {err}"),
+                }
+            }
+            if let Some(dev) = self.dev.as_mut() {
+                dev.shot_saved = true;
+            }
+            return;
+        }
+        // 可选 cycle：截图后模拟「收起贴角浮层 → 双击 Ctrl 唤出启动器」，
+        // 核对窗口是否回到普通尺寸（而不是停在 440 宽的贴角尺寸）。
+        let (cycle, shot_saved, cycled, cycle_written) = self
+            .dev
+            .as_ref()
+            .map(|dev| (dev.cycle, dev.shot_saved, dev.cycled, dev.cycle_written))
+            .unwrap_or((false, false, false, false));
+        if cycle && shot_saved && !cycled {
+            if let Some(dev) = self.dev.as_mut() {
+                dev.cycled = true;
+            }
+            lstr_index::snapshot::debug_log("dev: cycle hide attach + show launcher");
+            self.hide_inner(ctx);
+            self.show(ctx);
+            return;
+        }
+        if cycle && cycled && !cycle_written && self.shown_at.elapsed() >= Duration::from_millis(350)
+        {
+            if let Some(dev) = self.dev.as_mut() {
+                dev.cycle_written = true;
+            }
+            if let Some(path) = self.dev.as_ref().and_then(|dev| dev.shot.clone()) {
+                let mut text = String::from("== after cycle: attach hide -> launcher show ==\n");
+                text.push_str(&format!(
+                    "hidden={}\nlast_width={}\nlast_height={}\ninput={:?}\nentries={}\n",
+                    self.hidden,
+                    self.last_width,
+                    self.last_height,
+                    self.input,
+                    self.entries.len()
+                ));
+                text.push_str(&self.dev_geometry_text(ctx));
+                let _ = std::fs::write(format!("{path}.cycle.txt"), text);
+            }
+            return;
+        }
+        let Some((requested, delay)) = self.dev.as_ref().map(|dev| (dev.requested, dev.delay))
+        else {
+            return;
+        };
+        if !requested {
+            if self.shown_at.elapsed() >= delay {
+                if let Some(dev) = self.dev.as_mut() {
+                    dev.requested = true;
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                    egui::UserData::default(),
+                ));
+            } else {
+                // 隐藏态是事件驱动，这里主动续帧保证延迟到点能发截图请求。
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+    }
+
+    fn dev_geometry_text(&self, _ctx: &egui::Context) -> String {
+        let mut out = String::new();
+        if let Some(hwnd) = self.hwnd {
+            if let Some(rect) = window::frame_bounds(hwnd) {
+                out.push_str(&format!("lstr rect: {rect:?}\n"));
+            }
+        }
+        if let Some(anchor) = self.attach_hwnd {
+            if let Some(rect) = window::frame_bounds(anchor) {
+                out.push_str(&format!("anchor rect: {rect:?}\n"));
+            }
+        }
+        out.push_str(&format!("entries: {}\n", self.entries.len()));
+        out.push_str(&format!(
+            "attach_height: {}\nattach_status_slot: {}\nattach_rows_floor: {}\n",
+            self.attach_height(),
+            self.attach_status_slot,
+            self.attach_rows_floor
+        ));
+        out.push_str(&format!("row_h: {}\n", self.row_h()));
+        for (index, entry) in self.entries.iter().take(9).enumerate() {
+            out.push_str(&format!(
+                "entry[{index}]: name={:?} path={:?}\n",
+                entry.name,
+                entry.path.as_ref().map(|p| p.to_string_lossy().to_string())
+            ));
+        }
+        out
+    }
+}
+
+/// 取出本帧收到的 egui 截图事件（eframe 在请求后的下一帧塞进输入事件）。
+#[cfg(debug_assertions)]
+fn take_screenshot_event(ctx: &egui::Context) -> Option<std::sync::Arc<egui::ColorImage>> {
+    let mut shot = None;
+    ctx.input(|input| {
+        for event in &input.events {
+            if let egui::Event::Screenshot { image, .. } = event {
+                shot = Some(image.clone());
+            }
+        }
+    });
+    shot
+}
+
+/// 把 egui 的 `ColorImage` 存成 PNG。
+#[cfg(debug_assertions)]
+fn save_color_image(image: &egui::ColorImage, path: &std::path::Path) -> Result<(), image::ImageError> {
+    let [width, height] = image.size;
+    let mut buf = Vec::with_capacity(width * height * 4);
+    for pixel in &image.pixels {
+        buf.extend_from_slice(&[pixel.r(), pixel.g(), pixel.b(), pixel.a()]);
+    }
+    image::save_buffer(
+        path,
+        &buf,
+        width as u32,
+        height as u32,
+        image::ExtendedColorType::Rgba8,
+    )
 }

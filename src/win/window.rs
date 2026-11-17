@@ -4,8 +4,8 @@ use raw_window_handle::{
 use std::num::NonZeroIsize;
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_ROUND,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, RedrawWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -19,9 +19,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{ITaskbarList, TaskbarList};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    SwitchToThisWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    GetWindowThreadProcessId, IsWindow, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, SwitchToThisWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 pub fn hwnd_of_frame(frame: &eframe::Frame) -> Option<isize> {
@@ -242,6 +242,105 @@ pub fn hide(hwnd_value: isize) {
             0,
             SWP_NOSIZE | SWP_NOACTIVATE,
         );
+    }
+}
+
+/// 窗口「可见边框」的物理像素矩形 `(left, top, right, bottom)`。
+///
+/// 贴角浮层必须贴着 Explorer 真正看得见的边缘：Win10+ 的 `GetWindowRect`
+/// 含一圈不可见的阴影边框（最大化时左右各多出 7~8px），直接拿它当锚点
+/// 会在右侧/底边留一条缝，看起来像没贴住。优先用 DWM 扩展边框，取不到
+/// 再退回 `GetWindowRect`。
+pub fn frame_bounds(hwnd_value: isize) -> Option<[i32; 4]> {
+    if hwnd_value == 0 {
+        return None;
+    }
+    let target = hwnd(hwnd_value);
+    unsafe {
+        let mut rect = RECT::default();
+        let dwm = DwmGetWindowAttribute(
+            target,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        );
+        if dwm.is_err() || rect.right <= rect.left || rect.bottom <= rect.top {
+            rect = RECT::default();
+            if GetWindowRect(target, &mut rect).is_err() {
+                return None;
+            }
+        }
+        if rect.right <= rect.left || rect.bottom <= rect.top {
+            return None;
+        }
+        Some([rect.left, rect.top, rect.right, rect.bottom])
+    }
+}
+
+/// 一次 `SetWindowPos` 同时改位置与尺寸（贴角模式 B1）。
+///
+/// 不走 `ViewportCommand::InnerSize`：那条路径每次 resize 都要等 winit
+/// 下一帧同步，连续拖动 Explorer 时高度变化会追赶不及、肉眼可见抖动。
+/// 位置+尺寸合一次系统调用，浮层和资源管理器基本同帧移动。
+pub fn set_rect(hwnd_value: isize, x: i32, y: i32, width: i32, height: i32) {
+    if hwnd_value == 0 {
+        return;
+    }
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd(hwnd_value),
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            width.max(1),
+            height.max(1),
+            SWP_NOACTIVATE,
+        )
+    };
+}
+
+/// 锚点窗口是否还活着（Explorer 关窗/换窗口时贴角浮层要跟着收）。
+pub fn is_window(hwnd_value: isize) -> bool {
+    if hwnd_value == 0 {
+        return false;
+    }
+    unsafe { IsWindow(Some(hwnd(hwnd_value))).as_bool() }
+}
+
+/// 把前台交还给锚点窗口（贴角浮层收起后回到 Explorer）。
+///
+/// 浮层是「抢焦点」模式（F1，中文输入法必须靠窗口焦点），收起时如果
+/// 只做 `window::hide`，前台会落到别的窗口（甚至桌面）；用户在资源管理器
+/// 里刚打完字、按 Esc 关掉浮层后应当继续在 Explorer 里操作。
+pub fn restore_foreground(hwnd_value: isize) {
+    if hwnd_value == 0 {
+        return;
+    }
+    let target = hwnd(hwnd_value);
+    unsafe {
+        if GetForegroundWindow().0 == target.0 {
+            return;
+        }
+        // 本进程此刻通常就是前台（浮层刚抢过焦点），SetForegroundWindow 允许。
+        let _ = SetForegroundWindow(target);
+        let _ = SetActiveWindow(target);
+        let _ = SetFocus(Some(target));
+        if GetForegroundWindow().0 == target.0 {
+            return;
+        }
+        // 兜底：附着到目标线程再抢一次（跨进程前台锁/提权窗口场景）。
+        let mut pid = 0u32;
+        let target_thread = GetWindowThreadProcessId(target, Some(&mut pid));
+        let current_thread = GetCurrentThreadId();
+        if target_thread != 0 && target_thread != current_thread {
+            let _ = AttachThreadInput(current_thread, target_thread, true);
+            let _ = SetForegroundWindow(target);
+            let _ = SetActiveWindow(target);
+            let _ = AttachThreadInput(current_thread, target_thread, false);
+        }
+        if GetForegroundWindow().0 != target.0 {
+            SwitchToThisWindow(target, true);
+        }
     }
 }
 
