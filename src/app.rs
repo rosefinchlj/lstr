@@ -1797,6 +1797,9 @@ impl LstrApp {
                 // 标记内容形如 `2026-11-16T15:26:00.123Z (unix 1794…)`，
                 // 横幅里只保留可读时间，别把 unix 秒也塞进去占宽度。
                 let started = started.split(" (unix").next().unwrap_or(started);
+                lstr_index::snapshot::debug_log(&format!(
+                    "ui: unclean session detected (marker from {started})"
+                ));
                 Some(format!(
                     "上次 lstr 异常退出（启动于 {started}）；索引已自动校验，若结果异常可在设置→维护重建"
                 ))
@@ -1812,7 +1815,14 @@ impl LstrApp {
             ),
             None => crate::format_utc(std::time::SystemTime::now()),
         };
-        let _ = std::fs::write(&session_marker, marker_text);
+        // 标记写入失败（权限/杀软拦截等）会让「异常退出提示」永久静默失效，
+        // 至少留一条可诊断日志，而不是 `let _ =` 吞掉。
+        if let Err(err) = std::fs::write(&session_marker, marker_text) {
+            lstr_index::snapshot::debug_log(&format!(
+                "ui: session marker write failed: {err} (path {})",
+                session_marker.display()
+            ));
+        }
 
         Self {
             cfg,
@@ -11714,7 +11724,14 @@ impl eframe::App for LstrApp {
     /// 超时);worker 收到 Shutdown 后走 write_clean_exit_flag 优雅退出。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // P1-11：正常退出才删除存活标记；下次启动若仍存在即判定异常退出。
-        let _ = std::fs::remove_file(&self.session_marker);
+        // 删除失败只记日志（NotFound 属正常：可能已由更早的实例清理）。
+        if let Err(err) = std::fs::remove_file(&self.session_marker) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                lstr_index::snapshot::debug_log(&format!(
+                    "ui: session marker remove failed: {err}"
+                ));
+            }
+        }
         // 退出原因落 engine.log：下次出现「窗口突然消失」可直接定性，
         // 不用再靠时间线推断（window=关窗/Esc 等未标记路径，tray=托盘退出）。
         lstr_index::snapshot::debug_log(&format!("ui exit reason={}", self.exit_reason));
