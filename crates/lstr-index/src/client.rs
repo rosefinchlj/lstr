@@ -17,9 +17,55 @@ pub fn session_token() -> [u8; TOKEN_LEN] {
     *TOKEN.get_or_init(random_token)
 }
 
-/// `--index-token` 命令行参数形式。
-pub fn session_token_hex() -> String {
-    crate::proto::token_hex(&session_token())
+/// 跨进程共享的 worker 令牌（P1-1）。
+///
+/// 旧实现每个 GUI 进程随机生成令牌：`keep_worker_alive` 常驻模式下，退出后
+/// 旧 worker 还活着，下次启动是新进程 → 新令牌 ≠ worker 令牌 → 握手被拒，
+/// 白等约 60s 再 runas 新 worker（又一次 UAC）。令牌因此必须按用户持久化，
+/// 让「退出保留索引服务 → 下次启动」复用同一个 worker。
+///
+/// 令牌文件位于状态目录（%APPDATA%\lstr\index\worker.token，随用户 profile
+/// ACL 隔离）；首次生成后跨进程复用，文件损坏/不可写时回退到进程内随机值。
+pub fn worker_token() -> [u8; TOKEN_LEN] {
+    static TOKEN: OnceLock<[u8; TOKEN_LEN]> = OnceLock::new();
+    *TOKEN.get_or_init(|| {
+        token_state_dir()
+            .map(|dir| load_or_create_token(&dir))
+            .unwrap_or_else(random_token)
+    })
+}
+
+/// `--index-token` 命令行参数形式（与 [`worker_token`] 一致，跨进程稳定）。
+pub fn worker_token_hex() -> String {
+    crate::proto::token_hex(&worker_token())
+}
+
+/// 令牌所在状态目录（与快照/engine.log 相同）。
+fn token_state_dir() -> Option<std::path::PathBuf> {
+    std::env::var("APPDATA")
+        .ok()
+        .map(|base| std::path::PathBuf::from(base).join("lstr").join("index"))
+}
+
+/// 读取或创建令牌文件。写入用 tmp+rename，避免两个进程首次同时生成时
+/// 读到半个文件；写完再读回，竞态时以磁盘内容为准。
+fn load_or_create_token(dir: &std::path::Path) -> [u8; TOKEN_LEN] {
+    let path = dir.join("worker.token");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Some(token) = crate::proto::token_from_hex(text.trim()) {
+            return token;
+        }
+    }
+    let token = random_token();
+    let _ = std::fs::create_dir_all(dir);
+    let tmp = dir.join("worker.token.tmp");
+    if std::fs::write(&tmp, crate::proto::token_hex(&token)).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| crate::proto::token_from_hex(text.trim()))
+        .unwrap_or(token)
 }
 
 /// 无外部随机源依赖的伪随机:时间/进程/栈地址混合。仅用于能力校验
@@ -49,7 +95,7 @@ pub fn connect_and_handshake(
     handshake: Vec<(u128, u64, i64, u64, bool)>,
     timeout: Duration,
 ) -> Result<HANDLE, String> {
-    connect_and_handshake_at(crate::PIPE_NAME, session_token(), handshake, timeout)
+    connect_and_handshake_at(crate::PIPE_NAME, worker_token(), handshake, timeout)
 }
 
 /// 指定管道名/令牌的握手(集成测试复用;worker 侧校验令牌)。
@@ -192,7 +238,32 @@ mod tests {
         let a = session_token();
         assert_eq!(a, session_token(), "同进程内令牌必须稳定(重连复用)");
         assert!(a.iter().any(|&b| b != 0), "令牌不应全零");
-        let hex = session_token_hex();
+        let hex = crate::proto::token_hex(&session_token());
         assert_eq!(crate::proto::token_from_hex(&hex).unwrap(), a);
+    }
+
+    #[test]
+    fn persisted_worker_token_is_shared_across_processes() {
+        let dir = std::env::temp_dir().join(format!(
+            "lstr-token-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = load_or_create_token(&dir);
+        assert!(dir.join("worker.token").exists(), "首次必须落盘令牌文件");
+        // 模拟另一个 GUI 进程：同一状态目录、不经过本进程 OnceLock 缓存。
+        let b = load_or_create_token(&dir);
+        assert_eq!(a, b, "跨进程必须复用同一令牌，否则 keep-alive 重开握手失败");
+        assert!(a.iter().any(|&v| v != 0), "令牌不应全零");
+        // 文件损坏（半写/被改写）→ 重新生成，且之后保持稳定。
+        std::fs::write(dir.join("worker.token"), b"zz").unwrap();
+        let c = load_or_create_token(&dir);
+        assert_eq!(c, load_or_create_token(&dir));
+        assert_ne!(c, [0u8; TOKEN_LEN]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -82,6 +82,27 @@ fn install_panic_logger() {
     }));
 }
 
+/// P1-2：取单实例互斥体。
+///
+/// 普通启动：拿不到就通知已运行的实例唤出窗口并退出（原行为）。
+/// `--relaunch`（「重启」按钮拉起的新实例）：旧进程此时可能还在
+/// `on_exit` 的 `graceful_shutdown`/旁车落盘里（最长约 6s），互斥体尚未
+/// 释放；直接退出会把「重启」变成彻底关闭。因此 15s 内每 250ms 重试，
+/// 拿不到才放弃（用户手动再开）。
+fn acquire_single_instance() -> Option<win::single_instance::SingleInstance> {
+    let relaunch = std::env::args().any(|a| a == "--relaunch");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Some(guard) = win::single_instance::acquire() {
+            return Some(guard);
+        }
+        if !relaunch || std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 fn main() -> eframe::Result<()> {
     // panic 钩子必须先装:--index-worker 分支也要留下崩溃证据,
     // 否则提权 worker 在 release 下挂掉时没有任何日志可查。
@@ -93,7 +114,7 @@ fn main() -> eframe::Result<()> {
         win::hotkey_relay::start_worker_relay();
         std::process::exit(lstr_index::worker::worker_main());
     }
-    let single = match win::single_instance::acquire() {
+    let single = match acquire_single_instance() {
         Some(guard) => guard,
         None => return Ok(()),
     };

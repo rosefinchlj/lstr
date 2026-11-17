@@ -23,7 +23,7 @@ use crate::model::{Entry, Kind, Query, Scope};
 use crate::search::filters::SearchFilters;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use eframe::egui;
@@ -227,6 +227,10 @@ pub struct SearchService {
     /// 排除规则表共享槽(原始模式):设置页「立即重建」时更新,引擎在建新
     /// store/落快照指纹时取新表;finalize 硬过滤也实时取。
     noise_slot: Arc<Mutex<Vec<String>>>,
+    /// P1-3:维护页「重建索引」的一次性请求世代。worker 空闲轮询发现世代
+    /// 变化就重置全部卷 + 全量重扫(与排除规则变更走同一重置路径)。旧实现
+    /// 只更新槽并删快照:规则没变时 worker 判定「无需重建」→ 空操作。
+    rebuild_epoch: Arc<AtomicU64>,
     /// 优雅退出标志:on_exit 置位后 client 线程给 worker 发 Shutdown 并等其
     /// 退出;run_worker 的请求循环也据此提前收尾(flush_all 不再依赖通道断开)。
     shutdown_client: Arc<AtomicBool>,
@@ -283,6 +287,9 @@ impl SearchService {
             Arc::clone(&worker_collected),
             Arc::clone(&client_done),
         );
+        // P1-3:强制重建世代(0=启动值)。维护页点「重建索引」时 +1。
+        let rebuild_epoch = Arc::new(AtomicU64::new(0));
+        let worker_rebuild_epoch = Arc::clone(&rebuild_epoch);
         let worker_index_cmd_tx = index_cmd_tx.clone();
         std::thread::Builder::new()
             .name("lstr-search".to_string())
@@ -309,6 +316,7 @@ impl SearchService {
                         index_cmd_tx: worker_index_cmd_tx,
                         volume_mask: worker_volume_mask,
                         noise_slot: worker_noise_slot,
+                        rebuild_epoch: worker_rebuild_epoch,
                         shutdown_client: done_s,
                         worker_collected: done_w,
                         client_done: done_c,
@@ -361,6 +369,7 @@ impl SearchService {
             volume_mask,
             index_cmd: index_cmd_tx,
             noise_slot,
+            rebuild_epoch,
             shutdown_client,
             worker_collected,
             worker_panicked,
@@ -396,31 +405,30 @@ impl SearchService {
         ));
     }
 
-    /// 「立即重建」:排除规则变更后调用。更新共享槽 + 删旧快照。
-    /// run_worker 空闲轮询发现槽变化后:引擎重置受影响卷(丢弃旧 NOISE 位)
-    /// → 按差集算受影响盘发 Rescan 掩码 → worker 逐卷重扫。待重扫卷 3s
-    /// 未收到 ScanBegin 自动重发(自愈);重启后快照指纹不符也会重扫。
+    /// 排除规则变更后调用（设置页「立即重建」）。只更新共享槽：
+    /// run_worker 空闲轮询发现槽内容变化后，引擎重置受影响卷（丢弃旧
+    /// NOISE 位）→ 按差集算受影响盘发 Rescan 掩码 → worker 逐卷重扫。
+    ///
+    /// P1-3：这里**不再删快照**。旧实现对规则未变化的情况也会删掉快照，
+    /// 但 worker 判定「槽没变 → 无需重建」，结果只删了磁盘快照、索引还是
+    /// 旧的。快照本身带噪声规则内容哈希（snapshot.rs noise_hash），规则
+    /// 变化后旧快照会在下次启动被拒并自动全量扫描，无需 UI 代劳删除。
     pub fn rebuild_noise_index(&self, patterns: Vec<String>) {
         if let Ok(mut slot) = self.noise_slot.lock() {
             *slot = patterns;
         }
-        // 删旧快照:重建完成前的崩溃窗口里,旧快照指纹与新规则不符会被拒,
-        // 这里删掉更直接(避免旧 store 的周期性保存把旧快照写回盘)。
-        let dir = crate::config::attach_dir().join("index");
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let looks_like_snapshot = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("vol_") && n.ends_with(".bin"))
-                    .unwrap_or(false);
-                if looks_like_snapshot {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
         lstr_index::snapshot::debug_log("main: noise rules changed (slot updated)");
+    }
+
+    /// 维护页「重建索引」：强制 worker 丢弃全部卷的 store 并全量重扫。
+    ///
+    /// P1-3：旧实现把当前排除规则再传一遍 [`Self::rebuild_noise_index`]，
+    /// 规则没变时 worker 不重置、不重扫，只在磁盘上删了快照 —— 按钮实际
+    /// 是空操作，反而让下次启动丢失快照、只能全量 dirscan。现在用一次性
+    /// 世代计数显式请求重建；快照由引擎在重扫后自然覆盖。
+    pub fn rebuild_index(&self) {
+        self.rebuild_epoch.fetch_add(1, Ordering::Relaxed);
+        lstr_index::snapshot::debug_log("main: rebuild index requested (epoch bumped)");
     }
 
     pub fn search(
@@ -1730,6 +1738,8 @@ struct WorkerArgs {
     volume_mask: Arc<AtomicU32>,
     /// 排除规则共享槽(与 SearchService 共享,重建时换表)。
     noise_slot: Arc<Mutex<Vec<String>>>,
+    /// P1-3:强制重建请求世代(维护页「重建索引」)。
+    rebuild_epoch: Arc<AtomicU64>,
     shutdown_client: Arc<AtomicBool>,
     worker_collected: Arc<AtomicBool>,
     client_done: Arc<AtomicBool>,
@@ -1937,6 +1947,7 @@ fn run_worker(args: WorkerArgs) {
         index_cmd_tx,
         volume_mask,
         noise_slot,
+        rebuild_epoch,
         shutdown_client,
         worker_collected,
         client_done,
@@ -1949,6 +1960,8 @@ fn run_worker(args: WorkerArgs) {
     ));
     // 「立即重建」状态:槽内容与已应用表比对;待重扫卷 3s 未收到 ScanBegin 则重发。
     let mut noise_applied_raw = noise_slot.lock().unwrap().clone();
+    // P1-3:维护页「重建索引」请求世代;与启动值不同 = 强制全量重扫一次。
+    let mut rebuild_epoch_applied = rebuild_epoch.load(Ordering::Relaxed);
     let mut pending_rescan: Vec<(char, Instant)> = Vec::new();
     let mut last_resend = Instant::now();
     // 目录扫描(dir)会把 mtime 写进快照。纯 USN 首扫(旧 scan_mode="usn")
@@ -2114,28 +2127,38 @@ fn run_worker(args: WorkerArgs) {
                         .filter_map(|p| lstr_index::noise::normalize_pattern(p))
                         .collect()
                 };
-                if norm(&cur_raw) != norm(&noise_applied_raw) {
-                    let cur = norm(&cur_raw);
-                    let old = norm(&noise_applied_raw);
-                    let diff: Vec<String> = cur
-                        .difference(&old)
-                        .chain(old.difference(&cur))
-                        .cloned()
-                        .collect();
-                    let mut letters: Vec<char> = Vec::new();
-                    let mut all = false;
-                    for p in &diff {
-                        match lstr_index::noise::affected_drives_for_pattern(p) {
-                            None => all = true,
-                            Some(ds) => letters.extend(ds),
-                        }
-                    }
-                    let scope: Option<Vec<char>> = if all {
-                        None
+                // P1-3:维护页「重建索引」显式请求全卷重建，与规则变化共用
+                // 重置+重扫路径；规则没变也照样重置（旧实现这里会判定无变化
+                // 而什么都不做）。
+                let force_rebuild =
+                    rebuild_epoch.load(Ordering::Relaxed) != rebuild_epoch_applied;
+                if force_rebuild || norm(&cur_raw) != norm(&noise_applied_raw) {
+                    let (scope, reason): (Option<Vec<char>>, &str) = if force_rebuild {
+                        (None, "main: rebuild index requested")
                     } else {
-                        letters.sort_unstable();
-                        letters.dedup();
-                        (!letters.is_empty()).then_some(letters)
+                        let cur = norm(&cur_raw);
+                        let old = norm(&noise_applied_raw);
+                        let diff: Vec<String> = cur
+                            .difference(&old)
+                            .chain(old.difference(&cur))
+                            .cloned()
+                            .collect();
+                        let mut letters: Vec<char> = Vec::new();
+                        let mut all = false;
+                        for p in &diff {
+                            match lstr_index::noise::affected_drives_for_pattern(p) {
+                                None => all = true,
+                                Some(ds) => letters.extend(ds),
+                            }
+                        }
+                        let scope: Option<Vec<char>> = if all {
+                            None
+                        } else {
+                            letters.sort_unstable();
+                            letters.dedup();
+                            (!letters.is_empty()).then_some(letters)
+                        };
+                        (scope, "main: noise rules changed")
                     };
                     let (affected, mask) = if let Some(b) = &mut builtin {
                         let affected = b.engine.reset_volumes_for_noise(scope.as_deref());
@@ -2154,11 +2177,11 @@ fn run_worker(args: WorkerArgs) {
                     pending_rescan = affected.iter().map(|l| (*l, Instant::now())).collect();
                     last_resend = Instant::now();
                     lstr_index::snapshot::debug_log(&format!(
-                        "main: noise rules changed, reset {:?}, rescan mask=0x{mask:08x}",
-                        affected
+                        "{reason}, reset {affected:?}, rescan mask=0x{mask:08x}"
                     ));
                     noise_applied_raw = cur_raw;
                 }
+                rebuild_epoch_applied = rebuild_epoch.load(Ordering::Relaxed);
                 // 待重扫自愈:重发后 3s 仍未收到 ScanBegin 的卷 → 重发 Rescan
                 if !pending_rescan.is_empty()
                     && last_resend.elapsed() >= Duration::from_secs(3)

@@ -1536,6 +1536,9 @@ pub struct LstrApp {
     /// 索引是否处于 Fallback（未授权/worker 未运行）：P0-2 的「重新授权」
     /// 按钮与首启引导里的失败提示都据此显示。
     index_fallback: bool,
+    /// P1-3：当前索引阶段（Ready/Scanning/…）。维护页据此在重建/首扫期间
+    /// 禁用「重建索引」按钮，避免重复点或误以为按钮没生效。
+    index_phase: Option<lstr_index::Phase>,
     /// P1-11：会话存活标记文件路径；启动时存在=上次非正常退出。
     session_marker: std::path::PathBuf,
     /// P1-11：上次异常退出的提示（启动时若发现标记文件则填，展示一次后清除）。
@@ -1809,6 +1812,7 @@ impl LstrApp {
             index_note: None,
             index_note_since: None,
             index_fallback: false,
+            index_phase: None,
             session_marker,
             unclean_note,
             unclean_until,
@@ -4944,6 +4948,7 @@ impl LstrApp {
             }
         }
         self.index_fallback = fallback;
+        self.index_phase = status.as_ref().map(|st| st.phase);
         match &note {
             Some(_) => {
                 if self.index_note_since.is_none() {
@@ -4964,23 +4969,41 @@ impl LstrApp {
 
     /// P1-11：异常退出后一键重启。直接 spawn 会撞单实例互斥体，所以用
     /// `cmd /C timeout & start` 延迟拉起；CREATE_NO_WINDOW 避免闪黑框。
+    /// P1-2：拉起一个新实例。
+    /// ①旧实现用 `Command::args(["/C", "... start ..."])`；Rust 会按 MSVC 规则
+    /// 给参数补引号并把内层 `"` 转义成 `\"`，而 cmd 不认反斜杠转义，`start`
+    /// 的标题/路径被拆坏，实际什么都拉不起来。改用 `raw_arg` 直接拼命令行
+    /// （`src/win/shell.rs` 里已有同样的结论）。
+    /// ②`timeout /t` 在 `CREATE_NO_WINDOW` 的无控制台进程里会立即报「不支持
+    /// 输入重定向」，改成 `ping -n 3` 做约 2s 延迟。
+    /// 新实例带 `--relaunch`：若旧进程还在释放单实例互斥体，它会重试而不是
+    /// 直接退出。拉起失败时保留窗口并提示，不假装重启。
     fn relaunch_self(&mut self, ctx: &egui::Context) {
-        if let Ok(exe) = std::env::current_exe() {
-            use std::os::windows::process::CommandExt;
-            let _ = std::process::Command::new("cmd")
-                .args([
-                    "/C",
-                    &format!(
-                        "timeout /t 2 /nobreak >nul & start \"\" \"{}\"",
+        use std::os::windows::process::CommandExt;
+        let launched = std::env::current_exe()
+            .map_err(|err| format!("无法定位自身路径：{err}"))
+            .and_then(|exe| {
+                std::process::Command::new("cmd")
+                    .raw_arg(format!(
+                        "/C ping -n 3 127.0.0.1 >nul & start \"\" \"{}\" --relaunch",
                         exe.display()
-                    ),
-                ])
-                .creation_flags(0x0800_0000)
-                .spawn();
+                    ))
+                    .creation_flags(0x0800_0000)
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|err| format!("无法启动新实例：{err}"))
+            });
+        match launched {
+            Ok(()) => {
+                lstr_index::snapshot::debug_log("ui: restart requested (relaunch pending)");
+                self.exit_reason = "restart";
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(message) => {
+                lstr_index::snapshot::debug_log(&format!("ui: restart failed: {message}"));
+                self.toast(ctx, format!("重启失败：{message}；请手动重新打开 lstr"));
+            }
         }
-        lstr_index::snapshot::debug_log("ui: restart requested");
-        self.exit_reason = "restart";
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     fn toast(&mut self, ctx: &egui::Context, message: String) {
@@ -11145,8 +11168,15 @@ impl LstrApp {
         y += ROW;
 
         Self::settings_label(painter, &theme, area.left(), y, "索引服务");
+        // P1-3：重建/首扫期间按钮显示「重建中…」且不再重复触发。
+        let rebuilding = matches!(
+            self.index_phase,
+            Some(lstr_index::Phase::Scanning | lstr_index::Phase::Loading)
+        );
         let index_btn = if self.index_fallback {
             "重新授权"
+        } else if rebuilding {
+            "重建中…"
         } else {
             "重建索引"
         };
@@ -11163,18 +11193,15 @@ impl LstrApp {
                 crate::search::builtin::request_worker_relaunch();
                 self.toast(ctx, "已请求管理员授权：请在系统弹窗里点「是」".to_string());
                 ctx.request_repaint();
+            } else if rebuilding {
+                self.toast(ctx, "重建已在进行中（重扫完成前请稍候）".to_string());
             } else {
-                // 与噪声页「立即重建」同一路径：更新排除规则后删旧快照重扫。
-                let patterns = self
-                    .cfg
-                    .rank
-                    .noise_rules
-                    .iter()
-                    .filter(|r| r.exclude)
-                    .map(|r| r.pattern.clone())
-                    .collect();
-                self.service.rebuild_noise_index(patterns);
-                self.toast(ctx, "正在重建索引（后台进行，完成即生效）".to_string());
+                // P1-3：真正的强制重建（worker 重置全部卷 + 全量重扫）。
+                // 旧实现只把当前排除规则再传一遍：规则没变时 worker 不重置，
+                // 按钮是空操作，还删掉了快照。
+                self.service.rebuild_index();
+                self.toast(ctx, "已开始重建索引（后台重扫，完成即生效）".to_string());
+                ctx.request_repaint();
             }
         }
         painter.text(
@@ -11182,6 +11209,8 @@ impl LstrApp {
             Align2::LEFT_CENTER,
             if self.index_fallback {
                 "未连接：需要管理员授权"
+            } else if rebuilding {
+                "重建中…"
             } else {
                 "运行中"
             },

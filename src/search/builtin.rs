@@ -1017,17 +1017,16 @@ pub fn worker_launch_args(index: &crate::config::IndexConfig, volume_mask: u32) 
 }
 
 /// ShellExecute runas 拉起提权 worker(UAC 一次/会话)。
-/// 能力令牌经命令行传给 worker:固定管道名 + 只比 exe 名的校验挡不住同用户
+/// 令牌经命令行传给 worker:固定管道名 + 只比 exe 名的校验挡不住同用户
 /// 其它进程,worker 会用 Hello 里的令牌二次校验(L5)。
-/// 令牌通道取舍:主进程不提升,能传给提权 worker 的任何通道(用户目录文件/
-/// 环境变量/共享内存)对同用户非提权进程都更易读;命令行反而是最小暴露面。
-/// 属能力校验而非密码学防护,残余风险见 worker.rs 模块文档的威胁模型。
+/// P1-1:令牌按用户持久化(`worker_token_hex`),否则常驻 worker 退出后
+/// 新进程的随机令牌会让重开握手失败(白等 60s + 再次 UAC)。
 pub fn launch_worker(extra_args: &str) -> bool {
     let Some(exe) = std::env::current_exe().ok() else { return false };
     let exe_str = exe.display().to_string();
     let params = format!(
         "--index-worker --index-token {}{}",
-        idx_client::session_token_hex(),
+        idx_client::worker_token_hex(),
         extra_args
     );
     // 复用 lstr 的 shell_execute_with 语义:runas + 参数
