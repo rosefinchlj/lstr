@@ -1,7 +1,7 @@
 # 文件对话框停靠条设计（Listary 式吸附）
 
 日期：2026-11-17
-状态：已获用户批准（2026-11-17），待实施
+状态：已获用户批准（2026-11-17），已实施（见文末「实施记录」）
 
 ## 背景与目标
 
@@ -88,26 +88,28 @@ fn bar_rect(dialog: [i32; 4], work: [i32; 4], rows: i32) -> (i32, i32, i32, i32)
 
 ### 3. 布局
 
-自上而下：
+自上而下（窗口底部锚定，列表在上、输入行贴底，与 Explorer 浮层一致）：
 
-1. **输入行**（40px）：左侧放大镜图标；中间 `TextEdit`（`id = "lstr-dialog-input"`）；右侧灰字提示——
-   被动「点击或 Ctrl+G 搜索」，接管「Enter 跳转 · Esc 收起」。
+1. **结果行**（`paint_rows`，每行 32px）：
+   - 空查询：Quick Switch 建议（Explorer 已打开的文件夹），行尾显示盘符；
+   - 有查询：实时搜索结果，命中高亮沿用 `paint_rows` 现有实现；
+   - **被动态不响应单击/双击/拖出/右键**（只做 hover 高亮）：条子是 topmost 的，
+     用户想点文件名框时手一滑就会误把对话框跳到别的目录；要选结果先点条子接管。
 2. **1px 分隔线**。
-3. **结果行**（`paint_rows`，每行 32px）：
-   - 空查询：Quick Switch 建议（Explorer 已打开的文件夹），行尾显示 `Ctrl+G` 意思的反向提示改显示盘符；
-   - 有查询：实时搜索结果，命中高亮沿用 `paint_rows` 现有实现。
+3. **输入行**（40px，贴窗口底边）：左侧放大镜图标；中间 `TextEdit`（`id = "lstr-dialog-input"`，仅接管后创建）；
+   右侧灰字提示——被动「点条子或按 Ctrl+G 搜索 / 保存对话框为「…搜索文件夹」」，接管「Enter 跳转 · Esc 收起」。
 
-不画 Explorer 浮层那套「状态行」（选中项完整路径），紧凑条高度敏感；选中项的完整路径改为在输入行右侧灰字短暂显示。
+不画 Explorer 浮层那套「状态行」（选中项完整路径），紧凑条高度敏感。
 
 ### 4. 焦点与显示
 
-- 被动出现必须**不激活窗口**：
-  - `ShowWindow(hwnd, SW_SHOWNOACTIVATE)`；
-  - `SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW)`；
-  - 不调用 `force_foreground` / `restore_foreground`。
-- 接管时才 `restore_foreground(hwnd)` 并 `egui` 请求聚焦输入框。
-- 风险：winit 侧的 `Visible(true)` 可能触发激活。实现时用 `GetForegroundWindow()` 断言：被动显示后前台仍是对话框 hwnd；
-  若被激活，改走 `SW_SHOWNOACTIVATE` + 事后 `restore_foreground(dialog)` 兜底（并在手动清单里回归）。
+- 被动出现必须**不激活窗口**：窗口的「隐藏」本来就只是 `SetWindowPos` 到屏幕外（`window::hide`），
+  winit 侧始终 visible，所以被动显示只需 `place_attached` → `set_rect`（`HWND_TOPMOST | SWP_NOACTIVATE`），
+  **不调** `window::show` / `force_foreground` / `ViewportCommand::Visible(true)`。
+- 接管时才 `force_foreground(hwnd)` 并让 egui 请求聚焦输入框（只在接管那一刻 request 一次）。
+- 被动态「对话框不再是前台」→ 立即 `hide_keep`（条子 topmost，不能飘在别的应用上）；点回对话框时
+  `DialogWatch` 的前台事件会重新唤出。
+- 接管态失焦 → 回到被动停靠（`disengage_dialog`），而不是整条收起。
 
 ### 5. 设置与默认
 
@@ -117,12 +119,15 @@ fn bar_rect(dialog: [i32; 4], work: [i32; 4], rows: i32) -> (i32, i32, i32, i32)
 
 ### 6. 测试
 
-- 纯函数单测 `bar_rect`：
-  - 下方空间充足 → 下沿齐平、水平居中；
+- 纯函数单测 `dialog_bar_rect(dialog, work, width, row_px, chrome_px, rows)`（`src/app.rs` 的
+  `mod dialog_bar_tests`，7 个用例）：
+  - 下方空间充足 → 下沿齐平、水平居中、行数不变；
   - 下方空间只够 3 行 → rows 降为 3；
   - 下方空间不足 73px → 内侧贴底；
-  - 对话框贴屏幕左缘 → x 被夹到 4；
-  - 对话框高于工作区 → rows 至少 1、高度不超工作区。
+  - 对话框贴屏幕右缘 → x 被夹回工作区；
+  - 行数上限 9；
+  - 对话框被拖出工作区 → y 再夹；
+  - `rows = 0` → 仍给 1 行高度。
 - 手动清单：
   1. VS Code「打开文件」对话框 → 条子下沿居中、不抢焦点、文件名框可打字；
   2. 记事本「另存为」→ 同上；
@@ -140,3 +145,28 @@ fn bar_rect(dialog: [i32; 4], work: [i32; 4], rows: i32) -> (i32, i32, i32, i32)
 - **方案 A（采用）**：新增「锚点目标」概念（Explorer / Dialog），复用现有几何、跟随、行数引擎；按目标切换摆放规则与焦点策略。
 - 方案 B（另写一套对话框停靠逻辑）否决：跟随、尺寸槽位、抖动处理要复制一遍，两边会跑偏。
 - 方案 C（只把大窗口挪到下方居中）否决：仍是启动器大窗，不满足「条子」观感。
+
+## 实施记录（2026-11-17）
+
+落地位置（`E:\use\ai\deepseek\Rust\lstr`）：
+
+- `src/win/window.rs`：删 `position_near_dialog`（只服务旧的整窗弹窗）；新增
+  `work_area_for(hwnd) -> Option<[i32; 4]>`（`MonitorFromWindow` + `GetMonitorInfoW` → `rcWork`）。
+- `src/app.rs`：
+  - 新字段 `dialog_engaged`（被动/接管）、`dialog_focused`（是否拿到过焦点）；
+  - 新函数 `dialog_bar_rect`（纯几何 + 7 个单测）、`dialog_mode()`、`show_dialog_bar()`、
+    `engage_dialog()`、`disengage_dialog()`、`paint_dialog_input()`；
+  - `open_dialog_mode(ctx, info, engage)` 改为三参并复用 `attach_hwnd` 几何引擎（不再
+    `pending_show` / `position_near_dialog` / `Visible(true)`）；
+  - `place_attached` 按 `dialog_mode()` 分支出停靠条几何；`poll_attach` 被动态 50ms、接管 16ms；
+    `poll_attach_focus` 加对话框分支（被动失前台收起 / 接管失焦退回被动）；
+  - `paint_attach` 走 `paint_dialog_input`；`paint_rows` 被动态行只做 hover；
+  - `toggle()`：对话框在前台时聚焦停靠条；停靠条在时被动态接管、接管态收起；
+  - `HotkeyEvent::DialogSearch`：停靠条已挂上时先处理接管/跳转，避免清掉用户查询。
+- 与设计稿的差异：①`ShowWindow(SW_SHOWNOACTIVATE)` 不需要——窗口本来就没被真正的
+  `SW_HIDE`，只是挪到屏幕外；②结果行在被动态**不响应点击**（防误触把对话框跳到别的目录）；
+  ③补了「对话框不再是前台就收起」；④`Esc` / 执行 / 双击 Ctrl 收起后都会
+  `suppressed_dialog = Some(hwnd)`，同一对话框不再自动弹。
+
+验证：`cargo test` → 472 passed（含 7 个 `dialog_bar_tests`）；`cargo check --all-targets` 干净。
+GUI 行为（不抢焦点、跟随、误触防护）仍待按上面 10 条手动清单在真机上回归。

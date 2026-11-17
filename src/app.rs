@@ -333,6 +333,49 @@ const ATTACH_STATUS_PAD_TOP: f32 = 4.0;
 const ATTACH_STATUS_PAD_BOTTOM: f32 = 5.0;
 const ATTACH_STATUS_MAX_LINES: usize = 5;
 
+/// 文件对话框停靠条的几何：挂在对话框下沿外侧、水平居中。
+///
+/// `dialog` / `work` 都是物理像素的 `[left, top, right, bottom]`（`work` =
+/// 工作区，已扣掉任务栏）；返回 `(x, y, width, height)`。`row_px` 是结果行
+/// 高、`chrome_px` 是分隔线 + 输入行的高度，都由调用方按 DPI 换算好。
+///
+/// 规则（对齐 Listary 的吸附条）：
+/// 1. 默认与对话框下沿齐平：`y = dialog.bottom`；
+/// 2. 下方放不下时先减行数（最少 1 行）——条子永远优先留在「外侧」；
+/// 3. 连 1 行 + 输入行都放不下（对话框贴任务栏/最大化）→ 内侧贴底：底边
+///    仍对齐对话框下沿，条子压在对话框底部；
+/// 4. `x` 相对对话框水平居中，并夹在工作区内（对话框贴左/右缘时不越界）。
+fn dialog_bar_rect(
+    dialog: [i32; 4],
+    work: [i32; 4],
+    width: i32,
+    row_px: i32,
+    chrome_px: i32,
+    rows_wanted: usize,
+) -> (i32, i32, i32, i32) {
+    let row_px = row_px.max(1);
+    let chrome_px = chrome_px.max(1);
+    let width = width.max(1);
+    let mut rows = rows_wanted.clamp(1, ATTACH_MAX_ROWS);
+    let mut height = rows as i32 * row_px + chrome_px;
+    let below = (work[3] - dialog[3]).max(0);
+    while rows > 1 && height > below {
+        rows -= 1;
+        height = rows as i32 * row_px + chrome_px;
+    }
+    let mut y = dialog[3];
+    if height > below {
+        y = dialog[3] - height;
+    }
+    // 对话框被拖到工作区上/下缘之外时也别把条子丢在屏幕外。
+    let max_y = (work[3] - height).max(work[1]);
+    let y = y.clamp(work[1], max_y);
+    let center = (dialog[0] + dialog[2]) / 2;
+    let max_x = (work[2] - width - 4).max(work[0] + 4);
+    let x = (center - width / 2).clamp(work[0] + 4, max_x);
+    (x, y, width, height)
+}
+
 /// 搜索框左侧条件 chip 的宽度（不绘制）。`label` 为空 = 紧凑模式（只画值）。
 /// `dense` = 多个条件时的缩小版（字号/内边距/高度都更小）。
 fn condition_chip_width(painter: &egui::Painter, label: &str, value: &str, dense: bool) -> f32 {
@@ -1650,7 +1693,6 @@ pub struct LstrApp {
     preview_open: bool,
     autostart: bool,
     pending_show: bool,
-    pending_dialog: Option<isize>,
     menu_open: bool,
     menu_index: usize,
     manual_size: Option<Vec2>,
@@ -1761,12 +1803,24 @@ pub struct LstrApp {
     /// 换查询）时窗口高度与列表原点都不再变化，避免「输入 c 再删掉」这类
     /// 尺寸反复变化造成的晃动；代价是结果变少时列表下方留白。
     attach_rows_floor: usize,
+    /// 停靠条实际能画下的行数（由 `dialog_bar_rect` 按对话框下方空间收敛）。
+    /// 与 `attach_rows_floor`（想显示几行）区分开：对话框贴着屏幕底部时窗口
+    /// 只放得下 2 行，若仍按想显示的行数排版，列表会从顶部被裁掉、选中行也
+    /// 可能落在看不见的地方。
+    attach_rows_fit: usize,
     /// 上次同步选中项的时刻（节流：快速连按 ↑↓ 时别每帧都敲资源管理器）。
     attach_sel_at: Option<std::time::Instant>,
     /// 这次贴角浮层是否真的拿到过键盘焦点。抢前台失败（系统前台锁）时
     /// egui 会一直报 focused=false，若直接按失焦收起就会「闪一下不见」；
     /// 只有确实拿到过焦点、之后再丢焦点才收起。
     attach_focused: bool,
+    /// 文件对话框停靠条是否已接管焦点：false = 被动停靠（对话框自己拿着焦点，
+    /// 条子只显示 Quick Switch 建议），true = 用户点条子/按 Ctrl+G 后由条子
+    /// 收键。停靠条与 Explorer 贴角浮层共用 `attach_hwnd` 的几何引擎，靠
+    /// `dialog.is_some()` 区分是哪种锚点。
+    dialog_engaged: bool,
+    /// 停靠条是否拿到过焦点（理由同 `attach_focused`）。
+    dialog_focused: bool,
     /// 仅 debug 构建：无可见桌面时的贴角浮层开发验证钩子（开发用，release 不含）。
     #[cfg(debug_assertions)]
     dev: Option<DevHarness>,
@@ -1969,7 +2023,6 @@ impl LstrApp {
             preview_open,
             autostart: crate::win::autostart::is_enabled(),
             pending_show: false,
-            pending_dialog: None,
             menu_open: false,
             menu_index: 0,
             manual_size,
@@ -2027,8 +2080,11 @@ impl LstrApp {
             attach_sel: None,
         attach_status_slot: 0.0,
         attach_rows_floor: 0,
+        attach_rows_fit: 0,
             attach_sel_at: None,
             attach_focused: false,
+            dialog_engaged: false,
+            dialog_focused: false,
             #[cfg(debug_assertions)]
             dev: None,
             hotkey_recording: None,
@@ -2134,6 +2190,7 @@ impl LstrApp {
                 self.attach_sel_at = None;
                 self.attach_status_slot = 0.0;
                 self.attach_rows_floor = 0;
+                self.attach_rows_fit = 0;
                 self.attach_focused = false;
                 // 贴角浮层与启动器是两套现场：换模式时丢掉旧结果，也不复用
                 // 启动器（或上次贴角浮层）的输入——show() 会按 keep=false 清空。
@@ -2197,6 +2254,36 @@ impl LstrApp {
                     }
                 }
                 HotkeyEvent::DialogSearch => {
+                    // 停靠条已挂在这个对话框上：
+                    // - 被动 → Ctrl+G 就是「接管输入框」，别再重开一次
+                    //   （那会把用户已经敲了一半的查询清掉）；
+                    // - 已接管 → 条子拿着前台，`active_dialog()` 看不到对话框，
+                    //   这时 Ctrl+G 退回原本的语义：跳到 Explorer 正在浏览的目录。
+                    if self.dialog_mode() && !self.hidden {
+                        if self.dialog_engaged {
+                            let info = self.dialog.clone();
+                            match (info, crate::win::explorer::active_explorer_folder()) {
+                                (Some(info), Some(folder)) => {
+                                    match dialog::navigate_to_folder(
+                                        &info,
+                                        &folder.to_string_lossy(),
+                                    ) {
+                                        Ok(()) => {
+                                            self.suppressed_dialog = Some(info.hwnd);
+                                            self.dialog = None;
+                                            self.hide(ctx);
+                                            dialog::restore_focus(&info);
+                                        }
+                                        Err(err) => self.toast(ctx, err),
+                                    }
+                                }
+                                _ => self.toast(ctx, "没有可跳转的资源管理器窗口".to_string()),
+                            }
+                        } else {
+                            self.engage_dialog(ctx);
+                        }
+                        continue;
+                    }
                     if let Some(info) = dialog::active_dialog() {
                         // P0-3：有活动 Explorer 目录就零输入直跳，否则退回文件夹搜索。
                         let target = crate::win::explorer::active_explorer_folder();
@@ -2211,7 +2298,7 @@ impl LstrApp {
                                 Err(err) => self.toast(ctx, err),
                             }
                         } else {
-                            self.open_dialog_mode(ctx, info);
+                            self.open_dialog_mode(ctx, info, true);
                         }
                     } else if !self.hidden {
                         self.toast(ctx, "请先打开「打开/保存」对话框，再按 Ctrl+G".to_string());
@@ -2386,7 +2473,7 @@ impl LstrApp {
         }
     }
 
-    /// 自动唤出：前台出现标准文件对话框时弹到它旁边。
+    /// 自动唤出：前台出现标准文件对话框时，在它下沿外侧挂出停靠条。
     /// 抑制机制防止循环弹窗——凡是「我们主动把焦点还给对话框」的场景
     /// （填入成功、Esc、失焦隐藏）都记下 hwnd，同一个对话框不再自动弹。
     fn poll_dialog_watch(&mut self, ctx: &egui::Context) {
@@ -2423,7 +2510,8 @@ impl LstrApp {
             return;
         }
         self.suppressed_dialog = None;
-        self.open_dialog_mode(ctx, info);
+        // 被动停靠：对话框自己拿焦点，条子只是弹出来待命。
+        self.open_dialog_mode(ctx, info, false);
     }
 
     fn poll_tray(&mut self, ctx: &egui::Context) {
@@ -3862,7 +3950,27 @@ impl LstrApp {
 
     fn toggle(&mut self, ctx: &egui::Context) {
         if self.hidden {
+            // ⑥ 文件对话框在前台时，双击 Ctrl 聚焦停靠条，而不是在屏幕中间另开
+            // 一个启动器（那样会盖住对话框、还抢走文件名框的焦点）。
+            if let Some(info) = dialog::foreground_dialog() {
+                self.open_dialog_mode(ctx, info, true);
+                return;
+            }
             self.show(ctx);
+        } else if self.dialog_mode() {
+            // 停靠条在：被动态接管，接管态收起（相当于「再按一次退回去」）。
+            // 收起与 Esc 同语义：抑制这个对话框的自动挂出 + 把焦点还给对话框。
+            if self.dialog_engaged {
+                if let Some(dialog) = self.dialog.clone() {
+                    self.suppressed_dialog = Some(dialog.hwnd);
+                    self.hide_keep(ctx);
+                    dialog::restore_focus(&dialog);
+                } else {
+                    self.hide_keep(ctx);
+                }
+            } else {
+                self.engage_dialog(ctx);
+            }
         } else {
             self.hide_keep(ctx);
         }
@@ -3871,11 +3979,12 @@ impl LstrApp {
     /// 外部改写 input 后，TextEdit 的持久光标状态还停在旧位置（通常是 0），
     /// 清掉它，下一帧就会按 cursor_at_end 把光标放到文本末尾。
     fn reset_input_cursor(ctx: &egui::Context) {
-        // 普通启动器与贴角浮层各有一个输入框 id：两者都清，形态切换后
-        // 光标不会停在上一次搜索的后半截。
+        // 普通启动器、Explorer 贴角浮层、对话框停靠条各有一个输入框 id：
+        // 全清，形态切换后光标不会停在上一次搜索的后半截。
         let ids = [
             egui::Id::new("lstr-search-input"),
             egui::Id::new("lstr-attach-input"),
+            egui::Id::new("lstr-dialog-input"),
         ];
         ctx.data_mut(|data| {
             for id in ids {
@@ -3901,7 +4010,6 @@ impl LstrApp {
         // center_frames/pending_show 重定位链，否则每帧被拽回屏幕中间。
         let attach = self.attach_hwnd.is_some();
         self.pending_show = !attach;
-        self.pending_dialog = None;
         self.hidden = false;
         self.shown_at = Instant::now();
         self.center_frames = if attach { 0 } else { 3 };
@@ -3957,40 +4065,131 @@ impl LstrApp {
         self.trigger(ctx);
     }
 
-    fn open_dialog_mode(&mut self, ctx: &egui::Context, info: DialogInfo) {
+    /// 文件对话框停靠条：对话框成为前台时自动弹出，挂在它下沿外侧、水平居中。
+    ///
+    /// 与 Explorer 贴角浮层共用几何引擎（`attach_hwnd` 当锚点），区别只有两处：
+    /// - 默认**被动**：不抢焦点，对话框（含文件名框）照常可打字，条子只列
+    ///   Quick Switch 建议；点条子 / `Ctrl+G` / 双击 `Ctrl` 才 [`Self::engage_dialog`]。
+    /// - 行数按对话框下方剩余空间收敛（见 [`dialog_bar_rect`]）。
+    ///
+    /// `engage = true` 时直接接管焦点（`Ctrl+G` / 双击 Ctrl 唤出）。
+    fn open_dialog_mode(&mut self, ctx: &egui::Context, info: DialogInfo, engage: bool) {
+        // 已经停靠在同一个对话框上：只在被动/接管之间切换，别清掉用户输入。
+        let docked = self.dialog.as_ref().map(|d| d.hwnd) == Some(info.hwnd)
+            && self.attach_hwnd == Some(info.hwnd)
+            && !self.hidden;
+        if docked {
+            if engage {
+                self.engage_dialog(ctx);
+            }
+            return;
+        }
         self.dialog = Some(info.clone());
+        // 停靠条把锚点交给合并后的几何引擎；Explorer 贴角浮层此刻不可能同时
+        // 存在（两条入口互斥），直接覆盖即可。
+        self.attach_hwnd = Some(info.hwnd);
+        self.attach_last = None;
+        self.attach_px = None;
+        self.attach_sel = None;
+        self.attach_sel_at = None;
+        self.attach_status_slot = 0.0;
+        self.attach_rows_floor = 0;
+        self.attach_rows_fit = 0;
+        self.attach_focused = false;
+        self.dialog_engaged = false;
+        self.dialog_focused = false;
         self.typing_folder = None;
         self.typing_global = false;
         self.browse_root = None;
         self.browse_forward.clear();
+        self.settings_open = false;
         self.menu_open = false;
+        self.filter_menu = None;
+        // 停靠条自己按对话框边框定位，不走 position_center / position_near_dialog
+        // 那两条重定位链（否则会被拽回屏幕中间或对话框左上角）。
+        self.pending_show = false;
         self.center_frames = 0;
-        self.pending_show = true;
-        self.pending_dialog = Some(info.hwnd);
         self.scope = Scope::Folder;
         self.clear_input_text();
         self.entries.clear();
+        self.total = 0;
         self.selected = 0;
         self.scroll_y = 0.0;
         self.filters = SearchFilters::default();
         self.condition_error = None;
-        self.filter_menu = None;
         self.condition_history.clear();
-        self.hidden = false;
-        self.shown_at = Instant::now();
-        // 对话框模式不居中：保持贴着对话框（center_frames 只用于双击 Space 唤出）。
-        self.center_frames = 0;
-        self.focus_requested = true;
+        Self::reset_input_cursor(ctx);
+        self.focus_requested = false;
         self.mouse_moved = false;
         self.needle_ready = false;
-        self.apply_size(ctx);
-        if let Some(hwnd) = self.hwnd {
-            window::position_near_dialog(hwnd, info.hwnd);
-            window::show(hwnd);
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.request_repaint();
+        self.hidden = false;
+        self.shown_at = Instant::now();
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+            320.0,
+            ATTACH_MIN_H,
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+        // 空查询立刻发一次查询：`dialog_quick` 会把「Explorer 已打开的文件夹」
+        // 置顶成 Quick Switch 建议，被动停靠时就有东西可看。
         self.trigger(ctx);
+        self.show_dialog_bar(ctx);
+        if engage {
+            self.engage_dialog(ctx);
+        }
+    }
+
+    /// 显示停靠条：把窗口摆到对话框下沿——**不激活窗口**。
+    ///
+    /// 窗口的「隐藏」只是被移到屏幕外（`window::hide`），这里只需
+    /// `SetWindowPos` 把它挪回来（`SWP_NOACTIVATE`），绝不调 `window::show` /
+    /// `force_foreground`：否则文件对话框立刻失焦，文件名框的输入法组合会被
+    /// 打断，用户就再也「边看目录边打字」不了了。
+    fn show_dialog_bar(&mut self, ctx: &egui::Context) {
+        self.place_attached(ctx);
+        ctx.request_repaint();
+    }
+
+    /// 接管焦点：点条子 / `Ctrl+G` / 双击 `Ctrl`。
+    ///
+    /// 条子已经在对话框下沿摆好，这里只把前台拿过来，输入框才能收到按键与
+    /// 输入法组合（也就是 Listary 那条「点一下条子才开始搜」的语义）。
+    fn engage_dialog(&mut self, ctx: &egui::Context) {
+        if self.dialog.is_none() {
+            return;
+        }
+        self.dialog_engaged = true;
+        self.dialog_focused = false;
+        self.focus_requested = true;
+        self.hidden = false;
+        self.shown_at = Instant::now();
+        if let Some(hwnd) = self.hwnd {
+            window::force_foreground(hwnd);
+        }
+        ctx.request_repaint();
+    }
+
+    /// 交还焦点（回到被动停靠）：用户点回对话框时用。
+    ///
+    /// 查询清空、行数槽位归零：被动态展示的是 Quick Switch 建议，而不是
+    /// 接管时那半截查询。这里**不**抢前台——用户已经把焦点点回对话框了。
+    fn disengage_dialog(&mut self, ctx: &egui::Context) {
+        if !self.dialog_engaged {
+            return;
+        }
+        self.dialog_engaged = false;
+        self.focus_requested = false;
+        self.dialog_focused = false;
+        self.attach_status_slot = 0.0;
+        self.attach_rows_floor = 0;
+        self.attach_rows_fit = 0;
+        self.clear_input_text();
+        Self::reset_input_cursor(ctx);
+        self.entries.clear();
+        self.total = 0;
+        self.selected = 0;
+        self.scroll_y = 0.0;
+        self.trigger(ctx);
+        ctx.request_repaint();
     }
 
     fn open_settings(&mut self, ctx: &egui::Context) {
@@ -4041,6 +4240,11 @@ impl LstrApp {
         self.typing_global = false;
         // 贴角浮层收起：恢复普通启动器的窗口约束，并把前台交还给刚才那扇
         // Explorer 窗口——用户刚在它里面打字，Esc 关掉浮层后应能继续操作。
+        // 文件对话框停靠条走同一段清理（锚点就是对话框），交还焦点由调用方
+        // `dialog::restore_focus` 精确到文件名框。
+        self.dialog = None;
+        self.dialog_engaged = false;
+        self.dialog_focused = false;
         if let Some(anchor) = self.attach_hwnd.take() {
             self.attach_last = None;
             self.attach_px = None;
@@ -4048,6 +4252,7 @@ impl LstrApp {
             self.attach_sel_at = None;
             self.attach_status_slot = 0.0;
             self.attach_rows_floor = 0;
+            self.attach_rows_fit = 0;
             self.attach_focused = false;
             // 贴角浮层不保留现场：它的输入/结果不能泄漏到下一次双击 Ctrl
             // 唤出的启动器（两套模式互不影响）。last_width/last_height 必须
@@ -4066,8 +4271,15 @@ impl LstrApp {
                 420.0, 160.0,
             )));
             ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
-            window::restore_foreground(anchor);
+            if window::is_window(anchor) {
+                window::restore_foreground(anchor);
+            }
         }
+    }
+
+    /// 当前是否处于「文件对话框停靠条」模式（与 Explorer 贴角浮层互斥）。
+    fn dialog_mode(&self) -> bool {
+        self.dialog.is_some()
     }
 
     /// 当前模式的行高：贴角浮层用紧凑 32px（对齐 Listary 截图），普通启动器
@@ -4085,7 +4297,9 @@ impl LstrApp {
     /// 右侧路径列只有一列宽，长路径必须中段省略；选中/悬停时用底部状态行把
     /// 「完整路径」补出来，这样才不用为了看全路径去切回资源管理器。
     fn attach_status_text(&self, ctx: &egui::Context) -> Option<String> {
-        if self.attach_hwnd.is_none() {
+        // 停靠条没有状态行：它只有一两百像素高，路径列省略时点条子就能接管
+        // 搜索、结果行本身也够看，不需要再挤一行完整路径。
+        if self.attach_hwnd.is_none() || self.dialog_mode() {
             return None;
         }
         let entry = self.entries.get(self.selected)?;
@@ -4171,9 +4385,12 @@ impl LstrApp {
         if self.attach_hwnd.is_none() {
             return;
         }
-        let needed = self.attach_status_height(ctx);
-        if needed > self.attach_status_slot {
-            self.attach_status_slot = needed;
+        // 停靠条没有状态行（见 attach_status_text），只刷行数槽位。
+        if !self.dialog_mode() {
+            let needed = self.attach_status_height(ctx);
+            if needed > self.attach_status_slot {
+                self.attach_status_slot = needed;
+            }
         }
         let rows = Self::attach_rows_needed(self.entries.len());
         if rows > self.attach_rows_floor {
@@ -4181,16 +4398,22 @@ impl LstrApp {
         }
     }
 
-    /// 贴角浮层目标高度（点）：结果行（最多 9 行）+ 状态行槽位 + 分隔线 + 输入行。
-    /// 空态按 2 行算，让「输入以搜索」的提示不显得贴边。
+    /// 贴角浮层/停靠条的目标高度（点）：结果行（最多 9 行）+ 状态行槽位 +
+    /// 分隔线 + 输入行。空态按 2 行算，让提示不显得贴边。
     fn attach_height(&self) -> f32 {
         let rows = self.attach_rows_floor.max(1) as f32;
         let list_h = rows * ATTACH_ROW_H;
-        (list_h + self.attach_status_slot + ATTACH_DIVIDER + ATTACH_INPUT_H).max(ATTACH_MIN_H)
+        let status = if self.dialog_mode() {
+            0.0
+        } else {
+            self.attach_status_slot
+        };
+        (list_h + status + ATTACH_DIVIDER + ATTACH_INPUT_H).max(ATTACH_MIN_H)
     }
 
-    /// 按锚点 Explorer 的可见边框把窗口摆到右下角（B1：位置 + 尺寸一次
-    /// SetWindowPos）。右侧/底边贴住可见边缘，不额外留缝。
+    /// 按锚点窗口的可见边框摆放：Explorer = 右下角贴角浮层，文件对话框 =
+    /// 下沿外侧水平居中的停靠条（几何见 [`dialog_bar_rect`]）。两种模式都把
+    /// 位置 + 尺寸合成一次 `SetWindowPos`。
     fn place_attached(&mut self, ctx: &egui::Context) {
         let (Some(anchor), Some(hwnd)) = (self.attach_hwnd, self.hwnd) else {
             return;
@@ -4201,7 +4424,23 @@ impl LstrApp {
         let ppp = ctx.pixels_per_point();
         self.refresh_attach_status_slot(ctx);
         let width = (ATTACH_W * ppp).round() as i32;
-        let height = (self.attach_height() * ppp).round() as i32;
+        let (x, y, width, height) = if self.dialog_mode() {
+            let rows = self.attach_rows_floor.max(1);
+            let row_px = (ATTACH_ROW_H * ppp).round().max(1.0) as i32;
+            let chrome_px = ((ATTACH_DIVIDER + ATTACH_INPUT_H) * ppp).round().max(1.0) as i32;
+            // 工作区取不到（极小概率）就退化成「屏幕外框即工作区」：宁可贴边，
+            // 也别让条子跑到屏幕外。
+            let work =
+                window::work_area_for(anchor).unwrap_or([frame[0], frame[1], frame[2], frame[3]]);
+            let rect = dialog_bar_rect(frame, work, width, row_px, chrome_px, rows);
+            // 记下真正放得下的行数：排版按它算，列表才不会被窗口上沿裁掉。
+            self.attach_rows_fit =
+                (((rect.3 - chrome_px) / row_px).max(1) as usize).min(ATTACH_MAX_ROWS);
+            rect
+        } else {
+            let height = (self.attach_height() * ppp).round() as i32;
+            (frame[2] - width, frame[3] - height, width, height)
+        };
         if self.attach_last == Some(frame) && self.attach_px == Some((width, height)) {
             return;
         }
@@ -4217,33 +4456,41 @@ impl LstrApp {
                 self.shown_at.elapsed().as_secs_f32(),
             ));
         }
-        let x = frame[2] - width;
-        let y = frame[3] - height;
         window::set_rect(hwnd, x, y, width, height);
         self.attach_last = Some(frame);
         self.attach_px = Some((width, height));
     }
 
-    /// 贴角跟随（A1）：每帧廉价轮询锚点边框，变化才重摆；同时 16ms 续帧，
-    /// 让 Explorer 拖动/缩放时浮层基本同帧跟上。A2（SetWinEventHook 事件）
-    /// 留作后续优化——MVP 先保证正确，事件版本再省这点轮询开销。
+    /// 跟随：每帧廉价轮询锚点边框，变化才重摆；同时续帧，让锚点窗口拖动/
+    /// 缩放时浮层基本同帧跟上。A2（SetWinEventHook 事件）留作后续优化——
+    /// MVP 先保证正确，事件版本再省这点轮询开销。
     fn poll_attach(&mut self, ctx: &egui::Context) {
         let Some(anchor) = self.attach_hwnd else {
             return;
         };
         if !window::is_window(anchor) {
-            // Explorer 窗口被关掉：别把浮层留在空中。
+            // 锚点窗口被关掉：别把浮层/停靠条留在空中。
             self.hide_keep(ctx);
             return;
         }
         self.place_attached(ctx);
-        ctx.request_repaint_after(Duration::from_millis(16));
+        // 停靠条被动时只需慢慢跟随（对话框很少动），接管后才 16ms。
+        let interval = if self.dialog_mode() && !self.dialog_engaged {
+            50
+        } else {
+            16
+        };
+        ctx.request_repaint_after(Duration::from_millis(interval));
     }
 
-    /// 贴角浮层失焦即收起（Listary 行为：点回资源管理器/别的应用，浮层消失）。
+    /// 失焦处理。
     ///
-    /// 刚显示的 150ms 内不做判断：show() 里的 force_foreground 要等系统
-    /// 同步前台，第一帧 egui 可能仍认为没有焦点。
+    /// - Explorer 贴角浮层：失焦即收起（点回资源管理器/别的应用，浮层消失）。
+    /// - 文件对话框停靠条：被动时本来就没有焦点，不能按失焦收起；接管后失焦
+    ///   只回退到被动停靠（用户点回对话框），条子留着继续展示 Quick Switch。
+    ///
+    /// 刚显示的 150ms 内不做判断：force_foreground 要等系统同步前台，第一帧
+    /// egui 可能仍认为没有焦点。
     fn poll_attach_focus(&mut self, ctx: &egui::Context) {
         // 开发验证钩子模拟的贴角模式没有真实焦点，别让它自动收起。
         #[cfg(debug_assertions)]
@@ -4254,6 +4501,28 @@ impl LstrApp {
             return;
         }
         if self.shown_at.elapsed() < Duration::from_millis(150) {
+            return;
+        }
+        if self.dialog_mode() {
+            if ctx.input(|i| i.focused) {
+                self.dialog_focused = true;
+                return;
+            }
+            if !self.dialog_engaged {
+                // 被动停靠：条子是 topmost 的，对话框不是前台了就收起，别飘在
+                // 别的应用上。用户点回对话框时 DialogWatch 的前台事件会重新唤出。
+                let dialog_foreground =
+                    dialog::foreground_dialog().is_some_and(|d| Some(d.hwnd) == self.attach_hwnd);
+                if !dialog_foreground {
+                    self.hide_keep(ctx);
+                }
+                return;
+            }
+            if self.dialog_focused {
+                // 确实接管过、现在把焦点让出去了（点回对话框/切应用）：
+                // 回到被动停靠，而不是整条收起。
+                self.disengage_dialog(ctx);
+            }
             return;
         }
         if ctx.input(|i| i.focused) {
@@ -6329,6 +6598,8 @@ impl LstrApp {
         let painter = ui.painter().clone();
         let entries = self.entries.clone();
         let query = search::query::parse(&self.input, self.scope);
+        // 停靠条没有状态行、不做资源管理器选中联动，也只有接管后才画输入框。
+        let dialog_mode = self.dialog_mode();
         let input_h = ATTACH_INPUT_H;
         let input_top = rect.bottom() - input_h;
         // 状态行在列表「上方」：只有路径列放不下时才出现，给出选中项完整路径。
@@ -6337,14 +6608,23 @@ impl LstrApp {
         // 顶部则只是窗口顶部向上伸缩，列表行始终锚在输入行一侧。
         // 先按选中项把槽位抬到所需高度（只增不减），再按槽位排版。
         self.refresh_attach_status_slot(ctx);
-        let status_h = self.attach_status_slot;
+        let status_h = if dialog_mode {
+            0.0
+        } else {
+            self.attach_status_slot
+        };
         let list_bottom = input_top - ATTACH_DIVIDER;
         // 列表高度只由「可见结果行数」决定，**不再**从窗口实际高度里减状态行：
         // 窗口尺寸是 SetWindowPos 异步改的，改尺寸那一帧 `rect` 还是旧的，
         // 若按 `rect.top()` 反推 list_h，状态行 1 行↔2 行时列表会先跳 17px 再弹回
         // （用户看到的「列表晃动」）。改成底边锚定 + 固定行高后，行位置只与底边
         // 有关，状态行怎么变都只影响窗口上沿。
-        let rows = self.attach_rows_floor.max(1);
+        // 停靠条按「对话框下方实际放得下几行」排版（贴角浮层仍用行数槽位）。
+        let rows = if dialog_mode {
+            self.attach_rows_fit.max(1)
+        } else {
+            self.attach_rows_floor.max(1)
+        };
         let list_h = rows as f32 * ATTACH_ROW_H;
         let list_rect = Rect::from_min_max(
             egui::pos2(rect.left(), list_bottom - list_h),
@@ -6355,7 +6635,15 @@ impl LstrApp {
             // 会直接盖到输入行上。空态自己画一行紧凑提示。
             self.needle_target = 0.0;
             self.scrollable = false;
-            let hint = if query.is_empty() {
+            let hint = if !query.is_empty() {
+                "无匹配结果".to_string()
+            } else if dialog_mode {
+                if self.dialog_engaged {
+                    "输入文件夹名，Enter 跳转".to_string()
+                } else {
+                    "点条子或按 Ctrl+G 开始搜索".to_string()
+                }
+            } else {
                 match &self.typing_folder {
                     Some(folder) => {
                         let name = folder
@@ -6366,8 +6654,6 @@ impl LstrApp {
                     }
                     None => "输入以搜索…".to_string(),
                 }
-            } else {
-                "无匹配结果".to_string()
             };
             painter.text(
                 list_rect.center(),
@@ -6391,12 +6677,15 @@ impl LstrApp {
         }
 
         // C 联动：画完列表（选中项可能已因键盘/悬停变化）再同步给资源管理器。
-        self.sync_attach_selection();
+        // 停靠条不联动：它的选中项要 Enter 才作用到对话框，预览性选中没有意义。
+        if !dialog_mode {
+            self.sync_attach_selection();
+        }
 
         // 状态行：选中/悬停项的完整路径（仅当右侧路径列放不下时出现）。
         // 夹在窗口顶部与列表顶部之间：换行行数变化的那一帧窗口高度还没生效，
         // 多出来的行会被裁掉而不是盖到第一条结果上。
-        if status_h > 0.0 {
+        if !dialog_mode && status_h > 0.0 {
             if let Some(text) = self.attach_status_text(ctx) {
                 let wrap = (rect.width() - 28.0).max(80.0);
                 let job = Self::attach_status_job(&theme, &text, wrap);
@@ -6422,7 +6711,12 @@ impl LstrApp {
             Stroke::new(1.0_f32, theme.hair2),
         );
 
-        // 输入行：贴底、无框；右侧留出放大镜的位置。
+        // 输入行：贴底、无框。
+        if dialog_mode {
+            self.paint_dialog_input(ui, ctx, &painter, rect, input_top);
+            return;
+        }
+        // Explorer 贴角浮层：输入框靠左，右侧留出放大镜的位置。
         const ICON_W: f32 = 26.0;
         let input_rect = Rect::from_min_size(
             egui::pos2(rect.left() + 14.0, input_top + 8.0),
@@ -6459,6 +6753,99 @@ impl LstrApp {
             "⌕",
             ui::icon_font(15.0),
             theme.dim,
+        );
+    }
+
+    /// 文件对话框停靠条的输入行：左侧放大镜、右侧灰字提示。
+    ///
+    /// 被动时整行只是一个「点击接管」的按钮——刻意不建 `TextEdit`：它一旦
+    /// 存在就会 request_focus，把文件对话框的焦点抢走，用户就没法在文件名框
+    /// 里打字了。接管之后才换成真正的输入框。
+    fn paint_dialog_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        rect: Rect,
+        input_top: f32,
+    ) {
+        let theme = self.theme;
+        let save = self.dialog.as_ref().is_some_and(|dialog| dialog.is_save);
+        let mid_y = input_top + ATTACH_INPUT_H / 2.0;
+        // 左放大镜（截图里在行首，与 Explorer 浮层的右侧装饰相反）。
+        painter.text(
+            egui::pos2(rect.left() + 18.0, mid_y),
+            Align2::CENTER_CENTER,
+            "⌕",
+            ui::icon_font(15.0),
+            theme.dim,
+        );
+        if !self.dialog_engaged {
+            painter.text(
+                egui::pos2(rect.left() + 31.0, mid_y),
+                Align2::LEFT_CENTER,
+                if save {
+                    "点条子或按 Ctrl+G 搜索文件夹"
+                } else {
+                    "点条子或按 Ctrl+G 搜索"
+                },
+                ui::text_font(13.5),
+                theme.dim,
+            );
+            painter.text(
+                egui::pos2(rect.right() - 14.0, mid_y),
+                Align2::RIGHT_CENTER,
+                "Ctrl+G",
+                ui::mono_font(11.0),
+                theme.sub,
+            );
+            // 整条都是点击区：点哪儿都能接管（截图里条子整体像一个输入框）。
+            // 列表行的交互是之前注册的，先命中行即执行行本身，不会重复处理。
+            let response =
+                ui.interact(rect, egui::Id::new("lstr-dialog-bar"), egui::Sense::click());
+            if response.clicked() {
+                self.engage_dialog(ctx);
+            }
+            return;
+        }
+        const HINT_W: f32 = 104.0;
+        let input_rect = Rect::from_min_size(
+            egui::pos2(rect.left() + 31.0, input_top + 8.0),
+            egui::vec2((rect.width() - 31.0 - 14.0 - HINT_W).max(80.0), 24.0),
+        );
+        let response = ui.put(
+            input_rect,
+            egui::TextEdit::singleline(&mut self.input)
+                .frame(false)
+                .margin(egui::Margin::same(0))
+                .font(ui::text_font(13.5))
+                .text_color(theme.text)
+                .hint_text("输入以搜索…")
+                .desired_width(f32::INFINITY)
+                .id(egui::Id::new("lstr-dialog-input")),
+        );
+        if response.changed() {
+            self.menu_open = false;
+            self.reset_history_recall();
+            if !self.ime_composing {
+                self.trigger(ctx);
+            }
+        }
+        // 只在接管那一刻要一次焦点：之后用户点结果行/拖出时不该被抢回来。
+        if self.focus_requested {
+            response.request_focus();
+            self.focus_requested = false;
+        }
+        painter.text(
+            egui::pos2(rect.right() - 14.0, mid_y),
+            Align2::RIGHT_CENTER,
+            if save {
+                "Enter 填入 · Esc 收起"
+            } else {
+                "Enter 跳转 · Esc 收起"
+            },
+            ui::mono_font(11.0),
+            theme.sub,
         );
     }
 
@@ -8253,6 +8640,10 @@ impl LstrApp {
             theme.amber,
         )));
         let optical_bias = ((sub_ink.down - sub_plain.down) / 2.0).max(0.0);
+        // 对话框停靠条「被动」态（对话框自己拿着焦点）：行只做 hover 展示，
+        // 不响应单击/双击/右键——否则用户想去点文件名框，手一滑就把对话框
+        // 跳到了别的目录。要选结果先点条子接管（见 paint_dialog_input）。
+        let rows_passive = self.dialog_mode() && !self.dialog_engaged;
         for (index, entry) in entries.iter().enumerate() {
             let row_top = list_top + index as f32 * row_h - self.scroll_y;
             if row_top + row_h <= list_top || row_top >= list_top + view_h {
@@ -8278,7 +8669,11 @@ impl LstrApp {
             let response = ui.interact(
                 row_rect,
                 Id::new(("lstr-row", index)),
-                Sense::click_and_drag(),
+                if rows_passive {
+                    Sense::hover()
+                } else {
+                    Sense::click_and_drag()
+                },
             );
             // hover 抢选中只在鼠标「真的在动」时生效。否则滚轮滚动后指针停在
             // 某行上，每一帧都把键盘选中的行抢回去 → 上下键看起来失灵。
@@ -12715,11 +13110,7 @@ impl eframe::App for LstrApp {
         }
         if self.pending_show {
             if let Some(hwnd) = self.hwnd {
-                if let Some(dialog) = self.pending_dialog {
-                    window::position_near_dialog(hwnd, dialog);
-                } else {
-                    window::position_center(hwnd);
-                }
+                window::position_center(hwnd);
             }
             self.pending_show = false;
         }
@@ -13749,6 +14140,68 @@ mod path_layout_tests {
         compact.feed_digit('1');
         assert_eq!(compact.partial_text_for_exit(">"), "size:1MB");
         assert!(!compact.typed_empty());
+    }
+}
+
+#[cfg(test)]
+mod dialog_bar_tests {
+    use super::*;
+
+    // 工作区 1920x1040（已扣任务栏）；行高 32、chrome（分隔线 + 输入行）41。
+    const WORK: [i32; 4] = [0, 0, 1920, 1040];
+    const ROW: i32 = 32;
+    const CHROME: i32 = 41;
+    const W: i32 = 440;
+
+    #[test]
+    fn bar_hangs_below_dialog_centered_with_all_rows() {
+        // 对话框 (200,100)-(1200,700)：下方还有 340px，5 行 201px 放得下。
+        let rect = dialog_bar_rect([200, 100, 1200, 700], WORK, W, ROW, CHROME, 5);
+        assert_eq!(rect, (480, 700, 440, 201));
+    }
+
+    #[test]
+    fn bar_shrinks_rows_until_it_fits_below() {
+        // 下方只剩 140px：5 行 201 → 4 行 169 → 3 行 137 才放得下。
+        let rect = dialog_bar_rect([200, 100, 1200, 900], WORK, W, ROW, CHROME, 5);
+        assert_eq!(rect.3, 137);
+        assert_eq!(rect.1, 900, "仍在外侧，贴着对话框下沿");
+    }
+
+    #[test]
+    fn bar_falls_inside_when_not_even_one_row_fits() {
+        // 对话框贴着工作区底边（最大化/贴任务栏）：只剩 20px，连 1 行 73 都放不下。
+        let rect = dialog_bar_rect([200, 100, 1200, 1020], WORK, W, ROW, CHROME, 5);
+        assert_eq!(rect.3, ROW + CHROME);
+        assert_eq!(rect.1, 1020 - (ROW + CHROME), "内侧贴底：底边仍对齐对话框");
+    }
+
+    #[test]
+    fn bar_x_stays_inside_work_area_near_right_edge() {
+        // 对话框贴右缘：水平居中会越界，夹回工作区。
+        let rect = dialog_bar_rect([1600, 100, 1900, 700], WORK, W, ROW, CHROME, 3);
+        assert_eq!(rect.0, 1920 - W - 4);
+    }
+
+    #[test]
+    fn bar_rows_are_capped_at_attach_max_rows() {
+        let rect = dialog_bar_rect([200, 100, 1200, 700], WORK, W, ROW, CHROME, 20);
+        assert_eq!(rect.3, ATTACH_MAX_ROWS as i32 * ROW + CHROME);
+    }
+
+    #[test]
+    fn bar_y_is_clamped_when_dialog_leaves_work_area() {
+        // 对话框被拖到工作区下方：条子不能跟着跑到屏幕外。
+        let rect = dialog_bar_rect([200, 100, 1200, 1100], WORK, W, ROW, CHROME, 3);
+        assert_eq!(rect.1, 1040 - (ROW + CHROME));
+    }
+
+    #[test]
+    fn bar_keeps_chrome_when_rows_are_zero() {
+        // rows_wanted = 0（还没出结果）也要给出 1 行的高度，避免零高窗口。
+        let rect = dialog_bar_rect([200, 100, 1200, 700], WORK, W, ROW, CHROME, 0);
+        assert_eq!(rect.3, ROW + CHROME);
+        assert!(rect.3 >= ATTACH_MIN_H as i32 - ROW, "至少摆得下输入行");
     }
 }
 

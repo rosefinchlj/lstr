@@ -8,8 +8,8 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, RedrawWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, RedrawWindow, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -151,64 +151,28 @@ pub fn position_center(hwnd_value: isize) {
     }
 }
 
-pub fn position_near_dialog(hwnd_value: isize, dialog_hwnd: isize) -> bool {
-    if dialog_hwnd == 0 {
-        return false;
+/// 窗口所在显示器的工作区 `(left, top, right, bottom)`（已扣掉任务栏）。
+///
+/// 文件对话框停靠条要夹在工作区内：对话框贴边/最大化时，条子不能跑到屏幕外。
+pub fn work_area_for(hwnd_value: isize) -> Option<[i32; 4]> {
+    if hwnd_value == 0 {
+        return None;
     }
-    let target = hwnd(hwnd_value);
-    let dialog = hwnd(dialog_hwnd);
     unsafe {
-        let mut dialog_rect = RECT::default();
-        if GetWindowRect(dialog, &mut dialog_rect).is_err() {
-            return false;
-        }
-        let mut window_rect = RECT::default();
-        if GetWindowRect(target, &mut window_rect).is_err() {
-            return false;
-        }
-        let window_w = window_rect.right - window_rect.left;
-        let window_h = window_rect.bottom - window_rect.top;
-        let center = POINT {
-            x: (dialog_rect.left + dialog_rect.right) / 2,
-            y: (dialog_rect.top + dialog_rect.bottom) / 2,
-        };
-        let monitor = MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST);
+        let monitor = MonitorFromWindow(hwnd(hwnd_value), MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
         if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-            return false;
+            return None;
         }
-        let work = info.rcWork;
-        let max_x = (work.right - window_w - 8).max(work.left + 8);
-        // 左对齐停靠：与对话框左缘对齐（缩进 8px）。此前是水平居中于对话框，
-        // 而对话框通常在屏幕中央——看起来就像「弹了一下又移到居中」。
-        let x = (dialog_rect.left + 8).clamp(work.left + 8, max_x);
-        // P0-3：贴边自适应。对话框靠近工作区底部时，把快速切换窗口
-        // 翻到对话框上方（Listary V7 的做法），否则仍贴在下方。
-        let mut y = if dialog_rect.top + 56 + window_h <= work.bottom - 8 {
-            dialog_rect.top + 56
-        } else if dialog_rect.top - window_h - 8 >= work.top + 8 {
-            dialog_rect.top - window_h - 8
-        } else {
-            dialog_rect.bottom - window_h - 48
-        };
-        if y + window_h > work.bottom - 8 {
-            y = dialog_rect.bottom - window_h - 48;
-        }
-        let max_y = (work.bottom - window_h - 8).max(work.top + 8);
-        let y = y.clamp(work.top + 8, max_y);
-        let _ = SetWindowPos(
-            target,
-            Some(HWND_TOPMOST),
-            x,
-            y,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-        true
+        Some([
+            info.rcWork.left,
+            info.rcWork.top,
+            info.rcWork.right,
+            info.rcWork.bottom,
+        ])
     }
 }
 
