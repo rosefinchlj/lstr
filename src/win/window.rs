@@ -133,8 +133,12 @@ pub fn position_center(hwnd_value: isize) {
         let height = rect.bottom - rect.top;
         let work_width = info.rcWork.right - info.rcWork.left;
         let work_height = info.rcWork.bottom - info.rcWork.top;
-        let x = info.rcWork.left + (work_width - width) / 2;
-        let y = info.rcWork.top + (work_height - height) / 2;
+        // C13：居中后仍要 clamp 到工作区。窗口比工作区还大时（小屏/高缩放下
+        // 窗口被撑到 1000pt），居中公式会得到负偏移，导致标题栏跑到屏幕外。
+        let max_x = (info.rcWork.right - width).max(info.rcWork.left);
+        let max_y = (info.rcWork.bottom - height).max(info.rcWork.top);
+        let x = (info.rcWork.left + (work_width - width) / 2).clamp(info.rcWork.left, max_x);
+        let y = (info.rcWork.top + (work_height - height) / 2).clamp(info.rcWork.top, max_y);
         let _ = SetWindowPos(
             target,
             Some(HWND_TOPMOST),

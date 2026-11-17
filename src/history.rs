@@ -555,39 +555,47 @@ impl History {
             return;
         }
         // 最多 1001 条，拉到 Rust 里按 frecency 排序，删掉分数最低的一半。
-        let Ok(mut stmt) = self.db.prepare("SELECT id, count, last FROM history") else {
-            return;
+        // C16：查询放进独立作用域，让 prepared statement 的借用先结束（下面
+        // 要用 &mut self.db 开事务）。
+        let scored: Vec<(String, f32)> = {
+            let Ok(mut stmt) = self.db.prepare("SELECT id, count, last FROM history") else {
+                return;
+            };
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            });
+            let Ok(rows) = rows else {
+                return;
+            };
+            rows.filter_map(Result::ok)
+                .map(|(id, count, last)| {
+                    let age = now.saturating_sub(last.max(0) as u64) as f64;
+                    let score = count as f32 + 2.0 * (-(age / DECAY_SECS)).exp() as f32;
+                    (id, score)
+                })
+                .collect()
         };
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u32>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        });
-        let Ok(rows) = rows else {
-            return;
-        };
-        let mut scored: Vec<(String, f32)> = rows
-            .filter_map(Result::ok)
-            .map(|(id, count, last)| {
-                let age = now.saturating_sub(last.max(0) as u64) as f64;
-                let score = count as f32 + 2.0 * (-(age / DECAY_SECS)).exp() as f32;
-                (id, score)
-            })
-            .collect();
+        let mut scored = scored;
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let delete: Vec<String> = scored
             .into_iter()
             .take((count - MAX_ITEMS / 2) as usize)
             .map(|(id, _)| id)
             .collect();
-        for id in delete {
-            let _ = self.db.execute("DELETE FROM history WHERE id = ?1", params![id]);
-            let _ = self
-                .db
-                .execute("DELETE FROM query_hits WHERE entry_id = ?1", params![id]);
+        // C16：淘汰放进一个事务——逐条 DELETE 在 WAL 下每次独立提交，
+        // 上千条会把 WAL 写爆且失败时可能只删一半。
+        let Ok(tx) = self.db.transaction() else {
+            return;
+        };
+        for id in &delete {
+            let _ = tx.execute("DELETE FROM history WHERE id = ?1", params![id]);
+            let _ = tx.execute("DELETE FROM query_hits WHERE entry_id = ?1", params![id]);
         }
+        let _ = tx.commit();
     }
 
     /// 测试辅助：直接种一条带指定次数/时间的历史。

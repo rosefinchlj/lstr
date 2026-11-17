@@ -675,11 +675,39 @@ impl Config {
         self.index.noise_seeded = true;
     }
 
+    /// C16：清理历史遗留备份。`history.json.bak` 与 `config.toml.bak-*`
+    /// 都含完整查询/配置内容且旧逻辑永不删除；超过 30 天的清掉。
+    pub fn cleanup_stale_backups() {
+        const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3_600);
+        let Ok(entries) = fs::read_dir(attach_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let is_backup = name == "history.json.bak" || name.starts_with("config.toml.bak");
+            if !is_backup {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            if modified.elapsed().map(|age| age > MAX_AGE).unwrap_or(false) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
     pub fn path() -> PathBuf {
         attach_dir().join("config.toml")
     }
 
     pub fn load() -> Self {
+        // C16：清掉过期的历史/配置备份（含完整查询记录），避免长期留存。
+        Self::cleanup_stale_backups();
         let path = Self::path();
         let Ok(text) = fs::read_to_string(&path) else {
             let mut cfg = Self::default();

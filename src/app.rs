@@ -17,6 +17,29 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// C15：相对时间文案。USN 游标 age 只显示秒会让人误以为秒级新鲜度，
+/// 长间隔（分钟/小时/天）按人类可读单位收敛。
+fn format_relative_time(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs} 秒")
+    } else if secs < 3_600 {
+        format!("{} 分钟", secs / 60)
+    } else if secs < 86_400 {
+        format!("{} 小时", secs / 3_600)
+    } else {
+        format!("{} 天", secs / 86_400)
+    }
+}
+
+/// C15：页脚耗时展示，>1s 不再显示裸毫秒。
+fn format_ms(ms: f32) -> String {
+    if ms < 1_000.0 {
+        format!("{ms:.0}ms")
+    } else {
+        format!("{:.1}s", ms / 1_000.0)
+    }
+}
+
 /// 图标缓存：加载在后台线程进行，UI 先画占位图，图标到达后重绘。
 /// 之前每次搜索新结果都要在 UI 线程串行跑 SHGetFileInfoW（12 个结果 ≈ 60-120ms 卡顿）。
 struct IconStore {
@@ -1664,7 +1687,6 @@ pub struct LstrApp {
     ime_composing: bool,
     last_width: f32,
     center_frames: u8,
-    suppress_hide_until: Instant,
     icons: IconStore,
     /// 预览面板内容缓存(图片缩略图/文本头部)。
     previews: PreviewStore,
@@ -1925,7 +1947,6 @@ impl LstrApp {
             ime_composing: false,
             last_width: 0.0,
             center_frames: 0,
-            suppress_hide_until: Instant::now(),
             icons: IconStore::new(),
             previews: PreviewStore::new(),
             learn_for: String::new(),
@@ -1992,6 +2013,22 @@ impl LstrApp {
         }
     }
 
+    /// C12：唤起热键若是「双击 Space」，在自身窗口可见且有键盘焦点时忽略
+    /// 这次 toggle——否则每次在搜索框里连续敲两个空格都会把窗口收起来。
+    /// 其它热键（默认双击 Ctrl、组合键）不受影响。
+    fn space_tap_should_be_ignored(&self, ctx: &egui::Context) -> bool {
+        if self.hidden {
+            return false;
+        }
+        if !ctx.input(|i| i.focused) {
+            return false;
+        }
+        matches!(
+            crate::hotkey::parse_hotkey(&self.cfg.hotkey),
+            Some(WakeHotkey::DoubleTap(TapKey::Space))
+        )
+    }
+
     /// P0-2：Explorer 里敲下的第一个字符唤出启动器并写入输入框。
     /// 之后前台不再是 Explorer，钩子自动停止接管，后续输入交回 egui。
     fn poll_typing(&mut self, ctx: &egui::Context) {
@@ -2045,6 +2082,12 @@ impl LstrApp {
                 HotkeyEvent::Toggle => {
                     if relay_pending {
                         relay_pending = false;
+                    } else if self.space_tap_should_be_ignored(ctx) {
+                        // C12：自定义「双击 Space」在搜索框里打字时会连续触发，
+                        // 此时窗口可见且有键盘焦点，忽略这次 toggle（不收起窗口）。
+                        lstr_index::snapshot::debug_log(
+                            "hotkey: toggle ignored (space double-tap while typing)",
+                        );
                     } else {
                         lstr_index::snapshot::debug_log(&format!(
                             "hotkey: toggle hidden={}",
@@ -3745,7 +3788,6 @@ impl LstrApp {
         self.hidden = false;
         self.shown_at = Instant::now();
         self.center_frames = 3;
-        self.suppress_hide_until = Instant::now() + Duration::from_millis(500);
         self.focus_requested = true;
         self.mouse_moved = false;
         self.needle_ready = false;
@@ -3808,7 +3850,6 @@ impl LstrApp {
         self.shown_at = Instant::now();
         // 对话框模式不居中：保持贴着对话框（center_frames 只用于双击 Space 唤出）。
         self.center_frames = 0;
-        self.suppress_hide_until = Instant::now() + Duration::from_millis(500);
         self.focus_requested = true;
         self.mouse_moved = false;
         self.needle_ready = false;
@@ -3827,7 +3868,6 @@ impl LstrApp {
         self.hidden = false;
         self.shown_at = Instant::now();
         self.center_frames = 3;
-        self.suppress_hide_until = Instant::now() + Duration::from_millis(500);
         self.focus_requested = false;
         self.apply_size(ctx);
         if let Some(hwnd) = self.hwnd {
@@ -3903,6 +3943,24 @@ impl LstrApp {
         count as f32 * 30.0
     }
 
+    /// C13：设置面板高度按当前显示器工作区收敛。默认 600pt，小屏/低分辨率
+    /// 下留出任务栏与标题栏余量，避免底部按钮被截在屏幕外。
+    fn settings_height(&self, ctx: &egui::Context) -> f32 {
+        let monitor_h = ctx
+            .input(|i| i.viewport().monitor_size)
+            .map(|size| size.y)
+            .unwrap_or(800.0);
+        (monitor_h - 72.0).clamp(320.0, 600.0)
+    }
+
+    /// C14：滑杆拖动过程中只做即时生效/预览，不逐帧写盘；松手或键盘调整
+    /// （非拖动状态）时才落一次配置，避免一次拖动写几十次 config.toml。
+    fn slider_commit(&mut self, response: &egui::Response) {
+        if response.drag_stopped() || (response.changed() && !response.dragged()) {
+            let _ = self.cfg.save();
+        }
+    }
+
     fn apply_size(&mut self, ctx: &egui::Context) {
         if self.resizing {
             return;
@@ -3919,7 +3977,7 @@ impl LstrApp {
             width = width.max(780.0);
         }
         let height = if self.settings_open {
-            600.0
+            self.settings_height(ctx)
         } else {
             // 窗口高度按「一屏结果数」定：worker 会多送候选（可滚动），
             // 窗口只长到设置的行数，不会因为候选多就撑满屏幕。
@@ -4150,19 +4208,13 @@ impl LstrApp {
             return;
         }
 
+        // 设置面板打开时，其余常规快捷键本帧全部不处理（Esc 已在上方分层消费）。
         if self.settings_open {
-            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-                self.settings_open = false;
-            }
             return;
         }
 
-        // 筛选菜单打开时：Esc / 任意输入先收起菜单，不打断输入框内容。
+        // 筛选菜单打开时：任意输入先收起菜单，不打断输入框内容（Esc 已在上方分层消费）。
         if self.filter_menu.is_some() {
-            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-                self.filter_menu = None;
-                return;
-            }
             let typing = ctx.input(|i| {
                 i.events
                     .iter()
@@ -4327,9 +4379,7 @@ impl LstrApp {
                 self.menu_activate(ctx);
                 return;
             }
-            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
-                || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft))
-            {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft)) {
                 self.menu_open = false;
                 return;
             }
@@ -4537,21 +4587,6 @@ impl LstrApp {
             self.reveal_selected(ctx);
         } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
             self.activate_selected(ctx);
-        }
-
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-            if !self.input.is_empty() {
-                lstr_index::snapshot::debug_log("ui: esc_clear_input");
-                self.clear_input_text();
-                self.trigger(ctx);
-            } else if let Some(dialog) = self.dialog.take() {
-                // Esc 交还焦点：抑制这个对话框的自动唤出。
-                self.suppressed_dialog = Some(dialog.hwnd);
-                self.hide(ctx);
-                dialog::restore_focus(&dialog);
-            } else {
-                self.hide(ctx);
-            }
         }
 
         if input_empty && ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::C)) {
@@ -4974,7 +5009,8 @@ impl LstrApp {
             } else if st.phase == lstr_index::Phase::Fallback {
                 fallback = true;
                 note = Some(
-                    "内置索引不可用（未获管理员授权或 worker 未运行），暂时没有搜索结果"
+                    "内置索引不可用（未获管理员授权或 worker 未运行），暂时没有搜索结果；\
+                     可在设置 → 维护点「重新授权」"
                         .to_string(),
                 );
             } else if st.phase == lstr_index::Phase::Ready {
@@ -5108,7 +5144,7 @@ impl LstrApp {
         let banner_h = self.banner_height();
         let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
         let height = if self.settings_open {
-            600.0
+            self.settings_height(ctx)
         } else {
             (SEARCH_H
                 + TABS_H
@@ -8264,9 +8300,9 @@ impl LstrApp {
                 ""
             };
             format!(
-                "{total_text} 个结果 · 总 {:.0}ms · 引擎 {:.0}ms{}{cap_note}",
-                self.ui_total_ms.unwrap_or(self.elapsed_ms),
-                self.elapsed_ms,
+                "{total_text} 个结果 · 总 {} · 引擎 {}{}{cap_note}",
+                format_ms(self.ui_total_ms.unwrap_or(self.elapsed_ms)),
+                format_ms(self.elapsed_ms),
                 if self.scrollable { " · 滚轮查看更多" } else { "" },
             )
         };
@@ -8335,7 +8371,7 @@ impl LstrApp {
                 ("↑↓", "选择"),
                 ("→", "进入"),
                 ("Alt↑", "上一级"),
-                ("Esc", "清空"),
+                ("Esc", "收起"),
             ]
         } else if query.is_empty() {
             vec![
@@ -9902,11 +9938,11 @@ impl LstrApp {
         );
         if response.changed() {
             self.cfg.theme.opacity = opacity;
-            let _ = self.cfg.save();
             if let Some(hwnd) = self.hwnd {
                 window::apply_effects(hwnd, self.theme.light, self.cfg.theme.opacity);
             }
         }
+        self.slider_commit(&response);
         y += ROW;
 
         Self::settings_label(painter, &theme, area.left(), y, "圆角");
@@ -9918,8 +9954,8 @@ impl LstrApp {
         if response.changed() {
             self.cfg.theme.radius = radius;
             self.theme = Theme::from_config(&self.cfg);
-            let _ = self.cfg.save();
         }
+        self.slider_commit(&response);
         y += ROW;
 
         Self::settings_label(painter, &theme, area.left(), y, "行高");
@@ -9931,8 +9967,8 @@ impl LstrApp {
         if response.changed() {
             self.cfg.theme.row_height = row_height;
             self.theme = Theme::from_config(&self.cfg);
-            let _ = self.cfg.save();
         }
+        self.slider_commit(&response);
         y += ROW;
 
         Self::settings_label(painter, &theme, area.left(), y, "预览面板");
@@ -10688,23 +10724,23 @@ impl LstrApp {
         let status_text = match &status {
             Some(st) => {
                 let base = match st.phase {
-                    lstr_index::Phase::Ready => "内置索引:就绪".to_string(),
+                    lstr_index::Phase::Ready => "内置索引：就绪".to_string(),
                     lstr_index::Phase::Scanning => {
                         let total: u32 = st.volumes.iter().map(|v| v.count).sum();
                         let done = st.volumes.iter().filter(|v| v.complete).count();
                         format!(
-                            "内置索引:构建中({}/{}) · 已收录 {} 万项",
+                            "内置索引：构建中（{}/{}） · 已收录 {} 万项",
                             done,
                             st.volumes.len(),
                             total / 10_000
                         )
                     }
-                    lstr_index::Phase::Loading => "内置索引:等待 worker 连接…".to_string(),
-                    lstr_index::Phase::Fallback => "内置索引:未启用(需管理员授权)".to_string(),
+                    lstr_index::Phase::Loading => "内置索引：等待 worker 连接…".to_string(),
+                    lstr_index::Phase::Fallback => "内置索引：未启用（需管理员授权）".to_string(),
                 };
-                format!("{base} · 后端:内置索引")
+                format!("{base} · 后端：内置索引")
             }
-            None => "内置索引:未启用".to_string(),
+            None => "内置索引：未启用".to_string(),
         };
         Self::settings_label(painter, &theme, area.left(), y, "索引状态");
         painter.text(
@@ -10728,7 +10764,11 @@ impl LstrApp {
                 if let Some(usn) = v.usn_state {
                     match v.cursor_age_secs {
                         Some(age) => {
-                            line.push_str(&format!(" · USN:{}(游标 {age}s 前)", usn.label()))
+                            line.push_str(&format!(
+                                " · USN：{}（游标 {}前）",
+                                usn.label(),
+                                format_relative_time(age)
+                            ))
                         }
                         None => line.push_str(&format!(" · USN:{}", usn.label())),
                     }
@@ -11299,7 +11339,10 @@ impl LstrApp {
         painter.text(
             egui::pos2(area.left(), area.bottom() - 46.0),
             Align2::LEFT_TOP,
-            "配置文件：%APPDATA%\\lstr\\config.toml",
+            format!(
+                "配置文件：{}",
+                crate::config::attach_dir().join("config.toml").display()
+            ),
             ui::mono_font(10.0),
             theme.dim,
         );
@@ -11331,7 +11374,6 @@ impl LstrApp {
         );
         let drag = ui.interact(drag_rect, Id::new("lstr-drag"), Sense::drag());
         if drag.drag_started() {
-            self.suppress_hide_until = Instant::now() + Duration::from_millis(600);
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
@@ -11431,7 +11473,6 @@ impl LstrApp {
             }
             if response.drag_started() {
                 self.resizing = true;
-                self.suppress_hide_until = Instant::now() + Duration::from_millis(600);
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::BeginResize(*direction));
             }

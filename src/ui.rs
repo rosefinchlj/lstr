@@ -183,6 +183,13 @@ pub fn install_fonts(ctx: &egui::Context) {
         || add(&mut fonts, "lstr-cjk", "Deng.ttf", 0)
         || add(&mut fonts, "lstr-cjk", "simhei.ttf", 0);
     let cjk_bold_ok = add(&mut fonts, "lstr-cjk-bold", "msyhbd.ttc", 0);
+    if !cjk_ok {
+        // C17：中文字体缺失不再静默——界面会退化成方块，事后难以归因。
+        lstr_index::snapshot::debug_log(
+            "ui: CJK fonts missing (msyh/Deng/simhei not found in C:\\Windows\\Fonts); \
+             text may render as boxes",
+        );
+    }
 
     if ui_ok {
         if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
