@@ -28,15 +28,43 @@ use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThre
 /// 主界面侧的事件句柄：每帧非阻塞地取一次「提权 hotkey 已触发」信号。
 pub struct HotkeyRelay {
     event: HANDLE,
+    /// P2-16：独立的唤醒事件。中继线程 SetEvent 后，这里的常驻线程
+    /// WaitForSingleObject → request_repaint，隐藏态不必等 2s 保险丝重绘。
+    /// 与 `event` 分开是因为自动复位事件会被任一 waiter 消费：若共用，
+    /// 唤醒线程会把本该由 `take()` 消费的 toggle 信号吃掉。
+    wake_event: HANDLE,
 }
+
+struct SendHandle(isize);
+unsafe impl Send for SendHandle {}
 
 impl HotkeyRelay {
     /// 在启动 index worker **之前**创建，worker 才能 OpenEvent 到它。
-    pub fn create() -> Option<Self> {
+    pub fn create(ctx: Option<eframe::egui::Context>) -> Option<Self> {
         let event =
             unsafe { CreateEventW(None, false, false, w!("Local\\lstr-hotkey-relay-9c1f3a")) }
                 .ok()?;
-        Some(Self { event })
+        let wake_event = unsafe {
+            CreateEventW(None, false, false, w!("Local\\lstr-hotkey-relay-wake-9c1f3a"))
+        }
+        .ok()?;
+        if let Some(ctx) = ctx {
+            let wake = SendHandle(wake_event.0 as isize);
+            let _ = std::thread::Builder::new()
+                .name("lstr-relay-wake".to_string())
+                .spawn(move || {
+                    let handle =
+                        HANDLE(wake.0 as *mut core::ffi::c_void);
+                    loop {
+                        let _ = unsafe { WaitForSingleObject(handle, u32::MAX) };
+                        ctx.request_repaint();
+                    }
+                });
+        }
+        Some(Self {
+            event,
+            wake_event,
+        })
     }
 
     /// 有信号返回 true（自动复位事件已清除），供主循环 toggle 一次。
@@ -49,6 +77,7 @@ impl Drop for HotkeyRelay {
     fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.event);
+            let _ = CloseHandle(self.wake_event);
         }
     }
 }
@@ -150,6 +179,15 @@ fn signal_relay() {
             EVENT_MODIFY_STATE,
             false,
             w!("Local\\lstr-hotkey-relay-9c1f3a"),
+        ) {
+            let _ = SetEvent(event);
+            let _ = CloseHandle(event);
+        }
+        // P2-16：再敲一下唤醒事件，让隐藏态的主界面立刻 request_repaint。
+        if let Ok(event) = OpenEventW(
+            EVENT_MODIFY_STATE,
+            false,
+            w!("Local\\lstr-hotkey-relay-wake-9c1f3a"),
         ) {
             let _ = SetEvent(event);
             let _ = CloseHandle(event);

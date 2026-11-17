@@ -35,6 +35,10 @@ pub(crate) static KEEP_WORKER_ALIVE: AtomicBool = AtomicBool::new(true);
 /// 托盘「退出并停止索引服务」：本次退出强制发 `Shutdown`，不等 keep-alive。
 pub(crate) static STOP_WORKER_ON_EXIT: AtomicBool = AtomicBool::new(false);
 
+/// P2-9：托盘「退出（保留索引服务）」是显式承诺，必须无视设置里的
+/// `keep_worker_alive=false`；仅在本次退出生效。
+pub(crate) static FORCE_KEEP_ON_EXIT: AtomicBool = AtomicBool::new(false);
+
 /// 更新退出时是否保留索引服务（设置页开关调用）。
 pub fn set_keep_worker_alive(enabled: bool) {
     KEEP_WORKER_ALIVE.store(enabled, Ordering::SeqCst);
@@ -45,11 +49,17 @@ pub fn set_stop_worker_on_exit(enabled: bool) {
     STOP_WORKER_ON_EXIT.store(enabled, Ordering::SeqCst);
 }
 
+/// P2-9：托盘「退出（保留索引服务）」调用；优先于设置开关。
+pub(crate) fn set_force_keep_on_exit(enabled: bool) {
+    FORCE_KEEP_ON_EXIT.store(enabled, Ordering::SeqCst);
+}
+
 /// 退出收尾：常驻模式发 `Detach`（worker 不退出，保持索引热态），
 /// 否则发 `Shutdown` 并等 worker 收尾（有超时）。
 fn farewell(client: windows::Win32::Foundation::HANDLE) {
-    let keep = KEEP_WORKER_ALIVE.load(Ordering::Relaxed)
-        && !STOP_WORKER_ON_EXIT.load(Ordering::Relaxed);
+    let keep = FORCE_KEEP_ON_EXIT.load(Ordering::Relaxed)
+        || (KEEP_WORKER_ALIVE.load(Ordering::Relaxed)
+            && !STOP_WORKER_ON_EXIT.load(Ordering::Relaxed));
     if keep {
         let _ = idx_client::detach(client);
         lstr_index::snapshot::debug_log(
@@ -90,6 +100,11 @@ pub struct SplitOnceResult {
     /// 前缀补集(A-3):宽查询下保证名字以查询词开头的命中进入排序。
     pub prefix: Vec<Entry>,
     pub exact_ms: f32,
+    /// P2-7：本次 total 是否为「计数预算内下界」。引擎对空 token 且非 regex 的
+    /// 纯过滤查询只数到 FILTER_ONLY_TOTAL_CAP 就停扫（B5）；这里用同一个谓词
+    /// 判定，UI 才能对 `ext:rs` / `*.rs` / `C:` 这类同样走纯过滤路径的查询
+    /// 显示「N+」，而不是把下界当精确值。
+    pub total_rough: bool,
 }
 
 impl BuiltinProvider {
@@ -308,6 +323,10 @@ impl BuiltinProvider {
             files,
             folder_total: outcome.total_folders,
             all_total: outcome.total_all,
+            // P2-7：与引擎停扫谓词完全一致（空 token && 非 regex && 撞预算）。
+            total_rough: spec.tokens.is_empty()
+                && spec.regex.is_none()
+                && outcome.total_all >= lstr_index::query::FILTER_ONLY_TOTAL_CAP,
             exact,
             prefix,
             exact_ms,

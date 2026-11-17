@@ -920,6 +920,7 @@ impl Engine {
                 self.phase_since = Instant::now();
             }
             EngineMsg::VolumeMeta { guid, letter, journal_id, next_usn, est_records } => {
+                self.clear_fallback();
                 if let Some(i) = self.volume_idx(guid, true, letter) {
                     let v = &mut self.volumes[i];
                     v.letter = letter;
@@ -939,6 +940,7 @@ impl Engine {
                 }
             }
             EngineMsg::ScanBegin { guid, resume_frn } => {
+                self.clear_fallback();
                 if let Some(i) = self.volume_idx(guid, true, '?') {
                     let rules = self.noise_rules();
                     {
@@ -1018,6 +1020,24 @@ impl Engine {
                             Self::apply_rec(store, rec, syncing);
                         }
                         self.volumes[i].dirty = true;
+                    }
+                    // P2-8：默认增量后端是 journal（worker.rs 的 USN 轮询），这条
+                    // 路径不经过 watcher；只靠 DirChildren 收集 pinyin_dirty 会让
+                    // 中文名新建/改名在默认配置下仍要等最长 30min 的全量保存才
+                    // 能拼音命中。这里把本批记录对应的 slot 也收进待刷新表。
+                    if self.volumes[i].complete {
+                        let slots: Vec<u32> = match &self.volumes[i].store {
+                            Some(store) if !store.is_scanning() => recs
+                                .iter()
+                                .filter_map(|r| store.find_slot(r.frn))
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        let room =
+                            PINYIN_DIRTY_CAP.saturating_sub(self.volumes[i].pinyin_dirty.len());
+                        self.volumes[i]
+                            .pinyin_dirty
+                            .extend(slots.into_iter().take(room));
                     }
                     // 旁车捕获:就绪卷的稳态变更按 apply 同序记进内存日志,
                     // 由 maintain 以 ~5s 节流原子写盘 —— 全量快照因此降频到
@@ -1481,6 +1501,16 @@ impl Engine {
                 return;
             }
             self.apply_one_chunk();
+        }
+    }
+
+    /// P2-17：收到卷元数据 / 扫描开始说明 worker 已经恢复（Fallback 只在
+    /// WorkerLost 时设置）。把 Fallback 清掉，后续 `recompute_phase` 才能
+    /// 重新进入 Loading/Scanning/Ready，否则 UI 会一直显示「索引不可用」。
+    fn clear_fallback(&mut self) {
+        if self.phase == Phase::Fallback {
+            self.phase = Phase::Loading;
+            self.phase_since = Instant::now();
         }
     }
 

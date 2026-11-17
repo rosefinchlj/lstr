@@ -2044,10 +2044,18 @@ fn run_worker(args: WorkerArgs) {
     let mut apps_reloading = false;
     let mut bookmarks_reloading = false;
     let mut notes_reloading = false;
+    // P2-10：后台加载线程的启动时刻；超时未回来就视为失败（否则标志永远
+    // 卡在 reloading，索引在进程生命周期内不再更新）。
+    let mut apps_reload_started: Option<Instant> = None;
+    let mut bookmarks_reload_started: Option<Instant> = None;
+    let mut notes_reload_started: Option<Instant> = None;
     // UWP 枚举要走 PowerShell（Get-StartApps，冷启动 ~2s）。
     // 懒加载：只在第一次真正需要应用结果时才启动 PowerShell；
     // 只用文件/文件夹搜索的用户，PowerShell 永远不会被拉起。
     let mut uwp_started = false;
+    // P2-12：UWP 枚举失败（PowerShell 缺失/被杀）时不要整个进程生命周期
+    // 只试一次；冷却后允许重试，避免应用页永久缺 UWP 应用。
+    let mut uwp_retry_at: Option<Instant> = None;
 
     // 主循环改为超时驱动:空闲时也要消费引擎消息、发布状态,
     // 否则首装扫描期用户不击键 → 引擎停摆(实测抓出)。
@@ -2241,20 +2249,33 @@ fn run_worker(args: WorkerArgs) {
             }
         };
         while let Ok(uwp_entries) = uwp_rx.try_recv() {
-            apps.append_uwp(uwp_entries);
+            if uwp_entries.is_empty() {
+                // P2-12：空结果通常是 PowerShell 超时/失败（正常机器总会有
+                // 若干 UWP 应用）；冷却 60s 后允许重试，期间不再反复拉起。
+                uwp_retry_at = Some(Instant::now() + Duration::from_secs(60));
+                lstr_index::snapshot::debug_log(
+                    "uwp: empty app list; retry in 60s",
+                );
+            } else {
+                uwp_retry_at = None;
+                apps.append_uwp(uwp_entries);
+            }
         }
         // B3：后台重载完成 → 原位替换（不阻塞查询）。
         while let Ok(next) = apps_reload_rx.try_recv() {
             apps = next;
             uwp_started = false;
+            uwp_retry_at = None;
             apps_loaded = Instant::now();
             apps_reloading = false;
+            apps_reload_started = None;
         }
         while let Ok(next) = bookmarks_reload_rx.try_recv() {
             bookmarks = next;
             bookmarks_loaded = Instant::now();
             bookmarks_stamp = bookmarks::source_stamp();
             bookmarks_reloading = false;
+            bookmarks_reload_started = None;
             publish_bookmark_folders(&bookmark_folders, &bookmarks);
             lstr_index::snapshot::debug_log(&format!(
                 "bookmarks: reloaded {} entries",
@@ -2266,15 +2287,43 @@ fn run_worker(args: WorkerArgs) {
             notes_loaded = Instant::now();
             notes_stamp = notes::source_stamp();
             notes_reloading = false;
+            notes_reload_started = None;
             publish_note_folders(&note_folders, &notes);
             lstr_index::snapshot::debug_log(&format!(
                 "notes: reloaded {} entries",
                 notes.count()
             ));
         }
+        // P2-10：后台加载卡死（网络盘上的书签/被锁的笔记 DB）时不能永久
+        // 占着 reloading 标志；90s 视为失败，允许后续 TTL 重试。
+        const RELOAD_WATCHDOG: Duration = Duration::from_secs(90);
+        if apps_reloading && apps_reload_started.is_some_and(|t| t.elapsed() > RELOAD_WATCHDOG)
+        {
+            apps_reloading = false;
+            apps_reload_started = None;
+            lstr_index::snapshot::debug_log("apps: reload timed out, will retry");
+        }
+        if bookmarks_reloading
+            && bookmarks_reload_started.is_some_and(|t| t.elapsed() > RELOAD_WATCHDOG)
+        {
+            bookmarks_reloading = false;
+            bookmarks_reload_started = None;
+            lstr_index::snapshot::debug_log("bookmarks: reload timed out, will retry");
+        }
+        if notes_reloading && notes_reload_started.is_some_and(|t| t.elapsed() > RELOAD_WATCHDOG)
+        {
+            notes_reloading = false;
+            notes_reload_started = None;
+            lstr_index::snapshot::debug_log("notes: reload timed out, will retry");
+        }
         // 应用索引时效：TTL 到点或「重新加载」信号到了就重建（后台线程）。
         // 重载后 UWP 懒加载标志复位，下次需要应用结果时重新枚举。
         let forced = apps_dirty.swap(false, Ordering::Relaxed);
+        // P2-11：`forced` 被 swap 消费时若有加载在飞，这一轮不会真正重建；
+        // 补回标志，让下一轮立即重来，避免「点了重新加载却没反应」。
+        if forced && (apps_reloading || bookmarks_reloading || notes_reloading) {
+            apps_dirty.store(true, Ordering::Relaxed);
+        }
         if !apps_reloading && (forced || apps_loaded.elapsed() > APPS_RELOAD_INTERVAL) {
             let tx = apps_reload_tx.clone();
             let spawned = std::thread::Builder::new()
@@ -2284,6 +2333,7 @@ fn run_worker(args: WorkerArgs) {
                 });
             if spawned.is_ok() {
                 apps_reloading = true;
+                apps_reload_started = Some(Instant::now());
             } else {
                 // 线程创建失败（极端资源紧张）：退回同步加载，保证功能不断。
                 apps = apps::AppIndex::load();
@@ -2312,6 +2362,7 @@ fn run_worker(args: WorkerArgs) {
                     });
                 if spawned.is_ok() {
                     bookmarks_reloading = true;
+                    bookmarks_reload_started = Some(Instant::now());
                 } else {
                     bookmarks = bookmarks::BookmarkIndex::load();
                     bookmarks_stamp = stamp;
@@ -2340,6 +2391,7 @@ fn run_worker(args: WorkerArgs) {
                     });
                 if spawned.is_ok() {
                     notes_reloading = true;
+                    notes_reload_started = Some(Instant::now());
                 } else {
                     notes = notes::NoteIndex::load();
                     notes_stamp = stamp;
@@ -2512,7 +2564,10 @@ fn run_worker(args: WorkerArgs) {
                 }
                 _ => false,
             };
-        if needs_uwp && !uwp_started {
+        if needs_uwp
+            && !uwp_started
+            && uwp_retry_at.is_none_or(|at| Instant::now() >= at)
+        {
             uwp_started = true;
             let uwp_tx = uwp_tx.clone();
             std::thread::Builder::new()
@@ -2526,6 +2581,8 @@ fn run_worker(args: WorkerArgs) {
         let started = Instant::now();
         let mut entries = Vec::new();
         let mut total = 0usize;
+        // P2-7：total 是否为下界（B5 纯过滤查询的计数预算）。
+        let mut total_rough = false;
         let mut error = None;
         // 旧 scan_mode="usn" 的纯 USN 首扫没有 mtime：日期/时间条件无法成立。
         // 明确提示，避免用户把「0 结果」误当成「真的没有匹配文件」。
@@ -2605,7 +2662,12 @@ fn run_worker(args: WorkerArgs) {
             entries.retain(|entry| !stale_history_entry(entry, apps.all()));
             // B9：Fallback（内置索引不可用）时，历史里的文件/文件夹是旧快照，
             // 无法校验存在性、点开常失败；只保留不依赖索引来源的应用/命令/书签/笔记。
-            if builtin.is_none() {
+            // P2-3：此前用 `builtin.is_none()` 判定，而 builtin 在本函数里恒为
+            // Some —— 该分支是死代码。改看引擎阶段（Fallback 才隐藏）。
+            let builtin_fallback = builtin
+                .as_ref()
+                .is_none_or(|b| b.status().phase == lstr_index::Phase::Fallback);
+            if builtin_fallback {
                 entries.retain(|entry| {
                     matches!(
                         entry.kind,
@@ -2754,6 +2816,7 @@ fn run_worker(args: WorkerArgs) {
                                         .saturating_sub(result.folder_total);
                                     truncation += file_total.saturating_sub(result.files.len());
                                     total += result.folder_total + file_total;
+                                    total_rough |= result.total_rough;
                                     // 旧实现先 folders 后 files,保持同一 Entry 顺序。
                                     // 候选只带索引信息,由 finalize 内统一填 FS 元数据。
                                     pending_meta.mark(&result.folders, true);
@@ -2923,7 +2986,12 @@ fn run_worker(args: WorkerArgs) {
         // 路径条目在这里统一裁掉（应用/命令无盘符，不受影响）。
         // 查询文本里的盘符 token 与输入框盘符 chip 求交。
         let query_drive_mask = request.query.drive_mask();
-        let filter_drive_mask = request.filters.drive_mask();
+        // P2-2：位置/路径条件（D 盘、path:D:\work）隐含的盘符也要算进来，
+        // 否则「位置选 D 盘 + 输入 c:」时两套掩码求交非空，静默 0 结果。
+        let filter_drive_mask = filters::intersect_drive_masks(
+            request.filters.drive_mask(),
+            request.filters.location_drive_mask(),
+        );
         if error.is_none() {
             error = drive_mask_conflict_note(query_drive_mask, filter_drive_mask);
         }
@@ -2982,11 +3050,9 @@ fn run_worker(args: WorkerArgs) {
             ));
         }
 
-        // B5:空输入 + 筛选条件走引擎「纯过滤」路径,total 是计数预算内的
-        // 下界(见 query.rs FILTER_ONLY_TOTAL_CAP);UI 显示「N+」并提示。
-        let total_rough = request.query.text.trim().is_empty()
-            && !request.filters.is_empty()
-            && total >= lstr_index::query::FILTER_ONLY_TOTAL_CAP;
+        // B5/P2-7：total 是否为下界由 provider 按引擎同一谓词给出
+        // （空 token 且非 regex 且撞 FILTER_ONLY_TOTAL_CAP），不再由 UI
+        // 侧用 `text 为空 && filters 非空` 另算一套——两套谓词会漂移。`total_rough` 在 split 分支里累积。
 send_response(&tx, &request, Response {
             generation: request.generation,
             entries,

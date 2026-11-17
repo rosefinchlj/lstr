@@ -1726,7 +1726,9 @@ impl LstrApp {
         // P0-3：退出时是否保留索引服务（默认开）。设置页切换即时更新静态标志。
         crate::search::builtin::set_keep_worker_alive(cfg.index.keep_worker_alive);
         // 必须在 SearchService::new 之前创建：worker 启动后会立刻 OpenEvent。
-        let hotkey_relay = HotkeyRelay::create();
+        // P2-16：把 UI ctx 传给中继，worker 里 `foreground_is_elevated()`
+        // 触发的 toggle 信号能主动唤醒隐藏态窗口，而不是等下一次 2s 保险丝。
+        let hotkey_relay = HotkeyRelay::create(Some(cc.egui_ctx.clone()));
         let mut service = SearchService::new(cfg.clone(), Arc::clone(&history), cc.egui_ctx.clone());
         let pending_gen = service.search("", Scope::All, false, &SearchFilters::default(), &cfg.rank, cfg.show_history);
         let hotkey = match HotkeyService::start(cc.egui_ctx.clone(), &cfg.hotkey) {
@@ -1772,25 +1774,45 @@ impl LstrApp {
 
         // P1-11：上次异常退出检测。标记文件在启动时写入、正常退出时删除；
         // 启动时若已存在，说明上次被杀/崩溃/断电，索引可能未完整落盘。
+        // P2-19：注销/关机时进程可能来不及走 on_exit，标记会残留到下次开机。
+        // 标记里带「开机时刻（boot id）」：若与本次开机不同，说明中间整机
+        // 重启过，按正常关机处理，不误报异常退出。
         let session_marker = crate::config::attach_dir().join("app_running");
+        let boot = crate::boot_id_secs();
         let unclean_note = std::fs::read_to_string(&session_marker)
             .ok()
-            .map(|started| {
-                let started = started.trim();
+            .and_then(|raw| {
+                let mut parts = raw.trim().split('|');
+                let started = parts.next().unwrap_or_default().trim();
+                let stored_boot = parts.next().and_then(|v| v.trim().parse::<u64>().ok());
+                if let (Some(stored), Some(now)) = (stored_boot, boot) {
+                    // 允许 ±120s 误差：启动瞬间取 uptime 有抖动。
+                    if stored.abs_diff(now) > 120 {
+                        return None;
+                    }
+                }
+                if started.is_empty() {
+                    return None;
+                }
                 // 标记内容形如 `2026-11-16T15:26:00.123Z (unix 1794…)`，
                 // 横幅里只保留可读时间，别把 unix 秒也塞进去占宽度。
                 let started = started.split(" (unix").next().unwrap_or(started);
-                format!(
+                Some(format!(
                     "上次 lstr 异常退出（启动于 {started}）；索引已自动校验，若结果异常可在设置→维护重建"
-                )
+                ))
             });
-        let unclean_until = unclean_note
-            .as_ref()
-            .map(|_| Instant::now() + Duration::from_secs(20));
-        let _ = std::fs::write(
-            &session_marker,
-            crate::format_utc(std::time::SystemTime::now()),
-        );
+        // P2-1：横幅存活 20s 从「首次真正可见」开始计时，而不是从隐藏启动
+        // 开始——否则用户唤出窗口时提示可能已过期。
+        let unclean_until = None;
+        let marker_text = match boot {
+            Some(boot) => format!(
+                "{}|{}",
+                crate::format_utc(std::time::SystemTime::now()),
+                boot
+            ),
+            None => crate::format_utc(std::time::SystemTime::now()),
+        };
+        let _ = std::fs::write(&session_marker, marker_text);
 
         Self {
             cfg,
@@ -2261,6 +2283,9 @@ impl LstrApp {
             Some(TrayAction::Settings) => self.open_settings(ctx),
             Some(TrayAction::Menu) => {} // 右键菜单在 TrayState::poll 内部弹出
             Some(TrayAction::Quit) => {
+                // P2-9：菜单文案承诺「保留索引服务」，就必须无视设置里的
+                // keep_worker_alive=false —— 仅这一个动作强制保留。
+                crate::search::builtin::set_force_keep_on_exit(true);
                 self.exit_reason = "tray";
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -2431,6 +2456,9 @@ impl LstrApp {
                 }
                 self.waiting = false;
                 self.needle_ready = false;
+                // P2-21：服务已成功应答一轮，重启计数清零——该计数只用于
+                // 熔断「连续 panic」，不应在进程生命周期内一直累计。
+                self.service_restarts = 0;
                 if self.selected >= self.entries.len() {
                     self.selected = self.entries.len().saturating_sub(1);
                 }
@@ -2475,6 +2503,10 @@ impl LstrApp {
         self.search_sent_at = None;
         self.waiting = false;
         self.error = None;
+        // P2-18：新服务没有「加载更多」的上下文，清掉遗留标志，否则上一代
+        // 服务的 more_pending 会让新查询被当成续拉、首屏滚动位置也会错。
+        self.more_pending = false;
+        self.more_exhausted = false;
         // 下一帧经防抖路径立刻重发当前查询（含条件/浏览目录/对话框模式）。
         self.dirty_at = Some(Instant::now());
         self.toast(ctx, "搜索服务已自动重启".to_string());
@@ -11697,10 +11729,15 @@ impl eframe::App for LstrApp {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // P1-11：异常退出提示只展示一次（20s 或用户操作后清除）。
-        if let Some(until) = self.unclean_until {
-            if Instant::now() >= until {
-                self.unclean_note = None;
-                self.unclean_until = None;
+        // P2-1：20s 从首次可见起算，避免隐藏启动期间就过期。
+        if self.unclean_note.is_some() {
+            if let Some(until) = self.unclean_until {
+                if Instant::now() >= until {
+                    self.unclean_note = None;
+                    self.unclean_until = None;
+                }
+            } else if !self.hidden {
+                self.unclean_until = Some(Instant::now() + Duration::from_secs(20));
             }
         }
         if !self.effects_applied {

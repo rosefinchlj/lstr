@@ -39,6 +39,17 @@ pub(crate) fn format_utc(now: std::time::SystemTime) -> String {
     )
 }
 
+/// P2-19：本次开机的「boot id」（Unix 秒）。用当前时间减系统 uptime 近似
+/// 开机时刻，只用于判断标记文件是否来自上一次开机；精度 ±1s 足够。
+pub(crate) fn boot_id_secs() -> Option<u64> {
+    let uptime = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() } / 1_000;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(now.saturating_sub(uptime))
+}
+
 /// 自 1970-01-01 起的天数 → (年, 月, 日)。算法见
 /// <https://howardhinnant.github.io/date_algorithms.html#civil_from_days>。
 fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {

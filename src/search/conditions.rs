@@ -464,7 +464,13 @@ fn parse_from(
 /// 只有**整串真实存在**才扩展，所以 `path:D:\work 报告` 里的「报告」仍按
 /// 搜索词处理，不会把普通查询误吞成路径。
 fn extend_bare_path(raw: &str, start: usize, mut stop: usize) -> usize {
-    if !is_path_value(raw[start..stop].trim_end_matches([':', '：'])) {
+    let base = raw[start..stop].trim_end_matches([':', '：']);
+    if !is_path_value(base) {
+        return stop;
+    }
+    // P2-6：UNC 路径的 exists() 是同步 SMB 往返，逐字输入时每帧探测会卡 UI；
+    // 这里不做空格延伸（带空格的共享路径请用引号括起来）。
+    if base.starts_with("\\\\") || base.starts_with("//") {
         return stop;
     }
     loop {

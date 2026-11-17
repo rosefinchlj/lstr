@@ -686,6 +686,9 @@ impl Config {
                 cfg.rank.normalize_drive_weights();
                 // B21：手写 config.toml 里的极端分值/强度夹到安全区间。
                 cfg.rank.sanitize();
+                // P2-20：app_boost 在 Config 顶层，同样来自手写配置；极端值
+                // 会让应用结果恒压过文件结果，一并夹到安全区间。
+                cfg.app_boost = cfg.app_boost.clamp(0, 500);
                 cfg.max_load_results = normalize_max_load_results(cfg.max_load_results);
                 cfg.index.normalize_volumes();
                 cfg.index.normalize();
