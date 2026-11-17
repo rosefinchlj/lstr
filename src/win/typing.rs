@@ -10,7 +10,9 @@
 //!    设置页显式开启；P0-5 隐私：诊断日志不记录字符内容）；
 //! 2. 只在前台窗口类属于 Explorer/桌面白名单时生效；
 //! 3. 焦点落在任何编辑框（地址栏、搜索框、重命名框）时放行；
-//! 4. Ctrl / Alt / Win 组合、IME 组合键（VK_PROCESSKEY）一律放行；
+//! 4. Ctrl / Alt / Win 组合、IME 组合键（VK_PROCESSKEY）一律放行；修饰键状态
+//!    一律实时向系统查询（`GetAsyncKeyState`），不在回调里维护标志位——事件式
+//!    标志漏一次 keyup 就永久粘滞，「键入即搜」会彻底失效（见 `modifier_down`）；
 //! 5. 只吞「可打印字符」的第一个字符；lstr 窗口被唤出后前台不再是 Explorer，
 //!    后续输入交回 egui，因此不会破坏 Explorer 的 Enter / Esc / F2 等操作。
 //!
@@ -26,12 +28,15 @@
 //! 注意：这是简化形态——复用居中启动器窗口，不是贴在 Explorer 右下角的独立浮层。
 
 use eframe::egui::Context;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo,
     GetMessageW, KBDLLHOOKSTRUCT, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
@@ -61,11 +66,6 @@ static LOG_TX: OnceLock<Mutex<Option<SyncSender<String>>>> = OnceLock::new();
 const LOG_QUEUE_CAP: usize = 256;
 /// 日志文件上限：超过就清空重写，避免无限增长。
 const LOG_LIMIT_BYTES: u64 = 1 << 20;
-
-static MOD_CTRL: AtomicBool = AtomicBool::new(false);
-static MOD_ALT: AtomicBool = AtomicBool::new(false);
-static MOD_WIN: AtomicBool = AtomicBool::new(false);
-static MOD_SHIFT: AtomicBool = AtomicBool::new(false);
 
 /// 前台窗口类白名单：资源管理器、桌面。
 const EXPLORER_CLASSES: [&str; 4] = ["CabinetWClass", "ExploreWClass", "Progman", "WorkerW"];
@@ -317,7 +317,6 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             return LRESULT(0);
         }
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        update_modifiers(kb.vkCode, is_down);
         if !is_down {
             return LRESULT(0);
         }
@@ -342,17 +341,20 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     CallNextHookEx(None, code, wparam, lparam)
 }
 
-fn update_modifiers(vk: u32, is_down: bool) {
-    let slot: Option<&AtomicBool> = match vk {
-        0x10 | 0xA0 | 0xA1 => Some(&MOD_SHIFT),
-        0x11 | 0xA2 | 0xA3 => Some(&MOD_CTRL),
-        0x12 | 0xA4 | 0xA5 => Some(&MOD_ALT),
-        0x5B | 0x5C => Some(&MOD_WIN),
-        _ => None,
-    };
-    if let Some(slot) = slot {
-        slot.store(is_down, Ordering::Relaxed);
-    }
+/// 实时查询修饰键的物理状态（`GetAsyncKeyState` 第 15 位 = 当前是否按下）。
+///
+/// 这里**不能**沿用「在 hook 回调里维护 `static MOD_*` 标志位」的做法（旧实现）：
+/// 漏掉一次 keyup，标志就永久点亮，之后 `classify()` 每次都在修饰键检查处提前
+/// 返回 `None` —— 钩子不再吞键、`poll_typing()` 收不到字符，「键入即搜」表现为
+/// 彻底唤不醒（typing.log 里是成百上千行 `skip: modifier held`，只有重启应用
+/// 才恢复）。会漏 keyup 的路径都是真实存在的：
+/// - 更靠前的低级钩子把 keyup 吞掉（Win 键唤出开始菜单、远程桌面 / 输入法 /
+///   安全软件挂的 LL 钩子），我们的回调根本看不到那次抬起；
+/// - 用户按住修饰键时设置页重装钩子（`start()` 从不重置这些标志）；
+/// - UAC 安全桌面期间按下的键，抬起发生在切换之后。
+/// 实时查询没有任何可残留的状态：系统说没按就是没按。
+unsafe fn modifier_down(vk: VIRTUAL_KEY) -> bool {
+    GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000 != 0
 }
 
 /// 判定这个按键是否应该被 lstr 接管，并把原因写进 typing.log（1 秒限流）。
@@ -364,11 +366,18 @@ unsafe fn classify(kb: &KBDLLHOOKSTRUCT) -> Option<char> {
         log_decision(|| "skip: IME composition (VK_PROCESSKEY)".to_string());
         return None;
     }
-    if MOD_CTRL.load(Ordering::Relaxed)
-        || MOD_ALT.load(Ordering::Relaxed)
-        || MOD_WIN.load(Ordering::Relaxed)
-    {
-        log_decision(|| "skip: modifier held".to_string());
+    // 修饰键状态实时向系统查（见 `modifier_down`）：任何组合键都放行，
+    // 且不会因为漏掉一次 keyup 就永久卡在「修饰键按着」。
+    let ctrl = modifier_down(VK_CONTROL);
+    let alt = modifier_down(VK_MENU);
+    let win = modifier_down(VK_LWIN) || modifier_down(VK_RWIN);
+    if ctrl || alt || win {
+        log_decision(|| {
+            format!(
+                "skip: modifier held (ctrl={} alt={} win={})",
+                ctrl as u8, alt as u8, win as u8
+            )
+        });
         return None;
     }
     if !foreground_is_explorer() {
@@ -379,7 +388,7 @@ unsafe fn classify(kb: &KBDLLHOOKSTRUCT) -> Option<char> {
         log_decision(|| format!("skip: focus class={}", focus_class_name()));
         return None;
     }
-    let ch = vk_to_char(kb.vkCode, MOD_SHIFT.load(Ordering::Relaxed))?;
+    let ch = vk_to_char(kb.vkCode, modifier_down(VK_SHIFT))?;
     // P0-5（隐私）：诊断日志绝不落盘实际字符。旧版这里写 `capture: ch=s`，
     // 会把用户在资源管理器里敲下的每个字母明文写进 %APPDATA%\lstr\typing.log
     // （默认开启的全局钩子）。只保留窗口类名，排障足够、且不含用户输入。
