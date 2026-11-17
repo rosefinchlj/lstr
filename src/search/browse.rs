@@ -4,7 +4,8 @@
 
 use crate::model::{Entry, Kind};
 use crate::search::pinyin;
-use std::time::SystemTime;
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime};
 use windows::core::PCWSTR;
 use windows::Win32::NetworkManagement::NetManagement::{NetApiBufferFree, MAX_PREFERRED_LENGTH};
 use windows::Win32::Storage::FileSystem::{
@@ -149,11 +150,38 @@ fn list_shares(server: &str) -> Vec<Entry> {
     entries
 }
 
+/// P2-13：`NetShareEnum` 在主机离线/网络卡顿时可能阻塞数秒到数十秒。
+/// 放到独立线程限时等待，超时返回空列表（搜索线程继续响应后续输入）。
+/// 注意：超时后线程仍可能在后台等待系统返回，但每台主机只会因输入变化
+/// 触发一次（同目录由 `DirCache` 缓存），不会随每次按键堆积。
+fn list_shares_timeout(server: &str) -> Vec<Entry> {
+    const TIMEOUT: Duration = Duration::from_secs(3);
+    let (tx, rx) = mpsc::channel();
+    let server_owned = server.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("lstr-unc-shares".into())
+        .spawn(move || {
+            let _ = tx.send(list_shares(&server_owned));
+        });
+    if spawned.is_err() {
+        return Vec::new();
+    }
+    match rx.recv_timeout(TIMEOUT) {
+        Ok(entries) => entries,
+        Err(_) => {
+            lstr_index::snapshot::debug_log(&format!(
+                "browse: UNC share enumeration timed out after {TIMEOUT:?}: \\\\{server}"
+            ));
+            Vec::new()
+        }
+    }
+}
+
 /// 读取目录子项；目录不存在或无权限时返回空（UI 显示「没有匹配项」）。
 pub fn list_children(dir: &str) -> Vec<Entry> {
     // `\\server\` 不是文件系统目录：列出共享（B17）。
     if let Some(server) = unc_server_root(dir) {
-        return list_shares(server);
+        return list_shares_timeout(server);
     }
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();

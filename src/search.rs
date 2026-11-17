@@ -2732,20 +2732,31 @@ fn run_worker(args: WorkerArgs) {
                 Scope::App => {
                     // B2：应用页同样按 deliver 取数，滚到底「加载更多」才能真
                     // 的加载出后面的应用（旧实现固定 request.limit=8 条）。
+                    // P2-4：total 必须是全量匹配数（应用只几百条，一次全量过滤
+                    // 代价可忽略）；否则 entries.len()==total 会让 UI 立刻判定
+                    // 「已到底」，加载更多永远不可达。
                     let take = request.deliver.max(request.limit);
-                    entries = apps.search(&request.query.text, take);
-                    entries.retain(|entry| {
-                        app_matches_options(&entry.name, &request.query.text, &request.filters)
-                    });
-                    total = entries.len();
+                    let mut matches: Vec<Entry> = apps
+                        .search(&request.query.text, usize::MAX)
+                        .into_iter()
+                        .filter(|entry| {
+                            app_matches_options(&entry.name, &request.query.text, &request.filters)
+                        })
+                        .collect();
+                    total = matches.len();
+                    matches.truncate(take);
+                    entries = matches;
                 }
                 Scope::Bookmark => {
                     let take = request.deliver.max(request.limit);
-                    entries = if bookmarks_enabled.load(Ordering::Relaxed) {
+                    if bookmarks_enabled.load(Ordering::Relaxed) {
                         if request.query.text.is_empty() {
-                            bookmarks.top(take)
+                            total = bookmarks.count();
+                            entries = bookmarks.top(take);
                         } else {
-                            let mut hits = bookmarks.search(&request.query.text, take);
+                            // P2-4：先取全量匹配再按 take 截断，total 用真实匹配数
+                            // （书签总量小，全量过滤可承受）。
+                            let mut hits = bookmarks.search(&request.query.text, usize::MAX);
                             hits.retain(|entry| {
                                 app_matches_options(
                                     &entry.name,
@@ -2753,12 +2764,14 @@ fn run_worker(args: WorkerArgs) {
                                     &request.filters,
                                 )
                             });
-                            hits
+                            total = hits.len();
+                            hits.truncate(take);
+                            entries = hits;
                         }
                     } else {
-                        Vec::new()
-                    };
-                    total = entries.len();
+                        entries = Vec::new();
+                        total = 0;
+                    }
                 }
                 Scope::Command => {
                     entries = commands(&request.query.text, &config.commands);
@@ -2849,8 +2862,10 @@ fn run_worker(args: WorkerArgs) {
                     {
                         // B2：应用/书签/笔记同属「非文件来源」，也应按
                         // deliver 放宽取数；否则「加载更多」只增文件、这三类
-                        // 永远停在默认 8 条，且 total 也按 8 条封顶。
-                        let source_take = request.deliver.max(request.limit).min(120);
+                        // 永远停在默认 8 条。
+                        // P2-4：不再用 min(120) 封顶——All 页滚过 120 条后
+                        // 这三类也要能继续增长（各自索引总量都很小）。
+                        let source_take = request.deliver.max(request.limit);
                         let t_apps = Instant::now();
                         let mut app_hits = apps.search(&request.query.text, source_take);
                         app_hits.retain(|entry| {
