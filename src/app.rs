@@ -2184,6 +2184,8 @@ impl LstrApp {
             let anchor = crate::win::explorer::foreground_explorer_anchor();
             if let Some((hwnd, folder)) = anchor {
                 self.attach_hwnd = Some(hwnd);
+                // 只关心这个窗口自己的移动事件（停靠条跟着它走）。
+                crate::win::dialogwatch::set_anchor(Some(hwnd));
                 self.attach_last = None;
                 self.attach_px = None;
                 self.attach_sel = None;
@@ -2285,21 +2287,12 @@ impl LstrApp {
                         continue;
                     }
                     if let Some(info) = dialog::active_dialog() {
-                        // P0-3：有活动 Explorer 目录就零输入直跳，否则退回文件夹搜索。
-                        let target = crate::win::explorer::active_explorer_folder();
-                        if let Some(folder) = target {
-                            match dialog::navigate_to_folder(&info, &folder.to_string_lossy()) {
-                                Ok(()) => {
-                                    self.suppressed_dialog = Some(info.hwnd);
-                                    self.dialog = None;
-                                    self.hide(ctx);
-                                    dialog::restore_focus(&info);
-                                }
-                                Err(err) => self.toast(ctx, err),
-                            }
-                        } else {
-                            self.open_dialog_mode(ctx, info, true);
-                        }
+                        // 条子没挂着（首次 / Esc 收起过）→ 一律重挂并接管。
+                        // 这里曾经留了 P0-3 的「有 Explorer 目录就零输入直跳」，
+                        // 结果是 Esc 之后按 Ctrl+G 变成对话框跳目录、条子不回来,
+                        // 读起来就是「Ctrl+G 没反应」。零输入直跳只属于
+                        // 「已接管 + 再按 Ctrl+G」（见上面的分支）。
+                        self.open_dialog_mode(ctx, info, true);
                     } else if !self.hidden {
                         self.toast(ctx, "请先打开「打开/保存」对话框，再按 Ctrl+G".to_string());
                     }
@@ -4088,6 +4081,7 @@ impl LstrApp {
         // 停靠条把锚点交给合并后的几何引擎；Explorer 贴角浮层此刻不可能同时
         // 存在（两条入口互斥），直接覆盖即可。
         self.attach_hwnd = Some(info.hwnd);
+        crate::win::dialogwatch::set_anchor(Some(info.hwnd));
         self.attach_last = None;
         self.attach_px = None;
         self.attach_sel = None;
@@ -4246,6 +4240,8 @@ impl LstrApp {
         self.dialog_engaged = false;
         self.dialog_focused = false;
         if let Some(anchor) = self.attach_hwnd.take() {
+            // 不再跟随任何窗口：位置变化事件到此为止，主循环回到纯事件驱动。
+            crate::win::dialogwatch::set_anchor(None);
             self.attach_last = None;
             self.attach_px = None;
             self.attach_sel = None;
@@ -4459,11 +4455,13 @@ impl LstrApp {
         window::set_rect(hwnd, x, y, width, height);
         self.attach_last = Some(frame);
         self.attach_px = Some((width, height));
+        // 改尺寸后 egui 需要重画一帧才按新尺寸排版。
+        ctx.request_repaint_after(Duration::from_millis(16));
     }
 
-    /// 跟随：每帧廉价轮询锚点边框，变化才重摆；同时续帧，让锚点窗口拖动/
-    /// 缩放时浮层基本同帧跟上。A2（SetWinEventHook 事件）留作后续优化——
-    /// MVP 先保证正确，事件版本再省这点轮询开销。
+    /// 跟随：锚点移动/缩放由 `DialogWatch` 的 `EVENT_OBJECT_LOCATIONCHANGE` 叫醒
+    /// （跟随目标见 `dialogwatch::set_anchor`），这里只在醒来时核对一次边框。
+    /// 心跳只作兜底——事件丢失（换显示器、DPI 变化）时最迟 1s 也能纠正回来。
     fn poll_attach(&mut self, ctx: &egui::Context) {
         let Some(anchor) = self.attach_hwnd else {
             return;
@@ -4474,11 +4472,10 @@ impl LstrApp {
             return;
         }
         self.place_attached(ctx);
-        // 停靠条被动时只需慢慢跟随（对话框很少动），接管后才 16ms。
         let interval = if self.dialog_mode() && !self.dialog_engaged {
-            50
+            1000
         } else {
-            16
+            250
         };
         ctx.request_repaint_after(Duration::from_millis(interval));
     }

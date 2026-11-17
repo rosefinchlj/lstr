@@ -77,7 +77,9 @@ Quick Switch 建议，点条子或按 `Ctrl+G` 才把输入交给它。
 - **下方空间不足**：先按 `available = workarea.bottom - y` 降 `rows`，直到 `h <= available` 或 `rows == 1`；
   连 `rows=1` 都放不下（`available < 73`）→ **内侧贴底**：`y = dialog.bottom - h`，条子压在对话框底部内侧。
 - **水平夹取**：`x` 夹在 `[workarea.left + 4, workarea.right - w - 4]`。
-- **跟随**：`frame_bounds(dialog_hwnd)` 每帧对比，变化即 `set_rect`；被动 50ms 轮询、接管 16ms。
+- **跟随**：事件驱动——`DialogWatch` 的 `EVENT_OBJECT_LOCATIONCHANGE` 只对锚点 hwnd（`dialogwatch::set_anchor`）叫醒 UI，
+  `poll_attach` 醒来即 `frame_bounds` 对比、变化才 `set_rect`；没有周期节拍，`request_repaint_after` 只剩 1s 兜底心跳（被动态）
+  和 250ms（接管 / 贴角浮层）。`EVENT_OBJECT_DESTROY` 命中锚点也会立刻叫醒，由 `is_window` 检查收起。
 - **对话框消失**：`window::is_window` 判定失败或不可见 → 立即隐藏。
 
 几何计算抽成纯函数，便于单测：
@@ -158,8 +160,8 @@ fn bar_rect(dialog: [i32; 4], work: [i32; 4], rows: i32) -> (i32, i32, i32, i32)
     `engage_dialog()`、`disengage_dialog()`、`paint_dialog_input()`；
   - `open_dialog_mode(ctx, info, engage)` 改为三参并复用 `attach_hwnd` 几何引擎（不再
     `pending_show` / `position_near_dialog` / `Visible(true)`）；
-  - `place_attached` 按 `dialog_mode()` 分支出停靠条几何；`poll_attach` 被动态 50ms、接管 16ms；
-    `poll_attach_focus` 加对话框分支（被动失前台收起 / 接管失焦退回被动）；
+  - `place_attached` 按 `dialog_mode()` 分支出停靠条几何；`poll_attach` 只在事件唤醒时核对边框
+    （1s / 250ms 心跳兜底）；`poll_attach_focus` 加对话框分支（被动失前台收起 / 接管失焦退回被动）；
   - `paint_attach` 走 `paint_dialog_input`；`paint_rows` 被动态行只做 hover；
   - `toggle()`：对话框在前台时聚焦停靠条；停靠条在时被动态接管、接管态收起；
   - `HotkeyEvent::DialogSearch`：停靠条已挂上时先处理接管/跳转，避免清掉用户查询。
@@ -170,3 +172,23 @@ fn bar_rect(dialog: [i32; 4], work: [i32; 4], rows: i32) -> (i32, i32, i32, i32)
 
 验证：`cargo test` → 472 passed（含 7 个 `dialog_bar_tests`）；`cargo check --all-targets` 干净。
 GUI 行为（不抢焦点、跟随、误触防护）仍待按上面 10 条手动清单在真机上回归。
+
+## 修订 1（2026-11-17，真机反馈）
+
+用户跑起来后提了三条，逐条处理：
+
+1. **`Esc` 之后 `Ctrl+G` 不回来**：`HotkeyEvent::DialogSearch` 在「条子没挂着」的分支里留着旧的
+   P0-3 零输入直跳（有活动 Explorer 目录就直接 `navigate_to_folder` + 收起），用户按 `Ctrl+G`
+   看到的是对话框跳目录、条子不出现。现在这条分支一律 `open_dialog_mode(ctx, info, true)`
+   （重挂 + 接管），零输入直跳只保留在「已接管 + 再按 `Ctrl+G`」。
+2. **固定节拍轮询的 CPU 开销**：跟随改成事件驱动。`src/win/dialogwatch.rs` 新增
+   `EVENT_OBJECT_LOCATIONCHANGE`（锚点移动/缩放 → 只 `request_repaint`，不进事件通道）和
+   `EVENT_OBJECT_DESTROY`（锚点销毁 → 清锚点 + 叫醒），并用 `static ANCHOR: AtomicIsize` +
+   `pub fn set_anchor(Option<isize>)` 把「谁是跟随目标」告诉 hook 线程（别的窗口乱动不触发重绘）。
+   `poll_attach` 不再自己续 16/50ms：醒来才比一次 `frame_bounds`，`request_repaint_after` 只剩
+   被动 1s / 接管与贴角 250ms 的兜底心跳；`place_attached` 改完尺寸补一帧 16ms 让 egui 按新尺寸重排。
+   Explorer 贴角浮层同样受益（原来显示期间一直 60fps 重绘）。
+3. **「资源管理器键入即搜」不是轮询**：一直是 `WH_KEYBOARD_LL` 低级钩子（`src/win/typing.rs`），
+   吞掉首字符后 `ctx.request_repaint()` 即时唤醒；轮询只用在窗口几何跟随上，而那条路现在已经事件化。
+
+验证：`cargo test` 472 passed；`cargo check --all-targets` 干净；release 重建并重启。

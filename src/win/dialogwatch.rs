@@ -24,12 +24,30 @@ const DIALOG_CLASS: &str = "#32770";
 const EVENT_SYSTEM_FOREGROUND: u32 = 3;
 /// EVENT_OBJECT_SHOW：对象显示。范围事件，回调里靠类名过滤。
 const EVENT_OBJECT_SHOW: u32 = 0x8002;
+/// EVENT_OBJECT_DESTROY：对象销毁（用来发现锚定的对话框被关掉）。
+const EVENT_OBJECT_DESTROY: u32 = 0x8001;
+/// EVENT_OBJECT_LOCATIONCHANGE：对象移动/缩放（用来跟随停靠条，替代轮询）。
+const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
 const OBJID_WINDOW: i32 = 0;
 const CHILDID_SELF: i32 = 0;
 
 static EVENT_TX: OnceLock<Sender<isize>> = OnceLock::new();
 /// UI 唤醒器:hook 事件一到就 `request_repaint`,隐藏窗口无需周期重绘。
 static WAKE_CTX: OnceLock<eframe::egui::Context> = OnceLock::new();
+/// 当前正在跟随的窗口（贴角浮层的资源管理器 / 停靠条的文件对话框）。
+/// 只有它自己的位置变化才会唤醒 UI，别的窗口乱动不会触发重绘。
+static ANCHOR: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
+/// 设置/清除跟随目标。`None` 表示当前没有浮层，不关心任何窗口的位置变化。
+pub fn set_anchor(hwnd: Option<isize>) {
+    ANCHOR.store(hwnd.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn anchor_is(hwnd: HWND) -> bool {
+    let anchor = ANCHOR.load(std::sync::atomic::Ordering::Relaxed);
+    anchor != 0 && hwnd.0 as isize == anchor
+}
 
 /// 对话框自动唤出监听器；Drop 时反挂 hook 并结束线程。
 pub struct DialogWatch {
@@ -112,12 +130,33 @@ fn run(ready_tx: Sender<Result<u32, String>>) {
             0,
             WINEVENT_OUTOFCONTEXT,
         );
-        if foreground.0.is_null() || shown.0.is_null() {
-            if !foreground.0.is_null() {
-                let _ = UnhookWinEvent(foreground);
-            }
-            if !shown.0.is_null() {
-                let _ = UnhookWinEvent(shown);
+        let moved = SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            None,
+            Some(win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        let destroyed = SetWinEventHook(
+            EVENT_OBJECT_DESTROY,
+            EVENT_OBJECT_DESTROY,
+            None,
+            Some(win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        if foreground.0.is_null()
+            || shown.0.is_null()
+            || moved.0.is_null()
+            || destroyed.0.is_null()
+        {
+            for hook in [foreground, shown, moved, destroyed] {
+                if !hook.0.is_null() {
+                    let _ = UnhookWinEvent(hook);
+                }
             }
             let _ = ready_tx.send(Err("SetWinEventHook 失败".to_string()));
             return;
@@ -131,6 +170,8 @@ fn run(ready_tx: Sender<Result<u32, String>>) {
         }
         let _ = UnhookWinEvent(foreground);
         let _ = UnhookWinEvent(shown);
+        let _ = UnhookWinEvent(moved);
+        let _ = UnhookWinEvent(destroyed);
     }
 }
 
@@ -146,6 +187,28 @@ unsafe extern "system" fn win_event_proc(
     // panic 穿过 FFI 边界会 fast-fail 整个进程，这里兜底。
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if idobject != OBJID_WINDOW || idchild != CHILDID_SELF || hwnd.0.is_null() {
+            return;
+        }
+        // 跟随目标自己的移动/缩放：只叫醒 UI 重算位置，不进事件通道——
+        // 通道是「有对话框出现/被激活」的语义，混进来会让停靠条误挂。
+        if event == EVENT_OBJECT_LOCATIONCHANGE {
+            if anchor_is(hwnd) {
+                if let Some(ctx) = WAKE_CTX.get() {
+                    ctx.request_repaint();
+                }
+            }
+            return;
+        }
+        // 跟随目标被销毁：只叫醒 UI 收起浮层（`poll_attach` 里的
+        // `is_window` 检查负责清理）。**不进事件通道**——通道语义是「有对话框
+        // 出现/被激活」，混进销毁事件会白开一轮 2.5s 探测。
+        if event == EVENT_OBJECT_DESTROY {
+            if anchor_is(hwnd) {
+                ANCHOR.store(0, std::sync::atomic::Ordering::Relaxed);
+                if let Some(ctx) = WAKE_CTX.get() {
+                    ctx.request_repaint();
+                }
+            }
             return;
         }
         // 前台事件不带类名（可能是不抢前台的 XAML 宿主）；显示事件量大，
@@ -186,9 +249,12 @@ fn class_is_dialog(hwnd: HWND) -> bool {
 mod tests {
     #[test]
     fn constants_match_win32_semantics() {
-        // EVENT_SYSTEM_FOREGROUND=3 / EVENT_OBJECT_SHOW=0x8002。
+        // EVENT_SYSTEM_FOREGROUND=3 / EVENT_OBJECT_SHOW=0x8002 /
+        // EVENT_OBJECT_DESTROY=0x8001 / EVENT_OBJECT_LOCATIONCHANGE=0x800B。
         assert_eq!(super::EVENT_SYSTEM_FOREGROUND, 3);
         assert_eq!(super::EVENT_OBJECT_SHOW, 0x8002);
+        assert_eq!(super::EVENT_OBJECT_DESTROY, 0x8001);
+        assert_eq!(super::EVENT_OBJECT_LOCATIONCHANGE, 0x800B);
         assert_eq!(super::DIALOG_CLASS, "#32770");
         assert_eq!(super::OBJID_WINDOW, 0);
         assert_eq!(super::CHILDID_SELF, 0);
