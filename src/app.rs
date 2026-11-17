@@ -11467,6 +11467,9 @@ impl LstrApp {
         }
 
         // C5：页脚跟随内容流（原先钉在 area.bottom，设置页滚动后会漂走）。
+        // 注意：必须先跳过「使用历史」这一行，否则页脚的两行字会直接压在
+        // 标签/「清空历史」按钮上（用户反馈的截图重叠问题）。
+        y += ROW;
         let foot_y = y + 10.0;
         painter.text(
             egui::pos2(area.left(), foot_y),
