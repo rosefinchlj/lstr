@@ -4,7 +4,13 @@
 
 use crate::model::{Entry, Kind};
 use crate::search::pinyin;
-use std::time::SystemTime;
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime};
+use windows::core::PCWSTR;
+use windows::Win32::NetworkManagement::NetManagement::{NetApiBufferFree, MAX_PREFERRED_LENGTH};
+use windows::Win32::Storage::FileSystem::{
+    NetShareEnum, SHARE_INFO_1, STYPE_DISKTREE, STYPE_MASK, STYPE_SPECIAL,
+};
 
 pub struct PathQuery {
     /// 要列出的目录（含末尾分隔符），如 `D:\proj\`。
@@ -44,6 +50,18 @@ pub fn parse(raw: &str) -> Option<PathQuery> {
             filter: trimmed.get(2..).unwrap_or("").to_string(),
         });
     }
+    // UNC 服务器根（`\\server` / `\\server\`）：列共享；不能按「父目录 + 过滤词」
+    // 拆，否则 dir 会变成 `\\`、filter 变成服务器名，列表永远为空。
+    if is_unc {
+        let rest = trimmed.trim_start_matches(['\\', '/']);
+        let rest = rest.trim_end_matches(['\\', '/']);
+        if !rest.is_empty() && !rest.contains(['\\', '/']) {
+            return Some(PathQuery {
+                dir: format!("\\\\{rest}\\"),
+                filter: String::new(),
+            });
+        }
+    }
     let split = trimmed.rfind(['\\', '/'])?;
     let (dir, filter) = trimmed.split_at(split + 1);
     Some(PathQuery {
@@ -52,8 +70,119 @@ pub fn parse(raw: &str) -> Option<PathQuery> {
     })
 }
 
+/// `\\server` / `\\server\` → `Some("server")`；带共享名的路径返回 None。
+fn unc_server_root(dir: &str) -> Option<&str> {
+    let rest = dir.strip_prefix("\\\\")?;
+    let rest = rest.trim_end_matches(['\\', '/']);
+    if rest.is_empty() || rest.contains(['\\', '/']) {
+        return None;
+    }
+    Some(rest)
+}
+
+fn share_entry(server: &str, name: &str) -> Entry {
+    let path = std::path::PathBuf::from(format!(r"\\{server}\{name}"));
+    Entry {
+        id: format!("path:{}", path.display()),
+        kind: Kind::Folder,
+        pinyin: Some(pinyin::keys(name)),
+        name: name.to_string(),
+        path: Some(path),
+        size: None,
+        modified: None,
+        initial: String::new(),
+        tone: 0,
+    }
+}
+
+/// 枚举 `\\server` 的磁盘共享（NetShareEnum level 1）。
+/// 失败（主机离线/无权限/非 Windows 网络）返回空，UI 显示「没有匹配项」。
+fn list_shares(server: &str) -> Vec<Entry> {
+    let server_w: Vec<u16> = format!("\\\\{server}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buf: *mut u8 = std::ptr::null_mut();
+    let mut read: u32 = 0;
+    let mut total: u32 = 0;
+    // SAFETY: 服务器名以 NUL 结尾且在本函数存活；`buf`/`read`/`total` 是有效的
+    // 输出指针；返回码为 0 时系统分配了 `buf`，下面用 NetApiBufferFree 释放。
+    let status = unsafe {
+        NetShareEnum(
+            PCWSTR(server_w.as_ptr()),
+            1,
+            &mut buf,
+            MAX_PREFERRED_LENGTH,
+            &mut read,
+            &mut total,
+            None,
+        )
+    };
+    if status != 0 {
+        return Vec::new();
+    }
+    let mut entries = Vec::new();
+    if !buf.is_null() {
+        for i in 0..read as usize {
+            // SAFETY: `buf` 指向 `read` 个连续的 SHARE_INFO_1。
+            let info = unsafe { &*(buf as *const SHARE_INFO_1).add(i) };
+            if info.shi1_type.0 & STYPE_MASK.0 != STYPE_DISKTREE.0 {
+                continue; // 跳过打印队列/IPC 等
+            }
+            if info.shi1_type.0 & STYPE_SPECIAL.0 != 0 {
+                continue; // 跳过 C$、ADMIN$ 等管理共享
+            }
+            // SAFETY: NetShareEnum 返回的 netname 是缓冲区内的 NUL 结尾宽字符串。
+            let Ok(name) = (unsafe { info.shi1_netname.to_string() }) else {
+                continue;
+            };
+            if name.is_empty() || name.ends_with('$') {
+                continue;
+            }
+            entries.push(share_entry(server, &name));
+        }
+        // SAFETY: `buf` 由 NetShareEnum 分配，必须用 NetApiBufferFree 释放。
+        unsafe {
+            let _ = NetApiBufferFree(Some(buf as *const core::ffi::c_void));
+        }
+    }
+    entries.sort_by_key(|e| e.name.to_lowercase());
+    entries
+}
+
+/// P2-13：`NetShareEnum` 在主机离线/网络卡顿时可能阻塞数秒到数十秒。
+/// 放到独立线程限时等待，超时返回空列表（搜索线程继续响应后续输入）。
+/// 注意：超时后线程仍可能在后台等待系统返回，但每台主机只会因输入变化
+/// 触发一次（同目录由 `DirCache` 缓存），不会随每次按键堆积。
+fn list_shares_timeout(server: &str) -> Vec<Entry> {
+    const TIMEOUT: Duration = Duration::from_secs(3);
+    let (tx, rx) = mpsc::channel();
+    let server_owned = server.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("lstr-unc-shares".into())
+        .spawn(move || {
+            let _ = tx.send(list_shares(&server_owned));
+        });
+    if spawned.is_err() {
+        return Vec::new();
+    }
+    match rx.recv_timeout(TIMEOUT) {
+        Ok(entries) => entries,
+        Err(_) => {
+            lstr_index::snapshot::debug_log(&format!(
+                "browse: UNC share enumeration timed out after {TIMEOUT:?}: \\\\{server}"
+            ));
+            Vec::new()
+        }
+    }
+}
+
 /// 读取目录子项；目录不存在或无权限时返回空（UI 显示「没有匹配项」）。
 pub fn list_children(dir: &str) -> Vec<Entry> {
+    // `\\server\` 不是文件系统目录：列出共享（B17）。
+    if let Some(server) = unc_server_root(dir) {
+        return list_shares_timeout(server);
+    }
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -204,6 +333,20 @@ mod tests {
         let pq = parse(r"\\server\share\do").expect("UNC");
         assert_eq!(pq.dir, r"\\server\share\");
         assert_eq!(pq.filter, "do");
+    }
+
+    #[test]
+    fn parses_bare_unc_server_root() {
+        // B17：`\\server` / `\\server\` 是服务器根，列表应走共享枚举。
+        for raw in [r"\\server", "\\\\server\\", r"\\server\\"] {
+            let pq = parse(raw).expect("UNC server root");
+            assert_eq!(pq.dir, r"\\server\");
+            assert_eq!(pq.filter, "");
+        }
+        assert_eq!(unc_server_root(r"\\server\"), Some("server"));
+        assert_eq!(unc_server_root(r"\\server"), Some("server"));
+        assert_eq!(unc_server_root(r"\\server\share\"), None);
+        assert_eq!(unc_server_root(r"D:\foo\"), None);
     }
 
     #[test]

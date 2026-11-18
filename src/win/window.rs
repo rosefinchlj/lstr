@@ -4,12 +4,12 @@ use raw_window_handle::{
 use std::num::NonZeroIsize;
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_ROUND,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, RedrawWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, RedrawWindow, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -19,9 +19,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{ITaskbarList, TaskbarList};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    SwitchToThisWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    GetWindowThreadProcessId, IsWindow, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, SwitchToThisWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 pub fn hwnd_of_frame(frame: &eframe::Frame) -> Option<isize> {
@@ -133,8 +133,12 @@ pub fn position_center(hwnd_value: isize) {
         let height = rect.bottom - rect.top;
         let work_width = info.rcWork.right - info.rcWork.left;
         let work_height = info.rcWork.bottom - info.rcWork.top;
-        let x = info.rcWork.left + (work_width - width) / 2;
-        let y = info.rcWork.top + (work_height - height) / 2;
+        // C13：居中后仍要 clamp 到工作区。窗口比工作区还大时（小屏/高缩放下
+        // 窗口被撑到 1000pt），居中公式会得到负偏移，导致标题栏跑到屏幕外。
+        let max_x = (info.rcWork.right - width).max(info.rcWork.left);
+        let max_y = (info.rcWork.bottom - height).max(info.rcWork.top);
+        let x = (info.rcWork.left + (work_width - width) / 2).clamp(info.rcWork.left, max_x);
+        let y = (info.rcWork.top + (work_height - height) / 2).clamp(info.rcWork.top, max_y);
         let _ = SetWindowPos(
             target,
             Some(HWND_TOPMOST),
@@ -147,64 +151,28 @@ pub fn position_center(hwnd_value: isize) {
     }
 }
 
-pub fn position_near_dialog(hwnd_value: isize, dialog_hwnd: isize) -> bool {
-    if dialog_hwnd == 0 {
-        return false;
+/// 窗口所在显示器的工作区 `(left, top, right, bottom)`（已扣掉任务栏）。
+///
+/// 文件对话框停靠条要夹在工作区内：对话框贴边/最大化时，条子不能跑到屏幕外。
+pub fn work_area_for(hwnd_value: isize) -> Option<[i32; 4]> {
+    if hwnd_value == 0 {
+        return None;
     }
-    let target = hwnd(hwnd_value);
-    let dialog = hwnd(dialog_hwnd);
     unsafe {
-        let mut dialog_rect = RECT::default();
-        if GetWindowRect(dialog, &mut dialog_rect).is_err() {
-            return false;
-        }
-        let mut window_rect = RECT::default();
-        if GetWindowRect(target, &mut window_rect).is_err() {
-            return false;
-        }
-        let window_w = window_rect.right - window_rect.left;
-        let window_h = window_rect.bottom - window_rect.top;
-        let center = POINT {
-            x: (dialog_rect.left + dialog_rect.right) / 2,
-            y: (dialog_rect.top + dialog_rect.bottom) / 2,
-        };
-        let monitor = MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST);
+        let monitor = MonitorFromWindow(hwnd(hwnd_value), MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
         if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-            return false;
+            return None;
         }
-        let work = info.rcWork;
-        let max_x = (work.right - window_w - 8).max(work.left + 8);
-        // 左对齐停靠：与对话框左缘对齐（缩进 8px）。此前是水平居中于对话框，
-        // 而对话框通常在屏幕中央——看起来就像「弹了一下又移到居中」。
-        let x = (dialog_rect.left + 8).clamp(work.left + 8, max_x);
-        // P0-3：贴边自适应。对话框靠近工作区底部时，把快速切换窗口
-        // 翻到对话框上方（Listary V7 的做法），否则仍贴在下方。
-        let mut y = if dialog_rect.top + 56 + window_h <= work.bottom - 8 {
-            dialog_rect.top + 56
-        } else if dialog_rect.top - window_h - 8 >= work.top + 8 {
-            dialog_rect.top - window_h - 8
-        } else {
-            dialog_rect.bottom - window_h - 48
-        };
-        if y + window_h > work.bottom - 8 {
-            y = dialog_rect.bottom - window_h - 48;
-        }
-        let max_y = (work.bottom - window_h - 8).max(work.top + 8);
-        let y = y.clamp(work.top + 8, max_y);
-        let _ = SetWindowPos(
-            target,
-            Some(HWND_TOPMOST),
-            x,
-            y,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-        true
+        Some([
+            info.rcWork.left,
+            info.rcWork.top,
+            info.rcWork.right,
+            info.rcWork.bottom,
+        ])
     }
 }
 
@@ -238,6 +206,105 @@ pub fn hide(hwnd_value: isize) {
             0,
             SWP_NOSIZE | SWP_NOACTIVATE,
         );
+    }
+}
+
+/// 窗口「可见边框」的物理像素矩形 `(left, top, right, bottom)`。
+///
+/// 贴角浮层必须贴着 Explorer 真正看得见的边缘：Win10+ 的 `GetWindowRect`
+/// 含一圈不可见的阴影边框（最大化时左右各多出 7~8px），直接拿它当锚点
+/// 会在右侧/底边留一条缝，看起来像没贴住。优先用 DWM 扩展边框，取不到
+/// 再退回 `GetWindowRect`。
+pub fn frame_bounds(hwnd_value: isize) -> Option<[i32; 4]> {
+    if hwnd_value == 0 {
+        return None;
+    }
+    let target = hwnd(hwnd_value);
+    unsafe {
+        let mut rect = RECT::default();
+        let dwm = DwmGetWindowAttribute(
+            target,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        );
+        if dwm.is_err() || rect.right <= rect.left || rect.bottom <= rect.top {
+            rect = RECT::default();
+            if GetWindowRect(target, &mut rect).is_err() {
+                return None;
+            }
+        }
+        if rect.right <= rect.left || rect.bottom <= rect.top {
+            return None;
+        }
+        Some([rect.left, rect.top, rect.right, rect.bottom])
+    }
+}
+
+/// 一次 `SetWindowPos` 同时改位置与尺寸（贴角模式 B1）。
+///
+/// 不走 `ViewportCommand::InnerSize`：那条路径每次 resize 都要等 winit
+/// 下一帧同步，连续拖动 Explorer 时高度变化会追赶不及、肉眼可见抖动。
+/// 位置+尺寸合一次系统调用，浮层和资源管理器基本同帧移动。
+pub fn set_rect(hwnd_value: isize, x: i32, y: i32, width: i32, height: i32) {
+    if hwnd_value == 0 {
+        return;
+    }
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd(hwnd_value),
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            width.max(1),
+            height.max(1),
+            SWP_NOACTIVATE,
+        )
+    };
+}
+
+/// 锚点窗口是否还活着（Explorer 关窗/换窗口时贴角浮层要跟着收）。
+pub fn is_window(hwnd_value: isize) -> bool {
+    if hwnd_value == 0 {
+        return false;
+    }
+    unsafe { IsWindow(Some(hwnd(hwnd_value))).as_bool() }
+}
+
+/// 把前台交还给锚点窗口（贴角浮层收起后回到 Explorer）。
+///
+/// 浮层是「抢焦点」模式（F1，中文输入法必须靠窗口焦点），收起时如果
+/// 只做 `window::hide`，前台会落到别的窗口（甚至桌面）；用户在资源管理器
+/// 里刚打完字、按 Esc 关掉浮层后应当继续在 Explorer 里操作。
+pub fn restore_foreground(hwnd_value: isize) {
+    if hwnd_value == 0 {
+        return;
+    }
+    let target = hwnd(hwnd_value);
+    unsafe {
+        if GetForegroundWindow().0 == target.0 {
+            return;
+        }
+        // 本进程此刻通常就是前台（浮层刚抢过焦点），SetForegroundWindow 允许。
+        let _ = SetForegroundWindow(target);
+        let _ = SetActiveWindow(target);
+        let _ = SetFocus(Some(target));
+        if GetForegroundWindow().0 == target.0 {
+            return;
+        }
+        // 兜底：附着到目标线程再抢一次（跨进程前台锁/提权窗口场景）。
+        let mut pid = 0u32;
+        let target_thread = GetWindowThreadProcessId(target, Some(&mut pid));
+        let current_thread = GetCurrentThreadId();
+        if target_thread != 0 && target_thread != current_thread {
+            let _ = AttachThreadInput(current_thread, target_thread, true);
+            let _ = SetForegroundWindow(target);
+            let _ = SetActiveWindow(target);
+            let _ = AttachThreadInput(current_thread, target_thread, false);
+        }
+        if GetForegroundWindow().0 != target.0 {
+            SwitchToThisWindow(target, true);
+        }
     }
 }
 

@@ -17,8 +17,8 @@ use windows::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, OpenEventW, OpenProcess, OpenProcessToken, SetEvent, WaitForSingleObject,
-    EVENT_MODIFY_STATE, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateEventW, GetCurrentProcess, OpenEventW, OpenProcess, OpenProcessToken, SetEvent,
+    WaitForSingleObject, EVENT_MODIFY_STATE, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -28,15 +28,43 @@ use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThre
 /// 主界面侧的事件句柄：每帧非阻塞地取一次「提权 hotkey 已触发」信号。
 pub struct HotkeyRelay {
     event: HANDLE,
+    /// P2-16：独立的唤醒事件。中继线程 SetEvent 后，这里的常驻线程
+    /// WaitForSingleObject → request_repaint，隐藏态不必等 2s 保险丝重绘。
+    /// 与 `event` 分开是因为自动复位事件会被任一 waiter 消费：若共用，
+    /// 唤醒线程会把本该由 `take()` 消费的 toggle 信号吃掉。
+    wake_event: HANDLE,
 }
+
+struct SendHandle(isize);
+unsafe impl Send for SendHandle {}
 
 impl HotkeyRelay {
     /// 在启动 index worker **之前**创建，worker 才能 OpenEvent 到它。
-    pub fn create() -> Option<Self> {
+    pub fn create(ctx: Option<eframe::egui::Context>) -> Option<Self> {
         let event =
             unsafe { CreateEventW(None, false, false, w!("Local\\lstr-hotkey-relay-9c1f3a")) }
                 .ok()?;
-        Some(Self { event })
+        let wake_event = unsafe {
+            CreateEventW(None, false, false, w!("Local\\lstr-hotkey-relay-wake-9c1f3a"))
+        }
+        .ok()?;
+        if let Some(ctx) = ctx {
+            let wake = SendHandle(wake_event.0 as isize);
+            let _ = std::thread::Builder::new()
+                .name("lstr-relay-wake".to_string())
+                .spawn(move || {
+                    let handle =
+                        HANDLE(wake.0 as *mut core::ffi::c_void);
+                    loop {
+                        let _ = unsafe { WaitForSingleObject(handle, u32::MAX) };
+                        ctx.request_repaint();
+                    }
+                });
+        }
+        Some(Self {
+            event,
+            wake_event,
+        })
     }
 
     /// 有信号返回 true（自动复位事件已清除），供主循环 toggle 一次。
@@ -49,6 +77,7 @@ impl Drop for HotkeyRelay {
     fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.event);
+            let _ = CloseHandle(self.wake_event);
         }
     }
 }
@@ -154,12 +183,21 @@ fn signal_relay() {
             let _ = SetEvent(event);
             let _ = CloseHandle(event);
         }
+        // P2-16：再敲一下唤醒事件，让隐藏态的主界面立刻 request_repaint。
+        if let Ok(event) = OpenEventW(
+            EVENT_MODIFY_STATE,
+            false,
+            w!("Local\\lstr-hotkey-relay-wake-9c1f3a"),
+        ) {
+            let _ = SetEvent(event);
+            let _ = CloseHandle(event);
+        }
     }
 }
 
 /// 当前前台窗口是否属于提权进程。只用于决定是否转发，不影响普通窗口：
 /// 普通窗口由主进程自己的钩子处理，避免同一次双击触发两次 toggle。
-fn foreground_is_elevated() -> bool {
+pub(crate) fn foreground_is_elevated() -> bool {
     unsafe {
         let foreground = GetForegroundWindow();
         if foreground.0.is_null() {
@@ -192,4 +230,31 @@ fn foreground_is_elevated() -> bool {
         let _ = CloseHandle(token);
         queried && elevation.TokenIsElevated != 0
     }
+}
+
+/// P2-15：本进程是否以提权身份运行（结果缓存）。
+///
+/// 提权进程安装的 LL 钩子不受 UIPI 限制，「前台是管理员窗口」对它不是合法
+/// 失明理由；只有普通进程才需要套用前台豁免。该查询只在 watchdog tick
+/// （30s 级）里用一次，缓存避免重复开令牌。
+pub(crate) fn process_is_elevated() -> bool {
+    static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ELEVATED.get_or_init(|| unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut size = 0u32;
+        let queried = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        queried && elevation.TokenIsElevated != 0
+    })
 }

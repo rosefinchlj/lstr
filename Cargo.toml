@@ -8,9 +8,14 @@ description = "A fast, quiet Windows launcher backed by a built-in file index"
 [workspace]
 members = ["crates/lstr-index"]
 
+[features]
+# P1-8 内存归因：计数分配器 + 周期统计日志，仅测量构建使用。
+# 默认关闭，发布版零开销；用法见 src/alloc_stats.rs。
+alloc-stats = []
+
 [dependencies]
 lstr-index = { path = "crates/lstr-index" }
-eframe = { version = "=0.32.3", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "=0.32.3", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 # 浏览器书签的网站图标来自 Favicons/favicons.sqlite 里的 PNG/ICO blob；
 # eframe 已间接依赖 image，这里只补解码特性。
 image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg"] }
@@ -43,6 +48,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_NetManagement",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_Security",

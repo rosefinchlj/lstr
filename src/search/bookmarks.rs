@@ -10,8 +10,9 @@
 //! 书签只参与「全部」范围的搜索：空输入不展示，筛选条（位置/时间/类型）
 //! 生效时也不混入——与应用的语义一致。Enter 由调用方交给默认浏览器打开。
 
+use crate::history::History;
 use crate::model::{Entry, Kind};
-use crate::search::{apps, fuzzy, pinyin};
+use crate::search::{apps, fuzzy, pinyin, rank};
 use crate::win::browserdata;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
@@ -88,10 +89,33 @@ impl BookmarkIndex {
             .collect()
     }
 
-    /// 书签页空输入：按名称列出前 `limit` 条（加载时已按名称排序）。
-    /// 与「应用」页的空输入语义一致，不掺历史/常用排序。
+    /// 按名称列出前 `limit` 条（加载时已按名称排序，不读历史）。
+    /// 只用作空输入的**兜底**顺序：正常路径见 [`Self::used_page`]（读过历史，
+    /// 用过的按 frecency 排前），本方法留给历史读不到（锁中毒）时的降级场景。
     pub fn top(&self, limit: usize) -> Vec<Entry> {
         self.marks.iter().take(limit).cloned().collect()
+    }
+
+    /// 书签页空输入的使用学习排序：用过的按 frecency 排前，其余保持名称序。
+    /// 传全量索引（不要先 `top`），名称窗口外的常用书签才升得上来。
+    pub fn used_page(&self, history: &History, take: usize) -> Vec<Entry> {
+        rank::usage_page(self.marks.iter(), history, take)
+    }
+
+    /// 测试辅助：用给定条目直接建索引，跳过浏览器收藏夹读取。
+    /// 保持传入顺序（生产路径按名称升序，测试自己控制「自然序」）；
+    /// `urls` 由条目路径推出，`folders` 留空（`used_page` 不看这两个）。
+    #[cfg(test)]
+    pub(crate) fn for_test(entries: Vec<Entry>) -> Self {
+        let urls = entries
+            .iter()
+            .map(|entry| entry.full_path().to_lowercase())
+            .collect();
+        Self {
+            marks: entries,
+            urls,
+            folders: Vec::new(),
+        }
     }
 
     /// 名称/拼音/模糊/URL 匹配。空查询返回空（空输入展示「最近使用」）。
@@ -189,9 +213,17 @@ struct RawBookmark {
 
 fn load_chromium_file(path: &Path, raw: &mut Vec<RawBookmark>) {
     let Ok(text) = fs::read_to_string(path) else {
+        lstr_index::snapshot::debug_log(&format!(
+            "bookmarks: read failed: {}",
+            path.display()
+        ));
         return;
     };
     let Ok(root) = serde_json::from_str::<Value>(&text) else {
+        lstr_index::snapshot::debug_log(&format!(
+            "bookmarks: invalid JSON: {}",
+            path.display()
+        ));
         return;
     };
     let Some(roots) = root.get("roots").and_then(Value::as_object) else {
@@ -354,7 +386,17 @@ fn load_firefox_db(db: &Path, raw: &mut Vec<RawBookmark>) {
                     }
                 }
             }
+        } else {
+            lstr_index::snapshot::debug_log(&format!(
+                "bookmarks: firefox copy open failed: {}",
+                db.display()
+            ));
         }
+    } else {
+        lstr_index::snapshot::debug_log(&format!(
+            "bookmarks: firefox places copy failed: {}",
+            db.display()
+        ));
     }
     let _ = fs::remove_dir_all(&tmp);
 }
@@ -586,5 +628,30 @@ mod tests {
         // Firefox 的内部根目录键 menu → 中文「书签菜单」，用户目录原样保留。
         assert_eq!(folders[0], "书签菜单 › 工作");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn used_page_lifts_bookmark_used_outside_the_name_window() {
+        let index = index_from(vec![
+            raw("Alpha", "https://a.example/"),
+            raw("beta", "https://b.example/"),
+            raw("gamma", "https://c.example/"),
+        ]);
+        let mut history = History::in_memory();
+        let gamma = index
+            .marks
+            .iter()
+            .find(|mark| mark.name == "gamma")
+            .expect("gamma 书签应存在");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_secs();
+        history.seed(gamma, 3, now);
+
+        let page = index.used_page(&history, 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].name, "gamma", "用过的书签必须排到名称窗口之前");
+        assert_eq!(page[1].name, "Alpha", "没用过的仍按名称序");
     }
 }

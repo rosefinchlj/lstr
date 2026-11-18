@@ -4,6 +4,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+/// 手动隐藏的应用：`path` 是匹配键（Windows 路径大小写不敏感），`name` 只
+/// 用于设置页/提示里认出是哪一条；写进 `config.toml` 的 `[[hidden_app]]`。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HiddenApp {
+    pub name: String,
+    pub path: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub hotkey: String,
@@ -39,6 +47,10 @@ pub struct Config {
     /// 收藏的文件夹/文件，Quick Switch 与菜单的数据源。
     #[serde(default)]
     pub favorites: Vec<Favorite>,
+    /// 手动隐藏的应用：空输入的应用页里不出现（输入名字仍能搜到，
+    /// Ctrl+H 可临时全部列出）。写入 `config.toml` 的 `[[hidden_apps]]`。
+    #[serde(default)]
+    pub hidden_apps: Vec<HiddenApp>,
     /// 自定义动作：作用于选中的搜索结果，支持 {action_path}。
     #[serde(default)]
     pub actions: Vec<ActionDef>,
@@ -46,10 +58,23 @@ pub struct Config {
     #[serde(default)]
     pub commands: Vec<CommandDef>,
     // —— P0-2 / P0-3 开关 ——
-    /// Explorer 内「直接键入搜索」：全局低级键盘钩子，默认关闭（需设置页显式开启）。
-    /// 判定严格：仅 Explorer 前台 + 非编辑框 + 无修饰键/IME；设置页可随时关闭。
+    /// Explorer 内「直接键入搜索」：全局低级键盘钩子，**默认关闭**（隐私优先，
+    /// 需设置页显式开启）。判定严格：仅 Explorer 前台 + 非编辑框 + 无修饰键/IME；
+    /// 设置页可随时关闭。
     #[serde(default)]
     pub explorer_typing: bool,
+
+    /// 内部迁移标记（P0-5 隐私修正）：v0.1.x 把 `explorer_typing` 默认写成
+    /// true 并落盘；升级后第一次 load 用本标记一次性关掉它，避免「默认监听
+    /// 键盘」延续到老用户。写进 config.toml，不参与任何 UI。
+    #[serde(default)]
+    pub privacy_v2: bool,
+
+    /// 是否已经看过首启欢迎引导。默认 false：新装用户第一次打开会看到
+    /// 「双击 Ctrl / 首次索引 / 托盘」三行提示 + 「开始使用」按钮，点掉后
+    /// 不再出现（老配置升级也会看一次，属于可接受的一次性引导）。
+    #[serde(default)]
+    pub onboarded: bool,
 
     /// 自研索引引擎（设置面板「搜索」页）。
     #[serde(default)]
@@ -113,6 +138,18 @@ pub struct IndexConfig {
     /// 设置页即时生效；关闭后 worker 立即清空索引。
     #[serde(default = "default_true")]
     pub notes: bool,
+    /// 退出 lstr 时保留提权索引服务常驻（P0-3）：
+    /// 下次启动免 UAC、免 1~3 分钟重建，索引保持热态；托盘「退出并停止
+    /// 索引服务」可强制连 worker 一起退出。默认开（爆款目标：关掉再开秒回）。
+    #[serde(default = "default_true")]
+    pub keep_worker_alive: bool,
+    /// 构建 trigram 倒排加速 2+ 字符（英文/数字）子串搜索（P1-8）：
+    /// 大卷每卷约 60~70MB 常驻堆；关闭后退回 memmem 扫描（仍亚秒级）。
+    /// **默认关闭**：启动内存更小、快照加载约快 2.6×（实测 private −127MB /
+    /// WS −129MB）；需要更快的宽泛子串搜索时设 `[index] ngram = true`，
+    /// 重启生效。
+    #[serde(default)]
+    pub ngram: bool,
 }
 
 fn default_incremental() -> String {
@@ -137,6 +174,8 @@ impl Default for IndexConfig {
             journal_poll_ms: default_journal_poll_ms(),
             bookmarks: true,
             notes: true,
+            keep_worker_alive: true,
+            ngram: false,
         }
     }
 }
@@ -464,6 +503,29 @@ impl RankConfig {
             .insert(letter.to_string(), weight.min(100));
     }
 
+    /// 手写 config.toml 的归一化：评分档位/历史/加成/噪声强度夹到安全区间。
+    /// 避免 `exact = 2147483647` 这类手写值让所有匹配分数溢出、排序错乱。
+    /// 不改变档位之间的相对顺序（用户可自行调档），只做上下界约束。
+    pub fn sanitize(&mut self) {
+        const SCORE_MAX: i32 = 10_000;
+        for score in [
+            &mut self.exact,
+            &mut self.prefix,
+            &mut self.substring,
+            &mut self.tokens,
+            &mut self.normalized,
+            &mut self.pinyin_prefix,
+            &mut self.pinyin_substring,
+            &mut self.fuzzy,
+            &mut self.path_only,
+        ] {
+            *score = (*score).clamp(0, SCORE_MAX);
+        }
+        self.history_cap = self.history_cap.clamp(0, 2_000);
+        self.recent_boost = self.recent_boost.clamp(0, 500);
+        self.noise_strength = self.noise_strength.clamp(0, 200);
+    }
+
     /// 手写 config.toml 的归一化：键统一成大写单字母、值夹到 0..=100，
     /// 非法键直接丢弃（不阻断整份配置加载）。
     pub fn normalize_drive_weights(&mut self) {
@@ -540,9 +602,14 @@ impl Default for Config {
             keywords: default_keywords(),
             rank: RankConfig::default(),
             favorites: Vec::new(),
+            hidden_apps: Vec::new(),
             actions: Vec::new(),
             commands: Vec::new(),
-            explorer_typing: true,
+            // P0-5：默认不安装全局键盘钩子（需要用户在设置页显式开启）。
+            explorer_typing: false,
+            privacy_v2: true,
+            // P0-2：新装默认展示一次首启引导。
+            onboarded: false,
             index: IndexConfig::default(),
         }
     }
@@ -608,11 +675,39 @@ impl Config {
         self.index.noise_seeded = true;
     }
 
+    /// C16：清理历史遗留备份。`history.json.bak` 与 `config.toml.bak-*`
+    /// 都含完整查询/配置内容且旧逻辑永不删除；超过 30 天的清掉。
+    pub fn cleanup_stale_backups() {
+        const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3_600);
+        let Ok(entries) = fs::read_dir(attach_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let is_backup = name == "history.json.bak" || name.starts_with("config.toml.bak");
+            if !is_backup {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            if modified.elapsed().map(|age| age > MAX_AGE).unwrap_or(false) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
     pub fn path() -> PathBuf {
         attach_dir().join("config.toml")
     }
 
     pub fn load() -> Self {
+        // C16：清掉过期的历史/配置备份（含完整查询记录），避免长期留存。
+        Self::cleanup_stale_backups();
         let path = Self::path();
         let Ok(text) = fs::read_to_string(&path) else {
             let mut cfg = Self::default();
@@ -625,6 +720,11 @@ impl Config {
             Ok(mut cfg) => {
                 cfg.rank.backfill_missing_noise_rules();
                 cfg.rank.normalize_drive_weights();
+                // B21：手写 config.toml 里的极端分值/强度夹到安全区间。
+                cfg.rank.sanitize();
+                // P2-20：app_boost 在 Config 顶层，同样来自手写配置；极端值
+                // 会让应用结果恒压过文件结果，一并夹到安全区间。
+                cfg.app_boost = cfg.app_boost.clamp(0, 500);
                 cfg.max_load_results = normalize_max_load_results(cfg.max_load_results);
                 cfg.index.normalize_volumes();
                 cfg.index.normalize();
@@ -634,10 +734,12 @@ impl Config {
                 let seeded_before = cfg.index.noise_seeded;
                 cfg.migrate_noise_list();
                 let migrated = !seeded_before;
+                // P0-5：老配置默认开着全局键盘钩子，升级后一次性关掉。
+                let privacy_reset = cfg.migrate_privacy();
                 // 唤起热键：手写 config.toml 的非法值（如裸字母）回退默认，
                 // 避免静默变成「永不生效」或全局吞键。
                 cfg.hotkey = crate::hotkey::normalize_hotkey_or_default(&cfg.hotkey);
-                if migrated {
+                if migrated || privacy_reset {
                     let _ = cfg.save();
                 }
                 cfg
@@ -647,6 +749,23 @@ impl Config {
                 Self::default()
             }
         }
+    }
+
+    /// P0-5（隐私）：老版本默认开启「资源管理器键入即搜」并把它持久化成
+    /// `explorer_typing = true`。升级后第一次 load 一次性关闭，让「默认不监听
+    /// 键盘」对存量用户也成立；用户要开仍可在设置页显式打开。
+    ///
+    /// 返回是否改动了配置（需要立即落盘）。幂等：`privacy_v2` 置位后不再动。
+    pub fn migrate_privacy(&mut self) -> bool {
+        if self.privacy_v2 {
+            return false;
+        }
+        self.privacy_v2 = true;
+        if self.explorer_typing {
+            self.explorer_typing = false;
+            return true;
+        }
+        false
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -665,7 +784,10 @@ impl Config {
 
 pub fn parse_hex(input: &str) -> Option<[u8; 3]> {
     let s = input.trim().trim_start_matches('#');
-    if s.len() != 6 {
+    // P1-3：必须先确认是 6 个 ASCII 十六进制字符，再按字节切片。
+    // 旧代码只查了 `s.len() == 6`——`accent = "红色"`（UTF-8 下恰好 6 字节）
+    // 会在 `&s[0..2]` 处按字符边界切开 panic（设置页一改主题就崩）。
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -853,14 +975,85 @@ mod tests {
         );
     }
 
+    /// P1-3：非法/多字节 accent 必须安全返回 None，不能按字节中间切片 panic。
+    #[test]
+    fn parse_hex_rejects_multibyte_and_bad_input() {
+        assert_eq!(parse_hex("#A78BFA"), Some([0xA7, 0x8B, 0xFA]));
+        assert_eq!(parse_hex(" a78bfa "), Some([0xA7, 0x8B, 0xFA]));
+        assert_eq!(parse_hex("红色"), None, "6 字节但非 ASCII 十六进制");
+        assert_eq!(parse_hex("红色ab"), None);
+        assert_eq!(parse_hex("#GGGGGG"), None);
+        assert_eq!(parse_hex(""), None);
+        assert_eq!(parse_hex("12345"), None);
+        // 兜底：[0] 开头但越界的输入也不 panic。
+        for input in ["ééé", "#中文字符", "\u{1F600}\u{1F600}\u{1F600}", "A7 8B FA"] {
+            assert!(parse_hex(input).is_none(), "不应解析: {input:?}");
+        }
+    }
+
+    /// P0-5：老配置里 explorer_typing=true 且没有 privacy_v2 标记时，
+    /// load 迁移只关一次，之后用户显式开启不会被再次关掉。
+    #[test]
+    fn legacy_explorer_typing_is_disabled_once() {
+        assert!(!Config::default().explorer_typing);
+        assert!(Config::default().privacy_v2, "新配置已带迁移标记");
+
+        let mut value = toml::Value::try_from(Config::default()).expect("config → toml value");
+        let table = value.as_table_mut().expect("table");
+        table.remove("privacy_v2");
+        table.insert("explorer_typing".to_string(), toml::Value::Boolean(true));
+        let text = toml::to_string(&value).expect("serialize legacy config");
+        let mut cfg: Config = toml::from_str(&text).expect("deserialize legacy config");
+        assert!(cfg.explorer_typing);
+        assert!(!cfg.privacy_v2);
+
+        assert!(cfg.migrate_privacy(), "首次迁移应关闭旧默认值");
+        assert!(!cfg.explorer_typing);
+        assert!(cfg.privacy_v2);
+        assert!(!cfg.migrate_privacy(), "已迁移后不再改动");
+
+        // 用户之后在设置页重新开启：不会在下一次 load 被再次关闭。
+        cfg.explorer_typing = true;
+        assert!(!cfg.migrate_privacy());
+        assert!(cfg.explorer_typing);
+    }
+
+    /// P0-2：首启引导默认未看过；用户点掉后写入 config 并持久化。
+    #[test]
+    fn onboarded_defaults_false_and_round_trips() {
+        let cfg = Config::default();
+        assert!(!cfg.onboarded, "新装用户应看到首启引导");
+        let text = toml::to_string(&cfg).expect("serialize config");
+        let parsed: Config = toml::from_str(&text).expect("deserialize config");
+        assert!(!parsed.onboarded);
+
+        let dismissed = Config {
+            onboarded: true,
+            ..Config::default()
+        };
+        let text = toml::to_string(&dismissed).expect("serialize config");
+        let parsed: Config = toml::from_str(&text).expect("deserialize config");
+        assert!(parsed.onboarded, "引导看过标记必须持久化");
+
+        // 老配置没有 onboarded 字段：serde(default) 回落 false（看一次引导），不报错。
+        let value = toml::Value::try_from(Config::default()).expect("config → toml");
+        let mut table = value.as_table().expect("table").clone();
+        table.remove("onboarded");
+        let text = toml::to_string(&table).expect("serialize legacy config");
+        let parsed: Config = toml::from_str(&text).expect("legacy config 必须可读");
+        assert!(!parsed.onboarded);
+    }
+
     #[test]
     fn default_config_round_trips_through_toml() {
         let text = toml::to_string(&Config::default()).expect("serialize config");
         let parsed: Config = toml::from_str(&text).expect("deserialize config");
         assert!(parsed.height.is_none());
         assert_eq!(parsed.theme.mode, "frost");
-        assert!(parsed.explorer_typing);
+        assert!(!parsed.explorer_typing, "默认不安装全局键盘钩子");
+        assert!(parsed.privacy_v2);
         assert!(parsed.favorites.is_empty());
+        assert!(parsed.hidden_apps.is_empty());
     }
 
     #[test]
@@ -909,5 +1102,24 @@ mod tests {
             .map(|rule| rule.penalty)
             .collect();
         assert_eq!(hits, vec![42], "用户调过的强度必须保留且不重复追加");
+    }
+
+    #[test]
+    fn rank_config_sanitize_clamps_out_of_range_values() {
+        // B21：手写 config.toml 的极端值必须被夹到安全区间，否则排名分数可溢出。
+        let mut cfg = RankConfig {
+            exact: i32::MAX,
+            prefix: -7,
+            history_cap: 99_999,
+            recent_boost: -1,
+            noise_strength: 999,
+            ..RankConfig::default()
+        };
+        cfg.sanitize();
+        assert_eq!(cfg.exact, 10_000);
+        assert_eq!(cfg.prefix, 0);
+        assert_eq!(cfg.history_cap, 2_000);
+        assert_eq!(cfg.recent_boost, 0);
+        assert_eq!(cfg.noise_strength, 200);
     }
 }

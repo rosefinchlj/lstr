@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 7 天衰减常数：每过 7 天，最近使用奖励衰减到约 37%（e^-1）。
 const DECAY_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
@@ -154,7 +154,16 @@ impl History {
         let db = Connection::open(path)?;
         // WAL：写入不阻塞读，崩溃也安全。
         db.pragma_update(None, "journal_mode", "WAL")?;
+        // P1-5/P2：histroy.db 与外部备份/杀软扫描并发时，默认 0ms 的 busy
+        // 等待会直接返回 "database is locked"。给 2s 退避窗口。
+        db.busy_timeout(Duration::from_millis(2_000))?;
+        // WAL 下 NORMAL 是官方推荐：掉电最多丢最后一个事务，不会损坏库；
+        // 比 FULL 少一次每次提交的 fsync。
+        db.pragma_update(None, "synchronous", "NORMAL")?;
         db.execute_batch(SCHEMA)?;
+        // 上次异常退出可能留下很大的 -wal 文件；启动时截断一次（只在本进程
+        // 打开、无并发读者时执行，安全）。
+        let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         let history = Self { db };
         history.migrate_json();
         Ok(history)
@@ -162,6 +171,8 @@ impl History {
 
     fn open_memory() -> Self {
         let db = Connection::open_in_memory().expect("open in-memory sqlite");
+        db.busy_timeout(Duration::from_millis(2_000))
+            .expect("set busy timeout");
         db.execute_batch(SCHEMA).expect("create schema");
         Self { db }
     }
@@ -371,9 +382,14 @@ impl History {
     }
 
     /// 清空全部历史（设置里的「清空历史」用），连带清空查询词学习数据。
+    /// P1-5：顺手把 WAL 截断并 VACUUM，避免删完数据后 history.db-wal 仍占
+    /// 数 MB（用户会以为「没删干净」）。
     pub fn clear(&mut self) {
         let _ = self.db.execute("DELETE FROM history", []);
         let _ = self.db.execute("DELETE FROM query_hits", []);
+        let _ = self
+            .db
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
     }
 
     /// 清空查询词学习数据，保留打开历史。
@@ -539,39 +555,47 @@ impl History {
             return;
         }
         // 最多 1001 条，拉到 Rust 里按 frecency 排序，删掉分数最低的一半。
-        let Ok(mut stmt) = self.db.prepare("SELECT id, count, last FROM history") else {
-            return;
+        // C16：查询放进独立作用域，让 prepared statement 的借用先结束（下面
+        // 要用 &mut self.db 开事务）。
+        let scored: Vec<(String, f32)> = {
+            let Ok(mut stmt) = self.db.prepare("SELECT id, count, last FROM history") else {
+                return;
+            };
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            });
+            let Ok(rows) = rows else {
+                return;
+            };
+            rows.filter_map(Result::ok)
+                .map(|(id, count, last)| {
+                    let age = now.saturating_sub(last.max(0) as u64) as f64;
+                    let score = count as f32 + 2.0 * (-(age / DECAY_SECS)).exp() as f32;
+                    (id, score)
+                })
+                .collect()
         };
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u32>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        });
-        let Ok(rows) = rows else {
-            return;
-        };
-        let mut scored: Vec<(String, f32)> = rows
-            .filter_map(Result::ok)
-            .map(|(id, count, last)| {
-                let age = now.saturating_sub(last.max(0) as u64) as f64;
-                let score = count as f32 + 2.0 * (-(age / DECAY_SECS)).exp() as f32;
-                (id, score)
-            })
-            .collect();
+        let mut scored = scored;
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let delete: Vec<String> = scored
             .into_iter()
             .take((count - MAX_ITEMS / 2) as usize)
             .map(|(id, _)| id)
             .collect();
-        for id in delete {
-            let _ = self.db.execute("DELETE FROM history WHERE id = ?1", params![id]);
-            let _ = self
-                .db
-                .execute("DELETE FROM query_hits WHERE entry_id = ?1", params![id]);
+        // C16：淘汰放进一个事务——逐条 DELETE 在 WAL 下每次独立提交，
+        // 上千条会把 WAL 写爆且失败时可能只删一半。
+        let Ok(tx) = self.db.transaction() else {
+            return;
+        };
+        for id in &delete {
+            let _ = tx.execute("DELETE FROM history WHERE id = ?1", params![id]);
+            let _ = tx.execute("DELETE FROM query_hits WHERE entry_id = ?1", params![id]);
         }
+        let _ = tx.commit();
     }
 
     /// 测试辅助：直接种一条带指定次数/时间的历史。
@@ -584,6 +608,14 @@ impl History {
                 params![entry.id, count, last as i64, entry_json],
             )
             .expect("seed history");
+    }
+}
+
+impl Drop for History {
+    /// P1-5：进程退出时把 WAL 合并回主库并截断，避免 history.db-wal 长期
+    /// 停在 ~4MB（实测 3,918,152B）。失败不影响主流程。
+    fn drop(&mut self) {
+        let _ = self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
 }
 
@@ -823,5 +855,49 @@ mod tests {
         assert!(!history.contains("beta"));
         history.remove("alpha");
         assert!(!history.contains("alpha"));
+    }
+
+    /// P1-5：文件型库必须是 WAL、有 busy_timeout、synchronous=NORMAL，
+    /// 且 clear() 后 WAL 被截断（不留下 ~4MB 的 history.db-wal）。
+    #[test]
+    fn file_db_pragmas_and_clear_truncates_wal() {
+        let base = std::env::temp_dir().join(format!(
+            "lstr-history-pragma-{}-{}.db",
+            std::process::id(),
+            now_secs()
+        ));
+        let wal = base.with_extension("db-wal");
+        let shm = base.with_extension("db-shm");
+        let _ = fs::remove_file(&base);
+        let _ = fs::remove_file(&wal);
+        let _ = fs::remove_file(&shm);
+        {
+            let mut history = History::open_test_db(&base);
+            let mode: String = history
+                .db
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .expect("journal_mode");
+            assert_eq!(mode.to_ascii_lowercase(), "wal");
+            let busy: i64 = history
+                .db
+                .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+                .expect("busy_timeout");
+            assert_eq!(busy, 2_000);
+            let sync: i64 = history
+                .db
+                .pragma_query_value(None, "synchronous", |row| row.get(0))
+                .expect("synchronous");
+            assert_eq!(sync, 1, "NORMAL");
+            // 制造一些 WAL 内容后再清空：WAL 应被 checkpoint 截断。
+            for index in 0..50u32 {
+                history.record(&entry(&format!("item-{index}")));
+            }
+            history.clear();
+            let wal_len = fs::metadata(&wal).map(|meta| meta.len()).unwrap_or(0);
+            assert!(wal_len < 64 * 1024, "clear() 后 WAL 应被截断，实际 {wal_len}B");
+        }
+        let _ = fs::remove_file(&base);
+        let _ = fs::remove_file(&wal);
+        let _ = fs::remove_file(&shm);
     }
 }

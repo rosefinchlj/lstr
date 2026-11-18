@@ -1,9 +1,10 @@
-//! 可暂停的整卷 compact（4ms 分片，查询线程片间照常服务）。
+//! 可暂停的整卷 compact（大卷独立后台线程，小卷引擎线程同步跑完）。
 //!
 //! 背景：`VolumeStore::compact` 是同步全量重建。实测 D 卷 148 万条最坏 3.6s，
 //! 其中全量噪声重判占 74%（已改为按 `ancestry_dirty` 触发）、ngram 重建
-//! 约 400ms、列重建约 100ms。引擎空闲维护直接调用它会把同一线程上的查询
-//! 堵住数秒。
+//! 约 400ms、列重建约 100ms。即使在引擎线程上切成 4ms 片，累计仍会占用
+//! 查询线程数秒；大卷现在改为「fork 快照 + 独立线程重排 + 完成后换血」，
+//! 查询线程只保留 channel 轮询与 O(1) 收尾。
 //!
 //! 本任务把 compact 拆成可恢复的阶段，每次 `advance` 最多跑 `budget`：
 //! 解析未消解父链 → 收集 live → 按需全量判噪 → FRN 排序 → 重映射 →
@@ -11,8 +12,8 @@
 //! 阶段会原地改 attrs/parent/anchors（与旧 compact 语义一致，查询可照常
 //! 读取）外，构建阶段只读旧列、结果写在任务自己的缓冲里，最后 O(1) 换血。
 //!
-//! 调用方（Engine）必须在任务运行期间冻结修改类消息（同分段保存），
-//! 并在换血后 bump generation、重建拼音缓存。
+//! 调用方（Engine）必须在任务运行期间冻结同卷修改类消息（同分段保存），
+//! 并在换血后 bump generation、替换拼音缓存。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -39,11 +40,8 @@ enum Phase {
 
 pub(crate) struct CompactTask {
     phase: Phase,
-    started: Instant,
     /// 换血是否已发生（持久;abort 时据此补代次/拼音收尾）。
     swapped: bool,
-    /// 换血事件是否已通知宿主（`take_installed` 只报一次）。
-    install_notified: bool,
     /// 任务开始时的旧列长度（remap 按旧 slot 下标寻址）。
     old_len: u32,
     /// 解析父链阶段快照（运行期 store 冻结，unresolved 稳定）。
@@ -66,6 +64,7 @@ pub(crate) struct CompactTask {
     parent: Vec<u32>,
     attrs: Vec<u16>,
     mtime: Vec<u32>,
+    size: Vec<u64>,
     frn: Vec<u64>,
     cols_cursor: usize,
     offs: Vec<u32>,
@@ -93,9 +92,7 @@ impl CompactTask {
         }
         Some(Self {
             phase: Phase::Resolve,
-            started: Instant::now(),
             swapped: false,
-            install_notified: false,
             old_len: store.name_off.len() as u32,
             resolve_pairs: Vec::new(),
             resolve_cursor: 0,
@@ -116,6 +113,7 @@ impl CompactTask {
             parent: Vec::new(),
             attrs: Vec::new(),
             mtime: Vec::new(),
+            size: Vec::new(),
             frn: Vec::new(),
             cols_cursor: 0,
             offs: Vec::new(),
@@ -131,23 +129,9 @@ impl CompactTask {
         })
     }
 
-    /// 是否刚完成换血（引擎据此 bump generation + 重建拼音缓存）。
-    pub(crate) fn take_installed(&mut self) -> bool {
-        if self.swapped && !self.install_notified {
-            self.install_notified = true;
-            true
-        } else {
-            false
-        }
-    }
-
     /// 换血是否已发生（持久标志,abort 收尾用）。
     pub(crate) fn installed(&self) -> bool {
         self.swapped
-    }
-
-    pub(crate) fn elapsed(&self) -> Duration {
-        self.started.elapsed()
     }
 
     /// 实际占用（片内耗时累计），不含片间处理消息/等调度。
@@ -358,6 +342,7 @@ impl CompactTask {
             self.parent.reserve(self.by_frn.len());
             self.attrs.reserve(self.by_frn.len());
             self.mtime.reserve(self.by_frn.len());
+            self.size.reserve(self.by_frn.len());
             self.frn.reserve(self.by_frn.len());
         }
         let mut n = 0usize;
@@ -369,6 +354,10 @@ impl CompactTask {
                 .push(if p == NO_PARENT { NO_PARENT } else { self.remap[p as usize] });
             self.attrs.push(store.attrs[old as usize] & !ATTR_INTERNAL);
             self.mtime.push(store.mtime[old as usize]);
+            // size 列与 mtime 同语义:按旧 slot 取值,写入新 slot 序。
+            // 漏掉这一列会让 `size:` 过滤指向别的文件(UI 由逐条 find_meta
+            // 覆盖,肉眼不易发现),且错位列会被快照持久化。
+            self.size.push(store.size[old as usize]);
             self.frn.push(store.frn[old as usize]);
             n += 1;
             if n % CHECK_EVERY == 0 && Instant::now() >= deadline {
@@ -460,14 +449,15 @@ impl CompactTask {
             self.offs.extend_from_slice(&self.offs_base[self.offs_base_pos..]);
             self.offs.extend_from_slice(&self.offs_delta[self.offs_delta_pos..]);
         }
-        store.names = std::mem::take(&mut self.names);
-        store.names_lc = std::mem::take(&mut self.names_lc);
+        store.names = std::sync::Arc::new(std::mem::take(&mut self.names));
+        store.names_lc = std::sync::Arc::new(std::mem::take(&mut self.names_lc));
         store.name_off = std::mem::take(&mut self.name_off);
         store.offs = std::mem::take(&mut self.offs);
         store.frn = std::mem::take(&mut self.frn);
         store.parent = std::mem::take(&mut self.parent);
         store.attrs = std::mem::take(&mut self.attrs);
         store.mtime = std::mem::take(&mut self.mtime);
+        store.size = std::mem::take(&mut self.size);
         store.char_mask = std::mem::take(&mut self.mask);
         store.off_index = store
             .name_off
@@ -500,6 +490,7 @@ impl CompactTask {
         store.reindex_mark.clear();
         store.reindex_mark.resize((store.name_off.len() + 63) / 64, 0);
         store.rebuild_mtime_pending();
+        store.rebuild_size_pending();
         if store.children_built {
             store.rebuild_children();
         }
@@ -738,6 +729,7 @@ mod tests {
         assert_eq!(a.parent, b.parent, "parent");
         assert_eq!(a.attrs, b.attrs, "attrs");
         assert_eq!(a.mtime, b.mtime, "mtime");
+        assert_eq!(a.size, b.size, "size");
         assert_eq!(a.char_mask, b.char_mask, "char_mask");
         assert_eq!(a.base_len, b.base_len, "base_len");
         assert_eq!(a.dead_count, b.dead_count, "dead_count");
@@ -778,7 +770,31 @@ mod tests {
         assert!(slices > 0, "极小预算下必须分片执行");
         assert_same_cols(&sync_store, &paged);
         assert_same_queries(&sync_store, &paged);
-        assert!(paged.ngram.is_some(), "测试构建强制建倒排（阈值 0）");
+        assert!(paged.ngram.is_some(), "测试构建强制建倒排（阈值 1）");
+    }
+
+    /// P1 回归:分片 compact 必须重排 size 列。同步 `compact` 会按新 slot 序
+    /// 重建 size,而 `CompactTask` 曾漏掉这一列 —— slot 按 FRN 重排后
+    /// `size[slot]` 指向别的文件,`size:` 过滤静默命中错误条目(UI 由逐条
+    /// find_meta 覆盖,肉眼不易发现),错位列还会被快照持久化。
+    #[test]
+    fn paged_compact_permutes_size_column() {
+        let mut sync_store = churned_store();
+        let mut paged = churned_store();
+        // 灌可区分的真实 size(u64::MAX 是「待回填」标记,用它测不出错位)。
+        for (i, s) in sync_store.size.iter_mut().enumerate() {
+            *s = (i as u64 + 1) * 4096;
+        }
+        for (i, s) in paged.size.iter_mut().enumerate() {
+            *s = (i as u64 + 1) * 4096;
+        }
+
+        sync_store.compact();
+        let mut task = CompactTask::new(&paged).expect("有待归并工作");
+        while !task.advance(&mut paged, Duration::from_micros(50)) {}
+
+        assert_eq!(sync_store.size, paged.size, "size 列必须随 slot 重排");
+        assert_eq!(paged.size.len(), paged.len(), "size 列必须与 live 列等长");
     }
 
     /// 逐名折叠与整缓冲折叠必须逐字节一致（分片构建 names_lc 的前提）。

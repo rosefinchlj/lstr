@@ -18,11 +18,69 @@ use crate::search::entrymeta::{initial_of, kept_in_scope, kind_of, tone_for};
 use crate::search::filters::SearchFilters;
 use crate::search::pinyin;
 
+/// P0-2：UI 里的「重新授权」入口。用户拒绝过 UAC 后 client 线程会记住
+/// `launch_declined` 并且不再弹窗（防骚扰）；点这个标志后线程在下一次
+/// 循环里重置拒绝状态、给足 UAC 等待时间并重新 runas 拉起 worker。
+pub(crate) static RELAUNCH_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// 请求重新拉起提权 worker（用户点击「重新授权」按钮时调用）。
+pub fn request_worker_relaunch() {
+    RELAUNCH_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// P0-3：GUI 正常退出时保留提权 worker 常驻（免下次 UAC、免重建索引）。
+/// 由设置页 `index.keep_worker_alive` 初始化，运行期改设置即时生效。
+pub(crate) static KEEP_WORKER_ALIVE: AtomicBool = AtomicBool::new(true);
+
+/// 托盘「退出并停止索引服务」：本次退出强制发 `Shutdown`，不等 keep-alive。
+pub(crate) static STOP_WORKER_ON_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// P2-9：托盘「退出（保留索引服务）」是显式承诺，必须无视设置里的
+/// `keep_worker_alive=false`；仅在本次退出生效。
+pub(crate) static FORCE_KEEP_ON_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// 更新退出时是否保留索引服务（设置页开关调用）。
+pub fn set_keep_worker_alive(enabled: bool) {
+    KEEP_WORKER_ALIVE.store(enabled, Ordering::SeqCst);
+}
+
+/// 本次退出是否要连带停掉索引服务。
+pub fn set_stop_worker_on_exit(enabled: bool) {
+    STOP_WORKER_ON_EXIT.store(enabled, Ordering::SeqCst);
+}
+
+/// P2-9：托盘「退出（保留索引服务）」调用；优先于设置开关。
+pub(crate) fn set_force_keep_on_exit(enabled: bool) {
+    FORCE_KEEP_ON_EXIT.store(enabled, Ordering::SeqCst);
+}
+
+/// 退出收尾：常驻模式发 `Detach`（worker 不退出，保持索引热态），
+/// 否则发 `Shutdown` 并等 worker 收尾（有超时）。
+fn farewell(client: windows::Win32::Foundation::HANDLE) {
+    let keep = FORCE_KEEP_ON_EXIT.load(Ordering::Relaxed)
+        || (KEEP_WORKER_ALIVE.load(Ordering::Relaxed)
+            && !STOP_WORKER_ON_EXIT.load(Ordering::Relaxed));
+    if keep {
+        let _ = idx_client::detach(client);
+        lstr_index::snapshot::debug_log(
+            "client: detached (worker kept alive for next launch)",
+        );
+    } else {
+        let _ = idx_client::shutdown_and_wait(
+            client,
+            lstr_index::PIPE_NAME,
+            WORKER_EXIT_WAIT,
+        );
+    }
+}
+
 /// UI 聚合状态:索引构建进度。
 #[derive(Clone, Debug)]
 pub struct IndexUiStatus {
     pub phase: lstr_index::Phase,
     pub volumes: Vec<lstr_index::VolumeProgress>,
+    /// 当前阶段开始时间：P1-9 用它估算 ETA / 显示已等待秒数。
+    pub since: std::time::Instant,
 }
 
 pub struct BuiltinProvider {
@@ -42,6 +100,11 @@ pub struct SplitOnceResult {
     /// 前缀补集(A-3):宽查询下保证名字以查询词开头的命中进入排序。
     pub prefix: Vec<Entry>,
     pub exact_ms: f32,
+    /// P2-7：本次 total 是否为「计数预算内下界」。引擎对空 token 且非 regex 的
+    /// 纯过滤查询只数到 FILTER_ONLY_TOTAL_CAP 就停扫（B5）；这里用同一个谓词
+    /// 判定，UI 才能对 `ext:rs` / `*.rs` / `C:` 这类同样走纯过滤路径的查询
+    /// 显示「N+」，而不是把下界当精确值。
+    pub total_rough: bool,
 }
 
 impl BuiltinProvider {
@@ -86,9 +149,13 @@ impl BuiltinProvider {
         IndexUiStatus {
             phase: st.phase,
             volumes: st.volumes,
+            since: st.since,
         }
     }
 
+    /// 测试辅助:生产路径走 [`Self::search_with_bounds`](A8 需要下界标志),
+    /// 这里只为对拍/验收测试保留旧二元组签名。
+    #[cfg(test)]
     pub fn search(
         &self,
         query: &Query,
@@ -96,6 +163,24 @@ impl BuiltinProvider {
         limit: usize,
         weights: &EffectiveWeights,
     ) -> Result<(Vec<Entry>, usize), String> {
+        let (entries, total, _lower_bound) = self.search_with_bounds(
+            query,
+            filters,
+            limit,
+            weights,
+        )?;
+        Ok((entries, total))
+    }
+
+    /// 与 [`Self::search`] 相同,但额外返回「total 是否为计数预算内下界」
+    /// (A8:宽查询扫描到 TOTAL_CAP 就停,total 不再精确;UI 据此显示「N+」)。
+    pub fn search_with_bounds(
+        &self,
+        query: &Query,
+        filters: &SearchFilters,
+        limit: usize,
+        weights: &EffectiveWeights,
+    ) -> Result<(Vec<Entry>, usize, bool), String> {
         // 单分类作用域(文件夹/程序/文件)必须在这里按 kind 过滤:引擎侧过滤
         // 负责候选,keep 再兜底类型漂移。8e2e208 把 kind 抽成 run 的参数后,
         // 这里一度误传 KindFilter::All + 全放行,导致三个分类 tab 都返回
@@ -126,6 +211,7 @@ impl BuiltinProvider {
                 kind != Kind::Folder
             }
         }, weights)
+        .map(|(entries, total, _lower_bound)| (entries, total))
     }
 
     /// 旧元数据路径(逐条 find_meta)的双路 oracle:只用于 release 基准对照
@@ -259,6 +345,10 @@ impl BuiltinProvider {
             files,
             folder_total: outcome.total_folders,
             all_total: outcome.total_all,
+            // A8：total 是否为下界——与引擎停扫谓词完全一致（宽查询在
+            // TOTAL_CAP 停扫、空 token 纯过滤在 FILTER_ONLY_TOTAL_CAP 停扫）。
+            total_rough: lstr_index::query::total_is_lower_bound(&spec, outcome.total_all)
+                || lstr_index::query::total_is_lower_bound(&spec, outcome.total_folders),
             exact,
             prefix,
             exact_ms,
@@ -295,14 +385,14 @@ impl BuiltinProvider {
         kind_filter: KindFilter,
         keep: impl Fn(Kind) -> bool,
         weights: &EffectiveWeights,
-    ) -> Result<(Vec<Entry>, usize), String> {
+    ) -> Result<(Vec<Entry>, usize, bool), String> {
         let mut spec = build_spec(query, filters, weights);
         spec.kind = kind_filter;
         let outcome = self.query_spec(&spec);
         let ordered = self.ordered_hits(&outcome.hits, weights);
         let mut entries = Vec::with_capacity(ordered.len().min(limit));
         self.collect_entries(&ordered, query, limit, keep, &mut entries);
-        Ok((entries, outcome.total))
+        Ok((entries, outcome.total, outcome.total_capped))
     }
 
     /// 多卷命中按盘符权重公平交织（返回按「该先看谁」排好的序列）。
@@ -687,7 +777,7 @@ fn effective_vol_mask(
 
 /// worker 收到 Shutdown 后的退出等待上限:worker 要 join 各卷线程(对账批次
 /// 间检查 stop)、写 clean-exit 标记后才释放管道;超时即放弃 —— 协议容忍
-/// 半开,残留 worker 由自身的 idle 超时与 clean-exit 降级机制兜底。
+/// 半开,残留 worker 由自身的 idle 超时与 clean-exit 标记/P1-5 逐卷窗口校验兜底。
 const WORKER_EXIT_WAIT: Duration = Duration::from_secs(3);
 
 /// client 线程任何退出路径都置位 `client_done`:run_worker 据此确认
@@ -717,6 +807,9 @@ pub fn spawn_client_thread(
         .name("lstr-idx-client".to_string())
         .spawn(move || {
             let _done_guard = ClientDoneGuard(client_done);
+            // P0-3：以启动时的配置初始化「退出保留索引服务」；设置页改动
+            // 通过 set_keep_worker_alive 即时更新，无需重启。
+            KEEP_WORKER_ALIVE.store(index_cfg.keep_worker_alive, Ordering::SeqCst);
             let mut first_connect = !launched_worker;
             let mut launch_declined = false;
             // 测试进程里不拉起提权 worker:UAC 弹窗会卡住无人值守的测试。
@@ -736,15 +829,20 @@ pub fn spawn_client_thread(
                         if let Ok(client) =
                             idx_client::connect_and_handshake(snapshot, Duration::from_secs(3))
                         {
-                            let _ = idx_client::shutdown_and_wait(
-                                client,
-                                lstr_index::PIPE_NAME,
-                                WORKER_EXIT_WAIT,
-                            );
+                            // 常驻模式下只 Detach：worker 保持索引热态，下次
+                            // 启动免 UAC、免重建；托盘「退出并停止」才真退出。
+                            farewell(client);
                             idx_win::close(client);
                         }
                     }
                     return;
+                }
+                // P0-2：用户在 Fallback 横幅里点了「重新授权」——重置拒绝
+                // 状态并给足 UAC 时间（首连 60s），下一次迭代重新 runas 拉起。
+                if RELAUNCH_REQUESTED.swap(false, Ordering::SeqCst) {
+                    launch_declined = false;
+                    first_connect = true;
+                    last_launch = std::time::Instant::now() - Duration::from_secs(60);
                 }
                 // 先拉起 worker 再连接(UAC 一次/会话);已提权常驻时秒连。
                 // 用户拒绝过 UAC 就不再弹(防骚扰),保持 Fallback 等下次启动。
@@ -797,6 +895,11 @@ pub fn spawn_client_thread(
                     if shutdown.load(Ordering::Relaxed) {
                         return;
                     }
+                    // P0-2：用户点了「重新授权」时别等满 20s 退避，立刻回到
+                    // 循环重拉（否则按钮点下去最多要等 20s 才弹 UAC）。
+                    if RELAUNCH_REQUESTED.load(Ordering::Relaxed) {
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(500));
                 }
             }
@@ -819,11 +922,11 @@ fn frame_loop(
     );
     'frames: loop {
         if shutdown.load(Ordering::Relaxed) {
-            // M4 + 退出收 worker:主进程要退出时显式发 Shutdown 并**等待
-            // worker 退出**(有超时)。旧实现只写一帧就断开,进程随即退出 ——
-            // 帧能不能到达全看线程调度,实测多次留下提权 worker 占住唯一
-            // 管道实例,下次启动撞上旧 worker 出现怪状态。
-            let _ = idx_client::shutdown_and_wait(client, lstr_index::PIPE_NAME, WORKER_EXIT_WAIT);
+            // M4 + 退出收 worker:主进程要退出时显式发 Shutdown/Detach 并
+            // 视模式等待 worker 退出(有超时)。旧实现只写一帧就断开,进程随即
+            // 退出 —— 帧能不能到达全看线程调度,实测多次留下提权 worker 占住
+            // 唯一管道实例,下次启动撞上旧 worker 出现怪状态。
+            farewell(client);
             break 'frames;
         }
         // 设置页指令(切卷/重建卷):非阻塞写帧,不打断下面的读循环。
@@ -851,13 +954,9 @@ fn frame_loop(
             Some(frame) => {
                 if let Some(msg) = to_engine_msg(frame) {
                     if tx.send(msg).is_err() {
-                        // 引擎线程已经收工(服务被 drop):顺手通知 worker 退出
-                        // 并等其收尾(与退出路径同款语义)。
-                        let _ = idx_client::shutdown_and_wait(
-                            client,
-                            lstr_index::PIPE_NAME,
-                            WORKER_EXIT_WAIT,
-                        );
+                        // 引擎线程已经收工(服务被 drop):顺手通知 worker 收尾
+                        // (常驻模式 Detach 保留热态,与退出路径同款语义)。
+                        farewell(client);
                         break 'frames;
                     }
                 }
@@ -898,7 +997,7 @@ fn to_engine_msg(frame: lstr_index::proto::Frame) -> Option<EngineMsg> {
         F::VolumeGone { guid } => EngineMsg::VolumeGone { guid },
         F::VolumeAppeared { guid, letter } => EngineMsg::VolumeAppeared { guid, letter },
         F::UsnWatch { guid, state } => EngineMsg::UsnWatch { guid, state },
-        F::WorkerExit { .. } | F::Shutdown => return None,
+        F::WorkerExit { .. } | F::Shutdown | F::Detach => return None,
         F::Hello { .. } | F::Welcome { .. } | F::Rescan { .. } => return None,
         // C→W 控制帧(设置页切卷):worker 不会回给主进程,遇到即忽略。
         F::SetVolumes { .. } => return None,
@@ -952,21 +1051,23 @@ pub fn worker_launch_args(index: &crate::config::IndexConfig, volume_mask: u32) 
             extra.push_str(&format!(" --index-volumes {}", volumes.join(",")));
         }
     }
+    if index.keep_worker_alive {
+        extra.push_str(" --index-keep-alive");
+    }
     extra
 }
 
 /// ShellExecute runas 拉起提权 worker(UAC 一次/会话)。
-/// 能力令牌经命令行传给 worker:固定管道名 + 只比 exe 名的校验挡不住同用户
+/// 令牌经命令行传给 worker:固定管道名 + 只比 exe 名的校验挡不住同用户
 /// 其它进程,worker 会用 Hello 里的令牌二次校验(L5)。
-/// 令牌通道取舍:主进程不提升,能传给提权 worker 的任何通道(用户目录文件/
-/// 环境变量/共享内存)对同用户非提权进程都更易读;命令行反而是最小暴露面。
-/// 属能力校验而非密码学防护,残余风险见 worker.rs 模块文档的威胁模型。
+/// P1-1:令牌按用户持久化(`worker_token_hex`),否则常驻 worker 退出后
+/// 新进程的随机令牌会让重开握手失败(白等 60s + 再次 UAC)。
 pub fn launch_worker(extra_args: &str) -> bool {
     let Some(exe) = std::env::current_exe().ok() else { return false };
     let exe_str = exe.display().to_string();
     let params = format!(
         "--index-worker --index-token {}{}",
-        idx_client::session_token_hex(),
+        idx_client::worker_token_hex(),
         extra_args
     );
     // 复用 lstr 的 shell_execute_with 语义:runas + 参数
@@ -987,6 +1088,8 @@ pub fn make_engine(
     } else {
         crate::config::attach_dir().join("index")
     };
+    // P1-8: 倒排是引擎堆里最大的一块可选项(大卷 60~70MB/卷),按配置开关。
+    lstr_index::store::set_ngram_enabled(cfg.ngram);
     Engine::new(EngineConfig {
         index_dir,
         noise,
@@ -1579,45 +1682,6 @@ mod tests {
         assert_eq!(lazy, per_entry, "exact 惰性填充与逐条填充不一致");
     }
 
-    /// 批量元数据填充对拍:共享 MetaFiller(同父目录第 2 条起批量枚举)必须与
-    /// 逐条 fill_one_meta 逐字段相等(复用含已删/无权限/类型漂移的真实夹具)。
-    #[test]
-    fn lazy_meta_batched_matches_per_entry_on_real_files() {
-        let Some(fx) = real_index(600, 120, "meta-batch") else { return };
-        let query = parse("ai", Scope::All);
-        let filters = SearchFilters::default();
-        let mut spec = build_spec(&query, &filters, &neutral_weights());
-        spec.kind = KindFilter::All;
-        let outcome = fx.provider.engine.query_split_with_exact(&spec, Some("ai"));
-        assert!(!outcome.aborted);
-        for (hits, keep_folder) in [(&outcome.folder_hits, true), (&outcome.file_hits, false)] {
-            let keep = |kind: Kind| {
-                if keep_folder {
-                    kind == Kind::Folder
-                } else {
-                    kind != Kind::Folder
-                }
-            };
-            let mut entries = Vec::new();
-            fx.provider.collect_entries(hits, &query, usize::MAX, keep, &mut entries);
-            let mut filler = super::super::MetaFiller::default();
-            let batched: Vec<Entry> = entries
-                .clone()
-                .into_iter()
-                .filter_map(|e| super::super::fill_one_meta_with(e, true, &mut filler))
-                .collect();
-            let per_entry: Vec<Entry> = entries
-                .into_iter()
-                .filter_map(|e| super::super::fill_one_meta(e, true))
-                .collect();
-            assert_eq!(
-                batched, per_entry,
-                "批量填充与逐条填充不一致(folder={keep_folder}, hits={})",
-                hits.len()
-            );
-        }
-    }
-
     /// split 并趟带回的 exact 候选:惰性填充后与旧 `search_exact` 逐条一致
     /// (字段/顺序/50 条预算)。
     #[test]
@@ -1803,6 +1867,8 @@ mod tests {
             rank: crate::config::RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -1889,6 +1955,8 @@ mod tests {
             rank: crate::config::RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -1979,6 +2047,8 @@ mod tests {
             rank: crate::config::RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -2066,6 +2136,8 @@ mod tests {
             rank: crate::config::RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -2174,6 +2246,8 @@ mod tests {
             rank: crate::config::RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -2336,6 +2410,20 @@ mod tests {
         assert!(!kept_in_scope(Scope::Program, Kind::File));
         assert!(kept_in_scope(Scope::File, Kind::File));
         assert!(!kept_in_scope(Scope::File, Kind::Program));
+    }
+
+    #[test]
+    fn relaunch_request_is_consumed_once() {
+        // P0-2：「重新授权」只触发一次拉起：client 线程 swap 消费后标志归零，
+        // 不会因为下一轮循环又弹一次 UAC。
+        RELAUNCH_REQUESTED.store(false, Ordering::SeqCst);
+        assert!(!RELAUNCH_REQUESTED.swap(false, Ordering::SeqCst));
+        request_worker_relaunch();
+        assert!(RELAUNCH_REQUESTED.swap(false, Ordering::SeqCst));
+        assert!(
+            !RELAUNCH_REQUESTED.swap(false, Ordering::SeqCst),
+            "消费后必须归零"
+        );
     }
 
     #[test]

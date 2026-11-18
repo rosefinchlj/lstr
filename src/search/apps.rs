@@ -1,6 +1,7 @@
 use crate::model::{Entry, Kind};
 use crate::search::{fuzzy, pinyin};
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
@@ -30,6 +31,38 @@ const TONES: [u32; 8] = [
     0xE0A040, 0x7C9CD6, 0x6BAF92, 0xD67C8A, 0x6FB7C4, 0xC58BD6, 0x9ABF6B, 0xD6B45C,
 ];
 
+/// 冷启动排序用的「常见应用」加权表：只在没有使用历史时生效。
+const COMMON: [(&str, i32); 10] = [
+    ("visual studio code", 100),
+    ("微信", 96),
+    ("wechat", 96),
+    ("everything", 92),
+    ("windows terminal", 88),
+    ("文件资源管理器", 84),
+    ("chrome", 78),
+    ("edge", 74),
+    ("notepad", 66),
+    ("计算器", 60),
+];
+
+/// Windows 自带页面的口语别名：开始菜单里叫「设置」，用户常打「系统设置」。
+/// 只参与搜索命中与排序，不改显示名；拼音也算（xtsz → 系统设置）。
+fn name_aliases(name: &str) -> &'static [&'static str] {
+    match name {
+        "设置" => &["系统设置", "windows设置", "windows 设置", "settings"],
+        "控制面板" => &["控制台"],
+        _ => &[],
+    }
+}
+
+fn common_boost(lower_name: &str) -> i32 {
+    COMMON
+        .iter()
+        .find(|(key, _)| lower_name.contains(key))
+        .map(|(_, boost)| *boost)
+        .unwrap_or(0)
+}
+
 pub struct AppIndex {
     pub apps: Vec<Entry>,
 }
@@ -37,7 +70,7 @@ pub struct AppIndex {
 impl AppIndex {
     pub fn load() -> Self {
         let mut apps = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         for dir in start_menu_dirs() {
             collect_links(&dir, 0, &mut apps, &mut seen);
@@ -57,8 +90,8 @@ impl AppIndex {
 
     /// 后台加载完成后并入 UWP 应用；同名时保留已有 Win32 条目。
     pub fn append_uwp(&mut self, mut entries: Vec<Entry>) {
-        let existing: HashSet<String> = self.apps.iter().map(|entry| entry.name.to_lowercase()).collect();
-        entries.retain(|entry| !existing.contains(&entry.name.to_lowercase()));
+        let existing: HashSet<String> = self.apps.iter().map(|entry| name_key(&entry.name)).collect();
+        entries.retain(|entry| !existing.contains(&name_key(&entry.name)));
         self.apps.append(&mut entries);
         self.apps.sort_by(|a, b| {
             a.name
@@ -90,18 +123,28 @@ impl AppIndex {
                 };
                 let py_prefix = py.split(' ').any(|token| token.starts_with(&needle));
                 let py_contains = py.split(' ').any(|token| token.contains(&needle));
+                // 口语别名：开始菜单里叫「设置」，用户常打「系统设置」。
+                // 别名只参与命中与排序（排在名字命中之后、拼音之前），不改显示名。
+                let alias_hit = name_aliases(&entry.name).iter().any(|alias| {
+                    alias.starts_with(&needle)
+                        || pinyin::keys(alias)
+                            .split(' ')
+                            .any(|token| token.starts_with(&needle))
+                });
                 let rank = if name.starts_with(&needle) {
                     0
                 } else if name.contains(&needle) {
                     1
-                } else if py_prefix {
+                } else if alias_hit {
                     2
-                } else if py_contains {
+                } else if py_prefix {
                     3
+                } else if py_contains {
+                    4
                 } else if fuzzy::score_gated(&entry.name, &needle).is_some() {
                     // 子序列模糊：vsc → Visual Studio Code（逐字符闸门：
                     // 散字母伪匹配如 rust → Blend for Visual Studio 直接拒绝）。
-                    4
+                    5
                 } else {
                     // 拼音容错（wxin → weixin）：中文名的「首字母串」「全拼串」
                     // 逐段密度匹配。纯 ASCII 名的 pinyin key 只是名字小写无空格
@@ -123,7 +166,7 @@ impl AppIndex {
                         .split(' ')
                         .any(|token| fuzzy::score_dense(token, &needle).is_some());
                     if ok {
-                        4
+                        5
                     } else {
                         return None;
                     }
@@ -146,39 +189,37 @@ impl AppIndex {
             .collect()
     }
 
+    /// 没有使用历史时的默认排序（内置常见名单 + 名字），供 `search("")` 用。
     pub fn top(&self, limit: usize) -> Vec<Entry> {
-        const COMMON: [(&str, i32); 10] = [
-            ("visual studio code", 100),
-            ("微信", 96),
-            ("wechat", 96),
-            ("everything", 92),
-            ("windows terminal", 88),
-            ("文件资源管理器", 84),
-            ("chrome", 78),
-            ("edge", 74),
-            ("notepad", 66),
-            ("计算器", 60),
-        ];
+        let mut apps = self.ranked(&HashMap::new());
+        apps.truncate(limit);
+        apps
+    }
+
+    /// 应用页空输入的完整排行：**用过的应用按使用频率（frecency）排前面**，
+    /// 没用过的再按内置常见名单兜底，最后名字升序。
+    ///
+    /// `usage` 的 key 是条目 id（`app:<path>`），值是该应用的 frecency 分
+    /// （来自 `History::rank_snapshot`）。内置名单只决定「冷启动」顺序：
+    /// 常用名单里的应用被真正用过之后，权重仍由历史说了算。
+    pub fn ranked(&self, usage: &HashMap<String, f32>) -> Vec<Entry> {
         let mut apps = self.apps.clone();
         apps.sort_by(|a, b| {
+            let used_a = usage.get(&a.id).copied().unwrap_or(0.0);
+            let used_b = usage.get(&b.id).copied().unwrap_or(0.0);
             let name_a = a.name.to_lowercase();
             let name_b = b.name.to_lowercase();
-            let boost_a = COMMON
-                .iter()
-                .find(|(key, _)| name_a.contains(key))
-                .map(|(_, boost)| *boost)
-                .unwrap_or(0);
-            let boost_b = COMMON
-                .iter()
-                .find(|(key, _)| name_b.contains(key))
-                .map(|(_, boost)| *boost)
-                .unwrap_or(0);
-            boost_b
-                .cmp(&boost_a)
+            // 用过的（分数 > 0）恒在一个单独的档位,避免内置 boost(60~100)
+            // 压过真实使用次数。
+            let tier_a = u8::from(used_a <= 0.0);
+            let tier_b = u8::from(used_b <= 0.0);
+            tier_a
+                .cmp(&tier_b)
+                .then_with(|| used_b.partial_cmp(&used_a).unwrap_or(Ordering::Equal))
+                .then_with(|| common_boost(&name_b).cmp(&common_boost(&name_a)))
                 .then_with(|| name_a.cmp(&name_b))
                 .then_with(|| a.name.cmp(&b.name))
         });
-        apps.truncate(limit);
         apps
     }
 
@@ -204,7 +245,12 @@ fn start_menu_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn collect_links(dir: &Path, depth: usize, apps: &mut Vec<Entry>, seen: &mut HashSet<String>) {
+fn collect_links(
+    dir: &Path,
+    depth: usize,
+    apps: &mut Vec<Entry>,
+    seen: &mut HashMap<String, usize>,
+) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -236,15 +282,27 @@ fn collect_links(dir: &Path, depth: usize, apps: &mut Vec<Entry>, seen: &mut Has
     }
 }
 
-fn push_app(apps: &mut Vec<Entry>, seen: &mut HashSet<String>, name: &str, path: PathBuf) {
+fn push_app(apps: &mut Vec<Entry>, seen: &mut HashMap<String, usize>, name: &str, path: PathBuf) {
     let name = name.trim();
     if name.is_empty() || is_excluded(name) {
         return;
     }
-    if !seen.insert(name.to_lowercase()) {
+    let key = name_key(name);
+    if let Some(&index) = seen.get(&key) {
+        // 同一个应用常有两份快捷方式（用户级 %APPDATA% 与机器级 %PROGRAMDATA%，
+        // 名字只差大小写/空格/连字符：`Clash Verge.lnk` 与 `clash-verge.lnk`）。
+        // 只留一份；换掉已有条目时挑名字更「好看」的（带空格、有大小写）。
+        if display_score(name) > display_score(&apps[index].name) {
+            apps[index] = app_entry(name, path);
+        }
         return;
     }
-    apps.push(Entry {
+    seen.insert(key, apps.len());
+    apps.push(app_entry(name, path));
+}
+
+fn app_entry(name: &str, path: PathBuf) -> Entry {
+    Entry {
         id: format!("app:{}", path.display()),
         kind: Kind::App,
         name: name.to_string(),
@@ -254,7 +312,28 @@ fn push_app(apps: &mut Vec<Entry>, seen: &mut HashSet<String>, name: &str, path:
         pinyin: Some(pinyin::keys(name)),
         initial: initial_for(name),
         tone: tone_for(name),
-    });
+    }
+}
+
+/// 去重键：忽略大小写与空白、`-`、`_`、`.`、`·` 等分隔符。安装程序同时写
+/// 用户级和机器级开始菜单时，两份快捷方式的名字往往只差这些字符。
+fn name_key(name: &str) -> String {
+    name.chars()
+        .filter(|ch| !ch.is_whitespace() && !matches!(ch, '-' | '_' | '.' | '·'))
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+/// 重名时保留哪份：带空格（分段更像产品名）优先，其次带大写字母的。
+fn display_score(name: &str) -> i32 {
+    let mut score = 0;
+    if name.chars().any(char::is_whitespace) {
+        score += 2;
+    }
+    if name.chars().any(char::is_uppercase) {
+        score += 1;
+    }
+    score
 }
 
 fn is_excluded(name: &str) -> bool {
@@ -302,7 +381,7 @@ pub(crate) fn tone_for(name: &str) -> u32 {
     TONES[(hash % TONES.len() as u64) as usize]
 }
 
-fn collect_app_paths(hive: HKEY, apps: &mut Vec<Entry>, seen: &mut HashSet<String>) {
+fn collect_app_paths(hive: HKEY, apps: &mut Vec<Entry>, seen: &mut HashMap<String, usize>) {
     let subkey = to_wide(APP_PATHS_SUBKEY);
     let mut root = HKEY::default();
     let status = unsafe { RegOpenKeyExW(hive, PCWSTR(subkey.as_ptr()), None, KEY_READ, &mut root) };
@@ -425,6 +504,7 @@ mod tests {
     use super::AppIndex;
     use crate::model::{Entry, Kind};
     use crate::search::pinyin;
+    use std::collections::HashMap;
 
     fn app(name: &str) -> Entry {
         Entry {
@@ -508,6 +588,31 @@ mod tests {
         assert_eq!(index.top(100).len(), 4);
     }
 
+    /// 用过的应用排在内置「常见应用」表前面：名单只决定冷启动顺序。
+    #[test]
+    fn ranked_puts_used_apps_before_common_list() {
+        let index = sample();
+        let mut usage = HashMap::new();
+        usage.insert("app:计算器".to_string(), 12.0);
+        let names: Vec<String> = index.ranked(&usage).into_iter().map(|e| e.name).collect();
+        assert_eq!(names[0], "计算器", "用过的应用应排第一: {names:?}");
+        // 没用过的一档仍按内置名单：VSC(100) > 微信(96) > 文件资源管理器(84)
+        assert_eq!(names[1], "Visual Studio Code");
+        assert_eq!(names[2], "微信");
+    }
+
+    /// 同为用过的应用时按频率（frecency 分）降序。
+    #[test]
+    fn ranked_orders_used_apps_by_score() {
+        let index = sample();
+        let mut usage = HashMap::new();
+        usage.insert("app:计算器".to_string(), 3.0);
+        usage.insert("app:微信".to_string(), 9.0);
+        let names: Vec<String> = index.ranked(&usage).into_iter().map(|e| e.name).collect();
+        assert_eq!(names[0], "微信");
+        assert_eq!(names[1], "计算器");
+    }
+
     #[test]
     fn initial_uses_two_ascii_word_initials_or_first_cjk_char() {
         assert_eq!(super::initial_for("Visual Studio Code"), "VS");
@@ -557,6 +662,93 @@ mod tests {
         let index = AppIndex::load();
         println!("AppIndex loaded {} apps", index.len());
     }
+
+    /// 同一应用的用户级/机器级快捷方式（`clash-verge.lnk` 与 `Clash Verge.lnk`）
+    /// 必须合成一条，并保留名字更「好看」的那份。
+    #[test]
+    fn push_app_merges_same_app_with_different_separators() {
+        let mut apps = Vec::new();
+        let mut seen = HashMap::new();
+        super::push_app(
+            &mut apps,
+            &mut seen,
+            "clash-verge",
+            std::path::PathBuf::from(r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\clash-verge.lnk"),
+        );
+        super::push_app(
+            &mut apps,
+            &mut seen,
+            "Clash Verge",
+            std::path::PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Clash Verge.lnk"),
+        );
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "Clash Verge");
+        assert!(apps[0]
+            .path
+            .as_ref()
+            .unwrap()
+            .to_string_lossy()
+            .contains("ProgramData"));
+    }
+
+    /// 同名但先遇到好看的那份时，后一份不应把名字换回小写连字符形态。
+    #[test]
+    fn push_app_keeps_prettier_name_when_it_comes_first() {
+        let mut apps = Vec::new();
+        let mut seen = HashMap::new();
+        super::push_app(
+            &mut apps,
+            &mut seen,
+            "Clash Verge",
+            std::path::PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Clash Verge.lnk"),
+        );
+        super::push_app(
+            &mut apps,
+            &mut seen,
+            "clash-verge",
+            std::path::PathBuf::from(r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\clash-verge.lnk"),
+        );
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "Clash Verge");
+    }
+
+    /// 去重键忽略大小写/空白/常见分隔符，但不同应用不能因此合并。
+    #[test]
+    fn name_key_folds_case_and_separators_only() {
+        assert_eq!(super::name_key("Clash Verge"), super::name_key("clash-verge"));
+        assert_eq!(super::name_key("V.S. Code"), super::name_key("v s code"));
+        assert_ne!(super::name_key("微信"), super::name_key("WeChat"));
+        assert_ne!(super::name_key("微信输入法"), super::name_key("微信"));
+    }
+
+    /// 系统页面按口语名字也能搜到：开始菜单里只有「设置」，用户常打「系统设置」。
+    #[test]
+    fn builtin_settings_match_colloquial_names() {
+        let mut index = sample();
+        index.apps.extend(super::system_entries());
+        for query in ["系统设置", "设置", "settings", "xtsz", "windows设置"] {
+            let hits = index.search(query, 10);
+            assert!(
+                hits.iter().any(|entry| entry.name == "设置"),
+                "「{query}」应能找到「设置」，实际: {:?}",
+                hits.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+            );
+        }
+        // 别名不该把「系统属性 / 系统信息」挤到前面。
+        let hits = index.search("系统设置", 10);
+        assert_eq!(hits[0].name, "设置");
+    }
+
+    /// 系统工具的内置条目都带可启动目标（ms-settings:/cpl/msc/exe 之类）。
+    #[test]
+    fn system_entries_all_have_launch_targets() {
+        for entry in super::system_entries() {
+            let Some(path) = entry.path.as_ref() else {
+                panic!("{} 缺少启动目标", entry.name);
+            };
+            assert!(!path.as_os_str().is_empty(), "{} 目标为空", entry.name);
+        }
+    }
 }
 
 
@@ -569,6 +761,10 @@ fn system_entries() -> Vec<Entry> {
         ("卸载程序", "appwiz.cpl", ""),
         ("程序和功能", "appwiz.cpl", ""),
         ("应用和功能", "ms-settings:appsfeatures", ""),
+        // 「设置」在开始菜单里是 UWP 条目，加载要比这慢一截（Get-StartApps ~2s）；
+        // 内置一份让「设置 / 系统设置」在 UWP 并入前就能搜到，同名 UWP 条目会被
+        // name_key 去重掉。
+        ("设置", "ms-settings:", ""),
         ("设备管理器", "devmgmt.msc", ""),
         ("磁盘管理", "diskmgmt.msc", ""),
         ("服务", "services.msc", ""),

@@ -13,11 +13,14 @@
 //!   scan_mode 与 base_len 解耦:空卷 compact 后 base_len 仍为 0,但已 ready。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::noise::{is_build_output_segment, is_exec_name};
 use crate::usn::Rec;
 
-/// 可暂停的 compact（4ms 分片），供引擎空闲维护使用。
+/// 可暂停的 compact（默认 25ms 片）。小卷由引擎同步跑完，大卷在独立
+/// 后台线程里对 fork 快照重排，查询线程不再执行任何 compact 切片。
 mod compact;
 pub(crate) use compact::CompactTask;
 
@@ -43,6 +46,26 @@ pub const NO_PARENT: u32 = u32::MAX;
 /// compact 250 万条,CPU 单核打满、查询被饿死。根目录必须当作 NO_PARENT。
 pub const ROOT_FRN: u64 = 5;
 
+/// A11：名字区用 u32 偏移寻址，容量上限 `u32::MAX` 字节；超过后
+/// `as u32` 会静默截断、写坏索引。500 万条目规模（名字区约 100MB）远达
+/// 不到上限，但插入/改名路径必须显式拒绝而不是悄悄出错。
+const NAME_SPACE_LIMIT: usize = u32::MAX as usize;
+
+fn name_space_fits(len: usize) -> bool {
+    len <= NAME_SPACE_LIMIT
+}
+
+/// A11：名字区溢出告警只记一次（否则每条记录都会刷 engine.log）。
+static NAME_OVERFLOW_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn log_name_space_overflow() {
+    if !NAME_OVERFLOW_LOGGED.swap(true, Ordering::Relaxed) {
+        crate::snapshot::debug_log(
+            "store: name space overflow (>4GiB-1), refusing further inserts/renames",
+        );
+    }
+}
+
 /// compact 触发阈值:delta 新 slot 数(同样用作 reindex overlay 阈值)。
 pub(crate) const COMPACT_DELTA: usize = 32_768;
 /// compact 触发阈值:死 slot 占比(分子)。
@@ -52,11 +75,24 @@ const COMPACT_DEAD: u32 = 4096;
 /// 94³×8B≈6.6MB/卷,小卷(如 1.7 万条)的倒排几乎全是这个固定表开销;
 /// 而小卷名字区用 memmem SIMD 扫描本就极快(<8MB 约 <3ms),不值得为它
 /// 常驻 6.6MB 表。低于阈值不建倒排,查询回落 memmem(等价性有测试保证)。
-/// 测试构建恒为 0:始终建倒排,保证「快路径≡memmem」等价性测试覆盖 ngram。
+/// 测试构建取 1:只要有名字就建倒排(test 里没有 8MB 大卷),保证
+/// 「快路径≡memmem」等价性测试覆盖 ngram。不能取 0:`--all-targets` 下
+/// `len() < 0` 会被 clippy 判成恒假比较(absurd_extreme_comparisons)。
+/// 取 1 与取 0 等价:两处调用点都先判 `name_off.is_empty()`。
 #[cfg(not(test))]
 const NGRAM_MIN_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(test)]
-const NGRAM_MIN_BYTES: usize = 0;
+const NGRAM_MIN_BYTES: usize = 1;
+
+/// 运行时 ngram 开关(P1-8):`[index] ngram = false` → 不建 trigram 倒排,
+/// 大卷可省 60~70MB/卷常驻堆,查询回落 memmem 扫描(等价性有测试保证)。
+/// 进程级;由主进程 `make_engine` 在构造引擎前设置,worker 不建倒排。
+static NGRAM_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// 设置 ngram 倒排是否可用(进程级;在卷 compact/加载建索引前调用)。
+pub fn set_ngram_enabled(enabled: bool) {
+    NGRAM_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 /// n-gram 字母表大小:可打印非空格 ASCII(0x21..=0x7E)。
 /// 空格与非 ASCII 视为分隔符(切分 run):全字母表 token 的子串出现必然
@@ -339,8 +375,11 @@ fn for_each_ngram(name: &[u8], b: &mut impl FnMut(usize), t: &mut impl FnMut(usi
 }
 
 pub struct VolumeStore {
-    pub names: Vec<u8>,
-    pub names_lc: Vec<u8>,
+    /// 名字区。用 `Arc` 是为了后台 compact 的 fork 快照能共享大块名字区:
+    /// 稳态写入唯一持有(make_mut 原地扩展),只有后台任务运行期间才可能
+    /// 短暂共享(此时写入被引擎冻结,不会触发整块复制)。
+    pub names: Arc<Vec<u8>>,
+    pub names_lc: Arc<Vec<u8>>,
     pub name_off: Vec<u32>,
     /// slot 按小写名序排序;仅 compact 后有效,scan 模式为空。
     pub offs: Vec<u32>,
@@ -474,8 +513,8 @@ impl VolumeStore {
             exclude.summary()
         ));
         Self {
-            names: Vec::with_capacity(4 << 20),
-            names_lc: Vec::with_capacity(4 << 20),
+            names: Arc::new(Vec::with_capacity(4 << 20)),
+            names_lc: Arc::new(Vec::with_capacity(4 << 20)),
             name_off: Vec::with_capacity(1 << 16),
             off_index: Vec::with_capacity(1 << 16),
             offs: Vec::new(),
@@ -539,8 +578,8 @@ impl VolumeStore {
             .map(|&o| mask_of_bytes(slice_at(&names_lc, o as usize)))
             .collect();
         let mut s = Self {
-            names,
-            names_lc,
+            names: Arc::new(names),
+            names_lc: Arc::new(names_lc),
             name_off,
             off_index,
             offs,
@@ -587,6 +626,49 @@ impl VolumeStore {
         s.rebuild_mtime_pending();
         s.rebuild_size_pending();
         s
+    }
+
+    /// 后台 compact 用的快照:名字区共享 `Arc`(大块零拷贝),其余列浅拷贝。
+    ///
+    /// 只复制 compact 会读取/改写的列;派生索引(`off_index`/`ngram`/
+    /// `children`/待回填队列)不复制 —— compact 不读它们,Install 阶段会按
+    /// 新列重建。调用期间引擎必须冻结同卷写入(与旧分片 compact 相同),
+    /// 因此快照与实时列同构,回放语义一致。
+    pub fn fork_for_compact(&self) -> Self {
+        Self {
+            names: Arc::clone(&self.names),
+            names_lc: Arc::clone(&self.names_lc),
+            name_off: self.name_off.clone(),
+            off_index: Vec::new(),
+            offs: self.offs.clone(),
+            frn: self.frn.clone(),
+            parent: self.parent.clone(),
+            attrs: self.attrs.clone(),
+            mtime: self.mtime.clone(),
+            size: self.size.clone(),
+            mtime_pending: Vec::new(),
+            size_pending: Vec::new(),
+            char_mask: self.char_mask.clone(),
+            base_len: self.base_len,
+            scan_mode: self.scan_mode,
+            delta: self.delta.clone(),
+            delta_frn: self.delta_frn.clone(),
+            dead_count: self.dead_count,
+            renames: self.renames,
+            ancestry_dirty: self.ancestry_dirty,
+            unresolved: self.unresolved.clone(),
+            noise_anchors: self.noise_anchors.clone(),
+            soft_anchors: self.soft_anchors.clone(),
+            exclude: self.exclude.clone(),
+            letter: self.letter,
+            chain_buf: Vec::new(),
+            ngram: None,
+            ngram_base_len: self.ngram_base_len,
+            reindex: self.reindex.clone(),
+            reindex_mark: self.reindex_mark.clone(),
+            children: HashMap::new(),
+            children_built: self.children_built,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -730,7 +812,8 @@ impl VolumeStore {
             return;
         }
         // 小卷不建倒排:省 trigram 固定表(~6.6MB/卷),memmem 扫描已足够快。
-        if self.names_lc.len() < NGRAM_MIN_BYTES {
+        // 用户显式关闭 ngram 时一律不建(P1-8 内存开关)。
+        if !NGRAM_ENABLED.load(Ordering::Relaxed) || self.names_lc.len() < NGRAM_MIN_BYTES {
             return;
         }
         self.ngram = Some(NgramIndex::build(&self.names_lc, &self.name_off));
@@ -831,6 +914,60 @@ impl VolumeStore {
     /// 对外可见(未删、非噪声)。
     pub fn visible(&self, slot: u32) -> bool {
         self.attrs[slot as usize] & ATTR_INTERNAL == 0
+    }
+
+    /// watch 整目录刷新(DirChildren)入口的噪声判定:父目录 `parent_slot` 之下的
+    /// 整批子项是否应被排除。返回 `(hard, soft)`:
+    /// - `hard`:父链落在硬噪声(段名/锚点/已判噪祖先/锚定路径)下 → 子项全部不可见,
+    ///   调用方可以整帧丢弃(不 apply、不进旁车),避免构建产物/依赖目录的高 churn
+    ///   把旁车顶到 32768 条触发 62MB 全量保存;
+    /// - `soft`:父链只命中构建产物段 → 目录与可执行文件仍可见,其余文件排除;
+    /// - 两者皆 false:不需要过滤。
+    ///
+    /// 与 [`Self::classify_chain`] 的语义一致,但判定对象是「子项」而不是父目录
+    /// 自身,所以从 parent_slot **自身**开始上溯(命中父目录自己的段名即排除其子项)。
+    /// 槽位越界/父未解析时返回 (false, false),交由后续 apply 走原路径。
+    pub fn parent_noise_kind(&self, parent_slot: u32) -> (bool, bool) {
+        if parent_slot as usize >= self.attrs.len() {
+            return (false, false);
+        }
+        let has_anchored = self.exclude.has_anchored();
+        // 锚定路径需要根优先的祖先链;最近祖先在前的暂存,末尾 reverse。
+        let mut chain: Vec<&[u8]> = Vec::new();
+        let mut hard = false;
+        let mut soft = false;
+        let mut cur = parent_slot;
+        let mut hops = 0;
+        while cur != NO_PARENT && hops < 64 {
+            let name_lc = self.name_lc(cur);
+            if self.exclude.is_segment(name_lc)
+                || self.noise_anchors.contains(&self.frn[cur as usize])
+            {
+                if is_build_output_segment(name_lc) {
+                    // 软噪声不能提前收手:外层可能还包着 node_modules 等硬噪声。
+                    soft = true;
+                } else {
+                    hard = true;
+                    break;
+                }
+            } else if self.attrs[cur as usize] & ATTR_NOISE != 0 {
+                // 祖先已判噪(其父链可能已断),子孙必然同判。
+                hard = true;
+                break;
+            }
+            if has_anchored {
+                chain.push(name_lc);
+            }
+            cur = self.parent[cur as usize];
+            hops += 1;
+        }
+        if !hard && has_anchored && hops > 0 {
+            chain.reverse();
+            if self.exclude.chain_anchored(&chain, self.letter) {
+                hard = true;
+            }
+        }
+        (hard, soft)
     }
 
     /// 存活(未删)。NOISE 槽位对 USN 定位仍然存在(父链解析需要),只是查询不可见。
@@ -940,7 +1077,30 @@ impl VolumeStore {
     /// 构建索引,之后由 insert_meta/compact 精确维护。
     pub fn apply_children(&mut self, parent_slot: u32, recs: &[Rec]) -> (usize, usize) {
         if parent_slot == NO_PARENT {
-            self.clear_seen();
+            // A10:父项未解析(例如 watcher 先看到新子项、父目录记录还没到)时,
+            // 仍可借 `unresolved` 映射做删除对账:同一父 FRN 下的旧条目,本次
+            // 刷新没出现就是已删除。卷根刷新(parent_frn==ROOT_FRN)不走这里,
+            // 由 apply_root_children 按 ATTR_ROOT_CHILD 处理。
+            let reconcile_parent = match recs.first().map(|r| r.parent_frn) {
+                Some(p) if p != 0 && p != ROOT_FRN => Some(p),
+                _ => None,
+            };
+            let mut existing: Vec<u32> = Vec::new();
+            if let Some(pfrn) = reconcile_parent {
+                existing = self
+                    .unresolved
+                    .iter()
+                    .filter(|&(_, &p)| p == pfrn)
+                    .map(|(&slot, _)| slot)
+                    .collect();
+                for &slot in &existing {
+                    if self.alive(slot) {
+                        self.attrs[slot as usize] &= !ATTR_SEEN;
+                    }
+                }
+            } else {
+                self.clear_seen();
+            }
             let mut added = 0usize;
             for r in recs {
                 if self.insert_meta(r.frn, r.parent_frn, r.attrs, r.name.as_bytes(), r.mtime, r.size) {
@@ -950,8 +1110,32 @@ impl VolumeStore {
                     self.attrs[slot as usize] |= ATTR_SEEN;
                 }
             }
-            self.clear_seen();
-            return (added, 0);
+            let Some(_pfrn) = reconcile_parent else {
+                self.clear_seen();
+                return (added, 0);
+            };
+            let mut removed = 0usize;
+            for slot in existing {
+                if !self.alive(slot) {
+                    continue;
+                }
+                let a = self.attrs[slot as usize];
+                if a & ATTR_SEEN == 0 {
+                    self.attrs[slot as usize] = a | ATTR_DEAD;
+                    removed += 1;
+                    self.unresolved.remove(&slot);
+                } else {
+                    self.attrs[slot as usize] = a & !ATTR_SEEN;
+                }
+            }
+            // 本次刷新到的新槽不在 existing 里,同样清掉临时 SEEN 位。
+            for r in recs {
+                if let Some(slot) = self.find_slot(r.frn) {
+                    self.attrs[slot as usize] &= !ATTR_SEEN;
+                }
+            }
+            self.dead_count = self.dead_count.saturating_add(removed as u32);
+            return (added, removed);
         }
         if !self.children_built {
             self.rebuild_children();
@@ -996,9 +1180,14 @@ impl VolumeStore {
     /// [`NO_PARENT`],必须靠 [`ATTR_ROOT_CHILD`] 与「父未消解」条目区分开;
     /// 否则不敢删除,根目录下的删除要等下次启动对账。
     pub fn apply_root_children(&mut self, recs: &[Rec]) -> (usize, usize) {
+        // A9:旧实现对全表扫两遍(清 SEEN 一遍、标 DEAD 一遍)。合并成
+        // 「一次全表扫描收集根子项」+「只遍历根子项收尾」,大卷(百万级)下
+        // 省掉第二遍 O(全表)。
+        let mut existing: Vec<u32> = Vec::new();
         for slot in 0..self.attrs.len() {
             let a = self.attrs[slot];
             if a & ATTR_ROOT_CHILD != 0 && a & ATTR_DEAD == 0 {
+                existing.push(slot as u32);
                 self.attrs[slot] = a & !ATTR_SEEN;
             }
         }
@@ -1012,15 +1201,22 @@ impl VolumeStore {
             }
         }
         let mut removed = 0usize;
-        for slot in 0..self.attrs.len() {
-            let a = self.attrs[slot];
-            if a & ATTR_ROOT_CHILD != 0 && a & ATTR_DEAD == 0 {
-                if a & ATTR_SEEN == 0 {
-                    self.attrs[slot] = a | ATTR_DEAD;
-                    removed += 1;
-                } else {
-                    self.attrs[slot] = a & !ATTR_SEEN;
-                }
+        for slot in existing {
+            let a = self.attrs[slot as usize];
+            if a & ATTR_ROOT_CHILD == 0 || a & ATTR_DEAD != 0 {
+                continue;
+            }
+            if a & ATTR_SEEN == 0 {
+                self.attrs[slot as usize] = a | ATTR_DEAD;
+                removed += 1;
+            } else {
+                self.attrs[slot as usize] = a & !ATTR_SEEN;
+            }
+        }
+        // 本次刷新到的新槽同样清掉临时 SEEN 位。
+        for r in recs {
+            if let Some(slot) = self.find_slot(r.frn) {
+                self.attrs[slot as usize] &= !ATTR_SEEN;
             }
         }
         self.dead_count = self.dead_count.saturating_add(removed as u32);
@@ -1116,13 +1312,20 @@ impl VolumeStore {
                     self.ancestry_dirty = true;
                 }
                 if !same_name {
+                    // A11：名字区用 u32 偏移，追加新名字前必须确认放得下。
+                    if !name_space_fits(self.names.len().saturating_add(name.len() + 1)) {
+                        log_name_space_overflow();
+                        return false;
+                    }
                     self.renames += 1;
                     let name_lc = fold_case(name);
                     self.name_off[old as usize] = self.names.len() as u32;
-                    self.names.extend_from_slice(name);
-                    self.names.push(0);
-                    self.names_lc.extend_from_slice(&name_lc);
-                    self.names_lc.push(0);
+                    let names = Arc::make_mut(&mut self.names);
+                    names.extend_from_slice(name);
+                    names.push(0);
+                    let names_lc = Arc::make_mut(&mut self.names_lc);
+                    names_lc.extend_from_slice(&name_lc);
+                    names_lc.push(0);
                     self.off_index.push((self.name_off[old as usize], old));
                     self.char_mask[old as usize] = mask_of_bytes(name);
                     // base 槽改名:旧名 posting 失效 → 标记跳过 + 进 overlay
@@ -1163,15 +1366,22 @@ impl VolumeStore {
                 return true;
             }
         }
+        // A11：新槽要往名字区追加 `name + NUL`，name_off 用 u32 偏移。
+        if !name_space_fits(self.names.len().saturating_add(name.len() + 1)) {
+            log_name_space_overflow();
+            return false;
+        }
         let slot = self.name_off.len() as u32;
         let off = self.names.len() as u32;
         let name_lc = fold_case(name);
         self.name_off.push(off);
         self.off_index.push((off, slot));
-        self.names.extend_from_slice(name);
-        self.names.push(0);
-        self.names_lc.extend_from_slice(&name_lc);
-        self.names_lc.push(0);
+        let names = Arc::make_mut(&mut self.names);
+        names.extend_from_slice(name);
+        names.push(0);
+        let names_lc = Arc::make_mut(&mut self.names_lc);
+        names_lc.extend_from_slice(&name_lc);
+        names_lc.push(0);
         self.frn.push(frn);
         // 「父是噪声锚点 ⇒ 子项直接判噪」的快捷路径(父链断开也不再解析)。
         // 构建产物锚点(target/…)例外:必须正常解析父链并逐个分类,否则
@@ -1587,8 +1797,8 @@ impl VolumeStore {
         names_lc.shrink_to_fit();
         let off_index: Vec<(u32, u32)> =
             name_off.iter().enumerate().map(|(i, &o)| (o, i as u32)).collect();
-        self.names = names;
-        self.names_lc = names_lc;
+        self.names = Arc::new(names);
+        self.names_lc = Arc::new(names_lc);
         self.name_off = name_off;
         self.off_index = off_index;
         self.offs = offs;
@@ -2026,6 +2236,40 @@ mod tests {
         assert_eq!(total, 0, "中间产物(.rlib)不该出现在结果里");
     }
 
+    /// watch 刷新入口的噪声判定:软噪声(构建产物)只留目录+可执行文件,
+    /// 硬噪声(依赖/缓存目录)整帧丢弃,普通目录不过滤。
+    #[test]
+    fn parent_noise_kind_classifies_watch_refresh() {
+        let mut raws: Vec<String> = crate::noise::builtin_patterns();
+        raws.push("dist".to_string());
+        let mut s = VolumeStore::new(crate::noise::ExcludeRules::build(&raws), 'E');
+        insert(&mut s, 5, 0, 0x10, "proj");
+        insert(&mut s, 10, 5, 0x10, "target");
+        insert(&mut s, 11, 10, 0x10, "release");
+        insert(&mut s, 20, 5, 0x10, "node_modules");
+        insert(&mut s, 30, 5, 0x10, "src");
+        s.compact();
+        let slot = |frn: u64| s.find_slot(frn).expect("slot");
+        assert_eq!(s.parent_noise_kind(slot(30)), (false, false), "普通目录不过滤");
+        assert_eq!(
+            s.parent_noise_kind(slot(10)),
+            (false, true),
+            "target:靠软噪声只留目录与可执行文件"
+        );
+        assert_eq!(
+            s.parent_noise_kind(slot(11)),
+            (false, true),
+            "软噪声沿祖先链继承"
+        );
+        assert_eq!(
+            s.parent_noise_kind(slot(20)),
+            (true, false),
+            "node_modules:整帧丢弃"
+        );
+        assert_eq!(s.parent_noise_kind(NO_PARENT), (false, false), "未解析父安全回退");
+        assert_eq!(s.parent_noise_kind(u32::MAX - 1), (false, false), "越界槽位安全回退");
+    }
+
     #[test]
     fn packages_source_is_searchable() {
         // A-2:packages 是常见 monorepo 源码目录(pnpm/lerna workspace),不再误排。
@@ -2133,5 +2377,43 @@ mod tests {
         let (_, removed) = s.apply_children(b2, &[]);
         assert_eq!(removed, 1, "compact 后索引重建,刷新 dirB 为空应删 c1");
         assert!(s.find_slot(100).is_none());
+    }
+
+    /// A10:父项仍未被解析时,watcher 对该父的刷新也要能删除子项
+    /// (旧实现只做 upsert,删除要等下次启动对账)。
+    #[test]
+    fn unresolved_parent_refresh_reconciles_deleted_children() {
+        use crate::usn::{Op, Rec};
+        let rec = |frn: u64, parent_frn: u64, name: &str| Rec {
+            frn,
+            parent_frn,
+            attrs: 0,
+            op: Op::Upsert,
+            name: name.to_string(),
+            mtime: 0,
+            size: u64::MAX,
+        };
+        let mut s = VolumeStore::new(Default::default(), 'C');
+        assert!(s.insert_meta(100, 900, 0, b"a.txt", 0, u64::MAX));
+        assert!(s.insert_meta(101, 900, 0, b"b.txt", 0, u64::MAX));
+        assert_eq!(s.unresolved_pairs().len(), 2);
+        // compact 建 FRN→slot 索引(否则 apply 路径按「新插入」处理,重复计数)
+        s.compact();
+        let (added, removed) = s.apply_children(NO_PARENT, &[rec(100, 900, "a.txt")]);
+        assert_eq!((added, removed), (0, 1));
+        assert!(s.find_slot(100).is_some());
+        assert!(s.find_slot(101).is_none());
+        assert_eq!(s.unresolved_pairs().len(), 1, "被删子项应从 unresolved 移除");
+        // 根刷新不应受「未解析父」对账影响
+        let (_, removed) = s.apply_root_children(&[]);
+        assert_eq!(removed, 0);
+    }
+
+    /// A11:名字区容量上限守卫(超过 u32 偏移空间时拒绝插入,而不是静默截断)。
+    #[test]
+    fn name_space_guard_rejects_overflow() {
+        assert!(name_space_fits(0));
+        assert!(name_space_fits(NAME_SPACE_LIMIT));
+        assert!(!name_space_fits(NAME_SPACE_LIMIT + 1));
     }
 }

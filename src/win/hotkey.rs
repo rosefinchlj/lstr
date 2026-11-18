@@ -16,8 +16,10 @@
 //! channel `send`，`request_repaint` 交给 [`spawn_repaint_waker`] 专用线程
 //! （它要拿 egui 写锁，绝不能发生在钩子回调里）。
 //!
-//! 两条防线兜住「静默摘钩」：空闲 watchdog 定时重装钩子（摘钩后没有任何
-//! 系统通知可查），钩子线程意外退出则 channel 断开、由 UI 侧重启服务。
+//! 两条防线兜住「静默摘钩」：空闲 watchdog 只在**系统近期有输入、但本钩子
+//! 长时间没收到任何键**时判定为掉钩并重装（真·无人使用电脑时不重装，避免
+//! 此前约 1.7 次/分钟的无效全局钩子安装）；钩子线程意外退出则 channel
+//! 断开、由 UI 侧重启服务。
 //!
 //! 更换热键 = 丢弃本服务重新 [`HotkeyService::start`]（Drop 里干净卸载：
 //! unhook + unregister + join 线程），无需重启应用。
@@ -29,16 +31,17 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use eframe::egui::Context;
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
-    MOD_SHIFT,
+    GetLastInputInfo, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, LASTINPUTINFO, MOD_ALT,
+    MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, KillTimer, KBDLLHOOKSTRUCT, PostThreadMessageW,
-    SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSG, WH_KEYBOARD_LL, WM_HOTKEY,
-    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, KBDLLHOOKSTRUCT,
+    PostThreadMessageW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSG,
+    WH_KEYBOARD_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
 };
 
 use crate::hotkey::{
@@ -51,17 +54,29 @@ const WAKE_HOTKEY_ID: i32 = 1;
 /// 'G' 的虚拟键码（Ctrl+G = 对话框搜索）。
 const G_VKEY: u16 = 0x47;
 
-/// 空闲 watchdog 周期：这么久没有任何按键就重装一次钩子。
+/// 空闲 watchdog 周期，也是「钩子多久没收到键」的最小判定窗口。
 ///
 /// 低级钩子被系统摘掉后既没有通知也没有查询接口，「按了键却没回调」在
-/// 应用侧不可观测；反过来，空闲时重装钩子代价几乎为零。于是把重装放在
-/// 空闲窗口里做：用户真正按键时，钩子至多是 30s 内新装的。
+/// 应用侧不可观测。于是用系统级 `GetLastInputInfo` 交叉验证：只有「系统近期
+/// 有输入、但本钩子这么长时间没收到键」才判定为掉钩并重装（见
+/// [`reinstall_if_idle`]）。整机空闲时不重装。
 ///
 /// 阈值比周期短 5s：定时器有毫秒级抖动，相等会把第一次检查卡在边界上。
 const HOOK_IDLE_REHOOK: Duration = Duration::from_secs(25);
 const HOOK_WATCHDOG_MS: u32 = 30_000;
-/// 重装失败后的重试间隔（重起一个定时器）。
+/// 连续多少个 watchdog tick 都判定可疑才真正重装。
+/// 鼠标活动会刷新系统输入时刻，而键盘钩子看不到鼠标；两个 tick 可过滤掉
+/// 「只是用鼠标、没打字」的误报（真掉钩时最多多等一个 tick）。
+const HOOK_SUSPECT_TICKS: u32 = 2;
+/// 两次自动重装的最小间隔：纯鼠标/触控板输入已由光标位移过滤，
+/// 这里的限速只用于抑制「键盘输入但钩子确实收不到」时的重装风暴。
+/// P2-15：从 30min 收紧到 2min——30min 会让真掉钩（恰在重装后）静默失效
+/// 最长半小时；误报源已由 [`hook_is_suspect`] 的鼠标位移/提权判定消除。
+const HOOK_REHOOK_MIN_GAP: Duration = Duration::from_secs(2 * 60);
+/// 重装失败后的首次重试间隔（后续按 [`retry_delay_ms`] 退避）。
 const HOOK_RETRY_MS: u32 = 2_000;
+/// 重装失败的退避上限：连续失败多次后退回 watchdog 周期轮询。
+const HOOK_RETRY_MAX_MS: u32 = 30_000;
 /// 线程定时器的**请求** id。注意：`SetTimer(None, ...)` 会忽略它并返回
 /// 系统分配的 id（实测请求 0x4C535201 得到 0x7212），消息里的 wParam 是
 /// 返回的那个 id，所以比较与 KillTimer 都必须用返回值。
@@ -115,6 +130,21 @@ fn spawn_repaint_waker(ctx: Context) -> Result<Sender<()>, String> {
 
 thread_local! {
     static HOOK_HANDLER: RefCell<Option<HookHandler>> = const { RefCell::new(None) };
+}
+
+/// 空闲 watchdog 的线程本地状态：可疑计数、上次重装与失败退避。
+///
+/// 鼠标活动也会刷新系统输入时刻，但键盘钩子看不到鼠标——纯鼠标操作时
+/// 「系统有输入、钩子没收到键」会误报。P2-15 起用光标位移识别这类输入，
+/// 并要求连续两个 tick 都可疑才重装；限速只兜底重装风暴。
+#[derive(Default)]
+struct WatchdogState {
+    suspects: u32,
+    last_rehook: Option<Instant>,
+    /// P2-15：连续重装失败次数（`retry_delay_ms` 的退避索引）。
+    fail_streak: u32,
+    /// P2-15：上一 tick 的光标位置，用于区分「鼠标移动」与「键盘静默」。
+    last_cursor: Option<(i32, i32)>,
 }
 
 /// 一个后台服务线程：id 用于投递 WM_QUIT，join 用于退出时等待清理完成。
@@ -274,10 +304,11 @@ fn run_hook(
         if timer == 0 { ", timer failed" } else { "" }
     ));
 
+    let mut watchdog = WatchdogState::default();
     let mut message = MSG::default();
     while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
         if timer != 0 && message.message == WM_TIMER && message.wParam.0 == timer {
-            (hook, timer) = reinstall_if_idle(hook, timer);
+            (hook, timer) = reinstall_if_idle(hook, timer, &mut watchdog);
             continue;
         }
         unsafe { DispatchMessageW(&message) };
@@ -298,13 +329,24 @@ fn run_hook(
     }
 }
 
-/// 空闲 watchdog：最近 [`HOOK_IDLE_REHOOK`] 没收到任何按键就重装一次钩子。
+/// 空闲 watchdog：只在「系统近期有输入、但本钩子 [`HOOK_IDLE_REHOOK`] 没收到
+/// 任何按键」时判定为掉钩并重装。
 ///
 /// 系统静默摘钩后钩子线程照样活着（只是永远收不到回调），所以重装必须由
-/// 这个线程自己在空闲时做。按键进来就说明钩子是好的，不必折腾。
+/// 这个线程自己判断。判断依据必须同时看两个空闲时长：
+/// - 本钩子的 `last_key`（多久没收到键）；
+/// - 系统级的 `GetLastInputInfo`（整机多久没输入）。
+///
+/// 只有「系统比我们更近地收到过输入」才说明钩子漏键、可能被摘掉了。整机真空闲
+/// （夜间挂机、锁屏离开）时两者一起增长，此时重装纯属白折腾——旧实现每 30s
+/// 无条件重装一次，实测 12.4h 装了两千多次全局钩子。
 ///
 /// 返回（钩子句柄, 定时器 id）：定时器每次重起都会拿到新 id，必须一路带出去。
-fn reinstall_if_idle(current: HHOOK, timer: usize) -> (HHOOK, usize) {
+fn reinstall_if_idle(
+    current: HHOOK,
+    timer: usize,
+    watchdog: &mut WatchdogState,
+) -> (HHOOK, usize) {
     let idle = HOOK_HANDLER.with(|cell| {
         cell.borrow()
             .as_ref()
@@ -312,7 +354,46 @@ fn reinstall_if_idle(current: HHOOK, timer: usize) -> (HHOOK, usize) {
     });
     let idle = idle.unwrap_or(HOOK_IDLE_REHOOK);
     if idle < HOOK_IDLE_REHOOK {
+        watchdog.suspects = 0;
         return (current, timer);
+    }
+
+    // 系统的最近输入时刻：拿不到就保守不动（重装本身有短暂无钩窗口）。
+    let Some(system_idle) = system_idle_ms() else {
+        watchdog.suspects = 0;
+        return (current, timer);
+    };
+    let system_idle = Duration::from_millis(system_idle);
+    // P2-15：鼠标/触控板会刷新系统输入时刻，但键盘钩子看不到它们；
+    // 用光标位移识别「这段系统输入可能来自鼠标」，避免纯鼠标操作被误判。
+    let cursor = cursor_pos();
+    let mouse_moved = matches!(
+        (watchdog.last_cursor, cursor),
+        (Some(prev), Some(cur)) if prev != cur
+    );
+    watchdog.last_cursor = cursor;
+    let foreground_elevated = crate::win::hotkey_relay::foreground_is_elevated();
+    let self_elevated = crate::win::hotkey_relay::process_is_elevated();
+    if !hook_is_suspect(
+        idle,
+        system_idle,
+        mouse_moved,
+        foreground_elevated,
+        self_elevated,
+    ) {
+        watchdog.suspects = 0;
+        return (current, timer);
+    }
+
+    // 连续两个 tick 都可疑才认为是真掉钩（避免偶发输入判断误差）。
+    watchdog.suspects = watchdog.suspects.saturating_add(1);
+    if watchdog.suspects < HOOK_SUSPECT_TICKS {
+        return (current, timer);
+    }
+    if let Some(last) = watchdog.last_rehook {
+        if last.elapsed() < HOOK_REHOOK_MIN_GAP {
+            return (current, timer);
+        }
     }
 
     // 先卸再装（不留重叠，避免同一次按键被两条同源钩子重复计数）。
@@ -321,16 +402,90 @@ fn reinstall_if_idle(current: HHOOK, timer: usize) -> (HHOOK, usize) {
     }
     match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) } {
         Ok(hook) => {
+            watchdog.suspects = 0;
+            watchdog.fail_streak = 0;
+            watchdog.last_rehook = Some(Instant::now());
             lstr_index::snapshot::debug_log("hotkey: hook reinstalled (idle)");
             (hook, arm_watchdog(timer, HOOK_WATCHDOG_MS))
         }
         Err(err) => {
-            // 这段时间热键失效：留证 + 2s 后重试。
+            // 这段时间热键失效：按退避表重试（2s→4s→8s→30s），不记限速时刻。
+            let delay_ms = retry_delay_ms(watchdog.fail_streak);
+            watchdog.fail_streak = watchdog.fail_streak.saturating_add(1);
+            watchdog.suspects = 0;
             lstr_index::snapshot::debug_log(&format!(
-                "hotkey: reinstall failed: {err}; retry in {HOOK_RETRY_MS}ms"
+                "hotkey: reinstall failed: {err}; retry in {delay_ms}ms"
             ));
-            (current, arm_watchdog(timer, HOOK_RETRY_MS))
+            (current, arm_watchdog(timer, delay_ms))
         }
+    }
+}
+
+/// P2-15：掉钩判定的纯函数（便于单测，不依赖线程状态）。
+///
+/// 判定「本钩子可能已被系统静默摘掉」：本钩子很久没收到键、系统却有更近的
+/// 输入、且这段输入不能由鼠标解释（光标未移动）。管理员窗口在前台时，
+/// 普通进程受 UIPI 限制本来收不到按键，属合法失明；提权进程不受该限制，
+/// 因此豁免只适用于「前台提权 + 本进程非提权」的组合。
+fn hook_is_suspect(
+    idle: Duration,
+    system_idle: Duration,
+    mouse_moved: bool,
+    foreground_elevated: bool,
+    self_elevated: bool,
+) -> bool {
+    if idle < HOOK_IDLE_REHOOK {
+        return false;
+    }
+    if system_idle + Duration::from_secs(2) >= idle {
+        // 整机真空闲：钩子没消息是正常的，不重装。
+        return false;
+    }
+    if mouse_moved {
+        // 系统输入可由鼠标移动解释；键盘钩子看不到鼠标，不算掉钩证据。
+        return false;
+    }
+    if foreground_elevated && !self_elevated {
+        // 普通进程的 LL 钩子在管理员窗口前台时合法失明。
+        return false;
+    }
+    true
+}
+
+/// 重装失败的退避表：2s → 4s → 8s → 30s 封顶。
+fn retry_delay_ms(fail_streak: u32) -> u32 {
+    match fail_streak {
+        0 => HOOK_RETRY_MS,
+        1 => 4_000,
+        2 => 8_000,
+        _ => HOOK_RETRY_MAX_MS,
+    }
+}
+
+/// P2-15：当前光标位置（屏幕坐标），用于识别「系统输入来自鼠标」。
+fn cursor_pos() -> Option<(i32, i32)> {
+    let mut point = POINT::default();
+    if unsafe { GetCursorPos(&mut point) }.is_ok() {
+        Some((point.x, point.y))
+    } else {
+        None
+    }
+}
+
+/// 系统级空闲毫秒数：距离最近一次鼠标/键盘输入多久（含注入输入）。
+///
+/// 用 `GetTickCount` 做差而不是 `Instant`，因为 `LASTINPUTINFO.dwTime` 就是
+/// 毫秒 tick 计数；`wrapping_sub` 处理 49.7 天回绕。
+fn system_idle_ms() -> Option<u64> {
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    if unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+        let now = unsafe { GetTickCount() };
+        Some(now.wrapping_sub(info.dwTime) as u64)
+    } else {
+        None
     }
 }
 
@@ -584,6 +739,83 @@ mod tests {
     // 注意：HotkeyService::start 会安装真实的系统级钩子/热键，单测绝不直接
     // 调用它（约束：不运行真实 hook）；字符串解析与状态机行为全部在
     // crate::hotkey 与下方纯结构测试里覆盖。
+
+    // —— P2-15：掉钩判定与失败退避的纯函数 ——
+
+    #[test]
+    fn hook_is_not_suspect_while_idle_less_than_threshold() {
+        assert!(!hook_is_suspect(
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn hook_is_not_suspect_when_whole_machine_idle() {
+        // 整机 29s 没输入、钩子 30s 没键：输入差在 2s 容差内 → 正常空闲。
+        assert!(!hook_is_suspect(
+            Duration::from_secs(30),
+            Duration::from_secs(29),
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn hook_is_not_suspect_when_mouse_moved() {
+        assert!(!hook_is_suspect(
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            true, // 光标在移动：系统输入可能来自鼠标
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn hook_is_suspect_for_silent_keyboard_input() {
+        // 系统 1s 前有输入、光标没动、钩子 30s 没键 → 疑似掉钩。
+        assert!(hook_is_suspect(
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn elevated_worker_does_not_get_uipi_exemption() {
+        // 前台是管理员窗口 + 本进程已提权：UIPI 不适用，仍应判定可疑。
+        assert!(hook_is_suspect(
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            false,
+            true,
+            true,
+        ));
+        // 普通进程 + 管理员窗口前台：合法失明，不重装。
+        assert!(!hook_is_suspect(
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            false,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn reinstall_retry_backs_off_then_caps() {
+        assert_eq!(retry_delay_ms(0), HOOK_RETRY_MS);
+        assert_eq!(retry_delay_ms(1), 4_000);
+        assert_eq!(retry_delay_ms(2), 8_000);
+        assert_eq!(retry_delay_ms(3), HOOK_RETRY_MAX_MS);
+        assert_eq!(retry_delay_ms(9), HOOK_RETRY_MAX_MS);
+    }
 
     // —— CtrlGState（原 Raw Input 版测试原样保留，语义不变） ——
 

@@ -134,6 +134,45 @@ pub fn intersect_drive_masks(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     }
 }
 
+/// 路径的盘符位；非盘符路径（UNC/相对路径）返回 None。
+pub fn path_drive_bit(path: &std::path::Path) -> Option<u32> {
+    let text = path.to_string_lossy();
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => {
+            Some(1u32 << (letter.to_ascii_uppercase() as u32 - 'A' as u32))
+        }
+        _ => None,
+    }
+}
+
+impl SearchFilters {
+    /// 位置/路径条件隐含的盘符约束（P2-2）。
+    ///
+    /// `drive_mask()` 只看输入框盘符 chip；「位置」选 D 盘、或 `path:D:\work`
+    /// 这类条件在 build_spec 里被翻译成 path_prefix，不体现在 chip 掩码里。
+    /// 诊断盘符冲突时要把它们算进去，否则「位置 D 盘 + 输入 c:」会静默 0 结果。
+    pub fn location_drive_mask(&self) -> Option<u32> {
+        let mut mask: Option<u32> = None;
+        let mut merge = |bit: Option<u32>| {
+            if let Some(bit) = bit {
+                mask = Some(mask.map_or(bit, |m: u32| m & bit));
+            }
+        };
+        match &self.location {
+            Some(LocationFilter::Drive(letter)) => {
+                merge(Some(1u32 << (*letter as u32 - 'A' as u32)));
+            }
+            Some(LocationFilter::Folder { path, .. }) => merge(path_drive_bit(path)),
+            None => {}
+        }
+        if let Some(path) = &self.path {
+            merge(path_drive_bit(path));
+        }
+        mask
+    }
+}
+
 /// 路径是否落在卷掩码内。非盘符路径（UNC/相对路径）不参与裁剪。
 pub fn path_in_drive_mask(path: &std::path::Path, mask: u32) -> bool {
     let text = path.to_string_lossy();

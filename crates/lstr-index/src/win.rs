@@ -311,9 +311,7 @@ fn filetime_to_unix_secs(ticks: u64) -> i64 {
     }
 }
 
-/// 单条查询(`GetFileAttributesExW`)与目录枚举(`FindFirstFileW`)共用的
-/// 字段换算(size/mtime/is_dir)。两条路径必须走同一份换算,否则批量填充
-/// 会对不上逐条查询。
+/// 单条查询的字段换算(size/mtime/is_dir)。
 fn meta_from_parts(size_high: u32, size_low: u32, write_ticks: u64, attrs: u32) -> FileMeta {
     let size = ((size_high as u64) << 32) | size_low as u64;
     let mtime = filetime_to_unix_secs(write_ticks);
@@ -321,6 +319,8 @@ fn meta_from_parts(size_high: u32, size_low: u32, write_ticks: u64, attrs: u32) 
     FileMeta { size, mtime, is_dir }
 }
 
+/// FindFirstFileW 路径的字段换算(仅测试:与 GetFileAttributesExW 对拍)。
+#[cfg(test)]
 fn win32_meta(ffd: &windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW) -> FileMeta {
     let ticks = ((ffd.ftLastWriteTime.dwHighDateTime as u64) << 32)
         | ffd.ftLastWriteTime.dwLowDateTime as u64;
@@ -350,8 +350,8 @@ fn win32_attribute_meta(
 ///
 /// 用 GetFileAttributesExW 而不是 FindFirstFileW:后者每条都要开/关 find
 /// handle 并做通配符匹配,实测约 20–40µs/条;前者是单次属性查询,快 2–3 倍。
-/// 两者取的字段完全一致(同一套 `meta_from_parts` 换算),所以批量枚举
-/// (`list_dir_meta`)与逐条查询的结果仍逐字段相等。
+/// 搜索展示层因此始终逐条查询,不再按父目录批量枚举(大目录一次枚举可达
+/// 20ms、冷缓存 200ms+,远贵于几十条逐条查询)。
 pub fn find_meta(path: &str) -> Option<(u64, i64, bool)> {
     use windows::Win32::Storage::FileSystem::{
         GetFileAttributesExW, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA,
@@ -372,90 +372,10 @@ pub fn find_meta(path: &str) -> Option<(u64, i64, bool)> {
 
 /// 一条元数据,字段与 [`find_meta`] 的返回值一一对应。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FileMeta {
-    pub size: u64,
-    pub mtime: i64,
-    pub is_dir: bool,
-}
-
-/// 一次目录枚举的结果:按名字(ASCII 大小写折叠,与索引 `name_lc` 同规则)
-/// 索引到元数据。同一目录里折叠后重名(只能在大小写敏感目录出现)的条目
-/// 会被标记为歧义,`get` 返回 None,调用方回退逐条 `find_meta` —— 绝不猜
-/// 哪一条才是候选路径对应的文件。
-#[derive(Debug, Default)]
-pub struct DirMeta {
-    map: std::collections::HashMap<Vec<u8>, FileMeta>,
-    ambiguous: std::collections::HashSet<Vec<u8>>,
-}
-
-impl DirMeta {
-    /// 按名字查元数据。None = 目录枚举不可用 / 名字歧义 / 名字不在目录内,
-    /// 调用方一律回退逐条查询(与旧路径语义完全一致)。
-    pub fn get(&self, name: &str) -> Option<FileMeta> {
-        let folded = crate::store::fold_case(name.as_bytes());
-        if self.ambiguous.contains(folded.as_slice()) {
-            return None;
-        }
-        self.map.get(folded.as_slice()).copied()
-    }
-
-    /// 枚举到的唯一条目数(诊断用)。
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-}
-
-/// 一次 `FindFirstFileExW` 拿回整个目录的 attrs/mtime/size,按名匹配候选,
-/// 取代「每个候选一次 FindFirstFileW」。失败(权限/目录不存在/路径过长)返回
-/// None,调用方逐条回退。语义与逐条查询一致:同一 API 的同一组字段,
-/// 且不做任何缓存/TTL —— 每次查询自己枚举一次,不引入陈旧元数据。
-pub fn list_dir_meta(dir: &str) -> Option<DirMeta> {
-    use windows::Win32::Storage::FileSystem::{
-        FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
-        FIND_FIRST_EX_FLAGS, WIN32_FIND_DATAW,
-    };
-    if dir.is_empty() {
-        return None;
-    }
-    let pattern = if dir.ends_with('\\') || dir.ends_with('/') {
-        format!("{dir}*")
-    } else {
-        format!("{dir}\\*")
-    };
-    let wpattern = to_wide(&pattern);
-    let mut ffd = WIN32_FIND_DATAW::default();
-    let handle = unsafe {
-        FindFirstFileExW(
-            PCWSTR(wpattern.as_ptr()),
-            FindExInfoBasic,
-            &mut ffd as *mut _ as *mut std::ffi::c_void,
-            FindExSearchNameMatch,
-            None,
-            FIND_FIRST_EX_FLAGS(0),
-        )
-    }
-    .ok()?;
-    let mut out = DirMeta::default();
-    loop {
-        let name = from_wide(&ffd.cFileName);
-        // "." / ".." 正常不会由通配匹配返回;防御性跳过,绝不进入映射。
-        if !name.is_empty() && name != "." && name != ".." {
-            let meta = win32_meta(&ffd);
-            let folded = crate::store::fold_case(name.as_bytes());
-            if out.map.contains_key(folded.as_slice()) {
-                out.ambiguous.insert(folded);
-            } else {
-                out.map.insert(folded, meta);
-            }
-        }
-        if unsafe { FindNextFileW(handle, &mut ffd) }.is_err() {
-            break;
-        }
-    }
-    unsafe {
-        let _ = FindClose(handle);
-    }
-    Some(out)
+struct FileMeta {
+    size: u64,
+    mtime: i64,
+    is_dir: bool,
 }
 
 #[cfg(test)]
@@ -528,77 +448,4 @@ mod tests {
         );
     }
 
-    /// 对拍:目录枚举(按名查)与逐条 GetFileAttributesExW 在真实文件系统上
-    /// 逐字段一致。覆盖 500 条(大小写混写/子目录/中文名)、大小写不同名查询、
-    /// 磁盘上缺失的候选,以及目录不存在时的回退信号。
-    #[test]
-    fn dir_meta_matches_find_meta_on_real_entries() {
-        let dir = std::env::temp_dir().join(format!(
-            "lstr-dirmeta-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut names: Vec<(String, bool)> = Vec::new();
-        for i in 0..480 {
-            let name = if i % 2 == 0 {
-                format!("Case_Mix_{i:04}.TXT")
-            } else {
-                format!("case_mix_{i:04}.txt")
-            };
-            std::fs::write(dir.join(&name), vec![0u8; (i % 31) as usize]).unwrap();
-            names.push((name, false));
-        }
-        for i in 0..20 {
-            let name = format!("Sub_Dir_{i:02}");
-            std::fs::create_dir_all(dir.join(&name)).unwrap();
-            // 子目录里放一个文件,证明枚举不只是在根上碰巧一致。
-            std::fs::write(dir.join(&name).join("inner.txt"), b"x").unwrap();
-            names.push((name, true));
-        }
-        for (name, is_dir) in [
-            ("AI_CAPS.TXT", false),
-            ("报告_AI.txt", false),
-            ("MiXeD_报告_AI.LOG", false),
-        ] {
-            std::fs::write(dir.join(name), b"meta").unwrap();
-            names.push((name.to_string(), is_dir));
-        }
-
-        let dir_str = dir.to_string_lossy().into_owned();
-        let meta = list_dir_meta(&dir_str).expect("目录枚举必须成功");
-        assert_eq!(meta.len(), names.len(), "枚举条目数");
-
-        for (name, _) in &names {
-            let path = dir.join(name);
-            let path_str = path.to_string_lossy().into_owned();
-            let expect = find_meta(&path_str);
-            let got = meta.get(name).map(|m| (m.size, m.mtime, m.is_dir));
-            assert_eq!(got, expect, "元数据不一致: {name}");
-            // Windows 路径大小写不敏感;索引名折叠只覆盖 ASCII 大小写,
-            // 批量匹配必须和 find_meta(传入大小写不同的路径)一致。
-            let upper = name.to_ascii_uppercase();
-            let upper_path = dir.join(&upper).to_string_lossy().into_owned();
-            let expect_upper = find_meta(&upper_path);
-            assert_eq!(
-                meta.get(&upper).map(|m| (m.size, m.mtime, m.is_dir)),
-                expect_upper,
-                "大小写不同名查询不一致: {name}"
-            );
-        }
-
-        // 索引有、磁盘无:两条路径都必须返回 None。
-        let missing_path = dir.join("missing.txt").to_string_lossy().into_owned();
-        assert_eq!(meta.get("missing.txt"), None);
-        assert_eq!(find_meta(&missing_path), None);
-
-        // 目录不存在/不可枚举 → None,调用方据此回退逐条。
-        let gone = dir.join("gone-dir").to_string_lossy().into_owned();
-        assert!(list_dir_meta(&gone).is_none());
-        assert!(list_dir_meta("").is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

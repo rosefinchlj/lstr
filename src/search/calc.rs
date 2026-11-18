@@ -43,11 +43,14 @@ fn looks_like_math(s: &str) -> bool {
     true
 }
 
-/// 三段纯数字以 `-` 连接且含四位年份 → 视为日期而非算式。
+/// 两/三段纯数字以 `-` 连接且含四位年份 → 视为日期（`2024-01`、`2024-01-01`），
+/// 避免「年月」输入被当成减法算出 2023。
 fn is_date_like(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
-    parts.len() == 3
-        && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    (parts.len() == 2 || parts.len() == 3)
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 4 && p.chars().all(|c| c.is_ascii_digit()))
         && parts.iter().any(|p| p.len() == 4)
 }
 
@@ -239,6 +242,8 @@ mod tests {
         assert!(!looks_like_math("report-2024")); // 含字母
         assert!(!looks_like_math("2024-01-01")); // 日期
         assert!(!looks_like_math("01-01-2024")); // 日期
+        assert!(!looks_like_math("2024-01")); // 年月（此前被当减法算出 2023）
+        assert!(!looks_like_math("2024-1")); // 年月
         assert!(!looks_like_math("123")); // 无运算符
         assert!(!looks_like_math("ext:rs"));
         assert!(looks_like_math("1-2-3")); // 非日期(无四位年)→是算式
@@ -261,5 +266,6 @@ mod tests {
         assert_eq!(e.path.unwrap().to_string_lossy(), "7");
         assert!(calc_entry("report.txt").is_none());
         assert!(calc_entry("2024-01-01").is_none());
+        assert!(calc_entry("2024-01").is_none()); // 年月不触发计算器
     }
 }

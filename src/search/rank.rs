@@ -227,6 +227,57 @@ pub fn score_entry_planned(
         + plan.snapshot.boost(&entry.id)
 }
 
+/// 类型页空输入的使用学习排序：用过的条目按 frecency 降序排前面，没用过的
+/// 保持 `items` 给出的自然顺序（书签 = 名称升序，笔记 = 修改时间降序），只取
+/// 前 `take` 条，且只 clone 这 `take` 条。
+///
+/// 必须在**全量候选**上调用：调用方不要把 `top(take)` 的结果传进来，否则名称
+/// / 时间窗口之外的常用条目仍然升不上来（这正是本函数要修的问题）。
+///
+/// 「用过的全部排在没用过的之前」是硬约定，不是巧合：调用方拿到的结果之后
+/// 还会再 `truncate` 到更小的 `take`（请求参数变化、上层二次截断都可能），只要
+/// 每个 used 条目先于任何 unused，任何更小的截断都只会削掉没用过的尾部，绝不
+/// 会把已经用过、本该浮上来的条目挤出去。
+pub fn usage_page<'a>(
+    items: impl IntoIterator<Item = &'a Entry>,
+    history: &History,
+    take: usize,
+) -> Vec<Entry> {
+    if take == 0 {
+        return Vec::new();
+    }
+    let items: Vec<&Entry> = items.into_iter().collect();
+    let snapshot = history.rank_snapshot("");
+    let mut used: Vec<(f32, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let score = snapshot.score(&entry.id);
+            (score > 0.0).then_some((score, index))
+        })
+        .collect();
+    // 稳定排序：同分时保持自然顺序。
+    used.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out = Vec::with_capacity(take.min(items.len()));
+    let mut taken = vec![false; items.len()];
+    for (_, index) in used {
+        if out.len() >= take {
+            return out;
+        }
+        out.push(Entry::clone(items[index]));
+        taken[index] = true;
+    }
+    for (index, entry) in items.iter().enumerate() {
+        if out.len() >= take {
+            break;
+        }
+        if !taken[index] {
+            out.push(Entry::clone(entry));
+        }
+    }
+    out
+}
+
 /// 盘符权重扣分：路径所在盘每降 1 点权重扣 1 分（权重 100 = 0 分）。
 /// 不参与空查询的「最近使用」排序——历史是用户真实用过的，不该被偏好压。
 fn drive_points(entry: &Entry, path_lc: &str, plan: &RankPlan) -> i32 {
@@ -383,23 +434,28 @@ fn path_adjustment(
     let mut hint = (name_raw + depth_raw) * detail_cap / 50;
 
     let env = env_paths();
-    let mut context = 0;
+    // B8：上下文按「档位内剩余预算」等比例缩放，而不是直接截断。
+    // 旧实现把 home(20)/parent(60)/cwd(90) 直接 min 到 15，三档全部饱和成
+    // 同一个分，当前目录优先实际失效；缩放后仍保持 cwd > parent > home 的
+    // 相对次序，同时永远不越过下一档（总预算仍是 cap - detail_cap）。
+    let mut context_raw = 0;
     if let Some(home) = &env.home {
         if is_under_path(&path, home) {
-            context += 20;
+            context_raw += 20;
         }
     }
     if let Some(parent) = &env.cwd_parent {
         if is_under_path(&path, parent) {
-            context += 60;
+            context_raw += 60;
         }
     }
     if let Some(cwd) = &env.cwd {
         if is_under_path(&path, cwd) {
-            context += 90;
+            context_raw += 90;
         }
     }
-    hint += context.min(cap - detail_cap);
+    const CONTEXT_RAW_MAX: i32 = 170; // home 20 + parent 60 + cwd 90
+    hint += context_raw * (cap - detail_cap) / CONTEXT_RAW_MAX;
 
     // 噪声惩罚是「排除」信号，不受上界限制：该沉下去的就要沉下去。
     hint - noise_penalty_prepared(&normalized_path, needle, entry.kind, cfg, rules)
@@ -974,6 +1030,31 @@ mod tests {
     }
 
     #[test]
+    fn cwd_context_outranks_parent_and_home_without_saturating() {
+        // B8 回归：旧实现 context.min(15) 让 home/parent/cwd 全饱和，
+        // 当前目录优先卖点失效。缩放后必须 cwd > parent，且仍受档位帽约束。
+        let cfg = RankConfig::default();
+        let cap = heuristic_cap(&cfg);
+        let cwd = std::env::current_dir().expect("cwd");
+        let parent = cwd.parent().expect("cwd parent");
+        let mut in_cwd = entry("in_cwd", "a", Kind::Folder);
+        in_cwd.path = Some(cwd.join("a"));
+        let mut in_parent = entry("in_parent", "a", Kind::Folder);
+        in_parent.path = Some(parent.join("a"));
+        let cwd_hint = adj(&in_cwd, "a", &cfg);
+        let parent_hint = adj(&in_parent, "a", &cfg);
+        assert!(
+            cwd_hint > parent_hint,
+            "当前目录内条目应高于父目录: cwd={cwd_hint}, parent={parent_hint}"
+        );
+        assert!(
+            cwd_hint <= cap,
+            "上下文加分不得跨档: hint={cwd_hint}, cap={cap}"
+        );
+    }
+
+
+    #[test]
     fn tokens_match_not_overtaken_by_cwd_normalized_match() {
         // M1 回归：「my report」多词命中（tokens 550）vs cwd 里只靠分隔符
         // 不敏感的命中（normalized 520）。旧 cap=80 时 cwd 的 +80 让后者反超。
@@ -1118,5 +1199,70 @@ mod tests {
             score_entry_planned(&on_d, &plan, 3, &cfg),
             "应用条目不参与盘符权重"
         );
+    }
+
+    #[test]
+    fn usage_page_puts_used_first_and_keeps_natural_order() {
+        let now = now();
+        // Beta 用过 5 次、Gamma 1 次；Alpha 没用过。
+        let history = history(&[("b", 5, now), ("c", 1, now)]);
+        let entries = vec![
+            entry("a", "Alpha", Kind::File),
+            entry("b", "Beta", Kind::File),
+            entry("c", "Gamma", Kind::File),
+        ];
+
+        let page = usage_page(entries.iter(), &history, 3);
+        let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Beta", "Gamma", "Alpha"],
+            "用过的按 frecency 排前，其余保持自然序"
+        );
+
+        let page = usage_page(entries.iter(), &history, 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].name, "Beta");
+        assert_eq!(page[1].name, "Gamma");
+
+        assert!(
+            usage_page(entries.iter(), &history, 0).is_empty(),
+            "take=0 必须返回空"
+        );
+    }
+
+    /// 边界：`take` 大于候选数、空候选、frecency 同分。同分必须按自然序而不是
+    /// 反过来——类型页书签按名称、笔记按修改时间，用户对这两条自然序有预期。
+    #[test]
+    fn usage_page_edges_and_ties() {
+        let now = now();
+        let used = history(&[("b", 3, now)]);
+        let entries = vec![
+            entry("a", "Alpha", Kind::File),
+            entry("b", "Beta", Kind::File),
+        ];
+        let page = usage_page(entries.iter(), &used, 10);
+        let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Beta", "Alpha"], "take 超过候选数时全部返回，used 仍在前");
+
+        assert!(
+            usage_page(std::iter::empty::<&Entry>(), &used, 5).is_empty(),
+            "空候选时间页为空"
+        );
+        assert!(
+            usage_page(std::iter::empty::<&Entry>(), &used, 0).is_empty(),
+            "空候选 + take=0 也不能 panic"
+        );
+
+        // 两条用得一样多、一样新：同分按自然序（Alpha 在 Gamma 前）。
+        let tied = history(&[("a", 2, now), ("c", 2, now)]);
+        let entries = vec![
+            entry("a", "Alpha", Kind::File),
+            entry("b", "Beta", Kind::File),
+            entry("c", "Gamma", Kind::File),
+        ];
+        let page = usage_page(entries.iter(), &tied, 3);
+        let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "Gamma", "Beta"], "同分保持自然序，未用过的跟在后面");
     }
 }

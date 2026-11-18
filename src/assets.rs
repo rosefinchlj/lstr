@@ -311,6 +311,52 @@ pub fn add_favorite(cfg: &mut Config, name: &str, path: &str) -> Result<bool, St
     Ok(true)
 }
 
+/// 手动隐藏一个应用（空输入的应用页里不再出现）；重复路径不新增。
+/// 只在内存里改动 + 写回配置，搜索服务由调用方同步。
+pub fn hide_app(cfg: &mut Config, name: &str, path: &str) -> Result<bool, String> {
+    if !hide_app_in_memory(cfg, name, path) {
+        return Ok(false);
+    }
+    cfg.save()?;
+    Ok(true)
+}
+
+/// 纯内存版：不写盘（测试用，也避免批量调整时反复落盘）。
+pub fn hide_app_in_memory(cfg: &mut Config, name: &str, path: &str) -> bool {
+    if is_hidden(cfg, path) {
+        return false;
+    }
+    cfg.hidden_apps.push(crate::config::HiddenApp {
+        name: name.to_string(),
+        path: path.to_string(),
+    });
+    true
+}
+
+/// 取消隐藏；返回是否真的移除了（false = 本来就没藏）。
+pub fn unhide_app(cfg: &mut Config, path: &str) -> Result<bool, String> {
+    if !unhide_app_in_memory(cfg, path) {
+        return Ok(false);
+    }
+    cfg.save()?;
+    Ok(true)
+}
+
+/// 纯内存版：从隐藏列表移除，不写盘。
+pub fn unhide_app_in_memory(cfg: &mut Config, path: &str) -> bool {
+    let before = cfg.hidden_apps.len();
+    cfg.hidden_apps
+        .retain(|hidden| !hidden.path.eq_ignore_ascii_case(path));
+    cfg.hidden_apps.len() != before
+}
+
+/// 这条目标路径是否被手动隐藏（Windows 路径大小写不敏感）。
+pub fn is_hidden(cfg: &Config, path: &str) -> bool {
+    cfg.hidden_apps
+        .iter()
+        .any(|hidden| hidden.path.eq_ignore_ascii_case(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,5 +465,36 @@ mod tests {
             .favorites
             .iter()
             .any(|f| f.path.eq_ignore_ascii_case("d:\\A")));
+    }
+
+    /// 隐藏/取消隐藏：路径大小写不敏感、重复隐藏幂等、取消一次即彻底移除
+    /// （用内存版，避免测试写用户真实的 config.toml）。
+    #[test]
+    fn hide_and_unhide_are_case_insensitive_and_idempotent() {
+        let mut cfg = Config::default();
+        assert!(hide_app_in_memory(&mut cfg, "微信", r"C:\Start\微信.lnk"));
+        assert!(is_hidden(&cfg, r"c:\start\微信.lnk"));
+        assert!(
+            !hide_app_in_memory(&mut cfg, "微信", r"C:\Start\微信.lnk"),
+            "重复隐藏不应新增"
+        );
+        assert_eq!(cfg.hidden_apps.len(), 1);
+        assert_eq!(cfg.hidden_apps[0].name, "微信", "保留显示给用户的名字");
+
+        assert!(unhide_app_in_memory(&mut cfg, r"C:\START\微信.LNK"));
+        assert!(!is_hidden(&cfg, r"C:\Start\微信.lnk"));
+        assert!(!unhide_app_in_memory(&mut cfg, r"C:\Start\微信.lnk"), "已取消过");
+        assert!(cfg.hidden_apps.is_empty());
+    }
+
+    /// 隐藏列表写进 config.toml 的 `[[hidden_app]]`，旧配置没有这段也能读。
+    #[test]
+    fn hidden_apps_survive_config_round_trip() {
+        let mut cfg = Config::default();
+        hide_app_in_memory(&mut cfg, "Clash Verge", r"C:\ProgramData\Clash Verge.lnk");
+        let text = toml::to_string_pretty(&cfg).expect("序列化");
+        assert!(text.contains("[[hidden_apps]]"), "应写成 [[hidden_apps]] 表");
+        let parsed: Config = toml::from_str(&text).expect("反序列化");
+        assert_eq!(parsed.hidden_apps, cfg.hidden_apps);
     }
 }

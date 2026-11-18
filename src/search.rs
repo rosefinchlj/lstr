@@ -23,7 +23,7 @@ use crate::model::{Entry, Kind, Query, Scope};
 use crate::search::filters::SearchFilters;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use eframe::egui;
@@ -102,6 +102,11 @@ struct Request {
     show_history: bool,
     /// P0-1：收藏列表（Quick Switch 数据源）。
     favorites: Vec<crate::assets::Favorite>,
+    /// 手动隐藏的应用路径（小写）：空输入的应用页里默认不出现，
+    /// 输入名字仍能搜到（Ctrl+H 可临时全部列出）。
+    hidden: Vec<String>,
+    /// Ctrl+H：把已隐藏的应用也列出来（排最前，UI 标「已隐藏」）。
+    show_hidden: bool,
     /// P0-2：「Explorer 内键入即搜」锁定的当前目录（None = 全局搜索）。
     base_folder: Option<PathBuf>,
     /// 深路径浏览模式的当前目录：输入框只放过滤词，worker 直接列这个目录。
@@ -113,8 +118,28 @@ pub struct Response {
     pub generation: u64,
     pub entries: Vec<Entry>,
     pub total: usize,
+    /// B5:纯过滤(空输入 + 筛选条件)查询的 total 是下界(计数到预算即停)。
+    /// UI 显示成「N+」并提示输入关键词可缩小范围。
+    pub total_rough: bool,
     pub elapsed_ms: f32,
     pub error: Option<String>,
+}
+
+/// B18：输入框的盘符条件（`c:`）与位置/盘符 chip 求交后没有剩任何卷时，
+/// 返回可诊断提示（否则用户只看到 0 条，以为是「没有文件」）。
+fn drive_mask_conflict_note(
+    query_mask: Option<u32>,
+    filter_mask: Option<u32>,
+) -> Option<String> {
+    let mask = filters::intersect_drive_masks(query_mask, filter_mask)?;
+    if mask != 0 {
+        return None;
+    }
+    Some(
+        "盘符条件互相冲突或排除了所有卷（例如输入 c: 但位置筛选选了 D 盘），\
+         当前没有任何可查卷；请清掉其中一个后重试"
+            .to_string(),
+    )
 }
 
 /// 诊断：响应发出时距请求发出的总耗时（含排队）。仅慢查询写 engine.log。
@@ -134,6 +159,17 @@ fn send_response(tx: &Sender<Response>, request: &Request, response: Response) {
         ));
     }
     let _ = tx.send(response);
+}
+
+/// 把 `catch_unwind` 捕获的 panic 载荷转成一行可读摘要(日志与 UI 提示用)。
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "未知 panic 载荷".to_string()
+    }
 }
 
 /// 上一次查询的完整参数：滚到底加载更多时原样重发，只放大交付上限。
@@ -164,6 +200,10 @@ pub struct SearchService {
     keywords: Vec<KeywordConfig>,
     /// P0-1：收藏列表，新增收藏后由 UI 同步进来。
     favorites: Vec<crate::assets::Favorite>,
+    /// 已隐藏的应用路径（小写，空输入应用页过滤用）。
+    hidden: Vec<String>,
+    /// Ctrl+H「显示已隐藏」开关。
+    show_hidden: bool,
     /// 「重新加载」命令置位，worker 下一请求立即重建应用索引。
     apps_dirty: Arc<AtomicBool>,
     /// 浏览器书签索引开关（设置页即时生效）：worker 每轮维护读取，
@@ -187,12 +227,19 @@ pub struct SearchService {
     /// 排除规则表共享槽(原始模式):设置页「立即重建」时更新,引擎在建新
     /// store/落快照指纹时取新表;finalize 硬过滤也实时取。
     noise_slot: Arc<Mutex<Vec<String>>>,
+    /// P1-3:维护页「重建索引」的一次性请求世代。worker 空闲轮询发现世代
+    /// 变化就重置全部卷 + 全量重扫(与排除规则变更走同一重置路径)。旧实现
+    /// 只更新槽并删快照:规则没变时 worker 判定「无需重建」→ 空操作。
+    rebuild_epoch: Arc<AtomicU64>,
     /// 优雅退出标志:on_exit 置位后 client 线程给 worker 发 Shutdown 并等其
     /// 退出;run_worker 的请求循环也据此提前收尾(flush_all 不再依赖通道断开)。
     shutdown_client: Arc<AtomicBool>,
     /// 优雅退出收尾完成标志:run_worker 在 flush_all + 等 client 线程收尾后
     /// 置位;`graceful_shutdown` 轮询它给 eframe::App::on_exit 一个有界等待。
     worker_collected: Arc<AtomicBool>,
+    /// 搜索线程 panic 标志:外层 catch_unwind 兜住 unwind 后置位,UI 侧据此
+    /// 重建 SearchService。哨兵响应只是快路径,标志位保证不丢(同一帧兜底)。
+    worker_panicked: Arc<AtomicBool>,
 }
 
 impl SearchService {
@@ -229,35 +276,69 @@ impl SearchService {
         let shutdown_client = Arc::new(AtomicBool::new(false));
         let worker_collected = Arc::new(AtomicBool::new(false));
         let client_done = Arc::new(AtomicBool::new(false));
+        // supervisor:搜索线程 panic 时置位,UI 下一帧重建整个 SearchService。
+        let worker_panicked = Arc::new(AtomicBool::new(false));
+        let panic_flag = Arc::clone(&worker_panicked);
+        let panic_shutdown = Arc::clone(&shutdown_client);
+        let panic_collected = Arc::clone(&worker_collected);
+        let panic_tx = response_tx.clone();
         let (done_s, done_w, done_c) = (
             Arc::clone(&shutdown_client),
             Arc::clone(&worker_collected),
             Arc::clone(&client_done),
         );
+        // P1-3:强制重建世代(0=启动值)。维护页点「重建索引」时 +1。
+        let rebuild_epoch = Arc::new(AtomicU64::new(0));
+        let worker_rebuild_epoch = Arc::clone(&rebuild_epoch);
         let worker_index_cmd_tx = index_cmd_tx.clone();
         std::thread::Builder::new()
             .name("lstr-search".to_string())
             .spawn(move || {
-                run_worker(WorkerArgs {
-                    rx: request_rx,
-                    tx: response_tx,
-                    history: worker_history,
-                    config: worker_config,
-                    ctx,
-                    apps_dirty: worker_apps_dirty,
-                    bookmarks_enabled: worker_bookmarks_enabled,
-                    bookmark_folders: worker_bookmark_folders,
-                    notes_enabled: worker_notes_enabled,
-                    note_folders: worker_note_folders,
-                    status_slot: worker_status,
-                    index_cmd_rx,
-                    index_cmd_tx: worker_index_cmd_tx,
-                    volume_mask: worker_volume_mask,
-                    noise_slot: worker_noise_slot,
-                    shutdown_client: done_s,
-                    worker_collected: done_w,
-                    client_done: done_c,
-                })
+                // 搜索线程是全局单点:一旦 panic,整个搜索服务失联,UI 会永久
+                // 停在「搜索中…」(评审 P1-13/B1)。这里兜住 unwind:记日志、
+                // 让 client 线程走优雅收尾(否则它发现引擎通道断开后会再
+                // runas 拉起提权 worker,无端弹一次 UAC)、置标志并给 UI 发
+                // 一条哨兵响应(gen=u64::MAX)触发重建。
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_worker(WorkerArgs {
+                        rx: request_rx,
+                        tx: response_tx,
+                        history: worker_history,
+                        config: worker_config,
+                        ctx,
+                        apps_dirty: worker_apps_dirty,
+                        bookmarks_enabled: worker_bookmarks_enabled,
+                        bookmark_folders: worker_bookmark_folders,
+                        notes_enabled: worker_notes_enabled,
+                        note_folders: worker_note_folders,
+                        status_slot: worker_status,
+                        index_cmd_rx,
+                        index_cmd_tx: worker_index_cmd_tx,
+                        volume_mask: worker_volume_mask,
+                        noise_slot: worker_noise_slot,
+                        rebuild_epoch: worker_rebuild_epoch,
+                        shutdown_client: done_s,
+                        worker_collected: done_w,
+                        client_done: done_c,
+                    })
+                }));
+                if let Err(payload) = result {
+                    let detail = panic_payload_message(payload.as_ref());
+                    lstr_index::snapshot::debug_log(&format!(
+                        "search: worker thread panicked, service will restart: {detail}"
+                    ));
+                    panic_shutdown.store(true, Ordering::Relaxed);
+                    panic_collected.store(true, Ordering::Relaxed);
+                    panic_flag.store(true, Ordering::Release);
+                    let _ = panic_tx.send(Response {
+                        generation: u64::MAX,
+                        entries: Vec::new(),
+                        total: 0,
+                        total_rough: false,
+                        elapsed_ms: 0.0,
+                        error: Some(format!("搜索服务异常退出：{detail}")),
+                    });
+                }
             })
             .expect("spawn search worker");
         Self {
@@ -273,6 +354,12 @@ impl SearchService {
             last: None,
             keywords: config.keywords,
             favorites: config.favorites,
+            hidden: config
+                .hidden_apps
+                .iter()
+                .map(|hidden| hidden.path.to_lowercase())
+                .collect(),
+            show_hidden: false,
             apps_dirty,
             bookmarks_enabled,
             bookmark_folders,
@@ -282,8 +369,10 @@ impl SearchService {
             volume_mask,
             index_cmd: index_cmd_tx,
             noise_slot,
+            rebuild_epoch,
             shutdown_client,
             worker_collected,
+            worker_panicked,
         }
     }
 
@@ -316,31 +405,30 @@ impl SearchService {
         ));
     }
 
-    /// 「立即重建」:排除规则变更后调用。更新共享槽 + 删旧快照。
-    /// run_worker 空闲轮询发现槽变化后:引擎重置受影响卷(丢弃旧 NOISE 位)
-    /// → 按差集算受影响盘发 Rescan 掩码 → worker 逐卷重扫。待重扫卷 3s
-    /// 未收到 ScanBegin 自动重发(自愈);重启后快照指纹不符也会重扫。
+    /// 排除规则变更后调用（设置页「立即重建」）。只更新共享槽：
+    /// run_worker 空闲轮询发现槽内容变化后，引擎重置受影响卷（丢弃旧
+    /// NOISE 位）→ 按差集算受影响盘发 Rescan 掩码 → worker 逐卷重扫。
+    ///
+    /// P1-3：这里**不再删快照**。旧实现对规则未变化的情况也会删掉快照，
+    /// 但 worker 判定「槽没变 → 无需重建」，结果只删了磁盘快照、索引还是
+    /// 旧的。快照本身带噪声规则内容哈希（snapshot.rs noise_hash），规则
+    /// 变化后旧快照会在下次启动被拒并自动全量扫描，无需 UI 代劳删除。
     pub fn rebuild_noise_index(&self, patterns: Vec<String>) {
         if let Ok(mut slot) = self.noise_slot.lock() {
             *slot = patterns;
         }
-        // 删旧快照:重建完成前的崩溃窗口里,旧快照指纹与新规则不符会被拒,
-        // 这里删掉更直接(避免旧 store 的周期性保存把旧快照写回盘)。
-        let dir = crate::config::attach_dir().join("index");
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let looks_like_snapshot = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("vol_") && n.ends_with(".bin"))
-                    .unwrap_or(false);
-                if looks_like_snapshot {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
         lstr_index::snapshot::debug_log("main: noise rules changed (slot updated)");
+    }
+
+    /// 维护页「重建索引」：强制 worker 丢弃全部卷的 store 并全量重扫。
+    ///
+    /// P1-3：旧实现把当前排除规则再传一遍 [`Self::rebuild_noise_index`]，
+    /// 规则没变时 worker 不重置、不重扫，只在磁盘上删了快照 —— 按钮实际
+    /// 是空操作，反而让下次启动丢失快照、只能全量 dirscan。现在用一次性
+    /// 世代计数显式请求重建；快照由引擎在重扫后自然覆盖。
+    pub fn rebuild_index(&self) {
+        self.rebuild_epoch.fetch_add(1, Ordering::Relaxed);
+        lstr_index::snapshot::debug_log("main: rebuild index requested (epoch bumped)");
     }
 
     pub fn search(
@@ -456,6 +544,8 @@ impl SearchService {
                 rank: rank.clone(),
                 show_history,
                 favorites: self.favorites.clone(),
+                hidden: self.hidden.clone(),
+                show_hidden: self.show_hidden,
                 base_folder,
                 browse_root,
             })
@@ -510,6 +600,19 @@ impl SearchService {
         self.favorites = favorites;
     }
 
+    /// 隐藏列表变更后同步给 worker（空输入的应用页立即少掉这些条目）。
+    pub fn set_hidden(&mut self, hidden: &[crate::config::HiddenApp]) {
+        self.hidden = hidden
+            .iter()
+            .map(|entry| entry.path.to_lowercase())
+            .collect();
+    }
+
+    /// Ctrl+H：显示/收起已隐藏的应用（下一次查询生效）。
+    pub fn set_show_hidden(&mut self, show: bool) {
+        self.show_hidden = show;
+    }
+
     /// 应用索引立刻重建：新装/卸载应用后不想等 TTL 就执行「重新加载」命令。
     pub fn invalidate_apps(&self) {
         self.apps_dirty.store(true, Ordering::Relaxed);
@@ -547,6 +650,12 @@ impl SearchService {
             latest = Some(response);
         }
         latest
+    }
+
+    /// 搜索线程是否已 panic 退出。哨兵响应可能因通道状态丢失(或 UI 还没
+    /// 处理到),UI 每帧读这个标志兜底触发重建。
+    pub fn worker_panicked(&self) -> bool {
+        self.worker_panicked.load(Ordering::Relaxed)
     }
 
     pub fn record_open(&self, entry: &Entry) {
@@ -753,9 +862,24 @@ mod pin_tests {
             rank: RankConfig::default(),
             show_history: true,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         }
+    }
+
+    #[test]
+    fn drive_mask_conflict_is_diagnosed() {
+        // B18：`c:` + 位置 D 盘 → 掩码求交为空，必须给可诊断提示而不是静默 0 条。
+        let c = 1u32 << 2;
+        let d = 1u32 << 3;
+        assert!(drive_mask_conflict_note(Some(c), Some(d)).is_some());
+        assert!(drive_mask_conflict_note(Some(c), Some(c)).is_none());
+        assert!(drive_mask_conflict_note(Some(c), None).is_none());
+        assert!(drive_mask_conflict_note(None, None).is_none());
+        // 手动把全部卷都排除（含 0 卷掩码）同样提示。
+        assert!(drive_mask_conflict_note(None, Some(0)).is_some());
     }
 
     #[test]
@@ -856,6 +980,26 @@ mod pin_tests {
         );
         let count = out.iter().filter(|e| e.name == "config.json").count();
         assert_eq!(count, 5, "同名候选不得被丢弃（总数与列表条数一致）");
+    }
+
+    /// B4：meta 缓存命中后不再探测 FS —— 文件被删掉，TTL 内第二次调用仍返回
+    /// 首次的缓存值；清缓存后才按真实 FS 返回 None。锁内只做小表操作。
+    #[test]
+    fn meta_cache_serves_recent_results_without_fs() {
+        clear_meta_cache();
+        let dir = std::env::temp_dir().join(format!("lstr-meta-cache-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("probe.txt");
+        std::fs::write(&file, b"lstr").expect("write probe file");
+        let path = file.to_string_lossy().to_string();
+        let first = find_meta_cached(&path);
+        assert!(first.is_some(), "存在的文件应返回元数据");
+        std::fs::remove_file(&file).expect("remove probe file");
+        let second = find_meta_cached(&path);
+        assert_eq!(second, first, "TTL 内应命中缓存，而不是重新探测已删除文件");
+        clear_meta_cache();
+        assert!(find_meta_cached(&path).is_none(), "清缓存后应反映文件已删除");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 回归：用户搜 `ucrtbase.dll`，索引里 147 条同名文件（C 60 / D 80 / E 6），
@@ -1213,6 +1357,45 @@ impl PendingMeta {
     }
 }
 
+/// B4：`fill_one_meta` 的短期元数据缓存。
+///
+/// 键入过程中前缀相同（"u"→"us"→"use"→"useb"）的连续查询会反复对同一批候选
+/// 调 `GetFileAttributesExW`；冷缓存下 meta 阶段可达 10~230ms。这里按
+/// 「小写路径 + 3s TTL」缓存元数据（含失败结果，减少对已删/无权限路径的重复
+/// 探测），只缓存最终候选这一小撮，512 条封顶，命中即零 FS。
+const META_CACHE_TTL: Duration = Duration::from_secs(3);
+const META_CACHE_CAP: usize = 512;
+/// `(size, modified, is_dir)`。
+type MetaValue = (u64, i64, bool);
+type MetaCache = HashMap<String, (Instant, Option<MetaValue>)>;
+thread_local! {
+    static META_CACHE: std::cell::RefCell<MetaCache> = std::cell::RefCell::new(HashMap::new());
+}
+
+fn find_meta_cached(path_str: &str) -> Option<MetaValue> {
+    let key = path_str.to_lowercase();
+    META_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((at, value)) = cache.get(&key) {
+            if at.elapsed() < META_CACHE_TTL {
+                return *value;
+            }
+            cache.remove(&key);
+        }
+        let value = lstr_index::win::find_meta(path_str);
+        if cache.len() >= META_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, (Instant::now(), value));
+        value
+    })
+}
+
+#[cfg(test)]
+fn clear_meta_cache() {
+    META_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 /// 单条最终候选的元数据填充 + 漂移校正;None = 旧路径同样会丢弃。
 /// `correct_kind=false` 用于精确同名补齐(旧 `search_exact` 不校正类型),
 /// 只填 size/mtime。
@@ -1223,67 +1406,18 @@ impl PendingMeta {
 /// 一次索引扫描后又被修改),这是刻意取舍:排序要避免每个候选一次 FS
 /// 调用,展示则要求时间新鲜。索引 mtime 为 0(未知)时,本函数从 FS 拿到
 /// 的值仍可补上,从而不影响展示。
-#[cfg(test)]
+///
+/// 这里**始终逐条** `GetFileAttributesExW`,不做同父目录批量枚举:
+/// 内置索引只收固定 NTFS 本地卷,逐条查询实测 ~17µs/条;而一次整目录
+/// 枚举(旧的 `list_dir_meta` 批量层)对 1.7 万文件的图标目录要 ~20ms
+/// (冷缓存 200ms+)。旧批量层从同目录第 2 条候选就触发,`useb` 命中 8 个
+/// 图标文件时把 meta 阶段从 <1ms 推到 233ms(2026-11-16 日志实锤)。
 fn fill_one_meta(entry: Entry, correct_kind: bool) -> Option<Entry> {
-    // 单条入口(测试 oracle 与无批量上下文用):fresh filler 首个候选必逐条,
-    // 行为与旧实现逐字节一致。生产路径走 fill_one_meta_with(共享 filler)。
-    fill_one_meta_with(entry, correct_kind, &mut MetaFiller::default())
-}
-
-/// 惰性元数据填充的批量优化:同一父目录第 2 个候选起改用一次
-/// `list_dir_meta` 目录枚举批量取 size/mtime,取代逐条 `GetFileAttributesExW`
-/// (load more 到数千条、结果集中在少数目录时收益明显)。首个候选仍逐条,
-/// 避免为单个条目枚举巨型目录;枚举失败/名字歧义一律回退逐条,语义不变。
-#[derive(Default)]
-struct MetaFiller {
-    dirs: HashMap<String, DirMetaState>,
-}
-
-enum DirMetaState {
-    /// 只见过一个候选:尚未枚举(逐条查)。
-    SeenOnce,
-    /// 已枚举(可能失败=None);后续候选按名取,取不到回退逐条。
-    Batched(Option<lstr_index::win::DirMeta>),
-}
-
-impl MetaFiller {
-    fn find(&mut self, path: &str) -> Option<(u64, i64, bool)> {
-        let p = std::path::Path::new(path);
-        let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
-            return lstr_index::win::find_meta(path);
-        };
-        let parent = parent.to_string_lossy().into_owned();
-        let name = name.to_string_lossy().into_owned();
-        use std::collections::hash_map::Entry;
-        match self.dirs.entry(parent) {
-            Entry::Vacant(v) => {
-                v.insert(DirMetaState::SeenOnce);
-                lstr_index::win::find_meta(path)
-            }
-            Entry::Occupied(mut o) => {
-                if matches!(o.get(), DirMetaState::SeenOnce) {
-                    let dm = lstr_index::win::list_dir_meta(o.key());
-                    o.insert(DirMetaState::Batched(dm));
-                }
-                let dm = match o.get() {
-                    DirMetaState::Batched(d) => d.as_ref(),
-                    DirMetaState::SeenOnce => None,
-                };
-                match dm.and_then(|d| d.get(&name)) {
-                    Some(m) => Some((m.size, m.mtime, m.is_dir)),
-                    None => lstr_index::win::find_meta(path),
-                }
-            }
-        }
-    }
-}
-
-fn fill_one_meta_with(entry: Entry, correct_kind: bool, filler: &mut MetaFiller) -> Option<Entry> {
     let Some(path) = entry.path.as_ref() else {
         return Some(entry);
     };
     let path_str = path.to_string_lossy();
-    let Some((size, modified, fs_dir)) = filler.find(&path_str) else {
+    let Some((size, modified, fs_dir)) = find_meta_cached(&path_str) else {
         return None;
     };
     // 候选阶段按索引 attrs 定的 kind:Folder ⇔ 索引说 is_dir。
@@ -1417,8 +1551,7 @@ fn finalize_entries_with_pending(
         let mut non_exact = 0usize;
         // 同一 id 的 split/exact 副本按出现顺序消费 PendingMeta 里的语义。
         let mut pending_uses: HashMap<String, usize> = HashMap::new();
-        // 跨候选共享的元数据填充器:同父目录批量枚举(见 MetaFiller)。
-        let mut filler = MetaFiller::default();
+        // 候选阶段零 FS,这里只对最终候选逐条取元数据(单条 ~17µs)。
         for entry in entries {
             let name_lower = entry.name.to_lowercase();
             let is_exact = !needle_lower.is_empty()
@@ -1453,7 +1586,7 @@ fn finalize_entries_with_pending(
                 continue;
             }
             let filled = match mode {
-                Some(correct_kind) => fill_one_meta_with(entry, correct_kind, &mut filler),
+                Some(correct_kind) => fill_one_meta(entry, correct_kind),
                 None => Some(entry),
             };
             let Some(entry) = filled else { continue };
@@ -1605,6 +1738,8 @@ struct WorkerArgs {
     volume_mask: Arc<AtomicU32>,
     /// 排除规则共享槽(与 SearchService 共享,重建时换表)。
     noise_slot: Arc<Mutex<Vec<String>>>,
+    /// P1-3:强制重建请求世代(维护页「重建索引」)。
+    rebuild_epoch: Arc<AtomicU64>,
     shutdown_client: Arc<AtomicBool>,
     worker_collected: Arc<AtomicBool>,
     client_done: Arc<AtomicBool>,
@@ -1724,6 +1859,7 @@ fn browse_response(
         generation: request.generation,
         entries,
         total,
+        total_rough: false,
         elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
         error: None,
     }
@@ -1759,14 +1895,18 @@ fn notes_response(
     let (entries, total) = if !enabled {
         (Vec::new(), 0)
     } else if request.query.text.trim().is_empty() {
-        // 空输入 = 最近修改的笔记；total 用真实总数，UI 才会发「加载更多」。
-        (notes.top(take), notes.count())
+        // 空输入 = 最近使用优先（frecency 排前，其余按修改时间）；
+        // total 用真实总数，UI 才会发「加载更多」。
+        let entries = match history.lock() {
+            Ok(history) => notes.used_page(&history, take),
+            Err(_) => notes.top(take),
+        };
+        (entries, notes.count())
     } else {
         let strict = !request.filters.matches.is_default();
-        // 严格匹配（大小写/全词/正则）时不做拼音/模糊/文件夹兜底，避免
-        // 「区分大小写搜 rust」仍被文件夹路径带出一整夹笔记。严格模式下
-        // 先取全量再复核，total 才与「复核后真正能看到的条数」同口径。
-        let limit = if strict { usize::MAX } else { take };
+        // 全量命中交给 rank（frecency / query_hits 才能把窗口外的常用笔记提上
+        // 来），响应末尾再按 take 截断。严格匹配仍先取全量再复核。
+        let limit = usize::MAX;
         let (mut hits, total) = match history.lock() {
             Ok(history) => notes.search(
                 &request.query.text,
@@ -1788,6 +1928,7 @@ fn notes_response(
         generation: request.generation,
         entries,
         total,
+        total_rough: false,
         elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
         error: None,
     }
@@ -1810,6 +1951,7 @@ fn run_worker(args: WorkerArgs) {
         index_cmd_tx,
         volume_mask,
         noise_slot,
+        rebuild_epoch,
         shutdown_client,
         worker_collected,
         client_done,
@@ -1822,6 +1964,8 @@ fn run_worker(args: WorkerArgs) {
     ));
     // 「立即重建」状态:槽内容与已应用表比对;待重扫卷 3s 未收到 ScanBegin 则重发。
     let mut noise_applied_raw = noise_slot.lock().unwrap().clone();
+    // P1-3:维护页「重建索引」请求世代;与启动值不同 = 强制全量重扫一次。
+    let mut rebuild_epoch_applied = rebuild_epoch.load(Ordering::Relaxed);
     let mut pending_rescan: Vec<(char, Instant)> = Vec::new();
     let mut last_resend = Instant::now();
     // 目录扫描(dir)会把 mtime 写进快照。纯 USN 首扫(旧 scan_mode="usn")
@@ -1833,10 +1977,14 @@ fn run_worker(args: WorkerArgs) {
     let (engine_tx, engine_rx) = mpsc::sync_channel::<EngineMsg>(16);
     let handshake_slot: Arc<Mutex<Vec<(u128, u64, i64, u64, bool)>>> =
         Arc::new(Mutex::new(Vec::new()));
+    #[cfg(feature = "alloc-stats")]
+    crate::alloc_stats::log_phase("worker-start");
     let mut engine = builtin::make_engine(
         &config.index,
         lstr_index::engine::NoiseRules::from_slot(Arc::clone(&noise_slot)),
     );
+    #[cfg(feature = "alloc-stats")]
+    crate::alloc_stats::log_phase("after-engine-load");
     // 分批 apply 的块间让路检查:对账/首扫的记录按块消化,块间发现
     // 等待中的查询(QUERY_INFLIGHT>0)立即收手,让主循环出队服务。
     engine.set_query_yield_hook(Some(Box::new(|| {
@@ -1894,10 +2042,28 @@ fn run_worker(args: WorkerArgs) {
     }
     let mut dir_cache = browse::DirCache::new();
     let (uwp_tx, uwp_rx) = mpsc::channel::<Vec<Entry>>();
+    // B3：索引 TTL 重建放到后台线程。应用目录解析 ~几十 ms，书签/笔记要读 JSON/
+    // SQLite，最长可达数百 ms；旧实现直接在搜索线程里 load，TTL 到点的那一次查询
+    // 会被加载阻塞。这里只发「重载请求」，主循环收到新索引再替换（替换是瞬时的）。
+    let (apps_reload_tx, apps_reload_rx) = mpsc::channel::<apps::AppIndex>();
+    let (bookmarks_reload_tx, bookmarks_reload_rx) =
+        mpsc::channel::<bookmarks::BookmarkIndex>();
+    let (notes_reload_tx, notes_reload_rx) = mpsc::channel::<notes::NoteIndex>();
+    let mut apps_reloading = false;
+    let mut bookmarks_reloading = false;
+    let mut notes_reloading = false;
+    // P2-10：后台加载线程的启动时刻；超时未回来就视为失败（否则标志永远
+    // 卡在 reloading，索引在进程生命周期内不再更新）。
+    let mut apps_reload_started: Option<Instant> = None;
+    let mut bookmarks_reload_started: Option<Instant> = None;
+    let mut notes_reload_started: Option<Instant> = None;
     // UWP 枚举要走 PowerShell（Get-StartApps，冷启动 ~2s）。
     // 懒加载：只在第一次真正需要应用结果时才启动 PowerShell；
     // 只用文件/文件夹搜索的用户，PowerShell 永远不会被拉起。
     let mut uwp_started = false;
+    // P2-12：UWP 枚举失败（PowerShell 缺失/被杀）时不要整个进程生命周期
+    // 只试一次；冷却后允许重试，避免应用页永久缺 UWP 应用。
+    let mut uwp_retry_at: Option<Instant> = None;
 
     // 主循环改为超时驱动:空闲时也要消费引擎消息、发布状态,
     // 否则首装扫描期用户不击键 → 引擎停摆(实测抓出)。
@@ -1958,11 +2124,12 @@ fn run_worker(args: WorkerArgs) {
                     }
                     b.engine.maintain();
                     *handshake_slot.lock().unwrap() = b.engine.handshake_state();
-                    // 分片 compact 也要持续推进:maintenance_busy 让主循环立刻
-                    // 回来再给下一片,否则会阻塞在 recv_timeout(150ms) 上。
+                    // 真后台 compact 不占用本线程:不需要忙轮询去看它,主循环
+                    // 正常 recv_timeout(150ms) 即可(查询/消息会立刻唤醒)。
+                    // 冻结消息只在 compact 结束后需要连续回放 —— 此时
+                    // compact_in_progress 已翻 false,has_deferred 才让本循环忙转。
                     maintenance_busy = b.engine.save_in_progress()
-                        || b.engine.has_deferred_msgs()
-                        || b.engine.compact_in_progress();
+                        || (b.engine.has_deferred_msgs() && !b.engine.compact_in_progress());
                 }
             }
             // —— 排除规则表变化检测(「立即重建」)——
@@ -1976,28 +2143,38 @@ fn run_worker(args: WorkerArgs) {
                         .filter_map(|p| lstr_index::noise::normalize_pattern(p))
                         .collect()
                 };
-                if norm(&cur_raw) != norm(&noise_applied_raw) {
-                    let cur = norm(&cur_raw);
-                    let old = norm(&noise_applied_raw);
-                    let diff: Vec<String> = cur
-                        .difference(&old)
-                        .chain(old.difference(&cur))
-                        .cloned()
-                        .collect();
-                    let mut letters: Vec<char> = Vec::new();
-                    let mut all = false;
-                    for p in &diff {
-                        match lstr_index::noise::affected_drives_for_pattern(p) {
-                            None => all = true,
-                            Some(ds) => letters.extend(ds),
-                        }
-                    }
-                    let scope: Option<Vec<char>> = if all {
-                        None
+                // P1-3:维护页「重建索引」显式请求全卷重建，与规则变化共用
+                // 重置+重扫路径；规则没变也照样重置（旧实现这里会判定无变化
+                // 而什么都不做）。
+                let force_rebuild =
+                    rebuild_epoch.load(Ordering::Relaxed) != rebuild_epoch_applied;
+                if force_rebuild || norm(&cur_raw) != norm(&noise_applied_raw) {
+                    let (scope, reason): (Option<Vec<char>>, &str) = if force_rebuild {
+                        (None, "main: rebuild index requested")
                     } else {
-                        letters.sort_unstable();
-                        letters.dedup();
-                        (!letters.is_empty()).then_some(letters)
+                        let cur = norm(&cur_raw);
+                        let old = norm(&noise_applied_raw);
+                        let diff: Vec<String> = cur
+                            .difference(&old)
+                            .chain(old.difference(&cur))
+                            .cloned()
+                            .collect();
+                        let mut letters: Vec<char> = Vec::new();
+                        let mut all = false;
+                        for p in &diff {
+                            match lstr_index::noise::affected_drives_for_pattern(p) {
+                                None => all = true,
+                                Some(ds) => letters.extend(ds),
+                            }
+                        }
+                        let scope: Option<Vec<char>> = if all {
+                            None
+                        } else {
+                            letters.sort_unstable();
+                            letters.dedup();
+                            (!letters.is_empty()).then_some(letters)
+                        };
+                        (scope, "main: noise rules changed")
                     };
                     let (affected, mask) = if let Some(b) = &mut builtin {
                         let affected = b.engine.reset_volumes_for_noise(scope.as_deref());
@@ -2016,11 +2193,11 @@ fn run_worker(args: WorkerArgs) {
                     pending_rescan = affected.iter().map(|l| (*l, Instant::now())).collect();
                     last_resend = Instant::now();
                     lstr_index::snapshot::debug_log(&format!(
-                        "main: noise rules changed, reset {:?}, rescan mask=0x{mask:08x}",
-                        affected
+                        "{reason}, reset {affected:?}, rescan mask=0x{mask:08x}"
                     ));
                     noise_applied_raw = cur_raw;
                 }
+                rebuild_epoch_applied = rebuild_epoch.load(Ordering::Relaxed);
                 // 待重扫自愈:重发后 3s 仍未收到 ScanBegin 的卷 → 重发 Rescan
                 if !pending_rescan.is_empty()
                     && last_resend.elapsed() >= Duration::from_secs(3)
@@ -2080,19 +2257,102 @@ fn run_worker(args: WorkerArgs) {
             }
         };
         while let Ok(uwp_entries) = uwp_rx.try_recv() {
-            apps.append_uwp(uwp_entries);
+            if uwp_entries.is_empty() {
+                // P2-12：空结果通常是 PowerShell 超时/失败（正常机器总会有
+                // 若干 UWP 应用）；冷却 60s 后允许重试，期间不再反复拉起。
+                uwp_retry_at = Some(Instant::now() + Duration::from_secs(60));
+                lstr_index::snapshot::debug_log(
+                    "uwp: empty app list; retry in 60s",
+                );
+            } else {
+                uwp_retry_at = None;
+                apps.append_uwp(uwp_entries);
+            }
         }
-        // 应用索引时效：TTL 到点或「重新加载」信号到了就重建。
+        // B3：后台重载完成 → 原位替换（不阻塞查询）。
+        while let Ok(next) = apps_reload_rx.try_recv() {
+            apps = next;
+            uwp_started = false;
+            uwp_retry_at = None;
+            apps_loaded = Instant::now();
+            apps_reloading = false;
+            apps_reload_started = None;
+        }
+        while let Ok(next) = bookmarks_reload_rx.try_recv() {
+            bookmarks = next;
+            bookmarks_loaded = Instant::now();
+            bookmarks_stamp = bookmarks::source_stamp();
+            bookmarks_reloading = false;
+            bookmarks_reload_started = None;
+            publish_bookmark_folders(&bookmark_folders, &bookmarks);
+            lstr_index::snapshot::debug_log(&format!(
+                "bookmarks: reloaded {} entries",
+                bookmarks.count()
+            ));
+        }
+        while let Ok(next) = notes_reload_rx.try_recv() {
+            notes = next;
+            notes_loaded = Instant::now();
+            notes_stamp = notes::source_stamp();
+            notes_reloading = false;
+            notes_reload_started = None;
+            publish_note_folders(&note_folders, &notes);
+            lstr_index::snapshot::debug_log(&format!(
+                "notes: reloaded {} entries",
+                notes.count()
+            ));
+        }
+        // P2-10：后台加载卡死（网络盘上的书签/被锁的笔记 DB）时不能永久
+        // 占着 reloading 标志；90s 视为失败，允许后续 TTL 重试。
+        const RELOAD_WATCHDOG: Duration = Duration::from_secs(90);
+        if apps_reloading && apps_reload_started.is_some_and(|t| t.elapsed() > RELOAD_WATCHDOG)
+        {
+            apps_reloading = false;
+            apps_reload_started = None;
+            lstr_index::snapshot::debug_log("apps: reload timed out, will retry");
+        }
+        if bookmarks_reloading
+            && bookmarks_reload_started.is_some_and(|t| t.elapsed() > RELOAD_WATCHDOG)
+        {
+            bookmarks_reloading = false;
+            bookmarks_reload_started = None;
+            lstr_index::snapshot::debug_log("bookmarks: reload timed out, will retry");
+        }
+        if notes_reloading && notes_reload_started.is_some_and(|t| t.elapsed() > RELOAD_WATCHDOG)
+        {
+            notes_reloading = false;
+            notes_reload_started = None;
+            lstr_index::snapshot::debug_log("notes: reload timed out, will retry");
+        }
+        // 应用索引时效：TTL 到点或「重新加载」信号到了就重建（后台线程）。
         // 重载后 UWP 懒加载标志复位，下次需要应用结果时重新枚举。
         let forced = apps_dirty.swap(false, Ordering::Relaxed);
-        if forced || apps_loaded.elapsed() > APPS_RELOAD_INTERVAL {
-            apps = apps::AppIndex::load();
-            uwp_started = false;
-            apps_loaded = Instant::now();
+        // P2-11：`forced` 被 swap 消费时若有加载在飞，这一轮不会真正重建；
+        // 补回标志，让下一轮立即重来，避免「点了重新加载却没反应」。
+        if forced && (apps_reloading || bookmarks_reloading || notes_reloading) {
+            apps_dirty.store(true, Ordering::Relaxed);
+        }
+        if !apps_reloading && (forced || apps_loaded.elapsed() > APPS_RELOAD_INTERVAL) {
+            let tx = apps_reload_tx.clone();
+            let spawned = std::thread::Builder::new()
+                .name("lstr-apps-reload".to_string())
+                .spawn(move || {
+                    let _ = tx.send(apps::AppIndex::load());
+                });
+            if spawned.is_ok() {
+                apps_reloading = true;
+                apps_reload_started = Some(Instant::now());
+            } else {
+                // 线程创建失败（极端资源紧张）：退回同步加载，保证功能不断。
+                apps = apps::AppIndex::load();
+                uwp_started = false;
+                apps_loaded = Instant::now();
+            }
         }
         // 书签索引：「重新加载」立即重建；平时按 TTL + 源文件 mtime 判断，
         // 浏览器没改书签就不重复解析。
-        if forced || bookmarks_loaded.elapsed() > BOOKMARKS_RELOAD_INTERVAL {
+        if !bookmarks_reloading && (forced || bookmarks_loaded.elapsed() > BOOKMARKS_RELOAD_INTERVAL)
+        {
             let enabled = bookmarks_enabled.load(Ordering::Relaxed);
             let stamp = bookmarks::source_stamp();
             if !enabled {
@@ -2102,20 +2362,27 @@ fn run_worker(args: WorkerArgs) {
                 bookmarks_loaded = Instant::now();
                 publish_bookmark_folders(&bookmark_folders, &bookmarks);
             } else if forced || stamp != bookmarks_stamp {
-                bookmarks = bookmarks::BookmarkIndex::load();
-                bookmarks_stamp = stamp;
-                bookmarks_loaded = Instant::now();
-                publish_bookmark_folders(&bookmark_folders, &bookmarks);
-                lstr_index::snapshot::debug_log(&format!(
-                    "bookmarks: reloaded {} entries",
-                    bookmarks.count()
-                ));
+                let tx = bookmarks_reload_tx.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("lstr-bookmarks-reload".to_string())
+                    .spawn(move || {
+                        let _ = tx.send(bookmarks::BookmarkIndex::load());
+                    });
+                if spawned.is_ok() {
+                    bookmarks_reloading = true;
+                    bookmarks_reload_started = Some(Instant::now());
+                } else {
+                    bookmarks = bookmarks::BookmarkIndex::load();
+                    bookmarks_stamp = stamp;
+                    bookmarks_loaded = Instant::now();
+                    publish_bookmark_folders(&bookmark_folders, &bookmarks);
+                }
             } else {
                 bookmarks_loaded = Instant::now();
             }
         }
         // 笔记索引：同书签，TTL + 主库/WAL mtime；开关关闭立即清空。
-        if forced || notes_loaded.elapsed() > NOTES_RELOAD_INTERVAL {
+        if !notes_reloading && (forced || notes_loaded.elapsed() > NOTES_RELOAD_INTERVAL) {
             let enabled = notes_enabled.load(Ordering::Relaxed);
             let stamp = notes::source_stamp();
             if !enabled {
@@ -2124,14 +2391,21 @@ fn run_worker(args: WorkerArgs) {
                 notes_loaded = Instant::now();
                 publish_note_folders(&note_folders, &notes);
             } else if forced || stamp != notes_stamp {
-                notes = notes::NoteIndex::load();
-                notes_stamp = stamp;
-                notes_loaded = Instant::now();
-                publish_note_folders(&note_folders, &notes);
-                lstr_index::snapshot::debug_log(&format!(
-                    "notes: reloaded {} entries",
-                    notes.count()
-                ));
+                let tx = notes_reload_tx.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("lstr-notes-reload".to_string())
+                    .spawn(move || {
+                        let _ = tx.send(notes::NoteIndex::load());
+                    });
+                if spawned.is_ok() {
+                    notes_reloading = true;
+                    notes_reload_started = Some(Instant::now());
+                } else {
+                    notes = notes::NoteIndex::load();
+                    notes_stamp = stamp;
+                    notes_loaded = Instant::now();
+                    publish_note_folders(&note_folders, &notes);
+                }
             } else {
                 notes_loaded = Instant::now();
             }
@@ -2259,6 +2533,7 @@ fn run_worker(args: WorkerArgs) {
                 generation: request.generation,
                 entries,
                 total,
+                total_rough: false,
                 elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
                 error: None,
             });
@@ -2297,7 +2572,10 @@ fn run_worker(args: WorkerArgs) {
                 }
                 _ => false,
             };
-        if needs_uwp && !uwp_started {
+        if needs_uwp
+            && !uwp_started
+            && uwp_retry_at.is_none_or(|at| Instant::now() >= at)
+        {
             uwp_started = true;
             let uwp_tx = uwp_tx.clone();
             std::thread::Builder::new()
@@ -2311,6 +2589,8 @@ fn run_worker(args: WorkerArgs) {
         let started = Instant::now();
         let mut entries = Vec::new();
         let mut total = 0usize;
+        // P2-7：total 是否为下界（B5 纯过滤查询的计数预算）。
+        let mut total_rough = false;
         let mut error = None;
         // 旧 scan_mode="usn" 的纯 USN 首扫没有 mtime：日期/时间条件无法成立。
         // 明确提示，避免用户把「0 结果」误当成「真的没有匹配文件」。
@@ -2368,6 +2648,9 @@ fn run_worker(args: WorkerArgs) {
             );
             total = keyword_rows.len();
         } else if request.query.is_empty() && request.filters.is_empty() {
+            // 应用页/书签页的「真实总数」：条目只交付首屏 take 条，
+            // total 必须是完整条数，UI 才会在滚到底时续拉。
+            let mut scope_total: Option<usize> = None;
             if request.show_history {
                 if let Ok(history) = history.lock() {
                     entries = history.recent_entries(request.limit.max(8));
@@ -2385,60 +2668,102 @@ fn run_worker(args: WorkerArgs) {
             // 再按当前世界过滤：文件可能已删除/移动/改名，应用可能已卸载，
             // 否则「最近使用」里点开就是「打开失败」。
             entries.retain(|entry| !stale_history_entry(entry, apps.all()));
+            // B9：Fallback（内置索引不可用）时，历史里的文件/文件夹是旧快照，
+            // 无法校验存在性、点开常失败；只保留不依赖索引来源的应用/命令/书签/笔记。
+            // P2-3：此前用 `builtin.is_none()` 判定，而 builtin 在本函数里恒为
+            // Some —— 该分支是死代码。改看引擎阶段（Fallback 才隐藏）。
+            let builtin_fallback = builtin
+                .as_ref()
+                .is_none_or(|b| b.status().phase == lstr_index::Phase::Fallback);
+            if builtin_fallback {
+                entries.retain(|entry| {
+                    matches!(
+                        entry.kind,
+                        Kind::App | Kind::Command | Kind::Bookmark | Kind::Note
+                    )
+                });
+            }
             // 空查询 = 纯「最近使用」：清空历史后就是空列表，不再补常用应用
             // （补位会让用户以为历史没清掉）；想看已安装应用去「应用」标签。
             if request.query.scope == Scope::App {
-                entries = apps.top(request.limit);
-                // 收藏的应用置顶：文件夹 Quick Switch 不再收应用，这里
-                // 是它们唯一的入口（空输入即见，Enter 启动）。
-                let mut pinned: Vec<Entry> = request
-                    .favorites
-                    .iter()
-                    .map(crate::assets::favorite_entry)
-                    .filter(|entry| entry.kind == Kind::App)
-                    .collect();
-                pinned.retain(|entry| !entries.iter().any(|e| e.id == entry.id));
-                if !pinned.is_empty() {
-                    let room = request.limit.saturating_sub(pinned.len());
-                    entries.truncate(room);
-                    pinned.append(&mut entries);
-                    entries = pinned;
-                }
+                // 排序权重来自使用历史（frecency）：微信用得多就排前面，
+                // 内置的「常见应用」表只在没有历史时兜底。rank_snapshot 一次
+                // 读出全部 history 行，逐条查 id 的代价可以忽略。
+                let usage: HashMap<String, f32> = history
+                    .lock()
+                    .ok()
+                    .map(|history| {
+                        let snapshot = history.rank_snapshot("");
+                        apps.all()
+                            .iter()
+                            .filter_map(|app| {
+                                let score = snapshot.score(&app.id);
+                                (score > 0.0).then(|| (app.id.clone(), score))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // 取 deliver 而不是 limit：应用页也能滚到底「加载更多」，
+                // 首屏 100 条 > 窗口行数，UI 才滚得动（同书签页）。
+                // 已到设置的「加载更多上限」时一次给全：应用总共只有几百条，
+                // 上限调小（如 100）也不该把后面的应用永远藏起来。
+                let take = if request.deliver >= config.max_load_results {
+                    usize::MAX
+                } else {
+                    request.deliver.max(request.limit)
+                };
+                let (rows, count) = app_scope_entries(
+                    &apps,
+                    &request.favorites,
+                    &usage,
+                    &request.hidden,
+                    request.show_hidden,
+                    take,
+                );
+                entries = rows;
+                scope_total = Some(count);
             } else if request.query.scope == Scope::Command {
                 entries = commands("", &config.commands);
             } else if request.query.scope == Scope::Bookmark {
-                // 书签页空输入 = 按名称列出全部书签（与应用页「空输入列应用」一致）；
-                // 取 deliver 而不是 limit：几百条书签也能滚到底「加载更多」。
+                // 书签页空输入 = 全部书签按「最近使用」排序（用过的在前，其余按
+                // 名称），与应用页空输入的学习语义一致；取 deliver 而不是 limit，
+                // 几百条书签也能滚到底「加载更多」。
+                let take = request.deliver.max(request.limit);
                 entries = if bookmarks_enabled.load(Ordering::Relaxed) {
-                    bookmarks.top(request.deliver.max(request.limit))
+                    scope_total = Some(bookmarks.count());
+                    bookmark_page_entries(&bookmarks, &history, take)
                 } else {
                     Vec::new()
                 };
             }
-            total = entries.len();
-            // 书签页空输入的 total 用真实总数：UI 只在 entries.len() < total
-            // 时才发「加载更多」，否则 482 条书签只能看到首屏 100 条。
-            if request.query.scope == Scope::Bookmark
-                && bookmarks_enabled.load(Ordering::Relaxed)
-            {
-                total = bookmarks.count();
-            }
+            total = scope_total.unwrap_or(entries.len());
         } else {
             match request.query.scope {
                 Scope::App => {
-                    entries = apps.search(&request.query.text, request.limit);
-                    entries.retain(|entry| {
-                        app_matches_options(&entry.name, &request.query.text, &request.filters)
-                    });
-                    total = entries.len();
+                    // B2：应用页同样取全量候选：`total` 必须是全量匹配数；候选
+                    // 全量进入 finalize 打分，frecency / query_hits 才能把窗口外
+                    // 的常用应用提上来，最后由 finalize 按 deliver 截断。
+                    let matches: Vec<Entry> = apps
+                        .search(&request.query.text, usize::MAX)
+                        .into_iter()
+                        .filter(|entry| {
+                            app_matches_options(&entry.name, &request.query.text, &request.filters)
+                        })
+                        .collect();
+                    total = matches.len();
+                    entries = matches;
                 }
                 Scope::Bookmark => {
                     let take = request.deliver.max(request.limit);
-                    entries = if bookmarks_enabled.load(Ordering::Relaxed) {
+                    if bookmarks_enabled.load(Ordering::Relaxed) {
                         if request.query.text.is_empty() {
-                            bookmarks.top(take)
+                            total = bookmarks.count();
+                            entries = bookmark_page_entries(&bookmarks, &history, take);
                         } else {
-                            let mut hits = bookmarks.search(&request.query.text, take);
+                            // P2-4：先取全量匹配，total 用真实匹配数（书签总量小，
+                            // 全量过滤可承受）；候选全量进 finalize 打分，由 finalize
+                            // 按 deliver 截断。
+                            let mut hits = bookmarks.search(&request.query.text, usize::MAX);
                             hits.retain(|entry| {
                                 app_matches_options(
                                     &entry.name,
@@ -2446,12 +2771,13 @@ fn run_worker(args: WorkerArgs) {
                                     &request.filters,
                                 )
                             });
-                            hits
+                            total = hits.len();
+                            entries = hits;
                         }
                     } else {
-                        Vec::new()
-                    };
-                    total = entries.len();
+                        entries = Vec::new();
+                        total = 0;
+                    }
                 }
                 Scope::Command => {
                     entries = commands(&request.query.text, &config.commands);
@@ -2509,6 +2835,7 @@ fn run_worker(args: WorkerArgs) {
                                         .saturating_sub(result.folder_total);
                                     truncation += file_total.saturating_sub(result.files.len());
                                     total += result.folder_total + file_total;
+                                    total_rough |= result.total_rough;
                                     // 旧实现先 folders 后 files,保持同一 Entry 顺序。
                                     // 候选只带索引信息,由 finalize 内统一填 FS 元数据。
                                     pending_meta.mark(&result.folders, true);
@@ -2539,8 +2866,11 @@ fn run_worker(args: WorkerArgs) {
                         && !file_filter_active
                         && !request.filters.matches.regex
                     {
+                        // 非文件来源全部进 finalize 打分：应用/命令/书签/笔记总量
+                        // 都小，打分前截断会让「用得多的冷门条目」永远升不上来。
+                        let source_fetch = usize::MAX;
                         let t_apps = Instant::now();
-                        let mut app_hits = apps.search(&request.query.text, request.limit);
+                        let mut app_hits = apps.search(&request.query.text, source_fetch);
                         app_hits.retain(|entry| {
                             app_matches_options(
                                 &entry.name,
@@ -2559,7 +2889,7 @@ fn run_worker(args: WorkerArgs) {
                         if bookmarks_enabled.load(Ordering::Relaxed) {
                             let t_bookmarks = Instant::now();
                             let mut bookmark_hits =
-                                bookmarks.search(&request.query.text, request.limit);
+                                bookmarks.search(&request.query.text, source_fetch);
                             // 严格匹配（大小写/全词）同样约束书签：拼音/模糊/
                             // 纯 URL 命中都要按名字复核，否则「区分大小写」失效。
                             bookmark_hits.retain(|entry| {
@@ -2580,14 +2910,14 @@ fn run_worker(args: WorkerArgs) {
                             let (mut note_hits, _) = match history.lock() {
                                 Ok(history) => notes.search(
                                     &request.query.text,
-                                    request.limit,
+                                    source_fetch,
                                     false,
                                     Some(&history),
                                     &request.rank,
                                 ),
                                 Err(_) => notes.search(
                                     &request.query.text,
-                                    request.limit,
+                                    source_fetch,
                                     false,
                                     None,
                                     &request.rank,
@@ -2640,9 +2970,11 @@ fn run_worker(args: WorkerArgs) {
                     let mut needs_exact = false;
                     if let Some(b) = &builtin {
                         let fetch = fetch_count(&request.query, request.limit, request.deliver);
-                        match b.search(&request.query, &request.filters, fetch, &drive_weights) {
-                            Ok((mut files, count)) => {
+                        match b.search_with_bounds(&request.query, &request.filters, fetch, &drive_weights) {
+                            Ok((mut files, count, lower_bound)) => {
                                 total = count;
+                                // A8：宽查询/纯过滤查询的 total 可能只是下界。
+                                total_rough |= lower_bound;
                                 needs_exact = count > files.len();
                                 pending_meta.mark(&files, true);
                                 entries.append(&mut files);
@@ -2673,10 +3005,17 @@ fn run_worker(args: WorkerArgs) {
         // 盘符过滤兜底：内置引擎已按卷掩码查询；历史等其余来源的
         // 路径条目在这里统一裁掉（应用/命令无盘符，不受影响）。
         // 查询文本里的盘符 token 与输入框盘符 chip 求交。
-        if let Some(mask) = filters::intersect_drive_masks(
-            request.query.drive_mask(),
+        let query_drive_mask = request.query.drive_mask();
+        // P2-2：位置/路径条件（D 盘、path:D:\work）隐含的盘符也要算进来，
+        // 否则「位置选 D 盘 + 输入 c:」时两套掩码求交非空，静默 0 结果。
+        let filter_drive_mask = filters::intersect_drive_masks(
             request.filters.drive_mask(),
-        ) {
+            request.filters.location_drive_mask(),
+        );
+        if error.is_none() {
+            error = drive_mask_conflict_note(query_drive_mask, filter_drive_mask);
+        }
+        if let Some(mask) = filters::intersect_drive_masks(query_drive_mask, filter_drive_mask) {
             entries.retain(|e| {
                 let Some(path) = &e.path else { return true };
                 filters::path_in_drive_mask(path, mask)
@@ -2711,7 +3050,11 @@ fn run_worker(args: WorkerArgs) {
         let diag_finalize =
             (t_finalize.elapsed().as_secs_f32() * 1000.0 - diag_meta).max(0.0);
         let diag_total = started.elapsed().as_secs_f32() * 1000.0;
-        if (diag_total > 15.0 || profile_queries()) && !request.query.text.is_empty() {
+        // B5:空输入 + 筛选(纯过滤)路径此前完全不打 stage 日志,排障时看不到
+        // split 耗时;把「有筛选条件」也纳入记录条件。
+        if (diag_total > 15.0 || profile_queries())
+            && (!request.query.text.is_empty() || !request.filters.is_empty())
+        {
             lstr_index::snapshot::debug_log(&format!(
                 "search: stage gen={} split={:.1}ms apps={:.1}ms bm={:.1}ms notes={:.1}ms exact={:.1}ms finalize={:.1}ms meta={:.1}ms total={:.1}ms text={:?}",
                 request.generation,
@@ -2727,10 +3070,14 @@ fn run_worker(args: WorkerArgs) {
             ));
         }
 
+        // B5/P2-7：total 是否为下界由 provider 按引擎同一谓词给出
+        // （空 token 且非 regex 且撞 FILTER_ONLY_TOTAL_CAP），不再由 UI
+        // 侧用 `text 为空 && filters 非空` 另算一套——两套谓词会漂移。`total_rough` 在 split 分支里累积。
 send_response(&tx, &request, Response {
             generation: request.generation,
             entries,
             total,
+            total_rough,
             elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
             error,
         });
@@ -2808,6 +3155,97 @@ fn scope_matches(scope: Scope, entry: &Entry) -> bool {
         Scope::Bookmark => entry.kind == Kind::Bookmark,
         Scope::Note => entry.kind == Kind::Note,
         Scope::Command => entry.kind == Kind::Command,
+    }
+}
+
+/// 同一条启动目标：收藏的 id 是 `fav:<path>`、索引条目是 `app:<path>`，
+/// 只比 id 会让同一条 .lnk 在应用页出现两次（截图里的两行「微信」）。
+/// Windows 路径大小写不敏感，统一按路径比较。
+fn same_target(a: &Entry, b: &Entry) -> bool {
+    if a.id == b.id {
+        return true;
+    }
+    match (a.path.as_deref(), b.path.as_deref()) {
+        (Some(pa), Some(pb)) => pa
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&pb.to_string_lossy()),
+        _ => false,
+    }
+}
+
+/// 应用页空输入的列表：收藏的应用置顶（文件夹 Quick Switch 不再收应用，
+/// 这里是它们唯一的入口），其余按 `AppIndex::ranked`（使用历史 → 常见名单
+/// → 名字）排序。返回 `(首屏条目, 完整条数)`：`total` 给 UI 的「加载更多」
+/// 用真实总数，滚动到底才能把剩下的应用续拉出来。
+///
+/// `hidden` 是手动隐藏的应用路径（小写）：默认不出现（隐藏优先于收藏），
+/// 但 `show_hidden`（Ctrl+H）时排在最前，让用户一眼看到藏了哪些。
+fn app_scope_entries(
+    apps: &apps::AppIndex,
+    favorites: &[crate::assets::Favorite],
+    usage: &HashMap<String, f32>,
+    hidden: &[String],
+    show_hidden: bool,
+    take: usize,
+) -> (Vec<Entry>, usize) {
+    let is_hidden = |entry: &Entry| {
+        let path = entry.full_path().to_lowercase();
+        hidden.contains(&path)
+    };
+    let mut rest = apps.ranked(usage);
+    if !show_hidden {
+        rest.retain(|app| !is_hidden(app));
+    }
+    let mut pinned: Vec<Entry> = Vec::new();
+    for favorite in favorites {
+        let stored = crate::assets::favorite_entry(favorite);
+        if stored.kind != Kind::App {
+            continue;
+        }
+        // 收藏是保存时的旧快照（没有拼音/图标色调）：索引里有同一条就换成
+        // 索引条目，显示才和正文里的应用一致，同时避免重复行。
+        let entry = rest
+            .iter()
+            .find(|app| same_target(app, &stored))
+            .cloned()
+            .unwrap_or(stored);
+        // 手动隐藏优先于收藏：藏起来的应用不置顶。
+        if is_hidden(&entry) {
+            continue;
+        }
+        if pinned.iter().any(|pin| same_target(pin, &entry)) {
+            continue;
+        }
+        rest.retain(|app| !same_target(app, &entry));
+        pinned.push(entry);
+    }
+    let mut rows = pinned;
+    if show_hidden {
+        // Ctrl+H：已隐藏的排最前（按这个键就是想看/恢复它们）。
+        let (mut hidden_rows, visible): (Vec<Entry>, Vec<Entry>) =
+            rest.into_iter().partition(|entry| is_hidden(entry));
+        hidden_rows.append(&mut rows);
+        hidden_rows.extend(visible);
+        rows = hidden_rows;
+    } else {
+        rows.extend(rest);
+    }
+    let total = rows.len();
+    rows.truncate(take);
+    (rows, total)
+}
+
+/// 书签页空输入的首屏：用过的按 frecency 排前，其余保持名称序。
+/// 必须传**全量索引**（不是 `top(take)`），名称窗口外的常用书签才升得上来；
+/// 历史读不到（锁中毒）时退回名称序——宁可按名称列，也不要整页空白。
+fn bookmark_page_entries(
+    bookmarks: &bookmarks::BookmarkIndex,
+    history: &Arc<Mutex<History>>,
+    take: usize,
+) -> Vec<Entry> {
+    match history.lock() {
+        Ok(history) => bookmarks.used_page(&history, take),
+        Err(_) => bookmarks.top(take),
     }
 }
 
@@ -3056,6 +3494,28 @@ mod tests {
         assert!(!stale_history_entry(&bookmark, &[]), "书签历史不按磁盘存在性判断");
     }
 
+    /// 搜索线程 supervisor:panic 载荷转成可读摘要(&str / String / 其他)。
+    #[test]
+    fn panic_payload_message_is_readable() {
+        let text = std::panic::catch_unwind(|| std::panic::panic_any("搜索线程炸了"))
+            .err()
+            .map(|payload| panic_payload_message(payload.as_ref()))
+            .unwrap_or_default();
+        assert_eq!(text, "搜索线程炸了", "&str 载荷应原样取出");
+
+        let owned = std::panic::catch_unwind(|| std::panic::panic_any(String::from("assert failed")))
+            .err()
+            .map(|payload| panic_payload_message(payload.as_ref()))
+            .unwrap_or_default();
+        assert_eq!(owned, "assert failed", "String 载荷应原样取出");
+
+        let other = std::panic::catch_unwind(|| std::panic::panic_any(42u32))
+            .err()
+            .map(|payload| panic_payload_message(payload.as_ref()))
+            .unwrap_or_default();
+        assert_eq!(other, "未知 panic 载荷", "非字符串载荷回退固定文案");
+    }
+
     /// 测试隔离:测试进程不会拉起提权 worker(cfg(test) 下 spawn_client_thread
     /// 直接拒绝启动),引擎目录也走临时目录,不会触碰真实索引。
     fn test_config() -> crate::config::Config {
@@ -3102,6 +3562,8 @@ mod tests {
             rank: RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -3149,6 +3611,8 @@ mod tests {
             rank: RankConfig::default(),
             show_history: false,
             favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
             base_folder: None,
             browse_root: None,
         };
@@ -3690,4 +4154,292 @@ mod tests {
             );
         }
     }
+
+    fn app_row(id: &str, name: &str, path: &str) -> Entry {
+        Entry {
+            id: id.to_string(),
+            kind: Kind::App,
+            name: name.to_string(),
+            path: Some(std::path::PathBuf::from(path)),
+            size: None,
+            modified: None,
+            pinyin: None,
+            initial: String::new(),
+            tone: 0,
+        }
+    }
+
+    /// 应用页：收藏与索引里的同一条 .lnk 只出现一次（旧版按 id 去重，
+    /// `fav:<path>` 与 `app:<path>` 不相等 → 截图里的两行「微信」），
+    /// 且收藏换成索引条目（保留拼音/图标色调）。
+    #[test]
+    fn app_scope_dedupes_favorite_against_index_entry() {
+        let index = apps::AppIndex {
+            apps: vec![
+                app_row("app:C:\\Start\\微信.lnk", "微信", "C:\\Start\\微信.lnk"),
+                app_row(
+                    "app:C:\\Start\\Notepad.lnk",
+                    "Notepad",
+                    "C:\\Start\\Notepad.lnk",
+                ),
+            ],
+        };
+        // 收藏保存的是旧快照，路径大小写也可能不同。
+        let favorites = vec![crate::assets::Favorite {
+            name: "微信".to_string(),
+            path: "c:\\start\\微信.lnk".to_string(),
+        }];
+        let (rows, total) = app_scope_entries(&index, &favorites, &HashMap::new(), &[], false, 10);
+        assert_eq!(total, 2, "去重后总条数");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "微信");
+        assert_eq!(
+            rows[0].id, "app:C:\\Start\\微信.lnk",
+            "收藏命中索引时应换成索引条目"
+        );
+        assert_eq!(
+            rows.iter().filter(|entry| entry.name == "微信").count(),
+            1,
+            "同一条 .lnk 不能出现两次"
+        );
+        assert_eq!(rows[1].name, "Notepad");
+    }
+
+    /// 应用页首屏只交付 deliver 条，但 total 是完整条数：UI 靠
+    /// `entries.len() < total` 才会在滚到底时发「加载更多」。
+    #[test]
+    fn app_scope_total_counts_all_apps_for_load_more() {
+        let apps_vec: Vec<Entry> = (0..250)
+            .map(|i| {
+                app_row(
+                    &format!("app:C:\\{i}.lnk"),
+                    &format!("App {i:03}"),
+                    &format!("C:\\{i}.lnk"),
+                )
+            })
+            .collect();
+        let index = apps::AppIndex { apps: apps_vec };
+        let (rows, total) = app_scope_entries(&index, &[], &HashMap::new(), &[], false, MIN_DELIVER);
+        assert_eq!(rows.len(), MIN_DELIVER);
+        assert_eq!(total, 250);
+        assert!(
+            rows.len() < total,
+            "首屏少于总数，UI 才能续拉剩下的应用"
+        );
+    }
+
+    /// 隐藏的应用：空列表里不出现（收藏置顶的也一起藏），总数随之减少；
+    /// Ctrl+H（show_hidden=true）时回来并排在最前。
+    #[test]
+    fn app_scope_filters_hidden_apps_unless_revealed() {
+        let index = apps::AppIndex {
+            apps: vec![
+                app_row("app:C:\\Start\\微信.lnk", "微信", "C:\\Start\\微信.lnk"),
+                app_row(
+                    "app:C:\\Start\\Notepad.lnk",
+                    "Notepad",
+                    "C:\\Start\\Notepad.lnk",
+                ),
+                app_row(
+                    "app:C:\\Start\\Everything.lnk",
+                    "Everything",
+                    "C:\\Start\\Everything.lnk",
+                ),
+            ],
+        };
+        // 微信同时是收藏：隐藏优先于收藏置顶。
+        let favorites = vec![crate::assets::Favorite {
+            name: "微信".to_string(),
+            path: "C:\\Start\\微信.lnk".to_string(),
+        }];
+        let hidden = vec!["c:\\start\\微信.lnk".to_string()];
+
+        let (rows, total) = app_scope_entries(&index, &favorites, &HashMap::new(), &hidden, false, 10);
+        assert_eq!(total, 2, "隐藏项不计入总数");
+        let names: Vec<&str> = rows.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["Everything", "Notepad"]);
+
+        let (rows, total) = app_scope_entries(&index, &favorites, &HashMap::new(), &hidden, true, 10);
+        assert_eq!(total, 3);
+        assert_eq!(rows[0].name, "微信", "Ctrl+H 显示时隐藏项排最前");
+        assert_eq!(rows.len(), 3);
+    }
+
+    /// Ctrl+H 排序：多个隐藏项排前面，其余照原顺序跟在后面。
+    #[test]
+    fn app_scope_revealed_hidden_rows_come_first() {
+        let index = apps::AppIndex {
+            apps: vec![
+                app_row("app:C:\\A.lnk", "Alpha", "C:\\A.lnk"),
+                app_row("app:C:\\B.lnk", "Beta", "C:\\B.lnk"),
+                app_row("app:C:\\C.lnk", "Gamma", "C:\\C.lnk"),
+                app_row("app:C:\\D.lnk", "Delta", "C:\\D.lnk"),
+            ],
+        };
+        let hidden = vec!["c:\\b.lnk".to_string(), "c:\\d.lnk".to_string()];
+        let (rows, _total) = app_scope_entries(&index, &[], &HashMap::new(), &hidden, true, 10);
+        let names: Vec<&str> = rows.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["Beta", "Delta", "Alpha", "Gamma"]);
+    }
+
+    fn page_entry(id: &str, kind: Kind, name: &str, path: &str) -> Entry {
+        Entry {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            path: Some(PathBuf::from(path)),
+            size: None,
+            modified: None,
+            pinyin: None,
+            initial: String::new(),
+            tone: 0,
+        }
+    }
+
+    fn secs_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_secs()
+    }
+
+    /// 笔记页专用请求（`notes_response` 只读 query / filters / rank / limit /
+    /// deliver，其余字段给默认值即可）。
+    fn note_request(text: &str, limit: usize, deliver: usize) -> Request {
+        Request {
+            generation: 1,
+            sent_at: Instant::now(),
+            query: Query {
+                raw: text.to_string(),
+                scope: Scope::Note,
+                text: text.to_string(),
+                ext: None,
+                path_filter: None,
+                drives_include: 0,
+                drives_exclude: 0,
+                prefix: None,
+                suffix: None,
+                path_components: None,
+            },
+            limit,
+            deliver,
+            keywords: Vec::new(),
+            dialog_quick: false,
+            filters: SearchFilters::default(),
+            rank: RankConfig::default(),
+            show_history: false,
+            favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
+            base_folder: None,
+            browse_root: None,
+        }
+    }
+
+    /// 书签页空输入要读**全量**索引：用过的书签即使名字排在名称窗口之外，
+    /// 也必须出现在首屏。防的是旧实现 `bookmarks.top(take)`——先按名称截断，
+    /// 首屏永远是 A 开头那几张，常用的 Z 站永远升不上来。
+    #[test]
+    fn bookmark_empty_page_lifts_used_bookmark_outside_the_name_window() {
+        let entries = vec![
+            page_entry("bm:a.example", Kind::Bookmark, "A 站", "https://a.example/"),
+            page_entry("bm:z.example", Kind::Bookmark, "Z 站", "https://z.example/"),
+        ];
+        let mut history = History::in_memory();
+        history.seed(&entries[1], 5, secs_now());
+        let index = bookmarks::BookmarkIndex::for_test(entries);
+        let history = Arc::new(Mutex::new(history));
+
+        let page = bookmark_page_entries(&index, &history, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(
+            page[0].id, "bm:z.example",
+            "用过的书签即使排在名称窗口之外，也要进首屏"
+        );
+    }
+
+    /// 笔记页空输入同样要读全量索引：修改时间最旧但常用的笔记必须排到首屏。
+    /// 防的是旧实现 `notes.top(take)`——只取修改时间前 `take` 条，用过的笔记
+    /// 如果恰好是最旧的几条就永远看不到（`take` 之外的条目直接没进候选）。
+    #[test]
+    fn note_empty_page_lifts_used_note_outside_the_mtime_window() {
+        let rows = vec![
+            page_entry("note:1", Kind::Note, "新笔记 1", "https://note.youdao.com/file/1"),
+            page_entry("note:2", Kind::Note, "新笔记 2", "https://note.youdao.com/file/2"),
+            page_entry("note:3", Kind::Note, "新笔记 3", "https://note.youdao.com/file/3"),
+            page_entry("note:4", Kind::Note, "旧笔记 4", "https://note.youdao.com/file/4"),
+        ];
+        let mut history = History::in_memory();
+        // 最旧的一条恰好最常用。
+        history.seed(&rows[3], 6, secs_now());
+        let index = notes::NoteIndex::for_test(rows);
+        let history = Arc::new(Mutex::new(history));
+        let request = note_request("", 2, 2);
+
+        let response = notes_response(&request, &index, true, &history);
+        assert_eq!(response.total, 4, "total 用真实总数，与截断后的条目数无关");
+        assert_eq!(response.entries.len(), 2);
+        assert_eq!(
+            response.entries[0].id, "note:4",
+            "用过的笔记即使按修改时间排在窗口之外，也要进首屏"
+        );
+    }
+
+    /// 笔记搜索的 `limit` 只许截「尾巴」，不许参与候选收集：四条同名同分笔记
+    /// 里用到过的那条自然序在最后，`limit = 2` 时仍必须排第一。
+    /// 防的是把截断挪到打分之前（如 `title_hits.truncate(limit)`）——那样常用
+    /// 笔记连进 rank 的机会都没有，frecency 再准也提不上来。
+    #[test]
+    fn note_search_limit_truncates_after_ranking() {
+        let rows = vec![
+            page_entry("note:a", Kind::Note, "Rust 一", "https://note.youdao.com/file/a"),
+            page_entry("note:b", Kind::Note, "Rust 二", "https://note.youdao.com/file/b"),
+            page_entry("note:c", Kind::Note, "Rust 三", "https://note.youdao.com/file/c"),
+            page_entry("note:d", Kind::Note, "Rust 四", "https://note.youdao.com/file/d"),
+        ];
+        let mut history = History::in_memory();
+        history.seed(&rows[3], 8, secs_now());
+        let index = notes::NoteIndex::for_test(rows);
+
+        let (hits, total) = index.search(
+            "rust",
+            2,
+            true,
+            Some(&history),
+            &RankConfig::default(),
+        );
+        assert_eq!(total, 4, "total 是全量命中数，不受 limit 影响");
+        assert_eq!(hits.len(), 2, "limit 只截尾巴");
+        assert_eq!(
+            hits[0].id, "note:d",
+            "候选全量进 rank 后再截断，用过的笔记才排得到第一"
+        );
+    }
+
+    /// 笔记页查询的端到端首屏：`notes_response` 必须把历史交给 rank（否则
+    /// frecency 不生效）、`total` 用全量命中数，首屏按 take 截断。
+    #[test]
+    fn note_query_page_lifts_used_note_into_first_page() {
+        let rows = vec![
+            page_entry("note:a", Kind::Note, "Rust 一", "https://note.youdao.com/file/a"),
+            page_entry("note:b", Kind::Note, "Rust 二", "https://note.youdao.com/file/b"),
+            page_entry("note:c", Kind::Note, "Rust 三", "https://note.youdao.com/file/c"),
+            page_entry("note:d", Kind::Note, "Rust 四", "https://note.youdao.com/file/d"),
+        ];
+        let mut history = History::in_memory();
+        history.seed(&rows[3], 8, secs_now());
+        let index = notes::NoteIndex::for_test(rows);
+        let history = Arc::new(Mutex::new(history));
+        let request = note_request("rust", 2, 2);
+
+        let response = notes_response(&request, &index, true, &history);
+        assert_eq!(response.total, 4, "total 必须是全量命中数");
+        assert_eq!(response.entries.len(), 2);
+        assert_eq!(
+            response.entries[0].id, "note:d",
+            "用过的笔记要进首屏第一行"
+        );
+    }
 }
+
+

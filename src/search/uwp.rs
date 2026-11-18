@@ -2,9 +2,11 @@ use crate::model::{Entry, Kind};
 use crate::search::pinyin;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MAX_ENTRIES: usize = 200;
@@ -39,15 +41,47 @@ pub fn load() -> Vec<Entry> {
 }
 
 fn query_start_apps() -> Option<String> {
-    let output = Command::new("powershell")
+    // B16：PowerShell 冷启动/被安全软件拦截时可能长时间不返回；搜索线程是懒启动
+    // UWP 索引的调用方，必须硬超时，否则整条搜索链路会永久「搜索中…」。
+    const TIMEOUT: Duration = Duration::from_secs(8);
+    let mut child = Command::new("powershell")
         .args(["-NoProfile", "-Command", POWERSHELL_SCRIPT])
         .creation_flags(CREATE_NO_WINDOW)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let bytes = reader.join().unwrap_or_default();
+                if !status.success() {
+                    lstr_index::snapshot::debug_log("uwp: Get-StartApps failed (non-zero exit)");
+                    return None;
+                }
+                return String::from_utf8(bytes).ok();
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                lstr_index::snapshot::debug_log(
+                    "uwp: Get-StartApps timed out after 8s; using empty app list",
+                );
+                return None;
+            }
+            Err(_) => return None,
+        }
     }
-    String::from_utf8(output.stdout).ok()
 }
 
 fn entries_from_json(json: &str) -> Vec<Entry> {

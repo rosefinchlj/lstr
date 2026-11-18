@@ -21,10 +21,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::IO::CancelSynchronousIo;
+use windows::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_TERMINATE};
 
 use crate::proto::{self, Frame, TOKEN_LEN};
 use crate::scan::{self, JournalError};
@@ -37,6 +39,12 @@ const FRAME_CHANNEL_CAP: usize = 32;
 /// 无客户端连接的空闲上限:超过即退出。兜底清理「主进程崩溃、没发
 /// Shutdown」留下的提权 worker;正常关闭走 Shutdown 立即退出,不会等这么久。
 const IDLE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 常驻模式(`--index-keep-alive`)下无客户端等待上限:客户端正常退出时
+/// 发 `Detach` 而不是 `Shutdown`,worker 保持索引热态等下一次连接——
+/// 下次启动免 UAC、免 1~3 分钟重建。30 分钟窗口覆盖「关掉再打开」的日常
+/// 使用;超时后仍优雅退出并写 clean-exit 标记(用户注销/关机同样会结束它)。
+const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// 退出看门狗宽限:stop 发出后给卷线程这么久退出;到点仍未退则强制结束
 /// 进程,保证正常退出几秒内 worker 必退(不锁 exe 挡住重编译)。与主进程
@@ -84,6 +92,9 @@ pub struct WorkerOpts {
     pub scan_throttle_ms: u64,
     /// journal 轮询间隔毫秒(usn 增量层;worker 侧二次兜底最小 100)。
     pub journal_poll_ms: u64,
+    /// 会话结束后是否继续常驻（客户端 Detach/退出时保留索引热态）。
+    /// 常驻时无客户端等待期从 120s 延长到 [`KEEP_ALIVE_IDLE_TIMEOUT`]。
+    pub keep_alive: bool,
 }
 
 impl Default for WorkerOpts {
@@ -94,6 +105,7 @@ impl Default for WorkerOpts {
             volumes: None,
             scan_throttle_ms: 0,
             journal_poll_ms: 500,
+            keep_alive: false,
         }
     }
 }
@@ -192,10 +204,14 @@ const MIN_POLL_MS: u64 = 100;
 /// clean-exit 标记文件名(位于 %APPDATA%\lstr\index\)。
 ///
 /// 崩溃自保护:worker 优雅退出时写,启动时「检查即消费」。启动时缺失 =
-/// 上次非正常退出(崩溃/被杀/断电)→ 本次 session 强制纯 dirscan(等价
-/// builtin,零 USN FSCTL),日志说明原因;正常退出后自动恢复。
-/// 防误伤:worker 被杀(用户关机/升级)属常见 —— 只降级一次 session,
-/// 不永久锁死(降级 session 正常退出即重写标记)。
+/// 上次非正常退出(崩溃/被杀/断电)。
+///
+/// P1-5:缺失时不再把整个 session 降级成纯 dirscan。快照 tmp+rename 原子、
+/// 旁车载入会截掉撕裂块,而 [`plan_volume_session`] 还会逐卷校验 journal
+/// 窗口(journal_id 一致且快照游标落在 [first_usn, next_usn] 内);任何
+/// 不可信状态都自动回退该卷全量扫描。整体降级会让「强杀后再启动」把所有
+/// 卷重扫一遍(几十秒),远重于上述已经存在的逐卷兜底。
+/// 只在 engine.log 记录告警,便于排障;正常退出后自动恢复标记。
 const CLEAN_EXIT_FLAG: &str = "worker_clean_exit";
 
 /// clean-exit 标记所在目录(与快照/engine.log 同一状态目录)。
@@ -203,6 +219,15 @@ fn clean_exit_flag_dir() -> Option<std::path::PathBuf> {
     std::env::var("APPDATA")
         .ok()
         .map(|base| std::path::PathBuf::from(base).join("lstr").join("index"))
+}
+
+/// P1-5:上次非正常退出(clean-exit 标记缺失)后,是否把整个 session 降级成
+/// 纯 dirscan(零 USN FSCTL)。保持 `false`:快照原子落盘 + 旁车载入校验 +
+/// [`plan_volume_session`] 的逐卷 journal 窗口校验已经能回退不可信卷;整体
+/// 降级会把「强杀 lstr 后下次启动」变成全卷重扫(几十秒),收益不成比例。
+/// 保留此函数为单点策略开关,并让回归测试可以明确断言当前行为。
+fn unclean_exit_downgrades_journal() -> bool {
+    false
 }
 
 /// 检查并清除标记(检查即消费:本次会话结束无论好坏都要重写)。
@@ -281,6 +306,7 @@ pub fn worker_main() -> i32 {
                 };
             }
             "--index-journal" => parsed.journal = true,
+            "--index-keep-alive" => parsed.keep_alive = true,
             "--index-poll-ms" => {
                 let Some(raw) = args.next() else {
                     crate::snapshot::debug_log("worker: missing --index-poll-ms value");
@@ -327,18 +353,23 @@ pub fn worker_main() -> i32 {
         }
     }
     let mode = parsed.scan_mode;
-    // clean-exit 自保护(见模块下方 CLEAN_EXIT_FLAG 文档):上次非正常退出
-    // → 本次 session 强制纯 dirscan(等价 builtin,零 USN FSCTL),只降级一次。
+    // clean-exit 自保护(见 CLEAN_EXIT_FLAG 文档):上次非正常退出时只记录
+    // 告警,仍启用 USN 增量。快照原子落盘 + 旁车载入校验 + 逐卷 journal
+    // 窗口校验(plan_volume_session 不匹配即回退 Full)负责兜底;整体降级
+    // 为纯 dirscan 会把强杀后的下次启动变成全卷重扫(P1-5)。
     if parsed.journal {
         let unclean = clean_exit_flag_dir()
             .map(|dir| !take_clean_exit_flag(&dir))
-            .unwrap_or(false); // 无法定位状态目录时不降级(防环境问题误伤)
+            .unwrap_or(false); // 无法定位状态目录时按正常处理(防环境问题误伤)
         if unclean {
             crate::snapshot::debug_log(
-                "worker: clean-exit flag missing (last exit unclean) \
-                 → journal disabled this session (pure dirscan)",
+                "worker: clean-exit flag missing (last exit unclean); \
+                 journal kept enabled — per-volume journal window validation \
+                 falls back to full scan when the snapshot cursor is untrusted",
             );
-            parsed.journal = false;
+            if unclean_exit_downgrades_journal() {
+                parsed.journal = false;
+            }
         }
     }
     let journal = parsed.journal;
@@ -351,9 +382,10 @@ pub fn worker_main() -> i32 {
     let _ = OPTS.set(parsed);
     crate::snapshot::debug_log(&format!(
         "worker: opts scan_mode={mode:?} journal={journal} volumes={volumes:?} \
-         poll_ms={} throttle_ms={}",
+         poll_ms={} throttle_ms={} keep_alive={}",
         opts().journal_poll_ms,
         opts().scan_throttle_ms,
+        opts().keep_alive,
     ));
     let Ok(server) = win::create_pipe_server(PIPE_NAME) else {
         // 管道已存在 = 已有 worker 在跑(主进程重拉时可能撞上),静默退出
@@ -378,7 +410,8 @@ impl Worker {
     fn run(&mut self) -> i32 {
         loop {
             // 阻塞的 ConnectNamedPipe 放到独立线程,主线程带超时等待:
-            // 无客户端超过 IDLE_ACCEPT_TIMEOUT 就关闭句柄退出(兜底清理残留)。
+            // 无客户端超过空闲上限就关闭句柄退出(兜底清理残留)。
+            // 常驻模式用 KEEP_ALIVE_IDLE_TIMEOUT,普通模式 120s。
             let (connected_tx, connected_rx) = mpsc::channel::<bool>();
             let addr = self.server.0 as usize;
             let acceptor = std::thread::Builder::new()
@@ -389,13 +422,21 @@ impl Worker {
                     let _ = connected_tx.send(ok);
                 })
                 .ok();
-            let connected = match connected_rx.recv_timeout(IDLE_ACCEPT_TIMEOUT) {
+            let idle_timeout = if opts().keep_alive {
+                KEEP_ALIVE_IDLE_TIMEOUT
+            } else {
+                IDLE_ACCEPT_TIMEOUT
+            };
+            let connected = match connected_rx.recv_timeout(idle_timeout) {
                 Ok(v) => v,
                 Err(_) => {
                     // 空闲超时:没有客户端。accept 线程仍阻塞在 ConnectNamedPipe,
                     // 不做关闭/join(同步句柄上的取消行为不可靠),直接返回让进程退出
                     // —— worker 是独立进程,main 返回即回收所有线程。
-                    crate::snapshot::debug_log("worker: idle timeout, exiting");
+                    crate::snapshot::debug_log(&format!(
+                        "worker: idle timeout (keep_alive={}), exiting",
+                        opts().keep_alive
+                    ));
                     return 0;
                 }
             };
@@ -416,8 +457,8 @@ impl Worker {
             }
             // 触发窗口:仅在「会话结束但未置位 EXIT_AFTER_SESSION」时到达 ——
             // 即主进程崩溃/被杀,管道断开恰落在 try_read_frame 读帧间隙、由
-            // 会话循环末尾的 pipe_alive 兜底检出。重建后等新主进程重连;
-            // 无客户端则 IDLE_ACCEPT_TIMEOUT 兜底退出。
+            // 会话循环末尾的 pipe_alive 兜底检出;或者客户端显式 Detach 常驻。
+            // 重建后等新主进程重连;无客户端则空闲上限兜底退出。
             match win::create_pipe_server(PIPE_NAME) {
                 Ok(s) => self.server = s,
                 Err(_) => {
@@ -579,6 +620,14 @@ fn run_session(client: HANDLE) {
                 }
                 Frame::Shutdown => {
                     EXIT_AFTER_SESSION.store(true, Ordering::Relaxed);
+                    break 'session;
+                }
+                Frame::Detach => {
+                    // 客户端正常退出、但要求保留索引服务:结束本会话,
+                    // 不置 EXIT_AFTER_SESSION → 外层重建管道等待下一次连接。
+                    crate::snapshot::debug_log(
+                        "worker: client detached, staying alive for next session",
+                    );
                     break 'session;
                 }
                 _ => {}
@@ -1353,6 +1402,52 @@ fn write_all(h: HANDLE, mut buf: &[u8]) -> bool {
     true
 }
 
+/// A13:带超时的帧写入(客户端 → worker 的所有写路径)。
+///
+/// 管道写在对端卡死(对端不读/半开)时会无限阻塞,旧实现会把 GUI/搜索线程
+/// 一并拖住。这里把写挪到一次性线程,主线程最多等 `timeout`;超时用
+/// `CancelSynchronousIo` 取消该线程挂起的写并返回 false(调用方按连接失效
+/// 处理)。worker 侧的写帧(worker→client)仍走阻塞实现 —— 背压是设计。
+pub fn write_frame_timed(client: HANDLE, frame: &Frame, timeout: Duration) -> bool {
+    let bytes = frame.encode();
+    let raw = SendHandle(client.0 as isize);
+    let (done_tx, done_rx) = mpsc::channel::<bool>();
+    let tid = Arc::new(AtomicU32::new(0));
+    let tid_in = Arc::clone(&tid);
+    let spawned = std::thread::Builder::new()
+        .name("lstr-pipe-write".to_string())
+        .spawn(move || {
+            let h = HANDLE(raw.0 as *mut core::ffi::c_void);
+            tid_in.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+            let ok = write_all(h, &bytes);
+            let _ = done_tx.send(ok);
+        });
+    if spawned.is_err() {
+        // 起不了线程就退回阻塞写(宁可有极小概率卡住,也不能静默丢帧)。
+        let bytes = frame.encode();
+        return write_all(client, &bytes);
+    }
+    match done_rx.recv_timeout(timeout) {
+        Ok(ok) => ok,
+        Err(_) => {
+            let id = tid.load(Ordering::Acquire);
+            if id != 0 {
+                if let Ok(thread) = unsafe { OpenThread(THREAD_TERMINATE, false, id) } {
+                    unsafe {
+                        let _ = CancelSynchronousIo(thread);
+                        let _ = CloseHandle(thread);
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+/// 跨线程传递句柄的裸值包装(句柄本身是进程内值,跨线程只读使用是安全的)。
+struct SendHandle(isize);
+unsafe impl Send for SendHandle {}
+
 pub fn read_frame_pub(client: HANDLE, timeout: Duration) -> Option<Frame> {
     let deadline = std::time::Instant::now() + timeout;
     let mut len_buf = [0u8; 4];
@@ -1683,7 +1778,7 @@ mod tests {
         assert_eq!(plan_dir_usn_session(None, live), DirUsnPlan::FullScan { sync: false });
     }
 
-    /// clean-exit 标记语义:缺失=上次非正常退出(降级);写→存在;检查即消费。
+    /// clean-exit 标记语义:缺失=上次非正常退出(仅告警,不再整体降级);写→存在;检查即消费。
     #[test]
     fn clean_exit_flag_take_once() {
         let dir = std::env::temp_dir().join(format!("lstr-worker-flag-{}", std::process::id()));
@@ -1691,7 +1786,16 @@ mod tests {
         assert!(!take_clean_exit_flag(&dir), "缺失 → 按上次非正常退出处理");
         write_clean_exit_flag(&dir);
         assert!(take_clean_exit_flag(&dir), "优雅退出写回 → 本 session 信任 USN");
-        assert!(!take_clean_exit_flag(&dir), "消费后必须消失:worker 被杀 → 下次降级一次");
+        assert!(!take_clean_exit_flag(&dir), "消费后必须消失:worker 被杀 → 下次告警一次");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-5:强杀/崩溃后不再整体降级为全卷 dirscan,依赖逐卷 journal 窗口校验。
+    #[test]
+    fn unclean_exit_keeps_journal_enabled() {
+        assert!(
+            !unclean_exit_downgrades_journal(),
+            "P1-5:上次非正常退出不应关闭 journal(全卷重扫代价过大)"
+        );
     }
 }

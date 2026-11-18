@@ -124,6 +124,31 @@ impl NoteIndex {
             .collect()
     }
 
+    /// 笔记页空输入的使用学习排序：用过的按 frecency 排前，其余保持修改时间序。
+    /// 传全量索引（不要先 `top`），修改时间窗口外的常用笔记才升得上来。
+    pub fn used_page(&self, history: &History, take: usize) -> Vec<Entry> {
+        rank::usage_page(self.rows.iter().map(|row| &row.entry), history, take)
+    }
+
+    /// 测试辅助：用给定条目直接建索引，跳过有道云笔记本地库读取。
+    /// 保持传入顺序（生产路径按修改时间降序，测试自己控制「自然序」）；
+    /// 文件夹层级留空（`used_page` / 名称命中都不看它）。
+    #[cfg(test)]
+    pub(crate) fn for_test(entries: Vec<Entry>) -> Self {
+        let rows = entries
+            .into_iter()
+            .map(|entry| NoteRow {
+                entry,
+                folder: String::new(),
+                folder_key: String::new(),
+            })
+            .collect();
+        Self {
+            rows,
+            folders: HashMap::new(),
+        }
+    }
+
     /// 名称/拼音/模糊 + （可选）文件夹路径匹配。
     ///
     /// 返回 `(条目, 命中总数)`；条目已截断到 `limit`，总数用于「加载更多」。
@@ -321,6 +346,12 @@ fn load_one(
         }
         drop(conn);
         let _ = fs::remove_dir_all(&tmp);
+    } else {
+        // B16：整条笔记源静默为空时，至少留一条可诊断日志。
+        lstr_index::snapshot::debug_log(&format!(
+            "notes: skipped {} (open direct/temp copy failed; client may be writing or DB locked)",
+            db.display()
+        ));
     }
 }
 
@@ -842,5 +873,31 @@ mod tests {
                 .all(|row| row.entry.full_path().starts_with(WEB_BASE)),
             "所有条目都必须是可打开的网页深链"
         );
+    }
+
+    #[test]
+    fn used_page_lifts_note_used_outside_the_modified_window() {
+        // 自然序 = 修改时间降序：新笔记, 中间笔记, 旧笔记。
+        let index = index(vec![
+            note_row("新笔记", "", "1", 300),
+            note_row("中间笔记", "", "1", 200),
+            note_row("旧笔记", "", "1", 100),
+        ]);
+        let mut history = History::in_memory();
+        let old = index
+            .rows
+            .iter()
+            .find(|row| row.entry.name == "旧笔记")
+            .expect("旧笔记应存在");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_secs();
+        history.seed(&old.entry, 3, now);
+
+        let page = index.used_page(&history, 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].name, "旧笔记", "用过的笔记必须排到修改时间窗口之前");
+        assert_eq!(page[1].name, "新笔记", "没用过的仍按修改时间序");
     }
 }

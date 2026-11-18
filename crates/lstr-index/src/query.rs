@@ -474,6 +474,33 @@ const CANCEL_CHECK_MASK: usize = CANCEL_CHECK_EVERY - 1;
 /// 到达上限即停止计数(收集仍照常封顶 candidate_cap)。
 pub const TOTAL_CAP: usize = 100_000;
 
+/// B5:空 token(纯过滤)查询的计数预算。这类查询里所有条目都能通过名字
+/// 过滤,逐条计数到 TOTAL_CAP 会让每次筛选变更都近似全卷扫描(实测
+/// p50 81ms / max 363ms);而且 Folders 计数几乎撞不到 10 万,split 的
+/// 合并遍历会被拖到卷尾。降到 2 万并在扫到该数量候选时直接停扫,
+/// total 变为下界——UI 用 `Response.total_rough` 标注「N+」并提示
+/// 「筛选较宽,输入关键词可缩小范围」。
+pub const FILTER_ONLY_TOTAL_CAP: usize = 20_000;
+
+/// 本次查询的计数预算:B5 的纯过滤查询用更小的 `FILTER_ONLY_TOTAL_CAP`。
+pub fn total_budget_for(spec: &QuerySpec) -> usize {
+    if spec.tokens.is_empty() && spec.regex.is_none() {
+        FILTER_ONLY_TOTAL_CAP
+    } else {
+        TOTAL_CAP
+    }
+}
+
+/// A8:本次查询的 `total` 是否只是**下界**——扫描在计数预算处提前停止,
+/// 后面可能还有命中没数。空 token 纯过滤查询用
+/// [`FILTER_ONLY_TOTAL_CAP`](B5),其余用 [`TOTAL_CAP`];`exact` 查询不限量、
+/// 始终精确(与 `query_volume_cancel` 的 `unbounded` 判定一致)。
+pub fn total_is_lower_bound(spec: &QuerySpec, total: usize) -> bool {
+    let has_tokens = spec.tokens.iter().any(|t| !t.is_empty());
+    let unbounded = has_tokens && spec.exact.is_some();
+    !unbounded && total >= total_budget_for(spec)
+}
+
 #[inline]
 fn cancelled(cancel: Option<u64>) -> bool {
     matches!(cancel, Some(my) if CANCEL_GEN.load(Ordering::Relaxed) != my)
@@ -584,6 +611,12 @@ pub struct Hit {
 pub struct QueryOutcome {
     pub hits: Vec<Hit>,
     pub total: usize,
+    /// A8:total 是「计数预算内下界」——扫描在 [`TOTAL_CAP`] /
+    /// [`FILTER_ONLY_TOTAL_CAP`] 处提前停止,total 不再精确。调用方应把它
+    /// 当作「N+」展示,而不是把下界当精确值(可用
+    /// [`total_is_lower_bound`] 复核)。`capped` 仍表示收集被
+    /// candidate_cap 截断。
+    pub total_capped: bool,
     /// 因 candidate_cap 提前截断(total 仍精确,仅收集截断)。
     pub capped: bool,
     /// 新查询已到达,本次查询被提前中止(hits/total 均为部分结果,调用方应丢弃)。
@@ -837,6 +870,9 @@ pub(crate) fn query_volume_cancel(
     // 一致的条目本来就少,旧实现直接返回全部;wfn 补齐依赖这个行为)。
     let unbounded = !tokens.is_empty() && spec.exact.is_some();
     let cap_eff = if unbounded { usize::MAX } else { cap };
+    // B5:纯过滤查询(空 token)用更小的计数预算,避免每次筛选变更都数到
+    // TOTAL_CAP 才停;total 变为下界,由调用方用 Response.total_rough 标注。
+    let total_budget = total_budget_for(spec);
     let mut slots: Vec<u32> = Vec::with_capacity(256);
     let mut total = 0usize;
     let mut capped = false;
@@ -849,7 +885,7 @@ pub(crate) fn query_volume_cancel(
         cancel,
         &mut |slot| {
         total += 1;
-        if !unbounded && total >= TOTAL_CAP {
+        if !unbounded && total >= total_budget {
             return false; // total 已到显示上限,停止扫描(收集也随之中止)
         }
         if slots.len() < cap_eff {
@@ -925,6 +961,13 @@ pub(crate) fn query_volume_split_cancel(
     }
     let tokens = query_tokens(spec);
     let match_matcher = MatchMatcher::new(spec);
+    // B5:纯过滤查询(空 token)把计数预算降到 FILTER_ONLY_TOTAL_CAP,并在
+    // 扫到同样数量的候选后直接停——否则 Folders 计数几乎撞不到 10 万,
+    // 合并遍历会被拖到卷尾(等价于全卷扫描)。total 变为下界,由调用方用
+    // Response.total_rough 提示「N+」。
+    let total_budget = total_budget_for(spec);
+    let filter_only = total_budget < TOTAL_CAP;
+    let mut seen = 0usize;
     let mut all_slots: Vec<u32> = Vec::with_capacity(256);
     let mut folder_slots: Vec<u32> = Vec::with_capacity(256);
     let mut total_all = 0usize;
@@ -942,18 +985,24 @@ pub(crate) fn query_volume_split_cancel(
         if all_done && folder_done {
             return false;
         }
+        if filter_only {
+            if seen >= total_budget {
+                return false; // B5:够数即停,不再为精确 total 扫全卷
+            }
+            seen += 1;
+        }
         let is_dir = store.is_dir(slot);
         if !all_done {
             total_all += 1;
-            if total_all >= TOTAL_CAP {
-                all_done = true; // 与旧 All 查询一致:第 TOTAL_CAP 条只计数不收集
+            if total_all >= total_budget {
+                all_done = true; // 与旧 All 查询一致:第 total_budget 条只计数不收集
             } else if all_slots.len() < all_cap {
                 all_slots.push(slot);
             }
         }
         if is_dir && !folder_done {
             total_folders += 1;
-            if total_folders >= TOTAL_CAP {
+            if total_folders >= total_budget {
                 folder_done = true;
             } else if folder_slots.len() < folder_cap {
                 folder_slots.push(slot);
@@ -1909,6 +1958,32 @@ mod tests {
         assert_eq!(total_folders, 60_000, "Folders 计数未撞上限,应精确");
         assert_eq!(all_slots.len(), 1000);
         assert_eq!(folder_slots.len(), 1000);
+    }
+
+    #[test]
+    fn filter_only_counts_are_bounded() {
+        // B5:空 token(纯过滤)查询不能为了精确 total 扫全卷。构造 4 万条
+        // 目录+文件,split/single 都应在 FILTER_ONLY_TOTAL_CAP 处停。
+        let mut s = VolumeStore::new(Default::default(), 'C');
+        s.insert(5, 0, 0x10, b"root");
+        for i in 0..40_000u64 {
+            let attrs = if i % 2 == 0 { 0x10 } else { 0 };
+            s.insert(1000 + i, 5, attrs, format!("b_{i:06}.bin").as_bytes());
+        }
+        s.compact();
+        let spec = QuerySpec::default(); // 空 tokens = 纯过滤
+        let (_all, _folders, total_all, total_folders, aborted) =
+            query_volume_split_cancel(&s, &spec, 100, 100, None);
+        assert!(!aborted);
+        assert_eq!(
+            total_all, FILTER_ONLY_TOTAL_CAP,
+            "纯过滤 split 应在预算处停扫,total 作为下界"
+        );
+        assert!(total_folders <= total_all);
+        let (slots, total, _capped, aborted) = query_volume_cancel(&s, &spec, 100, None);
+        assert!(!aborted);
+        assert_eq!(total, FILTER_ONLY_TOTAL_CAP, "纯过滤 single 也应停在预算处");
+        assert_eq!(slots.len(), 100);
     }
 
     #[test]
