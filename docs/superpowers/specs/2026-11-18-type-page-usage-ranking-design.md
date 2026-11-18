@@ -167,3 +167,9 @@ pub fn usage_page<'a>(
   - `Scope::All` 非文件来源 `source_fetch = usize::MAX` 并删除 `truncate(source_take)`；
 - `README.md`：「书签」「笔记」页空输入说明补一句「按最近使用排序（学习）」；
 - 完成后补「实施记录」小节，并跑 `cargo test` / `cargo build`。
+
+## 实施记录
+
+- 2026-11-18：`rank::usage_page` + `BookmarkIndex::used_page` / `NoteIndex::used_page`；
+  书签页、笔记页空输入改为使用历史排序；应用 / 书签 / 「全部」页非文件来源取消打分前截断；
+  `notes_response` 非空分支改为全量进 rank。README 同步。
