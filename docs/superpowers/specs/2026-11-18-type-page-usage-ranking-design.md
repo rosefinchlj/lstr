@@ -1,7 +1,7 @@
 # 类型页使用学习排序设计（先全量、后打分、再截断）
 
 日期：2026-11-18
-状态：已获用户批准（2026-11-18），待实施
+状态：已实施（2026-11-18）
 
 ## 背景与目标
 
@@ -114,6 +114,9 @@ pub fn usage_page<'a>(
 - `Scope::Note`（`notes_response`）：非空分支不再用 `take` 作为 `notes.search` 的 `limit`
   上限，改传 `usize::MAX`（严格模式原本就是）；`notes.search` 内部 rank 后返回全部命中，
   `notes_response` 末尾再 `truncate(take)`。这样 frecency / query_hits 能作用到全部命中。
+- 注意 `notes.search` 里只有**名称命中**走 `rank::rank_with`；**文件夹路径命中**（名称不含
+  查询词的条目）不参与打分，按修改时间倒序追加在名称命中之后，再整体截断到 `limit`。
+  也就是说「全量进 rank」指的是名称命中这一路，文件夹命中的次序仍是修改时间。
 - `Scope::All` 的非文件来源：`source_fetch` 改为 `usize::MAX`（不再受 `source_take` 限制），
   并删掉 `src/search.rs:2889`、`2911` 及笔记处的 `truncate(source_take)`。文件候选的
   `fetch` / `folder_fetch` / `file_fetch` 预算**保持不变**。
@@ -127,9 +130,14 @@ pub fn usage_page<'a>(
   对高分条目并列——稳定排序会保持 `usage_page` 给出的次序（用过的恒在未用过的之上，因为
   未用过 score=0）。因此两段排序不会互相打架，无需给 `usage_page` 加特例。
 - 收藏置顶（`pin_favorites`）、精确同名置顶、按 id 小写去重、同名保留规则全部不变。
-- `total` 口径不变（仍为全量匹配数 / `count()`），`entries` 只交付 `deliver` 条，UI 的
-  「加载更多」继续按 `total` 工作；「全部」页的 `total` 会变大（非文件来源不再只数窗口内
-  的条数），这是修正而非回归。
+- `total` 口径不变：仍是全量匹配数 / `count()`，`entries` 只交付 `deliver` 条，UI 的
+  「加载更多」继续按 `total` 工作。
+  - 「全部」页里非文件来源的 `total` 在**非严格匹配**下会比以前略大：旧代码
+    `source_fetch = if strict { usize::MAX } else { source_take }`，非严格时
+    `apps.search` / `bookmarks.search` / `notes.search` 先截到窗口大小，随后
+    `total += hits.len()` 数的就是被窗口封顶后的条数；现在取全量后 `total` 反映真实匹配
+    数。严格匹配旧代码本来就是 `usize::MAX`，`total` 不变。
+  - 这是修正而非回归：之前总数偏小，滚动到底也「加载」不出窗口外的匹配。
 
 ### 5. 边界与回退
 
@@ -165,7 +173,8 @@ pub fn usage_page<'a>(
   - 非空 App、Bookmark 删除 `truncate(take)`；
   - `notes_response` 空输入改 `used_page`，非空分支 `limit` 传 `usize::MAX`；
   - `Scope::All` 非文件来源 `source_fetch = usize::MAX` 并删除 `truncate(source_take)`；
-- `README.md`：「书签」「笔记」页空输入说明补一句「按最近使用排序（学习）」；
+- `README.md`：「书签」条目补一句「空输入按最近使用排序：用过的在前，其余按名称」；
+  README 没有「笔记」页小节，这部分不涉及；
 - 完成后补「实施记录」小节，并跑 `cargo test` / `cargo build`。
 
 ## 实施记录
