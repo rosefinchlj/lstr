@@ -2721,11 +2721,16 @@ fn run_worker(args: WorkerArgs) {
             } else if request.query.scope == Scope::Command {
                 entries = commands("", &config.commands);
             } else if request.query.scope == Scope::Bookmark {
-                // 书签页空输入 = 按名称列出全部书签（与应用页「空输入列应用」一致）；
-                // 取 deliver 而不是 limit：几百条书签也能滚到底「加载更多」。
+                // 书签页空输入 = 全部书签按「最近使用」排序（用过的在前，其余按
+                // 名称），与应用页空输入的学习语义一致；取 deliver 而不是 limit，
+                // 几百条书签也能滚到底「加载更多」。
+                let take = request.deliver.max(request.limit);
                 entries = if bookmarks_enabled.load(Ordering::Relaxed) {
                     scope_total = Some(bookmarks.count());
-                    bookmarks.top(request.deliver.max(request.limit))
+                    match history.lock() {
+                        Ok(history) => bookmarks.used_page(&history, take),
+                        Err(_) => bookmarks.top(take),
+                    }
                 } else {
                     Vec::new()
                 };
@@ -2756,7 +2761,10 @@ fn run_worker(args: WorkerArgs) {
                     if bookmarks_enabled.load(Ordering::Relaxed) {
                         if request.query.text.is_empty() {
                             total = bookmarks.count();
-                            entries = bookmarks.top(take);
+                            entries = match history.lock() {
+                                Ok(history) => bookmarks.used_page(&history, take),
+                                Err(_) => bookmarks.top(take),
+                            };
                         } else {
                             // P2-4：先取全量匹配再按 take 截断，total 用真实匹配数
                             // （书签总量小，全量过滤可承受）。
