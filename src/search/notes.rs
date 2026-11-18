@@ -130,6 +130,25 @@ impl NoteIndex {
         rank::usage_page(self.rows.iter().map(|row| &row.entry), history, take)
     }
 
+    /// 测试辅助：用给定条目直接建索引，跳过有道云笔记本地库读取。
+    /// 保持传入顺序（生产路径按修改时间降序，测试自己控制「自然序」）；
+    /// 文件夹层级留空（`used_page` / 名称命中都不看它）。
+    #[cfg(test)]
+    pub(crate) fn for_test(entries: Vec<Entry>) -> Self {
+        let rows = entries
+            .into_iter()
+            .map(|entry| NoteRow {
+                entry,
+                folder: String::new(),
+                folder_key: String::new(),
+            })
+            .collect();
+        Self {
+            rows,
+            folders: HashMap::new(),
+        }
+    }
+
     /// 名称/拼音/模糊 + （可选）文件夹路径匹配。
     ///
     /// 返回 `(条目, 命中总数)`；条目已截断到 `limit`，总数用于「加载更多」。

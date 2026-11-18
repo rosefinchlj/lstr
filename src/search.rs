@@ -2731,10 +2731,7 @@ fn run_worker(args: WorkerArgs) {
                 let take = request.deliver.max(request.limit);
                 entries = if bookmarks_enabled.load(Ordering::Relaxed) {
                     scope_total = Some(bookmarks.count());
-                    match history.lock() {
-                        Ok(history) => bookmarks.used_page(&history, take),
-                        Err(_) => bookmarks.top(take),
-                    }
+                    bookmark_page_entries(&bookmarks, &history, take)
                 } else {
                     Vec::new()
                 };
@@ -2743,10 +2740,9 @@ fn run_worker(args: WorkerArgs) {
         } else {
             match request.query.scope {
                 Scope::App => {
-                    // B2：应用页同样按 deliver 取数，滚到底「加载更多」才能真的
-                    // 加载出后面的应用。P2-4：total 必须是全量匹配数；候选全量
-                    // 进 finalize 打分，frecency / query_hits 才能把窗口外的常用
-                    // 应用提上来，最终由 finalize 按 deliver 截断。
+                    // B2：应用页同样取全量候选：`total` 必须是全量匹配数；候选
+                    // 全量进入 finalize 打分，frecency / query_hits 才能把窗口外
+                    // 的常用应用提上来，最后由 finalize 按 deliver 截断。
                     let matches: Vec<Entry> = apps
                         .search(&request.query.text, usize::MAX)
                         .into_iter()
@@ -2762,10 +2758,7 @@ fn run_worker(args: WorkerArgs) {
                     if bookmarks_enabled.load(Ordering::Relaxed) {
                         if request.query.text.is_empty() {
                             total = bookmarks.count();
-                            entries = match history.lock() {
-                                Ok(history) => bookmarks.used_page(&history, take),
-                                Err(_) => bookmarks.top(take),
-                            };
+                            entries = bookmark_page_entries(&bookmarks, &history, take);
                         } else {
                             // P2-4：先取全量匹配，total 用真实匹配数（书签总量小，
                             // 全量过滤可承受）；候选全量进 finalize 打分，由 finalize
@@ -3240,6 +3233,20 @@ fn app_scope_entries(
     let total = rows.len();
     rows.truncate(take);
     (rows, total)
+}
+
+/// 书签页空输入的首屏：用过的按 frecency 排前，其余保持名称序。
+/// 必须传**全量索引**（不是 `top(take)`），名称窗口外的常用书签才升得上来；
+/// 历史读不到（锁中毒）时退回名称序——宁可按名称列，也不要整页空白。
+fn bookmark_page_entries(
+    bookmarks: &bookmarks::BookmarkIndex,
+    history: &Arc<Mutex<History>>,
+    take: usize,
+) -> Vec<Entry> {
+    match history.lock() {
+        Ok(history) => bookmarks.used_page(&history, take),
+        Err(_) => bookmarks.top(take),
+    }
 }
 
 /// 历史条目是否已失效（空查询展示前过滤）：
@@ -4273,6 +4280,165 @@ mod tests {
         let (rows, _total) = app_scope_entries(&index, &[], &HashMap::new(), &hidden, true, 10);
         let names: Vec<&str> = rows.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, vec!["Beta", "Delta", "Alpha", "Gamma"]);
+    }
+
+    fn page_entry(id: &str, kind: Kind, name: &str, path: &str) -> Entry {
+        Entry {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            path: Some(PathBuf::from(path)),
+            size: None,
+            modified: None,
+            pinyin: None,
+            initial: String::new(),
+            tone: 0,
+        }
+    }
+
+    fn secs_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_secs()
+    }
+
+    /// 笔记页专用请求（`notes_response` 只读 query / filters / rank / limit /
+    /// deliver，其余字段给默认值即可）。
+    fn note_request(text: &str, limit: usize, deliver: usize) -> Request {
+        Request {
+            generation: 1,
+            sent_at: Instant::now(),
+            query: Query {
+                raw: text.to_string(),
+                scope: Scope::Note,
+                text: text.to_string(),
+                ext: None,
+                path_filter: None,
+                drives_include: 0,
+                drives_exclude: 0,
+                prefix: None,
+                suffix: None,
+                path_components: None,
+            },
+            limit,
+            deliver,
+            keywords: Vec::new(),
+            dialog_quick: false,
+            filters: SearchFilters::default(),
+            rank: RankConfig::default(),
+            show_history: false,
+            favorites: Vec::new(),
+            hidden: Vec::new(),
+            show_hidden: false,
+            base_folder: None,
+            browse_root: None,
+        }
+    }
+
+    /// 书签页空输入要读**全量**索引：用过的书签即使名字排在名称窗口之外，
+    /// 也必须出现在首屏。防的是旧实现 `bookmarks.top(take)`——先按名称截断，
+    /// 首屏永远是 A 开头那几张，常用的 Z 站永远升不上来。
+    #[test]
+    fn bookmark_empty_page_lifts_used_bookmark_outside_the_name_window() {
+        let entries = vec![
+            page_entry("bm:a.example", Kind::Bookmark, "A 站", "https://a.example/"),
+            page_entry("bm:z.example", Kind::Bookmark, "Z 站", "https://z.example/"),
+        ];
+        let mut history = History::in_memory();
+        history.seed(&entries[1], 5, secs_now());
+        let index = bookmarks::BookmarkIndex::for_test(entries);
+        let history = Arc::new(Mutex::new(history));
+
+        let page = bookmark_page_entries(&index, &history, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(
+            page[0].id, "bm:z.example",
+            "用过的书签即使排在名称窗口之外，也要进首屏"
+        );
+    }
+
+    /// 笔记页空输入同样要读全量索引：修改时间最旧但常用的笔记必须排到首屏。
+    /// 防的是旧实现 `notes.top(take)`——只取修改时间前 `take` 条，用过的笔记
+    /// 如果恰好是最旧的几条就永远看不到（`take` 之外的条目直接没进候选）。
+    #[test]
+    fn note_empty_page_lifts_used_note_outside_the_mtime_window() {
+        let rows = vec![
+            page_entry("note:1", Kind::Note, "新笔记 1", "https://note.youdao.com/file/1"),
+            page_entry("note:2", Kind::Note, "新笔记 2", "https://note.youdao.com/file/2"),
+            page_entry("note:3", Kind::Note, "新笔记 3", "https://note.youdao.com/file/3"),
+            page_entry("note:4", Kind::Note, "旧笔记 4", "https://note.youdao.com/file/4"),
+        ];
+        let mut history = History::in_memory();
+        // 最旧的一条恰好最常用。
+        history.seed(&rows[3], 6, secs_now());
+        let index = notes::NoteIndex::for_test(rows);
+        let history = Arc::new(Mutex::new(history));
+        let request = note_request("", 2, 2);
+
+        let response = notes_response(&request, &index, true, &history);
+        assert_eq!(response.total, 4, "total 用真实总数，与截断后的条目数无关");
+        assert_eq!(response.entries.len(), 2);
+        assert_eq!(
+            response.entries[0].id, "note:4",
+            "用过的笔记即使按修改时间排在窗口之外，也要进首屏"
+        );
+    }
+
+    /// 笔记搜索的 `limit` 只许截「尾巴」，不许参与候选收集：四条同名同分笔记
+    /// 里用到过的那条自然序在最后，`limit = 2` 时仍必须排第一。
+    /// 防的是把截断挪到打分之前（如 `title_hits.truncate(limit)`）——那样常用
+    /// 笔记连进 rank 的机会都没有，frecency 再准也提不上来。
+    #[test]
+    fn note_search_limit_truncates_after_ranking() {
+        let rows = vec![
+            page_entry("note:a", Kind::Note, "Rust 一", "https://note.youdao.com/file/a"),
+            page_entry("note:b", Kind::Note, "Rust 二", "https://note.youdao.com/file/b"),
+            page_entry("note:c", Kind::Note, "Rust 三", "https://note.youdao.com/file/c"),
+            page_entry("note:d", Kind::Note, "Rust 四", "https://note.youdao.com/file/d"),
+        ];
+        let mut history = History::in_memory();
+        history.seed(&rows[3], 8, secs_now());
+        let index = notes::NoteIndex::for_test(rows);
+
+        let (hits, total) = index.search(
+            "rust",
+            2,
+            true,
+            Some(&history),
+            &RankConfig::default(),
+        );
+        assert_eq!(total, 4, "total 是全量命中数，不受 limit 影响");
+        assert_eq!(hits.len(), 2, "limit 只截尾巴");
+        assert_eq!(
+            hits[0].id, "note:d",
+            "候选全量进 rank 后再截断，用过的笔记才排得到第一"
+        );
+    }
+
+    /// 笔记页查询的端到端首屏：`notes_response` 必须把历史交给 rank（否则
+    /// frecency 不生效）、`total` 用全量命中数，首屏按 take 截断。
+    #[test]
+    fn note_query_page_lifts_used_note_into_first_page() {
+        let rows = vec![
+            page_entry("note:a", Kind::Note, "Rust 一", "https://note.youdao.com/file/a"),
+            page_entry("note:b", Kind::Note, "Rust 二", "https://note.youdao.com/file/b"),
+            page_entry("note:c", Kind::Note, "Rust 三", "https://note.youdao.com/file/c"),
+            page_entry("note:d", Kind::Note, "Rust 四", "https://note.youdao.com/file/d"),
+        ];
+        let mut history = History::in_memory();
+        history.seed(&rows[3], 8, secs_now());
+        let index = notes::NoteIndex::for_test(rows);
+        let history = Arc::new(Mutex::new(history));
+        let request = note_request("rust", 2, 2);
+
+        let response = notes_response(&request, &index, true, &history);
+        assert_eq!(response.total, 4, "total 必须是全量命中数");
+        assert_eq!(response.entries.len(), 2);
+        assert_eq!(
+            response.entries[0].id, "note:d",
+            "用过的笔记要进首屏第一行"
+        );
     }
 }
 

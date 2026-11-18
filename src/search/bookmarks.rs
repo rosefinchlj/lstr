@@ -89,8 +89,9 @@ impl BookmarkIndex {
             .collect()
     }
 
-    /// 书签页空输入：按名称列出前 `limit` 条（加载时已按名称排序）。
-    /// 与「应用」页的空输入语义一致，不掺历史/常用排序。
+    /// 按名称列出前 `limit` 条（加载时已按名称排序，不读历史）。
+    /// 只用作空输入的**兜底**顺序：正常路径见 [`Self::used_page`]（读过历史，
+    /// 用过的按 frecency 排前），本方法留给历史读不到（锁中毒）时的降级场景。
     pub fn top(&self, limit: usize) -> Vec<Entry> {
         self.marks.iter().take(limit).cloned().collect()
     }
@@ -99,6 +100,22 @@ impl BookmarkIndex {
     /// 传全量索引（不要先 `top`），名称窗口外的常用书签才升得上来。
     pub fn used_page(&self, history: &History, take: usize) -> Vec<Entry> {
         rank::usage_page(self.marks.iter(), history, take)
+    }
+
+    /// 测试辅助：用给定条目直接建索引，跳过浏览器收藏夹读取。
+    /// 保持传入顺序（生产路径按名称升序，测试自己控制「自然序」）；
+    /// `urls` 由条目路径推出，`folders` 留空（`used_page` 不看这两个）。
+    #[cfg(test)]
+    pub(crate) fn for_test(entries: Vec<Entry>) -> Self {
+        let urls = entries
+            .iter()
+            .map(|entry| entry.full_path().to_lowercase())
+            .collect();
+        Self {
+            marks: entries,
+            urls,
+            folders: Vec::new(),
+        }
     }
 
     /// 名称/拼音/模糊/URL 匹配。空查询返回空（空输入展示「最近使用」）。

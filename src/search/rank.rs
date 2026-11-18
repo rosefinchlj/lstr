@@ -233,6 +233,11 @@ pub fn score_entry_planned(
 ///
 /// 必须在**全量候选**上调用：调用方不要把 `top(take)` 的结果传进来，否则名称
 /// / 时间窗口之外的常用条目仍然升不上来（这正是本函数要修的问题）。
+///
+/// 「用过的全部排在没用过的之前」是硬约定，不是巧合：调用方拿到的结果之后
+/// 还会再 `truncate` 到更小的 `take`（请求参数变化、上层二次截断都可能），只要
+/// 每个 used 条目先于任何 unused，任何更小的截断都只会削掉没用过的尾部，绝不
+/// 会把已经用过、本该浮上来的条目挤出去。
 pub fn usage_page<'a>(
     items: impl IntoIterator<Item = &'a Entry>,
     history: &History,
@@ -1224,5 +1229,40 @@ mod tests {
             usage_page(entries.iter(), &history, 0).is_empty(),
             "take=0 必须返回空"
         );
+    }
+
+    /// 边界：`take` 大于候选数、空候选、frecency 同分。同分必须按自然序而不是
+    /// 反过来——类型页书签按名称、笔记按修改时间，用户对这两条自然序有预期。
+    #[test]
+    fn usage_page_edges_and_ties() {
+        let now = now();
+        let used = history(&[("b", 3, now)]);
+        let entries = vec![
+            entry("a", "Alpha", Kind::File),
+            entry("b", "Beta", Kind::File),
+        ];
+        let page = usage_page(entries.iter(), &used, 10);
+        let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Beta", "Alpha"], "take 超过候选数时全部返回，used 仍在前");
+
+        assert!(
+            usage_page(std::iter::empty::<&Entry>(), &used, 5).is_empty(),
+            "空候选时间页为空"
+        );
+        assert!(
+            usage_page(std::iter::empty::<&Entry>(), &used, 0).is_empty(),
+            "空候选 + take=0 也不能 panic"
+        );
+
+        // 两条用得一样多、一样新：同分按自然序（Alpha 在 Gamma 前）。
+        let tied = history(&[("a", 2, now), ("c", 2, now)]);
+        let entries = vec![
+            entry("a", "Alpha", Kind::File),
+            entry("b", "Beta", Kind::File),
+            entry("c", "Gamma", Kind::File),
+        ];
+        let page = usage_page(entries.iter(), &tied, 3);
+        let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "Gamma", "Beta"], "同分保持自然序，未用过的跟在后面");
     }
 }
