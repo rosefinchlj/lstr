@@ -120,6 +120,21 @@ pub fn mono_font(size: f32) -> FontId {
     FontId::new(size * TEXT_SCALE, FontFamily::Monospace)
 }
 
+/// galley 的墨迹范围（相对 galley 左上角）。
+///
+/// `Galley::size()` 是排版盒：行高里含 ascent/descent 和行距留白，同一字号下
+/// 「Tab」的墨迹只有 9px 高、旁边的中文标签却有 13px。两边都按盒子居中，键帽里
+/// 的字母/箭头就会比标签高 2px，看起来就是「图标和文字没对齐」。
+/// `mesh_bounds` 是所有字形四边形的并集（渲染时用的就是这批顶点），按它的中心
+/// 对齐才是光学居中。全是空白的串没有字形，退回排版盒免得位置退化成 0。
+pub fn ink_rect(galley: &egui::Galley) -> egui::Rect {
+    if galley.mesh_bounds.is_negative() {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, galley.size())
+    } else {
+        galley.mesh_bounds
+    }
+}
+
 /// 图标字号。和同号文本用同一套缩放，但固定落在 ICON_FAMILY 上。
 pub fn icon_font(size: f32) -> FontId {
     FontId::new(size * TEXT_SCALE, FontFamily::Name(ICON_FAMILY.into()))

@@ -3,3 +3,5 @@ __pycache__/
 target-opt/
 # 本机代理/工作树临时产物，不发布
 .agents/
+# 本地评审截图/日志，不发布
+.review2/

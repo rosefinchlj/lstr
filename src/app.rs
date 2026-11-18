@@ -293,7 +293,12 @@ const HELP_TOP_PAD: f32 = 14.0;
 const HELP_TITLE_H: f32 = 24.0;
 const HELP_GROUP_HEAD_H: f32 = 21.0;
 const HELP_ROW_H: f32 = 19.0;
-const HELP_GROUP_GAP: f32 = 8.0;
+/// 卡片内边距与卡片间距：面板做成等宽等高的卡片网格——每张卡片的
+/// 宽高都能提前算出来，内容少的卡片直接留白，不会一块高一块矮。
+const HELP_CARD_PAD_X: f32 = 12.0;
+const HELP_CARD_PAD_Y: f32 = 10.0;
+const HELP_CARD_GAP_X: f32 = 18.0;
+const HELP_CARD_GAP_Y: f32 = 20.0;
 /// Tab 行右端「系统盘权重」控件总宽（标签 + 滑轨 + 数值槽）。
 /// 数值槽固定成「不检索」的宽度：否则 99→100 多一位数字会把滑轨右边界
 /// 顶左，拖到端点时圆点会跟着跳一下。
@@ -1590,19 +1595,122 @@ impl ConditionHistory {
     }
 }
 
-/// 空查询帮助面板的内容高度（相对列表顶部）：宽窗口两列，以较高的左列
-/// 为准；窄窗口退化为单列顺排，两列内容相加。
-fn help_panel_height(width: f32) -> f32 {
-    let group = |rows: f32| HELP_GROUP_HEAD_H + rows * HELP_ROW_H + HELP_GROUP_GAP;
-    // 左列：位置 5 行（盘符 2 + 路径 2 + 分段）/ 筛选 6 行（日期、大小、
-    // 条件编辑、撤回…）/ 范围与搜索 4 行。行数必须与 `syntax` 表一致，否则末行被裁。
-    let left = group(5.0) + group(6.0) + group(4.0);
-    let head = HELP_TOP_PAD + HELP_TITLE_H;
-    if width >= 560.0 {
-        head + left
+/// 「搜索技巧」面板的一行：左边是打进去/按下的东西，右边是它的作用。
+///
+/// 这张表就是面板上显示的全部文字——界面、窗口定高、列宽都从它推出来。
+/// 之前文字与行数是两份手抄的（`syntax` 表 + `help_panel_height` 里的
+/// 5/6/4），改一处忘一处就会裁掉末行；`g rust` 也被写成了「全部当搜索词」，
+/// 而它其实是 Google 网页搜索关键字（默认还有 b/bd/gh/so）。
+struct HelpRow {
+    key: &'static str,
+    desc: &'static str,
+}
+
+/// 面板的一个分组（标题 + 若干行）。分组不跨列：列边界只落在分组之间，
+/// 无论窗口多窄都读得通。
+struct HelpGroup {
+    title: &'static str,
+    rows: &'static [HelpRow],
+}
+
+const HELP_GROUPS: &[HelpGroup] = &[
+    HelpGroup {
+        title: "范围",
+        rows: &[
+            HelpRow { key: "a 微信", desc: "只搜应用" },
+            HelpRow { key: "f 报告", desc: "只搜文件" },
+            HelpRow { key: "> ipconfig", desc: "只搜命令" },
+            HelpRow { key: "g rust", desc: "Google 搜网页" },
+            HelpRow { key: "b rust", desc: "Bing 搜网页" },
+            HelpRow { key: "Alt+←", desc: "上一个范围" },
+        ],
+    },
+    HelpGroup {
+        title: "位置",
+        rows: &[
+            HelpRow { key: "c: d:", desc: "限定盘符" },
+            HelpRow { key: "-c:", desc: "排除盘符" },
+            HelpRow { key: "path:D:\\代码", desc: "限定目录" },
+            HelpRow { key: "path:\"a b\"", desc: "含空格加引号" },
+            HelpRow { key: "目录\\名字", desc: "路径末尾分段匹配" },
+        ],
+    },
+    HelpGroup {
+        title: "筛选",
+        rows: &[
+            HelpRow { key: "ext:rs", desc: "扩展名" },
+            HelpRow { key: "date>近7天", desc: "修改时间" },
+            HelpRow { key: "size>10M:", desc: "文件大小" },
+            HelpRow { key: "匹配", desc: "大小写 / 全词 / 正则" },
+            HelpRow { key: "Ctrl+Bksp", desc: "删掉条件" },
+        ],
+    },
+    HelpGroup {
+        title: "输入与编辑",
+        rows: &[
+            HelpRow { key: "拼音", desc: "全拼或首字母" },
+            HelpRow { key: "Ctrl+↑↓", desc: "历史上下条" },
+            HelpRow { key: "Ctrl+Z / Y", desc: "撤回 / 重做条件" },
+            HelpRow { key: "Ctrl+L", desc: "路径改回输入框" },
+        ],
+    },
+    HelpGroup {
+        title: "快捷键",
+        rows: &[
+            HelpRow { key: "Esc", desc: "收起，保留输入" },
+            HelpRow { key: "Tab", desc: "切换范围（Shift 反向）" },
+            HelpRow { key: "Ctrl+G", desc: "文件对话框搜索" },
+            HelpRow { key: "Shift+F10", desc: "动作菜单" },
+            HelpRow { key: "Ctrl+H", desc: "显隐隐藏项" },
+            HelpRow { key: "Del", desc: "删除到回收站" },
+            HelpRow { key: "双击 Ctrl", desc: "唤出窗口" },
+        ],
+    },
+    HelpGroup {
+        title: "示例",
+        rows: &[
+            HelpRow { key: "f ext:rs 并发", desc: "文件+扩展名+词" },
+            HelpRow { key: "c: d: ext:log", desc: "两盘+扩展名" },
+            HelpRow { key: "b rust 泛型", desc: "回车搜网页" },
+            HelpRow { key: "> ipconfig", desc: "回车跑命令" },
+        ],
+    },
+];
+
+/// 面板列数：宽窗口三列并排，中等宽度两列，窄窗口单列顺排。
+fn help_columns(width: f32) -> usize {
+    if width >= 700.0 {
+        3
+    } else if width >= 520.0 {
+        2
     } else {
-        head + left + group(4.0) + group(5.0)
+        1
     }
+}
+
+/// 一张卡片的高度：上下内边距 + 组标题行 + 行数 × 行高。
+fn help_card_height(rows: usize) -> f32 {
+    HELP_CARD_PAD_Y * 2.0 + HELP_GROUP_HEAD_H + rows as f32 * HELP_ROW_H
+}
+
+/// 所有卡片统一成最高的那一张：块的大小与位置全部可预测，
+/// 内容少的卡片就在下面留白（用户要的就是「块大小已知」）。
+fn help_card_h() -> f32 {
+    let rows = HELP_GROUPS.iter().map(|g| g.rows.len()).max().unwrap_or(0);
+    help_card_height(rows)
+}
+
+/// 卡片网格的行数（卡片按行优先填）。
+fn help_grid_rows(cols: usize) -> usize {
+    let cols = cols.clamp(1, HELP_GROUPS.len());
+    HELP_GROUPS.len().div_ceil(cols)
+}
+
+/// 空查询帮助面板的内容高度（相对列表顶部）：卡片网格的行列固定，
+/// 高度 = 顶留白 + 标题 + 行数 × 卡片高 + 卡片间距。
+fn help_panel_height(width: f32) -> f32 {
+    let rows = help_grid_rows(help_columns(width)) as f32;
+    HELP_TOP_PAD + HELP_TITLE_H + rows * help_card_h() + (rows - 1.0) * HELP_CARD_GAP_Y
 }
 
 pub struct LstrApp {
@@ -1697,6 +1805,11 @@ pub struct LstrApp {
     menu_index: usize,
     manual_size: Option<Vec2>,
     resizing: bool,
+    /// 设置面板自己的窗口尺寸（用户拖过就沿用；与启动器尺寸互不影响）。
+    settings_size: Option<Vec2>,
+    /// 进设置前的启动器 `manual_size`：退出设置时原样还回去。
+    /// 外层 None = 当前不是「从启动器进设置」这条链；内层 None = 之前是自动高度。
+    launcher_size_before_settings: Option<Option<Vec2>>,
     /// 结果列表的滚动偏移（像素）。条目超出可视高度时靠滚轮/键盘跟随浏览。
     scroll_y: f32,
     /// 当前列表是否可滚动（paint_rows 计算，footer 用来提示「滚轮查看更多」）。
@@ -1901,6 +2014,11 @@ impl LstrApp {
         let manual_size = cfg
             .height
             .map(|height| egui::vec2(cfg.width.clamp(420.0, 1000.0), height.clamp(160.0, 800.0)));
+        // 设置面板自己的窗口尺寸（与启动器尺寸分开记，见 settings_window_size）。
+        let settings_size = match (cfg.settings_w, cfg.settings_h) {
+            (Some(w), Some(h)) => Some(egui::vec2(w, h)),
+            _ => None,
+        };
         // 已生效排除表:与当前配置比对决定「立即重建」按钮是否出现。
         let noise_exclude_applied = cfg
             .rank
@@ -2027,6 +2145,8 @@ impl LstrApp {
             menu_index: 0,
             manual_size,
             resizing: false,
+            settings_size,
+            launcher_size_before_settings: None,
             scroll_y: 0.0,
             scrollable: false,
             scroll_to_selection: false,
@@ -3997,7 +4117,7 @@ impl LstrApp {
             self.entries.len()
         ));
         self.dialog = None;
-        self.settings_open = false;
+        self.close_settings(ctx);
         self.menu_open = false;
         // 贴角模式自己按 Explorer 的边框定位：不能走 position_center 的
         // center_frames/pending_show 重定位链，否则每帧被拽回屏幕中间。
@@ -4096,7 +4216,7 @@ impl LstrApp {
         self.typing_global = false;
         self.browse_root = None;
         self.browse_forward.clear();
-        self.settings_open = false;
+        self.close_settings(ctx);
         self.menu_open = false;
         self.filter_menu = None;
         // 停靠条自己按对话框边框定位，不走 position_center / position_near_dialog
@@ -4186,15 +4306,42 @@ impl LstrApp {
         ctx.request_repaint();
     }
 
+    /// 关掉设置面板：顺手把启动器尺寸还回去，别让「点个齿轮窗口变大一截、
+    /// 退回搜索还回不去」这种体验留下。
+    fn close_settings(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        self.settings_open = false;
+        if let Some(prev) = self.launcher_size_before_settings.take() {
+            self.manual_size = prev;
+            // 尺寸变了要重新下发 InnerSize：apply_size 只在与 last_* 不同时才发。
+            self.apply_size(ctx);
+        }
+    }
+
     fn open_settings(&mut self, ctx: &egui::Context) {
+        // 从贴角浮层/文件对话框条进来的：那个位置是 Explorer 的角/对话框下沿，
+        // 放不下设置面板，居中更合适。普通启动器进来则**保持原位**——用户刚
+        // 把窗口挪到顺手的地方，点个齿轮就被拉回屏幕正中很难受。
+        let was_attached = self.attach_hwnd.is_some();
         self.settings_open = true;
         self.hidden = false;
         self.shown_at = Instant::now();
-        self.center_frames = 3;
+        // 设置面板不参与「唤出后居中」：center_frames 会在下面几帧里反复
+        // position_center，把用户摆好的位置拖走。
+        self.center_frames = 0;
         self.focus_requested = false;
+        // 记下进设置前的用户尺寸，退出设置时原样还回去。
+        self.launcher_size_before_settings = Some(self.manual_size);
         self.apply_size(ctx);
         if let Some(hwnd) = self.hwnd {
-            window::position_center(hwnd);
+            if was_attached {
+                window::position_center(hwnd);
+            } else {
+                // 变大之后可能顶出工作区（尤其贴右边/贴底部时）：只夹回来，不居中。
+                window::clamp_into_work_area(hwnd);
+            }
             window::show(hwnd);
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -4662,6 +4809,40 @@ impl LstrApp {
         }
     }
 
+    /// 启动器（搜索界面）当前宽度：用户拖过就用拖出来的，否则用主题默认。
+    fn launcher_width(&self) -> f32 {
+        self.manual_size
+            .map(|size| size.x)
+            .unwrap_or(self.theme.width)
+            .clamp(420.0, 1000.0)
+    }
+
+    /// 设置面板的窗口尺寸：用户拖过就用他的，否则给默认值。
+    ///
+    /// 与启动器尺寸完全分开记（`settings_size`，落盘到 `settings_w/settings_h`）：
+    /// 把设置拉成满屏、退回搜索界面不该跟着变巨屏。宽至少 780（侧栏 168 + 内容两列），
+    /// 上限按显示器工作区收；高默认 600，小屏按工作区收。
+    fn settings_window_size(&self, ctx: &egui::Context) -> (f32, f32) {
+        let (monitor_w, monitor_h) = ctx
+            .input(|i| i.viewport().monitor_size)
+            .map(|size| (size.x, size.y))
+            .unwrap_or((1280.0, 800.0));
+        let max_w = (monitor_w - 40.0).max(600.0);
+        let max_h = (monitor_h - 72.0).max(320.0);
+        let width = self
+            .settings_size
+            .map(|size| size.x)
+            .unwrap_or_else(|| self.launcher_width().max(780.0));
+        let height = self
+            .settings_size
+            .map(|size| size.y)
+            .unwrap_or_else(|| self.settings_height(ctx));
+        (
+            width.min(max_w).max(660.0_f32.min(max_w)),
+            height.min(max_h).max(320.0_f32.min(max_h)),
+        )
+    }
+
     fn apply_size(&mut self, ctx: &egui::Context) {
         if self.resizing {
             return;
@@ -4672,20 +4853,20 @@ impl LstrApp {
         if self.attach_hwnd.is_some() && !self.settings_open {
             return;
         }
-        let mut width = self
-            .manual_size
-            .map(|size| size.x)
-            .unwrap_or(self.theme.width)
-            .clamp(420.0, 1000.0);
+        if self.settings_open {
+            let (width, height) = self.settings_window_size(ctx);
+            if (width - self.last_width).abs() > 0.5 || (height - self.last_height).abs() > 0.5 {
+                self.last_width = width;
+                self.last_height = height;
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
+            }
+            return;
+        }
+        let mut width = self.launcher_width();
         if self.preview_open {
             width = width.max(560.0);
         }
-        if self.settings_open {
-            width = width.max(780.0);
-        }
-        let height = if self.settings_open {
-            self.settings_height(ctx)
-        } else {
+        let height = {
             // 窗口高度按「一屏结果数」定：worker 会多送候选（可滚动），
             // 窗口只长到设置的行数，不会因为候选多就撑满屏幕。
             let rows = self.entries.len().min(self.cfg.max_results);
@@ -4887,7 +5068,7 @@ impl LstrApp {
                 return;
             }
             if self.settings_open {
-                self.settings_open = false;
+                self.close_settings(ctx);
                 return;
             }
             self.menu_open = false;
@@ -5900,6 +6081,9 @@ impl LstrApp {
         };
         let banner_h = self.banner_height();
         let dialog_h = if self.dialog.is_some() { 30.0 } else { 0.0 };
+        // 设置面板的画布高度就是窗口高度（尺寸由 settings_window_size 决定，
+        // 用户拖多大就画多大），不要在这里按内容撑高。
+        let settings_open = self.settings_open;
         let height = if self.settings_open {
             self.settings_height(ctx)
         } else if self.attach_hwnd.is_some() {
@@ -5925,7 +6109,7 @@ impl LstrApp {
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
                 let mut rect = ui.max_rect();
-                if rect.height() < height - 2.0 {
+                if !settings_open && rect.height() < height - 2.0 {
                     rect.set_height(height);
                 }
                 let painter = ui.painter().clone();
@@ -5964,6 +6148,9 @@ impl LstrApp {
                     // C8：toast 原来只画在结果页脚，设置页里点「重建索引」
                     // 等操作完全看不到反馈；在设置面板底部叠一层同样的胶囊。
                     self.paint_settings_toast(&painter, rect);
+                    // 设置面板同样要能拖边改尺寸（无边框窗口没有系统的边缘热区），
+                    // 顶边让给那 44pt 的标题条。
+                    self.paint_edge_resize(ui, rect, 44.0);
                     return;
                 }
 
@@ -8327,6 +8514,185 @@ impl LstrApp {
         }
     }
 
+    /// 空查询的搜索技巧面板：`HELP_GROUPS` 排成 1–3 列的卡片网格。
+    /// 卡片宽高、行数、面板整体高度都从那张表推出来（`help_card_h` /
+    /// `help_panel_height` 共用一套算法），所以内容改了既不会裁行，也不会
+    /// 一块高一块矮——旧版手抄的行数和绘制各写一份，正是「看着乱」的来源。
+    fn paint_help(&self, painter: &egui::Painter, rect: Rect, list_top: f32) {
+        let theme = self.theme;
+        let cols = help_columns(rect.width());
+        let left = rect.left() + 26.0;
+        // 右边界取到列表面板自己的右边（它已经减过 PAD），左右留白才对称。
+        let avail = (rect.right() - left).max(1.0);
+        let card_w = ((avail - HELP_CARD_GAP_X * (cols as f32 - 1.0)) / cols as f32).max(1.0);
+        let title_y = list_top + HELP_TOP_PAD;
+        painter.text(
+            egui::pos2(left, title_y),
+            Align2::LEFT_TOP,
+            "搜索技巧",
+            ui::text_font(12.0),
+            theme.sub,
+        );
+        let top = title_y + HELP_TITLE_H;
+        let card_h = help_card_h();
+        for (i, group) in HELP_GROUPS.iter().enumerate() {
+            let col = (i % cols) as f32;
+            let row = (i / cols) as f32;
+            let x = left + col * (card_w + HELP_CARD_GAP_X);
+            let y = top + row * (card_h + HELP_CARD_GAP_Y);
+            let card = Rect::from_min_size(egui::pos2(x, y), egui::vec2(card_w, card_h));
+            self.paint_help_card(painter, card, group);
+        }
+    }
+
+    /// 画一张卡片：淡底 + 淡描边，里面是「组标题 + 键名/说明两列」。
+    /// 键名与说明按墨迹中心对齐到同一行（沿用页脚那套 `ui::ink_rect`，
+    /// mono/中文混排时不会一高一低），并整卡裁剪，长说明只会被裁掉。
+    fn paint_help_card(&self, painter: &egui::Painter, card: Rect, group: &HelpGroup) {
+        let theme = self.theme;
+        let radius = CornerRadius::same(theme.radius);
+        let fill = if theme.light {
+            Color32::from_black_alpha(12)
+        } else {
+            Color32::from_white_alpha(12)
+        };
+        painter.rect_filled(card, radius, fill);
+        painter.rect_stroke(
+            card,
+            radius,
+            Stroke::new(1.0_f32, theme.hair),
+            StrokeKind::Inside,
+        );
+
+        let inner = card.shrink2(egui::vec2(HELP_CARD_PAD_X, HELP_CARD_PAD_Y));
+        let painter = painter.with_clip_rect(inner);
+        let painter = &painter;
+        let key_font = ui::mono_font(11.0);
+        let desc_font = ui::text_font(11.0);
+
+        // 键名列宽 = 本卡最宽的那个键 + 12（这 12 就是键与说明的气口，
+        // 不能被上限吃掉）；上限只保证说明列至少还剩 56pt。
+        let mut key_w: f32 = 0.0;
+        for row in group.rows {
+            let w = painter
+                .layout_no_wrap(row.key.to_string(), key_font.clone(), theme.text)
+                .size()
+                .x;
+            key_w = key_w.max(w);
+        }
+        let key_col = (key_w + 12.0).min((inner.width() - 56.0).max(60.0));
+
+        let head = painter.layout_no_wrap(
+            group.title.to_string(),
+            ui::text_font(11.0),
+            theme.sub,
+        );
+        let head_ink = ui::ink_rect(&head);
+        let head_cy = inner.top() + HELP_GROUP_HEAD_H * 0.5;
+        painter.galley(
+            egui::pos2(inner.left() - head_ink.min.x, head_cy - head_ink.center().y),
+            head,
+            theme.sub,
+        );
+
+        let mut y = inner.top() + HELP_GROUP_HEAD_H;
+        for row in group.rows {
+            let cy = y + HELP_ROW_H * 0.5;
+            let key = painter.layout_no_wrap(row.key.to_string(), key_font.clone(), theme.text);
+            let key_ink = ui::ink_rect(&key);
+            painter.galley(
+                egui::pos2(inner.left() - key_ink.min.x, cy - key_ink.center().y),
+                key,
+                theme.text,
+            );
+            let desc = painter.layout_no_wrap(row.desc.to_string(), desc_font.clone(), theme.dim);
+            let desc_ink = ui::ink_rect(&desc);
+            painter.galley(
+                egui::pos2(inner.left() + key_col - desc_ink.min.x, cy - desc_ink.center().y),
+                desc,
+                theme.dim,
+            );
+            y += HELP_ROW_H;
+        }
+    }
+
+    /// 结果列表与技巧面板共用的右缘细滚动条：画轨道 + 滑块，并把点击/拖拽
+    /// 换算回 `self.scroll_y`。`total_h` 是内容总高（决定滑块长度），
+    /// `max_scroll` 是可滚距离，`id` 区分两处交互区。
+    #[allow(clippy::too_many_arguments)]
+    fn paint_scrollbar(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        theme: &Theme,
+        list_top: f32,
+        view_h: f32,
+        scroll_right: f32,
+        total_h: f32,
+        max_scroll: f32,
+        id: &str,
+    ) {
+
+    if max_scroll > 0.0 {
+        let attach = self.attach_hwnd.is_some();
+        let (bar_w, bar_gap) = if attach { (4.0, 3.0) } else { (3.0, 2.0) };
+        let track = Rect::from_min_max(
+            egui::pos2(scroll_right - bar_gap - bar_w, list_top + 2.0),
+            egui::pos2(scroll_right - bar_gap, list_top + view_h - 2.0),
+        );
+        // 命中区比视觉条宽很多；右端停在 -3，避开窗口右缘 3px 的缩放手势。
+        let hit = Rect::from_min_max(
+            egui::pos2(scroll_right - bar_gap - bar_w - 8.0, track.top() - 2.0),
+            egui::pos2(scroll_right - 3.0, track.bottom() + 2.0),
+        );
+        let response = ui.interact(hit, Id::new(id), Sense::click_and_drag());
+        if (response.dragged() || response.clicked()) && track.height() > 0.0 {
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                let ratio = ((pos.y - track.top()) / track.height()).clamp(0.0, 1.0);
+                self.scroll_y = ratio * max_scroll;
+                ui.ctx().request_repaint();
+            }
+        }
+        if response.hovered() || response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        // 轨道几乎不可见（只是位置提示），滑块轻量着色。
+        painter.rect_filled(track, CornerRadius::same(2), theme.hair);
+        let thumb_h = (view_h / total_h * track.height())
+            .max(18.0)
+            .min(track.height());
+        let travel = (track.height() - thumb_h).max(0.0);
+        let ratio = if max_scroll > 0.0 {
+            self.scroll_y / max_scroll
+        } else {
+            0.0
+        };
+        let thumb = Rect::from_min_size(
+            egui::pos2(track.left(), track.top() + ratio * travel),
+            egui::vec2(track.width(), thumb_h),
+        );
+        let resting = if attach {
+            // 参考图的滑块是浅灰：贴角模式不用普通启动器那套深色强调。
+            if theme.light {
+                egui::Color32::from_rgb(186, 191, 198)
+            } else {
+                egui::Color32::from_rgb(96, 102, 112)
+            }
+        } else {
+            theme.sub.gamma_multiply(0.7)
+        };
+        painter.rect_filled(
+            thumb,
+            CornerRadius::same(2),
+            if response.dragged() || response.hovered() {
+                theme.sub
+            } else {
+                resting
+            },
+        );
+    }
+    }
+
     fn paint_rows(
         &mut self,
         ui: &mut egui::Ui,
@@ -8352,125 +8718,43 @@ impl LstrApp {
                 self.paint_welcome(ui, painter, rect, list_top);
                 return;
             }
-            // 空查询（还没开始搜索）：分类两列的搜索技巧面板。
+            // 空查询（还没开始搜索）：搜索技巧面板（内容见 HELP_GROUPS）。
             if self.help_tips_active(query.is_empty()) {
                 self.needle_target = 0.0;
-                self.scrollable = false;
-                // 左列「搜索语法」：位置 / 筛选 / 范围；右列「输入与快捷键」。
-                // 分类标题（sub 色）+ 键名（mono sub）+ 说明（mono dim），
-                // 窗口窄时退化为单列顺排。
-                let syntax: [(&str, &[(&str, &str)]); 3] = [
-                    (
-                        "位置",
-                        &[
-                            ("c:  d:", "只搜这些盘，打 C: 即 chip"),
-                            ("-c:", "排除某盘，如 ap -c:"),
-                            ("path:D:\\目录", "空格/回车收成路径 chip"),
-                            ("path:\"带 空格\"", "路径含空格时加引号"),
-                            ("目录\\名字", "按路径分段精确查找"),
-                        ],
-                    ),
-                    (
-                        "筛选",
-                        &[
-                            ("ext:rs", "按扩展名"),
-                            ("日期", "date>2026-11-10: 今年/2025"),
-                            ("大小", "size>10M: 数字/单位分段"),
-                            ("Ctrl+Bksp", "删条件；加 Shift 编辑"),
-                            ("Ctrl+Z/Y", "撤回 / 取消撤回条件"),
-                            ("匹配", "大小写 / 全词 / 正则"),
-                        ],
-                    ),
-                    (
-                        "范围 / 搜索",
-                        &[
-                            ("a 微信", "搜应用，a 收成范围 chip"),
-                            ("f 文件", "只搜文件，f 收成范围 chip"),
-                            ("> 命令", "命令页，> 收成范围 chip"),
-                            ("g rust", "全部当搜索词，只出搜索行"),
-                        ],
-                    ),
-                ];
-                let misc: [(&str, &[(&str, &str)]); 2] = [
-                    (
-                        "输入",
-                        &[
-                            ("拼音", "全拼或首字母，wx → 微信"),
-                            ("Tab", "切换范围"),
-                            ("Alt+←", "返回上级范围"),
-                            ("Ctrl+↑↓", "上/下一条历史输入"),
-                        ],
-                    ),
-                    (
-                        "快捷键",
-                        &[
-                            ("Esc", "收起（再唤出保留输入）"),
-                            ("Ctrl+G", "对话框搜索并填入"),
-                            ("Shift+F10", "动作菜单（文件夹也可）"),
-                            ("Ctrl+H", "显示/收起已隐藏的应用"),
-                            ("Del", "删除到回收站（需确认）"),
-                            ("双击 Ctrl", "唤出"),
-                        ],
-                    ),
-                ];
-                let x0 = rect.left() + 26.0;
-                let two_col = rect.width() >= 560.0;
-                let col_w = if two_col {
-                    (rect.width() - 64.0) / 2.0
-                } else {
-                    rect.width() - 52.0
-                };
-                let key_w = 96.0;
-                let draw_group = |painter: &egui::Painter, x: f32, y: &mut f32, (title, rows): (&str, &[(&str, &str)])| {
-                    painter.text(
-                        egui::pos2(x, *y),
-                        Align2::LEFT_TOP,
-                        title,
-                        ui::text_font(11.5),
-                        theme.sub,
-                    );
-                    *y += HELP_GROUP_HEAD_H;
-                    for (key, desc) in rows {
-                        painter.text(
-                            egui::pos2(x + 6.0, *y),
-                            Align2::LEFT_TOP,
-                            *key,
-                            ui::mono_font(11.0),
-                            theme.sub,
-                        );
-                        painter.text(
-                            egui::pos2(x + 6.0 + key_w, *y),
-                            Align2::LEFT_TOP,
-                            *desc,
-                            ui::mono_font(11.0),
-                            theme.dim,
-                        );
-                        *y += HELP_ROW_H;
-                    }
-                    *y += HELP_GROUP_GAP;
-                };
-                let mut y = list_top + HELP_TOP_PAD;
-                painter.text(
-                    egui::pos2(x0, y),
-                    Align2::LEFT_TOP,
-                    "搜索技巧",
-                    ui::text_font(12.0),
-                    theme.sub,
+                // 卡片网格比可视区高时（窄窗两列、或用户把窗口拉矮），面板自己
+                // 滚：滚轮 + 右缘滑块，和结果列表同一套手感（共用 scroll_y）。
+                let list_area = Rect::from_min_max(
+                    egui::pos2(rect.left(), list_top),
+                    egui::pos2(rect.right(), list_top + view_h),
                 );
-                y += HELP_TITLE_H;
-                for group in syntax {
-                    draw_group(painter, x0, &mut y, group);
-                }
-                if two_col {
-                    let mut ry = list_top + HELP_TOP_PAD + HELP_TITLE_H;
-                    for group in misc {
-                        draw_group(painter, x0 + col_w + 12.0, &mut ry, group);
+                let total_h = help_panel_height(rect.width());
+                let max_scroll = (total_h - view_h).max(0.0);
+                if max_scroll > 0.0
+                    && ui
+                        .ctx()
+                        .input(|i| i.pointer.hover_pos().is_some_and(|p| list_area.contains(p)))
+                {
+                    let delta = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+                    if delta != 0.0 {
+                        self.scroll_y -= delta;
+                        ui.ctx().request_repaint();
                     }
-                } else {
-                    for group in misc {
-                        draw_group(painter, x0, &mut y, group);
-                    }
                 }
+                self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+                self.scrollable = max_scroll > 0.0;
+                let clipped = painter.with_clip_rect(list_area);
+                self.paint_help(&clipped, rect, list_top - self.scroll_y);
+                self.paint_scrollbar(
+                    ui,
+                    painter,
+                    &theme,
+                    list_top,
+                    view_h,
+                    scroll_right,
+                    total_h,
+                    max_scroll,
+                    "lstr-help-scrollbar",
+                );
                 return;
             }
             // 正在输入日期条件：查询已暂停，给出明确反馈，别让用户以为
@@ -9312,61 +9596,16 @@ impl LstrApp {
         // 也画——结果超过 9 行时用户需要知道下面还有内容。贴角模式把条加宽
         // 到 4px、改用参考图那种浅灰滑块，否则 3px 深色条太不起眼。
         if max_scroll > 0.0 {
-            let attach = self.attach_hwnd.is_some();
-            let (bar_w, bar_gap) = if attach { (4.0, 3.0) } else { (3.0, 2.0) };
-            let track = Rect::from_min_max(
-                egui::pos2(scroll_right - bar_gap - bar_w, list_top + 2.0),
-                egui::pos2(scroll_right - bar_gap, list_top + view_h - 2.0),
-            );
-            // 命中区比视觉条宽很多；右端停在 -3，避开窗口右缘 3px 的缩放手势。
-            let hit = Rect::from_min_max(
-                egui::pos2(scroll_right - bar_gap - bar_w - 8.0, track.top() - 2.0),
-                egui::pos2(scroll_right - 3.0, track.bottom() + 2.0),
-            );
-            let response = ui.interact(hit, Id::new("lstr-scrollbar"), Sense::click_and_drag());
-            if (response.dragged() || response.clicked()) && track.height() > 0.0 {
-                if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
-                    let ratio = ((pos.y - track.top()) / track.height()).clamp(0.0, 1.0);
-                    self.scroll_y = ratio * max_scroll;
-                    ui.ctx().request_repaint();
-                }
-            }
-            if response.hovered() || response.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            // 轨道几乎不可见（只是位置提示），滑块轻量着色。
-            raw_painter.rect_filled(track, CornerRadius::same(2), theme.hair);
-            let thumb_h = (view_h / total_h * track.height())
-                .max(18.0)
-                .min(track.height());
-            let travel = (track.height() - thumb_h).max(0.0);
-            let ratio = if max_scroll > 0.0 {
-                self.scroll_y / max_scroll
-            } else {
-                0.0
-            };
-            let thumb = Rect::from_min_size(
-                egui::pos2(track.left(), track.top() + ratio * travel),
-                egui::vec2(track.width(), thumb_h),
-            );
-            let resting = if attach {
-                // 参考图的滑块是浅灰：贴角模式不用普通启动器那套深色强调。
-                if theme.light {
-                    egui::Color32::from_rgb(186, 191, 198)
-                } else {
-                    egui::Color32::from_rgb(96, 102, 112)
-                }
-            } else {
-                theme.sub.gamma_multiply(0.7)
-            };
-            raw_painter.rect_filled(
-                thumb,
-                CornerRadius::same(2),
-                if response.dragged() || response.hovered() {
-                    theme.sub
-                } else {
-                    resting
-                },
+            self.paint_scrollbar(
+                ui,
+                &raw_painter,
+                &theme,
+                list_top,
+                view_h,
+                scroll_right,
+                total_h,
+                max_scroll,
+                "lstr-scrollbar",
             );
         }
 
@@ -9453,7 +9692,7 @@ impl LstrApp {
             "正在输入日期/大小/路径/盘符条件 · 冒号或回车提交".to_string()
         } else if query.is_empty() && self.filters.is_empty() {
             format!(
-                "{} 项{}{}",
+                "{} 项{}{}{}",
                 entries.len(),
                 if query.scope == Scope::All && self.cfg.show_history {
                     " · 最近使用"
@@ -9469,6 +9708,12 @@ impl LstrApp {
                     }
                 } else {
                     String::new()
+                },
+                // 空态「搜索技巧」面板内容超出可视高度时提示可滚（与结果列表同一句）。
+                if self.scrollable {
+                    " · 滚轮查看更多"
+                } else {
+                    ""
                 }
             )
         } else {
@@ -9585,6 +9830,15 @@ impl LstrApp {
         if self.input.is_empty() && self.has_input_chips() {
             hints.push(("Ctrl+Bksp", "删条件"));
         }
+        // 页脚所有元素共用一条光学中心线：键帽框、键字、标签、左侧文案、
+        // 「撤回删除」都按墨迹中心对齐（见 ui::ink_rect）。排版盒含 ascent/descent
+        // 与行距，键帽里的 ↑↓/Tab 墨迹只有 9px、中文标签 13px，各自按盒子居中
+        // 会让键字比标签高 2px。键帽高度固定成等宽行高 + 4，不再被回退字体撑高。
+        let hint_cy = footer_top + FOOTER_H * 0.5;
+        let keycap_h = painter
+            .ctx()
+            .fonts(|f| f.row_height(&ui::mono_font(10.0)))
+            + 4.0;
         let mut right = rect.right() - PAD;
         for (key, label) in hints.iter().rev() {
             let key_galley = painter.layout_no_wrap(
@@ -9597,17 +9851,14 @@ impl LstrApp {
                 ui::text_font(11.0),
                 theme.dim,
             );
+            let key_ink = ui::ink_rect(&key_galley);
+            let label_ink = ui::ink_rect(&label_galley);
             let key_w = key_galley.size().x + 8.0;
             let total = key_w + 4.0 + label_galley.size().x;
             let x = right - total;
-            // 键帽框围着键文字的实际 galley 画（+2px 内边距）：↑↓ 箭头来自
-            // CJK 回退字体，行高 >16px，固定高度的框会被字形撑出错位。
-            // 框与键文字共享同一几何(bounds+padding)，从构造上对齐；
-            // 标签文字用 LEFT_CENTER 锚到同一中心线(footer_top+18)。
-            let key_h = key_galley.size().y;
-            let key_rect = Rect::from_min_size(
-                egui::pos2(x, footer_top + 18.0 - key_h * 0.5 - 2.0),
-                egui::vec2(key_w, key_h + 4.0),
+            let key_rect = Rect::from_center_size(
+                egui::pos2(x + key_w * 0.5, hint_cy),
+                egui::vec2(key_w, keycap_h),
             );
             painter.rect_stroke(
                 key_rect,
@@ -9615,16 +9866,19 @@ impl LstrApp {
                 Stroke::new(1.0_f32, theme.hair),
                 StrokeKind::Inside,
             );
+            // 键字：墨迹中心对到键帽中心（横向也按墨迹，箭头/字母两侧留白才相等）。
             painter.galley(
-                egui::pos2(x + 4.0, footer_top + 18.0 - key_h * 0.5),
+                key_rect.center() - key_ink.center().to_vec2(),
                 key_galley,
                 theme.dim,
             );
-            painter.text(
-                egui::pos2(x + key_w + 4.0, footer_top + 18.0),
-                Align2::LEFT_CENTER,
-                label.to_string(),
-                ui::text_font(11.0),
+            // 标签：同一条中心线；左边按墨迹起点排，和键帽的间距才是真的 4px。
+            painter.galley(
+                egui::pos2(
+                    x + key_w + 4.0 - label_ink.min.x,
+                    hint_cy - label_ink.center().y,
+                ),
+                label_galley,
                 theme.dim,
             );
             right = x - 12.0;
@@ -9650,8 +9904,12 @@ impl LstrApp {
         job.wrap.break_anywhere = true;
         let galley = painter.layout_job(job);
         let text_w = galley.size().x;
+        let left_ink = ui::ink_rect(&galley);
         painter.galley(
-            egui::pos2(rect.left() + PAD, footer_top + 18.0 - galley.size().y / 2.0),
+            egui::pos2(
+                rect.left() + PAD - left_ink.min.x,
+                hint_cy - left_ink.center().y,
+            ),
             galley,
             left_color,
         );
@@ -9679,11 +9937,15 @@ impl LstrApp {
                 Stroke::new(1.0_f32, theme.amber.gamma_multiply(0.35)),
                 StrokeKind::Inside,
             );
-            painter.text(
-                pill.center(),
-                Align2::CENTER_CENTER,
-                "撤回删除",
+            let undo_galley = painter.layout_no_wrap(
+                "撤回删除".to_string(),
                 ui::text_font(11.0),
+                theme.amber,
+            );
+            let undo_ink = ui::ink_rect(&undo_galley);
+            painter.galley(
+                pill.center() - undo_ink.center().to_vec2(),
+                undo_galley,
                 theme.amber,
             );
             if response.hovered() {
@@ -10676,7 +10938,7 @@ impl LstrApp {
             if close.hovered() { theme.text } else { theme.sub },
         );
         if close.clicked() || close_keys {
-            self.settings_open = false;
+            self.close_settings(ui.ctx());
             // 关掉设置面板时退出热键录制态，避免录制提示残留到下次打开。
             self.hotkey_recording = None;
         }
@@ -10824,6 +11086,9 @@ impl LstrApp {
             }
         };
         ui.set_clip_rect(prev_clip);
+        // 各页返回的是「内容高度」而不是滚动坐标系里的绝对 y（见各页末尾的
+        // `- area.top()`）：否则滚多少，量出来的内容就矮多少，clamp 会把
+        // scroll 一帧一帧拽回来——滚到底时整个页面来回抖就是这个。
         self.settings_content_h[tab_idx] = content_height;
 
         // 滚动条：只有内容真的溢出时才画，给滚轮一个可见反馈。
@@ -11247,7 +11512,7 @@ impl LstrApp {
             self.preview_open = preview;
             let _ = self.cfg.save();
         }
-        y + 22.0 + 16.0
+        y + 22.0 + 16.0 - area.top()
     }
 
     fn paint_settings_behavior(
@@ -11532,7 +11797,7 @@ impl LstrApp {
             ui::mono_font(10.0),
             theme.dim,
         );
-        hint_y + 16.0 + 16.0
+        hint_y + 16.0 + 16.0 - area.top()
     }
 
     /// 设置页「资产」：收藏 / 动作 / 命令的可视化增删改。
@@ -11689,7 +11954,7 @@ impl LstrApp {
             let _ = self.cfg.save();
             self.trigger(ctx);
         }
-        reset_y + 24.0 + 12.0
+        reset_y + 24.0 + 12.0 - area.top()
     }
 
     /// 「噪声」页:统一规则列表。每行一个行为——排除(整树不索引,重建后
@@ -11777,7 +12042,19 @@ impl LstrApp {
                         continue;
                     }
                     ui.horizontal(|ui| {
-                        let edit_w = (list_rect.width() - 236.0).max(140.0);
+                        // 行内四段：路径框 / 排除·降权 chip / 罚分滑块 / 删除。
+                        // 宽度必须按「本行实际可用宽」算：ScrollArea 出现竖向滚动条时
+                        // 会吃掉右边十几个点，用 list_rect.width() 算会让最右的 × 被裁掉。
+                        const CHIP_W: f32 = 52.0;
+                        const SLIDER_W: f32 = 130.0;
+                        const BTN_W: f32 = 26.0;
+                        let row_w = ui.available_width();
+                        let gap = ui.spacing().item_spacing.x;
+                        let reserve = CHIP_W + SLIDER_W + BTN_W + gap * 2.0 + 12.0 + 8.0;
+                        let edit_w = (row_w - reserve).max(120.0);
+                        // 滑块自带的数值框（约 44pt）会画在给定矩形之外，
+                        // 所以把轨道压窄，让它连数值框一起塞进 SLIDER_W。
+                        ui.spacing_mut().slider_width = SLIDER_W - 48.0;
                         let response = ui.add_sized(
                             [edit_w, 22.0],
                             egui::TextEdit::singleline(&mut rule.pattern)
@@ -11833,7 +12110,7 @@ impl LstrApp {
                             ui.allocate_rect(
                                 Rect::from_min_size(
                                     egui::pos2(chip.right() + 6.0, cur_top),
-                                    egui::vec2(96.0, 22.0),
+                                    egui::vec2(SLIDER_W, 22.0),
                                 ),
                                 Sense::hover(),
                             );
@@ -11842,7 +12119,7 @@ impl LstrApp {
                             let slider = ui.put(
                                 Rect::from_min_size(
                                     egui::pos2(chip.right() + 6.0, cur_top),
-                                    egui::vec2(96.0, 22.0),
+                                    egui::vec2(SLIDER_W, 22.0),
                                 ),
                                 egui::Slider::new(&mut penalty, 0.0..=300.0).integer(),
                             );
@@ -12411,7 +12688,7 @@ impl LstrApp {
         painter.galley(egui::pos2(area.left(), y + 8.0), galley, theme.sub);
         // C5：把真实内容高度交给设置页外层滚动容器（原先固定区域，底部
         // 帮助文字在窗口不高时被裁掉且无法滚动）。
-        y + 8.0 + help_h + 16.0
+        y + 8.0 + help_h + 16.0 - area.top()
     }
 
     fn cfg_index_incremental(&self) -> &'static str {
@@ -12636,7 +12913,7 @@ impl LstrApp {
             ui::mono_font(10.0),
             theme.dim,
         );
-        foot_y + 18.0 + 14.0
+        foot_y + 18.0 + 14.0 - area.top()
     }
 
     /// 顶部拖动条：主界面 12px，设置面板放到 44px（标题整条都能拖）。
@@ -12649,9 +12926,16 @@ impl LstrApp {
     ) {
         let theme = self.theme;
         let corner = 12.0;
+        // 设置面板的标题条里有「×」关闭按钮（右边距 PAD 再往内 22pt）：
+        // 拖动条要给它让路，否则后注册的拖拽热区会盖住按钮 —— 点关闭变成拖窗口。
+        let right_inset = if drag_h > 20.0 {
+            PAD + 28.0
+        } else {
+            corner
+        };
         let drag_rect = Rect::from_min_max(
             egui::pos2(rect.left() + corner, rect.top()),
-            egui::pos2(rect.right() - corner, rect.top() + drag_h),
+            egui::pos2(rect.right() - right_inset, rect.top() + drag_h),
         );
         let drag = ui.interact(drag_rect, Id::new("lstr-drag"), Sense::drag());
         if drag.drag_started() {
@@ -12679,16 +12963,25 @@ impl LstrApp {
     }
 
     fn paint_drag_resize(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
-        let drag_h = 12.0;
+        self.paint_drag_strip(ui, painter, rect, 12.0);
+        self.paint_edge_resize(ui, rect, 12.0);
+    }
+
+    /// 四边 + 四角的缩放热区（无边框窗口自己实现）。
+    ///
+    /// `top_skip` 是顶部要让给「拖标题条移动」的高度：普通启动器 12pt，设置面板
+    /// 44pt（整条标题都能拖）。顶边/顶角一律从 `top_skip` 以下开始，否则拖标题
+    /// 会变成改高度。
+    fn paint_edge_resize(&mut self, ui: &mut egui::Ui, rect: Rect, top_skip: f32) {
         // 右缘只留 3px 给窗口缩放，其余让给滚动条拖拽。
         let edge = 3.0;
         let corner = 12.0;
-        self.paint_drag_strip(ui, painter, rect, drag_h);
+        let top_corner = (top_skip + corner).min(rect.height() * 0.5);
 
         let handles = [
             (
                 Rect::from_min_max(
-                    egui::pos2(rect.right() - edge, rect.top() + drag_h),
+                    egui::pos2(rect.right() - edge, rect.top() + top_skip),
                     rect.right_bottom(),
                 ),
                 egui::ResizeDirection::East,
@@ -12696,7 +12989,7 @@ impl LstrApp {
             ),
             (
                 Rect::from_min_max(
-                    egui::pos2(rect.left(), rect.top() + drag_h),
+                    egui::pos2(rect.left(), rect.top() + top_skip),
                     egui::pos2(rect.left() + edge, rect.bottom()),
                 ),
                 egui::ResizeDirection::West,
@@ -12728,16 +13021,16 @@ impl LstrApp {
             ),
             (
                 Rect::from_min_max(
-                    egui::pos2(rect.right() - corner, rect.top()),
-                    egui::pos2(rect.right(), rect.top() + corner),
+                    egui::pos2(rect.right() - corner, rect.top() + top_skip),
+                    egui::pos2(rect.right(), rect.top() + top_corner),
                 ),
                 egui::ResizeDirection::NorthEast,
                 egui::CursorIcon::ResizeNeSw,
             ),
             (
                 Rect::from_min_max(
-                    rect.left_top(),
-                    egui::pos2(rect.left() + corner, rect.top() + corner),
+                    egui::pos2(rect.left(), rect.top() + top_skip),
+                    egui::pos2(rect.left() + corner, rect.top() + top_corner),
                 ),
                 egui::ResizeDirection::NorthWest,
                 egui::CursorIcon::ResizeNwSe,
@@ -13184,10 +13477,17 @@ impl eframe::App for LstrApp {
             if !down {
                 self.resizing = false;
                 if let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|rect| rect.size())) {
-                    self.manual_size = Some(size);
-                    // 记住用户拖出来的尺寸，下次启动/唤出沿用。
-                    self.cfg.width = size.x.clamp(420.0, 1000.0);
-                    self.cfg.height = Some(size.y.clamp(160.0, 800.0));
+                    if self.settings_open {
+                        // 设置面板的尺寸单独记：别把启动器也撑成这个大小。
+                        self.settings_size = Some(size);
+                        self.cfg.settings_w = Some(size.x);
+                        self.cfg.settings_h = Some(size.y);
+                    } else {
+                        self.manual_size = Some(size);
+                        // 记住用户拖出来的尺寸，下次启动/唤出沿用。
+                        self.cfg.width = size.x.clamp(420.0, 1000.0);
+                        self.cfg.height = Some(size.y.clamp(160.0, 800.0));
+                    }
                     let _ = self.cfg.save();
                 }
             }

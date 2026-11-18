@@ -151,6 +151,45 @@ pub fn position_center(hwnd_value: isize) {
     }
 }
 
+/// 把窗口夹回当前显示器工作区：只在越界时移动，**不重新居中**。
+///
+/// 用在「窗口变大之后」的场景（打开设置面板）：用户在哪儿摆的就留在哪儿，
+/// 只是不许被顶到屏幕外。已经是完整可见的窗口位置不会被改动。
+pub fn clamp_into_work_area(hwnd_value: isize) {
+    if hwnd_value == 0 {
+        return;
+    }
+    let target = hwnd(hwnd_value);
+    unsafe {
+        let Some([work_l, work_t, work_r, work_b]) = work_area_for(hwnd_value) else {
+            return;
+        };
+        let mut rect = RECT::default();
+        if GetWindowRect(target, &mut rect).is_err() {
+            return;
+        }
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        // 窗口比工作区还大时贴住左上角，右下角自然溢出（与 position_center 一致）。
+        let max_x = (work_r - width).max(work_l);
+        let max_y = (work_b - height).max(work_t);
+        let x = rect.left.clamp(work_l, max_x);
+        let y = rect.top.clamp(work_t, max_y);
+        if x == rect.left && y == rect.top {
+            return;
+        }
+        let _ = SetWindowPos(
+            target,
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
 /// 窗口所在显示器的工作区 `(left, top, right, bottom)`（已扣掉任务栏）。
 ///
 /// 文件对话框停靠条要夹在工作区内：对话框贴边/最大化时，条子不能跑到屏幕外。

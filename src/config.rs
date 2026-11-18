@@ -26,6 +26,12 @@ pub struct Config {
     /// 用户拖拽后的窗口高度；None 表示按结果数量自动计算。
     #[serde(default)]
     pub height: Option<f32>,
+    /// 设置面板自己的窗口尺寸（宽, 高）：和启动器的 `width`/`height` 分开记，
+    /// 否则把设置拉大一次，退回搜索界面也跟着变巨型。None = 按显示器收敛。
+    #[serde(default)]
+    pub settings_w: Option<f32>,
+    #[serde(default)]
+    pub settings_h: Option<f32>,
     pub app_boost: i32,
     pub show_meta: bool,
     pub preview: bool,
@@ -593,6 +599,8 @@ impl Default for Config {
             max_load_results: default_max_load_results(),
             width: 640.0,
             height: None,
+            settings_w: None,
+            settings_h: None,
             app_boost: 3,
             show_meta: true,
             preview: true,
