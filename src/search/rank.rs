@@ -227,6 +227,52 @@ pub fn score_entry_planned(
         + plan.snapshot.boost(&entry.id)
 }
 
+/// 类型页空输入的使用学习排序：用过的条目按 frecency 降序排前面，没用过的
+/// 保持 `items` 给出的自然顺序（书签 = 名称升序，笔记 = 修改时间降序），只取
+/// 前 `take` 条，且只 clone 这 `take` 条。
+///
+/// 必须在**全量候选**上调用：调用方不要把 `top(take)` 的结果传进来，否则名称
+/// / 时间窗口之外的常用条目仍然升不上来（这正是本函数要修的问题）。
+pub fn usage_page<'a>(
+    items: impl IntoIterator<Item = &'a Entry>,
+    history: &History,
+    take: usize,
+) -> Vec<Entry> {
+    if take == 0 {
+        return Vec::new();
+    }
+    let items: Vec<&Entry> = items.into_iter().collect();
+    let snapshot = history.rank_snapshot("");
+    let mut used: Vec<(f32, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let score = snapshot.score(&entry.id);
+            (score > 0.0).then_some((score, index))
+        })
+        .collect();
+    // 稳定排序：同分时保持自然顺序。
+    used.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out = Vec::with_capacity(take.min(items.len()));
+    let mut taken = vec![false; items.len()];
+    for (_, index) in used {
+        if out.len() >= take {
+            return out;
+        }
+        out.push(Entry::clone(items[index]));
+        taken[index] = true;
+    }
+    for (index, entry) in items.iter().enumerate() {
+        if out.len() >= take {
+            break;
+        }
+        if !taken[index] {
+            out.push(Entry::clone(entry));
+        }
+    }
+    out
+}
+
 /// 盘符权重扣分：路径所在盘每降 1 点权重扣 1 分（权重 100 = 0 分）。
 /// 不参与空查询的「最近使用」排序——历史是用户真实用过的，不该被偏好压。
 fn drive_points(entry: &Entry, path_lc: &str, plan: &RankPlan) -> i32 {
@@ -1147,6 +1193,36 @@ mod tests {
             score_entry_planned(&on_c, &plan, 3, &cfg),
             score_entry_planned(&on_d, &plan, 3, &cfg),
             "应用条目不参与盘符权重"
+        );
+    }
+
+    #[test]
+    fn usage_page_puts_used_first_and_keeps_natural_order() {
+        let now = now();
+        // Beta 用过 5 次、Gamma 1 次；Alpha 没用过。
+        let history = history(&[("b", 5, now), ("c", 1, now)]);
+        let entries = vec![
+            entry("a", "Alpha", Kind::File),
+            entry("b", "Beta", Kind::File),
+            entry("c", "Gamma", Kind::File),
+        ];
+
+        let page = usage_page(entries.iter(), &history, 3);
+        let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Beta", "Gamma", "Alpha"],
+            "用过的按 frecency 排前，其余保持自然序"
+        );
+
+        let page = usage_page(entries.iter(), &history, 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].name, "Beta");
+        assert_eq!(page[1].name, "Gamma");
+
+        assert!(
+            usage_page(entries.iter(), &history, 0).is_empty(),
+            "take=0 必须返回空"
         );
     }
 }
