@@ -1895,14 +1895,18 @@ fn notes_response(
     let (entries, total) = if !enabled {
         (Vec::new(), 0)
     } else if request.query.text.trim().is_empty() {
-        // 空输入 = 最近修改的笔记；total 用真实总数，UI 才会发「加载更多」。
-        (notes.top(take), notes.count())
+        // 空输入 = 最近使用优先（frecency 排前，其余按修改时间）；
+        // total 用真实总数，UI 才会发「加载更多」。
+        let entries = match history.lock() {
+            Ok(history) => notes.used_page(&history, take),
+            Err(_) => notes.top(take),
+        };
+        (entries, notes.count())
     } else {
         let strict = !request.filters.matches.is_default();
-        // 严格匹配（大小写/全词/正则）时不做拼音/模糊/文件夹兜底，避免
-        // 「区分大小写搜 rust」仍被文件夹路径带出一整夹笔记。严格模式下
-        // 先取全量再复核，total 才与「复核后真正能看到的条数」同口径。
-        let limit = if strict { usize::MAX } else { take };
+        // 全量命中交给 rank（frecency / query_hits 才能把窗口外的常用笔记提上
+        // 来），响应末尾再按 take 截断。严格匹配仍先取全量再复核。
+        let limit = usize::MAX;
         let (mut hits, total) = match history.lock() {
             Ok(history) => notes.search(
                 &request.query.text,
